@@ -325,6 +325,7 @@ Environment variables still take precedence over YAML, and
 | Variable | Default | Use |
 |----------|---------|-----|
 | `LCM_CONTEXT_THRESHOLD` | `0.35` | Fraction of the context window that triggers LCM compaction |
+| `LCM_MODEL_THRESHOLDS` | empty | Per-model threshold overrides. Format: `"glm-5.2:0.70,glm-5.2-1M:0.25"`. Keys matched as substrings (longest wins). Also settable as `lcm.model_thresholds` in config.yaml. |
 | `LCM_FRESH_TAIL_COUNT` | `32` | Recent messages protected from compaction |
 | `LCM_INCREMENTAL_MAX_DEPTH` | `3` | Max DAG condensation depth (`-1` = unlimited, `0` = leaf only); enables hierarchical summarization |
 | `LCM_LEAF_CHUNK_TOKENS` | `20000` | Raw-backlog floor before leaf compaction; with dynamic chunking enabled, the base chunk target |

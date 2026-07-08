@@ -111,7 +111,49 @@ def _load_hermes_config_yaml() -> dict[str, Any]:
 
 
 def _supported_lcm_config_yaml_keys() -> frozenset[str]:
-    return frozenset({"context_threshold"} | {spec.name for spec in ENV_FIELD_SPECS})
+    return frozenset(
+        {"context_threshold", "model_thresholds"}
+        | {spec.name for spec in ENV_FIELD_SPECS}
+    )
+
+
+def _load_model_thresholds_from_yaml(
+    cfg: dict[str, Any] | None = None,
+) -> dict[str, float]:
+    """Read ``lcm.model_thresholds`` from config.yaml."""
+    cfg = cfg if cfg is not None else _load_hermes_config_yaml()
+    try:
+        lcm_section = cfg.get("lcm") or {}
+        if not isinstance(lcm_section, dict):
+            return {}
+        raw = lcm_section.get("model_thresholds")
+        if not isinstance(raw, dict):
+            return {}
+        result: dict[str, float] = {}
+        for key, value in raw.items():
+            if str(key).strip() and isinstance(value, (int, float)) and not isinstance(value, bool):
+                result[str(key)] = float(value)
+        return result
+    except Exception:
+        return {}
+
+
+def _parse_model_thresholds_env(raw: str) -> dict[str, float]:
+    """Parse ``LCM_MODEL_THRESHOLDS`` (``model:threshold,...``)."""
+    result: dict[str, float] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if ":" not in pair:
+            continue
+        key, _, value = pair.rpartition(":")
+        key = key.strip()
+        if not key:
+            continue
+        try:
+            result[key] = float(value.strip())
+        except ValueError:
+            continue
+    return result
 
 
 def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str]:
@@ -369,6 +411,8 @@ class LCMConfig:
     leaf_chunk_tokens: int = 20_000
     # Fraction of context window that triggers compaction (0.0–1.0)
     context_threshold: float = 0.35
+    # Model-substring overrides. Longest case-sensitive substring wins.
+    model_thresholds: dict[str, float] = field(default_factory=dict)
     # Mirror Hermes Agent's Codex gpt-5.5 route-specific threshold auto-raise
     # when LCM is inheriting the host compression threshold. Explicit LCM
     # threshold overrides remain authoritative.
@@ -536,6 +580,10 @@ class LCMConfig:
             default_source=context_source,
         )
         _record("context_threshold", source, warning)
+        c.model_thresholds = _load_model_thresholds_from_yaml(hermes_config)
+        raw_model_thresholds = os.environ.get("LCM_MODEL_THRESHOLDS")
+        if raw_model_thresholds is not None:
+            c.model_thresholds = _parse_model_thresholds_env(raw_model_thresholds)
         c.codex_gpt55_autoraise_enabled, source = _hermes_codex_gpt55_autoraise_with_source(
             c.codex_gpt55_autoraise_enabled, hermes_config
         )
