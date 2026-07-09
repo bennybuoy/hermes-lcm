@@ -17,7 +17,11 @@ from hermes_lcm.config import LCMConfig
 from hermes_lcm.tokens import count_tokens, count_message_tokens, count_messages_tokens
 from hermes_lcm.store import MessageStore
 from hermes_lcm.dag import SummaryDAG, SummaryNode
-from hermes_lcm.escalation import _deterministic_truncate
+from hermes_lcm.escalation import (
+    _build_l1_focus_brief,
+    _build_l2_focus_brief,
+    _deterministic_truncate,
+)
 from hermes_lcm.lifecycle_state import LifecycleStateStore
 from hermes_lcm.db_bootstrap import ExternalContentFtsSpec, ensure_external_content_fts
 from hermes_lcm.search_query import sanitize_fts5_query
@@ -32,6 +36,27 @@ from hermes_lcm.message_patterns import (
     compile_message_patterns,
     matches_message_pattern,
 )
+
+
+class TestFocusBriefFormatting:
+    def test_l1_focus_brief_preserves_literal_braces_in_focus_topic(self):
+        topic = 'Investigate JSON payload {"mode": "force", "items": [1, 2]} and placeholder {0}'
+
+        brief = _build_l1_focus_brief(topic)
+
+        assert topic in brief
+        assert "Replacement index" not in brief
+        assert "## Historical Task Snapshot" in brief
+        assert "mark them under one of these historical headings:" in brief
+
+    def test_l2_focus_brief_preserves_literal_braces_in_focus_topic(self):
+        topic = "Reconcile tool output with braces: {'force': true, 'topic': '{markers}'}"
+
+        brief = _build_l2_focus_brief(topic)
+
+        assert topic in brief
+        assert "## Historical Remaining Work" in brief
+        assert "Place non-current work under:" in brief
 
 
 class TestModelRouting:
