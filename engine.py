@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -177,6 +178,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._foreground_session_id: str = ""
         self._foreground_session_platform: str = ""
         self._foreground_conversation_id: str = ""
+        self._foreground_rebind_session_id: str = ""
+        self._foreground_rebind_previous_session_id: str = ""
+        self._foreground_rebind_previous_platform: str = ""
+        self._foreground_rebind_previous_conversation_id: str = ""
+        self._foreground_rebind_parent_session_id: str = ""
         self._conversation_id: str = ""
         self._session_match_keys: list[str] = []
         self._session_ignored = False
@@ -434,6 +440,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._foreground_session_id = ""
         self._foreground_session_platform = ""
         self._foreground_conversation_id = ""
+        self._clear_foreground_rebind_candidate()
         self._conversation_id = ""
         self._session_match_keys = []
         self._session_ignored = False
@@ -684,6 +691,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._last_compression_status = "pending"
         self._last_compression_noop_reason = ""
         return True
+
+    @property
+    def bound_session_id(self) -> str:
+        """Session id this engine is actively servicing for ingest/lifecycle.
+
+        This differs from ``current_session_id`` while a side-channel session is
+        bound but operator-facing tools should keep showing the foreground
+        session. Host lifecycle hooks must compare against this value before
+        deciding whether a post-turn ingest needs to rebind the engine.
+        """
+        return self._session_id
 
     @property
     def current_session_id(self) -> str:
@@ -958,15 +976,185 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         else:
             logger.warning(message, *args)
 
-    def _maybe_reclassify_current_session_as_auxiliary_at_ingest(self) -> bool:
+    def _clear_foreground_rebind_candidate(self) -> None:
+        self._foreground_rebind_session_id = ""
+        self._foreground_rebind_previous_session_id = ""
+        self._foreground_rebind_previous_platform = ""
+        self._foreground_rebind_previous_conversation_id = ""
+        self._foreground_rebind_parent_session_id = ""
+
+    def _clear_foreground_rebind_candidate_if_bound_session_confirmed(self) -> None:
+        if self._foreground_rebind_session_id == self._session_id:
+            self._clear_foreground_rebind_candidate()
+
+    def _session_has_foreground_branch_marker(
+        self,
+        session_id: str,
+        parent_session_id: str,
+    ) -> bool:
+        """Return True when Hermes state.db records ``session_id`` as a real branch.
+
+        An un-ingested foreground branch and a provisional late-marked auxiliary
+        child can both expose the same in-process parent id before either has
+        durable LCM rows. The canonical host signal for real foreground branches
+        is the ``sessions.model_config._branched_from`` marker in state.db; use
+        it to decide whether a displaced un-ingested candidate is safe to restore.
+        """
+        session_id = str(session_id or "")
+        parent_session_id = str(parent_session_id or "")
+        if not session_id or not parent_session_id:
+            return False
+        path = self._state_db_path()
+        if not path.exists():
+            return False
+        try:
+            uri = path.resolve().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT parent_session_id, model_config
+                    FROM sessions
+                    WHERE id = ?
+                    LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+        except Exception:
+            logger.debug("LCM foreground branch marker probe failed", exc_info=True)
+            return False
+        if not row:
+            return False
+        row_parent_id = str(row[0] or "")
+        if row_parent_id != parent_session_id:
+            return False
+        try:
+            model_config = json.loads(row[1] or "{}")
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(model_config, dict):
+            return False
+        return str(model_config.get("_branched_from") or "") == parent_session_id
+
+    def _remember_foreground_rebind_candidate(self, session_id: str) -> None:
+        """Remember the foreground view displaced by a provisional normal bind.
+
+        Bind-time auxiliary detection can miss background-review children when
+        the host seeds its marker late. If that happens, ``on_session_start``
+        temporarily classifies the child as a normal foreground and overwrites
+        the operator-facing foreground pointer. The first-ingest recheck may
+        later prove the child is auxiliary; this snapshot lets that recovery
+        restore the parent foreground instead of falling back to the child.
+        """
+        session_id = str(session_id or "")
+        if not session_id:
+            self._clear_foreground_rebind_candidate()
+            return
+        if self._foreground_rebind_session_id == session_id:
+            return
+        if (
+            self._foreground_rebind_session_id
+            and self._foreground_rebind_previous_session_id
+            and self._foreground_session_id == self._foreground_rebind_session_id
+        ):
+            parent_session_id = self._in_process_parent_session_id(
+                {},
+                session_id=session_id,
+                include_explicit=False,
+                require_auxiliary_frame=False,
+            )
+            rebind_candidate_is_foreground_branch = bool(
+                self._foreground_rebind_parent_session_id
+                and self._session_has_foreground_branch_marker(
+                    self._foreground_rebind_session_id,
+                    self._foreground_rebind_parent_session_id,
+                )
+            )
+            if (
+                (
+                    parent_session_id == self._foreground_rebind_session_id
+                    and (
+                        not self._foreground_rebind_parent_session_id
+                        or rebind_candidate_is_foreground_branch
+                    )
+                )
+                or (parent_session_id and not self._foreground_rebind_parent_session_id)
+                or (
+                    parent_session_id
+                    and parent_session_id == self._foreground_rebind_parent_session_id
+                    and rebind_candidate_is_foreground_branch
+                )
+            ):
+                self._foreground_rebind_previous_session_id = self._foreground_session_id
+                self._foreground_rebind_previous_platform = self._foreground_session_platform
+                self._foreground_rebind_previous_conversation_id = self._foreground_conversation_id
+            self._foreground_rebind_session_id = session_id
+            self._foreground_rebind_parent_session_id = parent_session_id
+            return
+        if self._foreground_session_id and self._foreground_session_id != session_id:
+            parent_session_id = self._in_process_parent_session_id(
+                {},
+                session_id=session_id,
+                include_explicit=False,
+                require_auxiliary_frame=False,
+            )
+            self._foreground_rebind_session_id = session_id
+            self._foreground_rebind_previous_session_id = self._foreground_session_id
+            self._foreground_rebind_previous_platform = self._foreground_session_platform
+            self._foreground_rebind_previous_conversation_id = self._foreground_conversation_id
+            self._foreground_rebind_parent_session_id = parent_session_id
+            return
+        self._clear_foreground_rebind_candidate()
+
+    def _restore_foreground_after_late_auxiliary_reclassification(self, session_id: str) -> None:
+        if self._foreground_session_id != session_id:
+            if self._foreground_rebind_session_id == session_id:
+                self._clear_foreground_rebind_candidate()
+            return
+        if (
+            self._foreground_rebind_session_id == session_id
+            and self._foreground_rebind_previous_session_id
+        ):
+            parent_session_id = self._in_process_parent_session_id(
+                {},
+                session_id=session_id,
+                include_explicit=False,
+            )
+            if (
+                parent_session_id
+                and parent_session_id != session_id
+                and parent_session_id == self._foreground_rebind_previous_session_id
+                and self._lcm_session_last_normal_conversation_id.get(parent_session_id)
+            ):
+                self._foreground_session_id = parent_session_id
+                self._foreground_session_platform = self._lcm_session_last_normal_platform.get(
+                    parent_session_id,
+                    self._foreground_rebind_previous_platform,
+                )
+                self._foreground_conversation_id = self._lcm_session_last_normal_conversation_id[
+                    parent_session_id
+                ]
+            else:
+                self._foreground_session_id = self._foreground_rebind_previous_session_id
+                self._foreground_session_platform = self._foreground_rebind_previous_platform
+                self._foreground_conversation_id = self._foreground_rebind_previous_conversation_id
+        else:
+            self._foreground_session_id = ""
+            self._foreground_session_platform = ""
+            self._foreground_conversation_id = ""
+        self._clear_foreground_rebind_candidate()
+
+    def _maybe_reclassify_current_session_as_auxiliary_before_message_ingest(self) -> bool:
         """Defense-in-depth for host markers that arrive after session binding.
 
         Older Hermes Agent background-review forks seed ``_memory_write_origin``
-        too late for ``on_session_start`` frame-walk detection. By first ingest
-        the marker is present on the running agent frame, so re-check only while
-        the bound session is still empty. That keeps normal foreground session
-        starts/resets writable and avoids reclassifying sessions after real data
-        has already been stored.
+        too late for ``on_session_start`` frame-walk detection. By the first
+        message-writing entry point the marker is present on the running agent
+        frame, so re-check only while the bound session is still empty. That
+        keeps normal foreground session starts/resets writable and avoids
+        reclassifying sessions after real data has already been stored.
         """
         session_id = str(self._session_id or "")
         if not session_id:
@@ -986,10 +1174,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return False
 
         self._mark_thread_context_stateless(session_id)
-        if self._foreground_session_id == session_id:
-            self._foreground_session_id = ""
-            self._foreground_session_platform = ""
-            self._foreground_conversation_id = ""
+        self._restore_foreground_after_late_auxiliary_reclassification(session_id)
         logger.info(
             "LCM reclassified session %s as auxiliary at first ingest after bind-time detection missed",
             session_id,
@@ -1009,7 +1194,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         compression runs later the same turn, already-ingested messages
         are skipped (no duplicates).
         """
-        if self._maybe_reclassify_current_session_as_auxiliary_at_ingest():
+        if self._maybe_reclassify_current_session_as_auxiliary_before_message_ingest():
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
             return
         if self._bypasses_lcm_context_management():
@@ -1024,6 +1209,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
                 self._ingest_messages(messages)
                 self._record_ingest_success()
+                self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
                 logger.debug(
                     "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
                     self._session_id, len(messages), self._ingest_cursor,
@@ -1137,6 +1323,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._last_compacted_store_id = state.current_frontier_store_id
         self._register_active_engine_binding()
         if not self._session_ignored and not self._session_stateless:
+            self._remember_foreground_rebind_candidate(session_id)
             self._lcm_session_last_normal_conversation_id[session_id] = state.conversation_id
             self._foreground_session_id = session_id
             self._foreground_session_platform = self._session_platform
@@ -1435,6 +1622,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # directly so cron's compress short-circuits correctly via the
         # _session_ignored / _session_stateless gates.
         if not self._session_ignored and not self._session_stateless:
+            self._remember_foreground_rebind_candidate(session_id)
             self._foreground_session_id = session_id
             self._foreground_session_platform = self._session_platform
         if "hermes_home" in kwargs:
@@ -1810,6 +1998,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 session_id,
                 conversation_id=kwargs.get("conversation_id"),
             )
+            self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
             self._schedule_ingest_cursor_reconciliation()
             self._clear_pending_reset_boundary()
             self._log_session_filter_diagnostics()
@@ -1817,6 +2006,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         self._apply_session_start_metadata(session_id, kwargs)
         self._bind_lifecycle_state(session_id, conversation_id=conversation_id)
+        self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
         if frontier > 0:
             state = self._lifecycle.advance_frontier(
                 self._conversation_id,
@@ -2906,14 +3096,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Ingest live messages if passed (enables current-turn search)
         messages = kwargs.get("messages")
 
-        if name != "lcm_inspect" and messages and self._session_id and not (
-            self._session_ignored or self._session_stateless or self._thread_context_stateless()
-        ):
-            try:
-                self._ingest_messages(messages)
-                self._record_ingest_success()
-            except Exception as e:
-                self._record_ingest_failure("tool-call ingest", e)
+        if name != "lcm_inspect" and messages and self._session_id:
+            if self._maybe_reclassify_current_session_as_auxiliary_before_message_ingest():
+                self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
+            elif not (
+                self._session_ignored or self._session_stateless or self._thread_context_stateless()
+            ):
+                try:
+                    self._ingest_messages(messages)
+                    self._record_ingest_success()
+                    self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+                except Exception as e:
+                    self._record_ingest_failure("tool-call ingest", e)
 
         handlers = {
             "lcm_grep": lcm_tools.lcm_grep,
@@ -3686,6 +3880,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._compression_boundary_active_placeholder_digest_budget = {}
             self._compression_boundary_active_placeholder_digest_ordinals = {}
             self._compression_boundary_stored_placeholder_digest_counts = {}
+            self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
             if cached_replay is not None:
                 return cached_replay
             return self._remember_active_replay_messages(messages, replay_messages)
@@ -3916,6 +4111,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._compression_boundary_active_placeholder_digest_budget = {}
             self._compression_boundary_active_placeholder_digest_ordinals = {}
             self._compression_boundary_stored_placeholder_digest_counts = {}
+            self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
             return self._remember_active_replay_messages(messages, active_replay_messages)
 
         protected_messages = protect_messages_for_ingest(
@@ -3951,6 +4147,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._compression_boundary_active_placeholder_digest_ordinals = {}
         self._compression_boundary_stored_placeholder_digest_counts = {}
         logger.debug("Ingested %d messages into LCM store", len(messages_to_store_with_index))
+        self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
         # Most ``protected_messages`` changes are storage-only: inline media,
         # tool results, and data/base64 substrings must stay provider-usable in
         # active replay. Whole-message ``raw_payload`` externalization is the

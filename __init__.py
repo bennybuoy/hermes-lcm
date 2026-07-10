@@ -47,6 +47,37 @@ def _host_forwards_registered_tool_messages(ctx) -> bool:
     return bool(capability)
 
 
+def _engine_bound_session_id(engine) -> str:
+    """Return the lifecycle/ingest session bound on an LCM engine.
+
+    ``current_session_id`` is an operator-facing foreground view and can differ
+    from the bound ingest session while an auxiliary side channel is active.
+    Post-turn ingest rebinding must use the bound id or it can append a resumed
+    foreground turn to a stale auxiliary child.
+    """
+    return str(
+        getattr(engine, "bound_session_id", "")
+        or getattr(engine, "_session_id", "")
+        or ""
+    )
+
+
+def _ensure_engine_bound_to_session(
+    active_engine,
+    session_id: str,
+    *,
+    platform: str = "",
+    conversation_id: str = "",
+) -> None:
+    session_id = str(session_id or "")
+    if session_id and _engine_bound_session_id(active_engine) != session_id:
+        active_engine.on_session_start(
+            session_id,
+            platform=platform,
+            conversation_id=conversation_id or None,
+        )
+
+
 def register(ctx):
     """Plugin entry point — register the LCM context engine and tools."""
     from .config import LCMConfig
@@ -205,15 +236,12 @@ def register(ctx):
                 # can deliver stale lane metadata alongside the correct active
                 # session id; rebinding a clone on conversation_id mismatch
                 # alone would move it away from the runtime it is serving.
-                if (
-                    session_id
-                    and str(getattr(active_engine, "current_session_id", "") or "") != session_id
-                ):
-                    active_engine.on_session_start(
-                        session_id,
-                        platform=platform,
-                        conversation_id=conversation_id or None,
-                    )
+                _ensure_engine_bound_to_session(
+                    active_engine,
+                    session_id,
+                    platform=platform,
+                    conversation_id=conversation_id,
+                )
                 active_engine.ingest(history)
             except Exception as exc:
                 logger.debug("LCM post_llm_call ingest error: %s", exc)

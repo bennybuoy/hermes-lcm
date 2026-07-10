@@ -586,6 +586,7 @@ class AuxiliarySessionMixin:
         kwargs: Dict[str, Any],
         session_id: str = "",
         include_explicit: bool = True,
+        require_auxiliary_frame: bool = True,
     ) -> str:
         explicit = str(kwargs.get("parent_session_id") or "")
         if include_explicit and explicit:
@@ -604,7 +605,7 @@ class AuxiliarySessionMixin:
                 if frame is None:
                     return ""
                 caller_self = frame.f_locals.get("self")
-                if not self._caller_is_auxiliary_agent_frame(caller_self):
+                if require_auxiliary_frame and not self._caller_is_auxiliary_agent_frame(caller_self):
                     frame = frame.f_back
                     continue
                 parent = str(getattr(caller_self, "_parent_session_id", "") or "")

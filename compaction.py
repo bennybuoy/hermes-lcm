@@ -28,6 +28,15 @@ logger = logging.getLogger(__name__)
 
 
 class CompactionMixin:
+    def _maybe_reclassify_late_auxiliary_before_compaction_write(self) -> None:
+        maybe_reclassify = getattr(
+            self,
+            "_maybe_reclassify_current_session_as_auxiliary_before_message_ingest",
+            None,
+        )
+        if callable(maybe_reclassify):
+            maybe_reclassify()
+
     def should_compress(self, prompt_tokens: int = None) -> bool:
         if self._bypasses_lcm_context_management():
             if self._compression_boundary_cooldown_active():
@@ -56,6 +65,7 @@ class CompactionMixin:
 
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
+        self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
             rough = count_messages_tokens(messages)
@@ -317,6 +327,7 @@ class CompactionMixin:
         self._last_compression_noop_reason = ""
         _compress_started = time.perf_counter()
 
+        self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
             bypass_current_tokens = current_tokens
             if bypass_current_tokens is None or bypass_current_tokens <= 0:
