@@ -473,7 +473,19 @@ the original text inline rather than dropping data.
 `lcm_doctor` reports the effective SQLite database path, core schema-table
 presence, SQLite `journal_mode`, `quick_check`, database/WAL sizes, the largest
 content/tool-call rows, suspicious inline `data:*;base64` rows, suspicious long
-base64-looking rows, and aggregate externalized-payload stats.
+base64-looking rows, and aggregate externalized-payload stats. It also reports a
+database-wide `leaf_health` check with depth-0 source-token buckets, oversized
+leaf/session counts relative to the effective leaf target, the configured base and
+dynamic policy, the worst oversized nodes, and high-raw-token sessions that have
+zero or one depth-0 node. The effective target is `leaf_chunk_tokens` when
+dynamic chunking is disabled, or the larger of `leaf_chunk_tokens` and
+`dynamic_leaf_chunk_max` when it is enabled. Forced-overflow recovery and a
+single indivisible large message can still exceed that target.
+`lcm_status` exposes the same aggregate under `leaf_health`; `/lcm status`
+includes the headline depth-0, oversized-node, and sparse-compaction counts.
+These checks are read-only and historical oversized nodes are warning evidence,
+not cleanup candidates. Enabling bounded dynamic leaf chunking affects future
+leaves only.
 Doctor output is metadata-only for these scans; it intentionally does not print
 raw payload previews.
 
@@ -489,9 +501,9 @@ actions:
 - `backup-first cleanup`: run the read-only preview command, create `/lcm backup`,
   then run the explicit apply command only if the preview still matches intent.
 
-Warning-only classes should not auto-clean state: `summary_quality`, broad
-`lifecycle_fragmentation`, payload-storage suspicion, and `context_pressure` are
-evidence for review, not proof that mutation is safe.
+Warning-only classes should not auto-clean state: `summary_quality`, `leaf_health`,
+broad `lifecycle_fragmentation`, payload-storage suspicion, and
+`context_pressure` are evidence for review, not proof that mutation is safe.
 
 This guard is scoped to LCM's own `lcm.db` write boundary. It does not prevent
 Hermes core, or any other host layer, from writing inline payloads to Hermes

@@ -1770,6 +1770,151 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     )
 
 
+def _leaf_health_stats(engine: "LCMEngine") -> dict[str, Any]:
+    """Return database-wide read-only depth-0 leaf size diagnostics."""
+    conn = engine._dag.connection
+    if conn is None:
+        raise RuntimeError("LCM DAG connection is not initialized")
+
+    configured_leaf_chunk_tokens = max(1, int(engine._config.leaf_chunk_tokens))
+    dynamic_leaf_chunk_enabled = bool(engine._config.dynamic_leaf_chunk_enabled)
+    configured_dynamic_leaf_chunk_max = max(
+        1, int(engine._config.dynamic_leaf_chunk_max)
+    )
+    effective_max = (
+        max(configured_leaf_chunk_tokens, configured_dynamic_leaf_chunk_max)
+        if dynamic_leaf_chunk_enabled
+        else configured_leaf_chunk_tokens
+    )
+    totals = conn.execute(
+        """
+        SELECT
+            COUNT(*),
+            COALESCE(SUM(source_token_count), 0),
+            COALESCE(AVG(source_token_count), 0),
+            COALESCE(MAX(source_token_count), 0),
+            COALESCE(SUM(token_count), 0),
+            SUM(CASE WHEN source_token_count <= 8000 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN source_token_count > 8000 AND source_token_count <= 20000 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN source_token_count > 20000 AND source_token_count <= 40000 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN source_token_count > 40000 AND source_token_count <= 80000 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN source_token_count > 80000 AND source_token_count <= 160000 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN source_token_count > 160000 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN source_token_count > ? THEN 1 ELSE 0 END),
+            COUNT(DISTINCT CASE WHEN source_token_count > ? THEN session_id END)
+        FROM summary_nodes
+        WHERE depth = 0
+        """,
+        (effective_max, effective_max),
+    ).fetchone()
+    worst_rows = conn.execute(
+        """
+        SELECT node_id, session_id, source_token_count, token_count
+        FROM summary_nodes
+        WHERE depth = 0 AND source_token_count > ?
+        ORDER BY source_token_count DESC, node_id ASC
+        LIMIT 10
+        """,
+        (effective_max,),
+    ).fetchall()
+    high_raw_threshold = max(100_000, effective_max * 2)
+    high_raw_rows = conn.execute(
+        """
+        WITH raw_sessions AS (
+            SELECT
+                session_id,
+                COALESCE(SUM(token_estimate), 0) AS raw_message_tokens,
+                COUNT(*) AS raw_message_count
+            FROM messages
+            GROUP BY session_id
+        ),
+        depth0_sessions AS (
+            SELECT session_id, COUNT(*) AS depth0_node_count
+            FROM summary_nodes
+            WHERE depth = 0
+            GROUP BY session_id
+        )
+        SELECT
+            raw.session_id,
+            raw.raw_message_tokens,
+            raw.raw_message_count,
+            COALESCE(leaves.depth0_node_count, 0),
+            COUNT(*) OVER () AS qualifying_session_count
+        FROM raw_sessions AS raw
+        LEFT JOIN depth0_sessions AS leaves ON leaves.session_id = raw.session_id
+        WHERE raw.raw_message_tokens >= ?
+          AND COALESCE(leaves.depth0_node_count, 0) <= 1
+        ORDER BY raw.raw_message_tokens DESC, raw.session_id ASC
+        LIMIT 20
+        """,
+        (high_raw_threshold,),
+    ).fetchall()
+
+    total_nodes = int(totals[0] or 0)
+    total_source_tokens = int(totals[1] or 0)
+    total_summary_tokens = int(totals[4] or 0)
+    return {
+        "scope": "database",
+        "total_depth0_nodes": total_nodes,
+        "total_source_tokens": total_source_tokens,
+        "average_source_tokens": round(float(totals[2] or 0), 1),
+        "max_source_tokens": int(totals[3] or 0),
+        "total_summary_tokens": total_summary_tokens,
+        "overall_compression_ratio": (
+            round(total_source_tokens / total_summary_tokens, 1)
+            if total_summary_tokens > 0
+            else 0.0
+        ),
+        "source_token_buckets": {
+            "up_to_8k": int(totals[5] or 0),
+            "8k_to_20k": int(totals[6] or 0),
+            "20k_to_40k": int(totals[7] or 0),
+            "40k_to_80k": int(totals[8] or 0),
+            "80k_to_160k": int(totals[9] or 0),
+            "over_160k": int(totals[10] or 0),
+        },
+        "configured_leaf_chunk_tokens": configured_leaf_chunk_tokens,
+        "dynamic_leaf_chunk_enabled": dynamic_leaf_chunk_enabled,
+        "configured_dynamic_leaf_chunk_max": configured_dynamic_leaf_chunk_max,
+        "effective_max_source_tokens": effective_max,
+        "oversized_depth0_nodes": int(totals[11] or 0),
+        "oversized_sessions": int(totals[12] or 0),
+        "high_raw_token_threshold": high_raw_threshold,
+        "high_raw_low_node_session_count": (
+            int(high_raw_rows[0][4]) if high_raw_rows else 0
+        ),
+        "high_raw_low_node_sessions": [
+            {
+                "session_id": session_id,
+                "raw_message_tokens": int(raw_message_tokens or 0),
+                "raw_message_count": int(raw_message_count or 0),
+                "depth0_node_count": int(depth0_node_count or 0),
+            }
+            for (
+                session_id,
+                raw_message_tokens,
+                raw_message_count,
+                depth0_node_count,
+                _qualifying_session_count,
+            ) in high_raw_rows
+        ],
+        "worst_oversized_nodes": [
+            {
+                "node_id": int(node_id),
+                "session_id": session_id,
+                "source_token_count": int(source_token_count or 0),
+                "token_count": int(token_count or 0),
+                "compression_ratio": (
+                    round(float(source_token_count) / float(token_count), 1)
+                    if token_count and token_count > 0
+                    else None
+                ),
+            }
+            for node_id, session_id, source_token_count, token_count in worst_rows
+        ],
+    }
+
+
 def _summary_quality_stats(engine: "LCMEngine", session_id: str) -> dict[str, Any]:
     """Return read-only summary compression quality diagnostics for one session."""
     conn = engine._dag.connection
@@ -2352,6 +2497,10 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     config_sources = full_status.get("config_sources") or {}
     config_source_warnings = full_status.get("config_source_warnings") or []
     ignored_config_yaml_lcm_keys = full_status.get("ignored_config_yaml_lcm_keys") or []
+    try:
+        leaf_health = _leaf_health_stats(engine)
+    except Exception as exc:
+        leaf_health = {"scope": "database", "status": "unavailable", "error": str(exc)}
 
     # Filter classification for the session lcm_status is reporting on.
     # The engine encapsulates the foreground vs bound divergence; this tool
@@ -2395,6 +2544,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
                 f"d{depth}": info for depth, info in sorted(depths.items())
             },
         },
+        "leaf_health": leaf_health,
         "config": {
             "fresh_tail_count": engine._config.fresh_tail_count,
             "leaf_chunk_tokens": engine._config.leaf_chunk_tokens,
@@ -2664,6 +2814,23 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     except Exception as e:
         checks.append({
             "check": "orphaned_dag_nodes",
+            "status": "fail",
+            "detail": str(e),
+        })
+
+    try:
+        leaf_health = _leaf_health_stats(engine)
+        checks.append({
+            "check": "leaf_health",
+            "status": "warn" if (
+                leaf_health["oversized_depth0_nodes"]
+                or leaf_health["high_raw_low_node_session_count"]
+            ) else "pass",
+            "detail": leaf_health,
+        })
+    except Exception as e:
+        checks.append({
+            "check": "leaf_health",
             "status": "fail",
             "detail": str(e),
         })

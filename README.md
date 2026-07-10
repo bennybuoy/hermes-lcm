@@ -86,8 +86,9 @@ Core capabilities:
   protect SQLite from inline media-ish base64 blobs
 - **Sensitive-pattern controls** - optional named redaction of API keys, bearer
   tokens, passwords, and private keys before LCM stores or summarizes them
-- **Diagnostics** - runtime health, database checks, optional `/lcm` slash
-  commands, backup-first repair/rotate paths
+- **Diagnostics** - runtime health, database checks, depth-0 leaf-size and
+  sparse-compaction health, optional `/lcm` slash commands, backup-first
+  repair/rotate paths
 
 ## LCM vs built-in compression
 

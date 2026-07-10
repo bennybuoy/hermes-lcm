@@ -1117,6 +1117,138 @@ def test_lcm_doctor_json_includes_runtime_identity(engine):
     assert "plugin_git_commit" in payload["runtime_identity"]
 
 
+def test_lcm_doctor_reports_database_wide_depth0_leaf_health(engine):
+    engine._config.dynamic_leaf_chunk_enabled = True
+    engine._config.leaf_chunk_tokens = 8_000
+    engine._config.dynamic_leaf_chunk_max = 40_000
+    for session_id, depth, source_tokens, summary_tokens in (
+        ("test-session", 0, 8_000, 800),
+        ("other-session", 0, 45_000, 450),
+        ("other-session", 0, 120_000, 300),
+        ("other-session", 1, 500_000, 500),
+    ):
+        engine._dag.add_node(SummaryNode(
+            session_id=session_id,
+            depth=depth,
+            summary="summary",
+            token_count=summary_tokens,
+            source_token_count=source_tokens,
+            source_ids=[],
+            source_type="messages" if depth == 0 else "nodes",
+            created_at=float(source_tokens),
+        ))
+
+    payload = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+    check = next(item for item in payload["checks"] if item["check"] == "leaf_health")
+
+    assert check["status"] == "warn"
+    assert check["detail"]["scope"] == "database"
+    assert check["detail"]["total_depth0_nodes"] == 3
+    assert check["detail"]["average_source_tokens"] == 57_666.7
+    assert check["detail"]["max_source_tokens"] == 120_000
+    assert check["detail"]["source_token_buckets"] == {
+        "up_to_8k": 1,
+        "8k_to_20k": 0,
+        "20k_to_40k": 0,
+        "40k_to_80k": 1,
+        "80k_to_160k": 1,
+        "over_160k": 0,
+    }
+    assert check["detail"]["configured_leaf_chunk_tokens"] == 8_000
+    assert check["detail"]["dynamic_leaf_chunk_enabled"] is True
+    assert check["detail"]["configured_dynamic_leaf_chunk_max"] == 40_000
+    assert check["detail"]["effective_max_source_tokens"] == 40_000
+    assert check["detail"]["oversized_depth0_nodes"] == 2
+    assert check["detail"]["oversized_sessions"] == 1
+    assert check["detail"]["worst_oversized_nodes"][0]["source_token_count"] == 120_000
+
+
+def test_lcm_doctor_uses_effective_leaf_limit_when_dynamic_chunking_is_disabled(engine):
+    engine._config.dynamic_leaf_chunk_enabled = False
+    engine._config.leaf_chunk_tokens = 20_000
+    engine._config.dynamic_leaf_chunk_max = 10_000
+    engine._dag.add_node(SummaryNode(
+        session_id="test-session",
+        depth=0,
+        summary="summary",
+        token_count=200,
+        source_token_count=15_000,
+        source_ids=[],
+        source_type="messages",
+        created_at=1.0,
+    ))
+
+    payload = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+    check = next(item for item in payload["checks"] if item["check"] == "leaf_health")
+
+    assert check["status"] == "pass"
+    assert check["detail"]["dynamic_leaf_chunk_enabled"] is False
+    assert check["detail"]["effective_max_source_tokens"] == 20_000
+    assert check["detail"]["oversized_depth0_nodes"] == 0
+
+
+def test_lcm_status_includes_database_leaf_health(engine):
+    engine._config.dynamic_leaf_chunk_max = 40_000
+    engine._dag.add_node(SummaryNode(
+        session_id="other-session",
+        depth=0,
+        summary="summary",
+        token_count=200,
+        source_token_count=80_000,
+        source_ids=[],
+        source_type="messages",
+        created_at=1.0,
+    ))
+
+    payload = json.loads(engine.handle_tool_call("lcm_status", {}))
+
+    assert payload["leaf_health"]["scope"] == "database"
+    assert payload["leaf_health"]["total_depth0_nodes"] == 1
+    assert payload["leaf_health"]["oversized_depth0_nodes"] == 1
+
+
+def test_lcm_doctor_reports_high_raw_token_sessions_with_few_depth0_nodes(engine):
+    engine._config.dynamic_leaf_chunk_max = 40_000
+    for index in range(2):
+        engine._store.append(
+            "raw-heavy-session",
+            {"role": "user", "content": f"large message {index}"},
+            token_estimate=60_000,
+        )
+
+    payload = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+    check = next(item for item in payload["checks"] if item["check"] == "leaf_health")
+
+    assert check["status"] == "warn"
+    assert check["detail"]["high_raw_token_threshold"] == 100_000
+    assert check["detail"]["high_raw_low_node_session_count"] == 1
+    assert check["detail"]["high_raw_low_node_sessions"] == [{
+        "session_id": "raw-heavy-session",
+        "raw_message_tokens": 120_000,
+        "raw_message_count": 2,
+        "depth0_node_count": 0,
+    }]
+
+
+def test_lcm_doctor_bounds_high_raw_session_details_but_preserves_count(engine):
+    for index in range(25):
+        engine._store.append(
+            f"raw-heavy-{index:02d}",
+            {"role": "user", "content": "large message"},
+            token_estimate=100_000 + index,
+        )
+
+    payload = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+    detail = next(
+        item["detail"] for item in payload["checks"] if item["check"] == "leaf_health"
+    )
+
+    assert detail["high_raw_low_node_session_count"] == 25
+    assert len(detail["high_raw_low_node_sessions"]) == 20
+    assert detail["high_raw_low_node_sessions"][0]["session_id"] == "raw-heavy-24"
+    assert detail["high_raw_low_node_sessions"][-1]["session_id"] == "raw-heavy-05"
+
+
 def test_lcm_doctor_warns_on_extreme_summary_compression_ratios(engine):
     engine._dag.add_node(SummaryNode(
         session_id="test-session",

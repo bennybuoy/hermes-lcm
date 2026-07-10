@@ -107,6 +107,13 @@ def _status_text(engine) -> str:
     config_sources = status.get("config_sources") or {}
     config_source_warnings = status.get("config_source_warnings") or []
     ignored_config_yaml_lcm_keys = status.get("ignored_config_yaml_lcm_keys") or []
+    try:
+        # Imported lazily because command and tool modules are initialized together.
+        from .tools import _leaf_health_stats
+
+        leaf_health = _leaf_health_stats(engine)
+    except Exception as exc:
+        leaf_health = {"status": "unavailable", "error": str(exc)}
 
     uninitialized = "(uninitialized)"
     unknown = "(unknown)"
@@ -175,6 +182,9 @@ def _status_text(engine) -> str:
         f"source_unknown_messages: {source_stats['normalized_unknown_messages']}",
         f"source_legacy_blank_messages: {source_stats['legacy_blank_source_messages']}",
         f"source_effective_unknown_messages: {source_stats['effective_unknown_messages']}",
+        f"leaf_health_depth0_nodes: {leaf_health.get('total_depth0_nodes', '(unavailable)')}",
+        f"leaf_health_oversized_depth0_nodes: {leaf_health.get('oversized_depth0_nodes', '(unavailable)')}",
+        f"leaf_health_high_raw_low_node_sessions: {leaf_health.get('high_raw_low_node_session_count', '(unavailable)')}",
     ]
 
     last_rotate_at = status.get("last_rotate_at")

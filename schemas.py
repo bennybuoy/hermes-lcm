@@ -251,7 +251,8 @@ LCM_STATUS = {
     "description": (
         "Get a quick health overview of the LCM engine for the current session. "
         "Shows compression count, store size, DAG depth distribution, context usage, "
-        "active configuration, session/message filter state, and rotate snapshot "
+        "active configuration, session/message filter state, database-wide depth-0 "
+        "leaf-health aggregates (including bounded cross-session IDs), and rotate snapshot "
         "state (last_rotate_at, rotate_backup_path, rotate_backup_size when a "
         "/lcm rotate apply has been run). Use this to understand how much history "
         "has been compacted, how the engine is performing, whether the current "
@@ -292,9 +293,9 @@ LCM_DOCTOR = {
     "name": "lcm_doctor",
     "description": (
         "Run diagnostics on the LCM database and configuration. Checks database "
-        "integrity, detects orphaned DAG nodes, validates configuration, and "
-        "reports potential issues. Use this to troubleshoot problems or verify "
-        "a healthy setup."
+        "integrity, detects orphaned DAG nodes, validates configuration, and reports "
+        "database-wide depth-0 leaf health with bounded cross-session identifiers. "
+        "Use this to troubleshoot problems or verify a healthy setup."
     ),
     "parameters": {
         "type": "object",

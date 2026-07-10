@@ -81,6 +81,9 @@ def test_lcm_status_default_reports_current_session(engine):
     assert f"threshold_tokens: {int(200000 * engine._config.context_threshold)}" in result
     assert "store_messages: 0" in result
     assert "dag_nodes: 0" in result
+    assert "leaf_health_depth0_nodes: 0" in result
+    assert "leaf_health_oversized_depth0_nodes: 0" in result
+    assert "leaf_health_high_raw_low_node_sessions: 0" in result
 
 
 def test_lcm_status_json_reports_runtime_context_indicators(engine):
@@ -701,6 +704,20 @@ def test_lcm_doctor_tool_guidance_maps_warning_classes_to_operator_actions(engin
     assert guidance["payload_storage"]["action"] == "safe/ignore"
     assert guidance["summary_quality"]["action"] == "inspect"
     assert guidance["summary_quality"]["warning_only"] is True
+
+
+def test_lcm_doctor_leaf_health_guidance_is_inspect_only():
+    guidance = doctor_guidance_for_check({
+        "check": "leaf_health",
+        "status": "warn",
+        "detail": {"oversized_depth0_nodes": 3},
+    })
+
+    assert guidance is not None
+    assert guidance["action"] == "inspect"
+    assert guidance["warning_only"] is True
+    assert "future depth-0 leaves" in guidance["operator_action"]
+    assert "historical nodes" in guidance["rationale"]
 
 
 def test_lcm_doctor_payload_failure_guidance_requires_inspection():

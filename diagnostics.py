@@ -135,6 +135,13 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
             warning_only = True
         else:
             rationale = "summary-quality diagnostic failures mean doctor could not read DAG quality state reliably"
+    elif name == "leaf_health":
+        command = "inspect oversized nodes and effective leaf policy; enable bounded dynamic leaf chunking for future depth-0 leaves where appropriate, but do not rewrite stored nodes automatically"
+        if status == "warn":
+            warning_only = True
+            rationale = "oversized historical nodes are diagnostic evidence; forced-overflow recovery and indivisible large messages can exceed the effective target, and changing future leaf policy does not require deleting historical nodes"
+        else:
+            rationale = "leaf-health diagnostic failures mean doctor could not read database-wide depth-0 node statistics reliably"
     elif name == "config_validation":
         command = "inspect LCM_* environment/config values and adjust only intentional operator overrides"
     elif name == "source_lineage_hygiene" and status == "warn":
