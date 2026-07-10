@@ -119,10 +119,11 @@ def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str
     lcm_section = cfg.get("lcm") if isinstance(cfg, dict) else None
     if not isinstance(lcm_section, dict):
         return []
+    supported_keys = _supported_lcm_config_yaml_keys()
     return sorted(
         str(key)
         for key in lcm_section
-        if str(key) not in _supported_lcm_config_yaml_keys()
+        if str(key) not in supported_keys
     )
 
 

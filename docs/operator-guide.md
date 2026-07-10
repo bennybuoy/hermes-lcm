@@ -136,8 +136,15 @@ Most installs only need `plugins.enabled` and `context.engine: lcm`. Useful
 settings are shown as environment variables below, but scalar `LCM_*` settings
 can also be set under the `lcm:` section in `~/.hermes/config.yaml` using the
 lower-case field name. For example, `LCM_DYNAMIC_LEAF_CHUNK_ENABLED=true`
-becomes `lcm.dynamic_leaf_chunk_enabled: true`. Environment variables still win
-over YAML, and `lcm_status.config_sources` reports the effective source.
+becomes:
+
+```yaml
+lcm:
+  dynamic_leaf_chunk_enabled: true
+```
+
+Environment variables still win over YAML, and `lcm_status.config_sources`
+reports the effective source.
 
 | Variable | Default | Use |
 |----------|---------|-----|
