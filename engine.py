@@ -8,6 +8,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -577,19 +578,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return raw_context_length, None, ""
 
     def _effective_threshold_tokens(self, context_threshold_tokens: int) -> int:
-        """Return the host-visible preflight trigger token count.
+        """Return the host-visible cutover trigger token count.
 
-        Hermes core uses ``threshold_tokens`` as a cheap gate before it pays for
-        the full request estimate that includes system prompt and tool schemas.
-        LCM can enforce a stricter active-context assembly cap than the normal
-        context-threshold value, so expose the stricter cap here; otherwise a
-        tool/schema-heavy request can skip host preflight entirely.
+        Assembly caps constrain the result of compaction; they are not preflight
+        triggers. Keeping these controls independent prevents a deliberately low
+        post-compaction target from causing repeated early compaction.
         """
-        assembly_cap = self._effective_assembly_token_cap()
-        if assembly_cap is not None and assembly_cap > 0:
-            if context_threshold_tokens > 0:
-                return min(context_threshold_tokens, assembly_cap)
-            return assembly_cap
         return context_threshold_tokens
 
     def _set_context_length(
@@ -3201,6 +3195,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "effective_context_length_cap": self.effective_context_length_cap,
             "effective_context_length_reason": self.effective_context_length_reason,
             "threshold_tokens": self.threshold_tokens,
+            "post_compaction_target_tokens": self._post_compaction_target_tokens(),
+            "emergency_pressure_ratio": self._config.emergency_pressure_ratio,
+            "emergency_threshold_tokens": self._effective_emergency_threshold_tokens(),
             "last_compression_status": self._last_compression_status,
             "last_compression_noop_reason": self._last_compression_noop_reason,
             "ingest_failure_count": self._ingest_failure_count,
@@ -4886,13 +4883,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
         return compressed
 
+    def _effective_emergency_threshold_tokens(self) -> Optional[int]:
+        """Resolve emergency provider-window pressure independently of assembly."""
+        ratio = float(self._config.emergency_pressure_ratio)
+        if self.context_length <= 0 or ratio <= 0:
+            return None
+        return max(1, math.ceil(self.context_length * ratio))
+
     def _should_force_overflow_recovery(
         self,
         observed_tokens: Optional[int] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> bool:
-        assembly_cap = self._effective_assembly_token_cap()
-        if assembly_cap is None:
+        """Force recovery only at configured provider-window pressure."""
+        emergency_tokens = self._effective_emergency_threshold_tokens()
+        if emergency_tokens is None:
             return False
 
         tokens = self._overflow_recovery_signal_tokens(
@@ -4901,7 +4906,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         if tokens is None:
             return False
-        return tokens >= assembly_cap
+        return tokens >= emergency_tokens
 
     def _overflow_recovery_signal_tokens(
         self,
@@ -4922,15 +4927,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         observed_tokens: Optional[int] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[int]:
-        assembly_cap = self._effective_assembly_token_cap()
-        if assembly_cap is None:
+        recovery_cap = self._effective_assembly_token_cap()
+        if recovery_cap is None:
+            emergency_threshold = self._effective_emergency_threshold_tokens()
+            if emergency_threshold is not None:
+                recovery_cap = max(1, emergency_threshold - 1)
+        if recovery_cap is None:
             return None
         if messages is None or observed_tokens is None or observed_tokens <= 0:
-            return assembly_cap
+            return recovery_cap
 
         message_tokens = count_messages_tokens(messages)
         overhead_tokens = max(0, observed_tokens - message_tokens)
-        return max(1, assembly_cap - overhead_tokens)
+        return max(1, recovery_cap - overhead_tokens)
+
+    def _post_compaction_target_tokens(self) -> Optional[int]:
+        """Return the independent target used when assembling compacted context."""
+        return self._effective_assembly_token_cap()
 
     def _effective_assembly_token_cap(self) -> Optional[int]:
         """Return the active assembly cap, if any.

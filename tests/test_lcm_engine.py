@@ -470,7 +470,7 @@ def test_codex_oauth_context_cap_constrains_reserve_based_assembly_cap(tmp_path)
         engine.shutdown()
 
 
-def test_threshold_tokens_respects_lower_max_assembly_cap_for_host_preflight(tmp_path):
+def test_threshold_tokens_are_independent_of_lower_max_assembly_target(tmp_path):
     config = LCMConfig(
         context_threshold=0.75,
         database_path=str(tmp_path / "codex-low-assembly-cap.db"),
@@ -488,13 +488,14 @@ def test_threshold_tokens_respects_lower_max_assembly_cap_for_host_preflight(tmp
         assert engine.context_length == 272_000
         assert int(272_000 * 0.75) == 204_000
         assert engine._effective_assembly_token_cap() == 96_000
-        assert engine.threshold_tokens == 96_000
-        assert engine.should_compress(96_000)
+        assert engine.threshold_tokens == 204_000
+        assert not engine.should_compress(96_000)
+        assert engine.should_compress(204_000)
     finally:
         engine.shutdown()
 
 
-def test_threshold_tokens_respects_lower_reserve_based_cap_for_host_preflight(tmp_path):
+def test_threshold_tokens_are_independent_of_lower_reserve_based_target(tmp_path):
     config = LCMConfig(
         context_threshold=0.90,
         database_path=str(tmp_path / "reserve-low-assembly-cap.db"),
@@ -509,8 +510,9 @@ def test_threshold_tokens_respects_lower_reserve_based_cap_for_host_preflight(tm
         )
 
         assert engine._effective_assembly_token_cap() == 70_000
-        assert engine.threshold_tokens == 70_000
-        assert engine.should_compress(70_000)
+        assert engine.threshold_tokens == 90_000
+        assert not engine.should_compress(70_000)
+        assert engine.should_compress(90_000)
     finally:
         engine.shutdown()
 
@@ -1674,7 +1676,7 @@ class TestEngineABC:
         assert not engine.should_compress(1000)
         assert engine.should_compress(engine.threshold_tokens)
 
-    def test_should_compress_when_explicit_assembly_cap_is_hit(self, tmp_path):
+    def test_should_compress_only_at_cutover_not_assembly_target(self, tmp_path):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_should_compress_cap.db"),
             max_assembly_tokens=90,
@@ -1683,7 +1685,8 @@ class TestEngineABC:
         instance.context_length = 200000
         instance.threshold_tokens = int(200000 * config.context_threshold)
 
-        assert instance.should_compress(90)
+        assert not instance.should_compress(90)
+        assert instance.should_compress(instance.threshold_tokens)
 
     def test_preflight_does_not_request_compaction_when_only_fresh_tail_is_over_threshold(self, tmp_path):
         config = LCMConfig(
@@ -2518,7 +2521,7 @@ class TestEngineABC:
         finally:
             instance.shutdown()
 
-    def test_bypassed_sessions_honor_assembly_cap_below_threshold(self, tmp_path):
+    def test_bypassed_sessions_do_not_trigger_at_assembly_target_below_cutover(self, tmp_path):
         config = LCMConfig(
             database_path=str(tmp_path / "ignored-assembly-cap.db"),
             ignore_session_patterns=["ignored:*"],
@@ -2532,8 +2535,9 @@ class TestEngineABC:
 
             assert count_messages_tokens(messages) < instance.threshold_tokens
             assert count_messages_tokens(messages) >= config.max_assembly_tokens
-            assert instance.should_compress_preflight(messages)
-            assert instance.should_compress(config.max_assembly_tokens)
+            assert not instance.should_compress_preflight(messages)
+            assert not instance.should_compress(config.max_assembly_tokens)
+            assert instance.should_compress(instance.threshold_tokens)
         finally:
             instance.shutdown()
 
@@ -3505,6 +3509,7 @@ class TestEngineABC:
             database_path=str(tmp_path / "bypass-over-cap-native.db"),
             ignore_session_patterns=["ignored:*"],
             max_assembly_tokens=200,
+            emergency_pressure_ratio=0.02,
         )
         instance = LCMEngine(config=config)
         messages = [
@@ -3550,6 +3555,7 @@ class TestEngineABC:
             database_path=str(tmp_path / "bypass-native-exception.db"),
             ignore_session_patterns=["ignored:*"],
             max_assembly_tokens=200,
+            emergency_pressure_ratio=0.02,
         )
         instance = LCMEngine(config=config)
         messages = [
@@ -5544,6 +5550,14 @@ class TestMessageFiltering:
         from hermes_lcm import message_patterns as message_patterns_mod
 
         monkeypatch.setattr(message_patterns_mod, "_regex_engine", _FakeTimeoutRegexEngine)
+        # This class isolates message filtering/replay semantics. Its historical
+        # fixtures use deliberately impossible current_tokens values to force
+        # compaction, so emergency-window policy is covered separately.
+        monkeypatch.setattr(
+            LCMEngine,
+            "_should_force_overflow_recovery",
+            lambda self, observed_tokens=None, messages=None: False,
+        )
 
     def _make_engine(self, tmp_path, db_name, **config_kwargs):
         config = LCMConfig(
@@ -11588,6 +11602,7 @@ class TestEngineCompress:
             dynamic_leaf_chunk_max=120,
             condensation_fanin=2,
             max_assembly_tokens=90,
+            emergency_pressure_ratio=0.0005,
             database_path=str(tmp_path / "lcm_cache_friendly_overflow.db"),
         )
         config.cache_friendly_condensation_enabled = True
@@ -20175,7 +20190,8 @@ class TestDeferredMaintenanceDebt:
         engine._config.deferred_maintenance_enabled = True
         engine._config.deferred_maintenance_max_passes = 4
         engine._config.critical_budget_pressure_ratio = 0.90
-        engine.on_session_start("critical-dynamic-debt-session", platform="cli", context_length=100)
+        engine._config.emergency_pressure_ratio = 1.0
+        engine.on_session_start("critical-dynamic-debt-session", platform="cli", context_length=1000)
         engine._lifecycle.record_debt(engine._conversation_id, kind="raw_backlog", size_estimate=500)
 
         messages = [
@@ -20193,7 +20209,17 @@ class TestDeferredMaintenanceDebt:
             lambda system_msg, tail_messages, assembly_cap_override=None, include_lcm_note=True: [system_msg, *tail_messages],
         )
 
-        engine.compress(messages, current_tokens=90)
+        assert engine._critical_budget_pressure_reached(observed_tokens=900, messages=messages), (
+            engine.context_length,
+            engine._config.critical_budget_pressure_ratio,
+            engine._budget_pressure_ratio(observed_tokens=900, messages=messages),
+        )
+        assert not engine._should_force_overflow_recovery(observed_tokens=900, messages=messages), (
+            engine.context_length,
+            engine._config.emergency_pressure_ratio,
+            engine._effective_emergency_threshold_tokens(),
+        )
+        engine.compress(messages, current_tokens=900)
         state = engine._lifecycle.get_by_conversation(engine._conversation_id)
 
         assert len(engine._dag.get_session_nodes("critical-dynamic-debt-session", depth=0)) >= 2
@@ -20510,6 +20536,110 @@ class TestAssemblyGuardrails:
 
         assert "reserve_tokens_floor=100 disables reserve-based assembly cap" in caplog.text
 
+    def test_emergency_threshold_rounds_up_to_configured_ratio(self, tmp_path):
+        instance = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm_emergency_rounding.db"),
+                emergency_pressure_ratio=0.95,
+            )
+        )
+        instance.context_length = 101
+
+        assert instance._effective_emergency_threshold_tokens() == 96
+        assert not instance._should_force_overflow_recovery(observed_tokens=95)
+        assert instance._should_force_overflow_recovery(observed_tokens=96)
+
+    def test_emergency_recovery_without_assembly_target_gets_provider_safe_cap(self, tmp_path):
+        instance = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm_emergency_without_target.db"),
+                max_assembly_tokens=0,
+                reserve_tokens_floor=0,
+                emergency_pressure_ratio=0.95,
+            )
+        )
+        instance.context_length = 100
+
+        assert instance._post_compaction_target_tokens() is None
+        assert instance._should_force_overflow_recovery(observed_tokens=95)
+        assert instance._overflow_recovery_assembly_cap(observed_tokens=95) == 94
+
+    def test_emergency_signal_uses_larger_of_provider_observation_and_local_estimate(
+        self, tmp_path, monkeypatch
+    ):
+        instance = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm_emergency_signal.db"),
+                emergency_pressure_ratio=0.95,
+            )
+        )
+        instance.context_length = 100
+        messages = [{"role": "user", "content": "locally estimated prompt"}]
+        monkeypatch.setattr(lcm_engine, "count_messages_tokens", lambda _: 96)
+
+        assert instance._overflow_recovery_signal_tokens(observed_tokens=94, messages=messages) == 96
+        assert instance._should_force_overflow_recovery(observed_tokens=94, messages=messages)
+
+        monkeypatch.setattr(lcm_engine, "count_messages_tokens", lambda _: 94)
+        assert instance._overflow_recovery_signal_tokens(observed_tokens=96, messages=messages) == 96
+        assert instance._should_force_overflow_recovery(observed_tokens=96, messages=messages)
+        assert not instance._should_force_overflow_recovery(observed_tokens=94, messages=messages)
+
+    def test_emergency_pressure_respects_compression_boundary_cooldown(self, tmp_path, monkeypatch):
+        instance = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm_emergency_cooldown.db"),
+                emergency_pressure_ratio=0.95,
+            )
+        )
+        instance.context_length = 100
+        instance.threshold_tokens = 50
+        monkeypatch.setattr(instance, "_compression_boundary_cooldown_active", lambda: True)
+
+        assert instance._should_force_overflow_recovery(observed_tokens=95)
+        assert not instance.should_compress(95)
+
+    def test_repeated_bypassed_turn_above_target_but_below_cutover_does_not_recompact(
+        self, tmp_path, monkeypatch
+    ):
+        instance = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm_repeated_target_no_loop.db"),
+                ignore_session_patterns=["ignored:*"],
+                max_assembly_tokens=90,
+                emergency_pressure_ratio=0.95,
+            )
+        )
+        instance.on_session_start("ignored:no-loop", platform="cli", context_length=1_000)
+        instance.threshold_tokens = 350
+        messages = [{"role": "user", "content": "unchanged assembled context"}]
+        from hermes_lcm import compaction as lcm_compaction_module
+        monkeypatch.setattr(lcm_compaction_module, "count_messages_tokens", lambda _: 110)
+
+        assert instance._post_compaction_target_tokens() == 90
+        assert not instance.should_compress_preflight(messages)
+        assert not instance.should_compress_preflight(messages)
+        assert instance.compression_count == 0
+
+    def test_status_reports_independent_cutover_target_and_emergency_policy(self, tmp_path):
+        instance = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm_independent_policy_status.db"),
+                context_threshold=0.75,
+                max_assembly_tokens=90,
+                emergency_pressure_ratio=0.95,
+            )
+        )
+        instance.context_length = 200
+        instance.threshold_tokens = 150
+
+        status = instance.get_status()
+
+        assert status["threshold_tokens"] == 150
+        assert status["post_compaction_target_tokens"] == 90
+        assert status["emergency_pressure_ratio"] == 0.95
+        assert status["emergency_threshold_tokens"] == 190
+
     def test_compress_forces_overflow_recovery_when_context_hits_assembly_cap(self, tmp_path, monkeypatch):
         import importlib
 
@@ -20518,10 +20648,12 @@ class TestAssemblyGuardrails:
             leaf_chunk_tokens=100,
             database_path=str(tmp_path / "lcm_guardrail_forced.db"),
             max_assembly_tokens=90,
+            emergency_pressure_ratio=0.90,
         )
         instance = LCMEngine(config=config)
         instance._session_id = "guardrail-session"
         instance.compression_count = 1
+        instance.context_length = 100
 
         lcm_engine_module = importlib.import_module("hermes_lcm.engine")
         monkeypatch.setattr(
@@ -20563,10 +20695,12 @@ class TestAssemblyGuardrails:
             fresh_tail_count=10,
             database_path=str(tmp_path / "lcm_guardrail_tail_only.db"),
             max_assembly_tokens=70,
+            emergency_pressure_ratio=0.90,
         )
         instance = LCMEngine(config=config)
         instance._session_id = "guardrail-session"
         instance.compression_count = 1
+        instance.context_length = 100
 
         lcm_engine_module = importlib.import_module("hermes_lcm.engine")
         monkeypatch.setattr(
@@ -20600,10 +20734,12 @@ class TestAssemblyGuardrails:
             fresh_tail_count=10,
             database_path=str(tmp_path / "lcm_guardrail_overhead.db"),
             max_assembly_tokens=90,
+            emergency_pressure_ratio=0.90,
         )
         instance = LCMEngine(config=config)
         instance._session_id = "guardrail-session"
         instance.compression_count = 1
+        instance.context_length = 100
 
         lcm_engine_module = importlib.import_module("hermes_lcm.engine")
         monkeypatch.setattr(
@@ -20689,10 +20825,12 @@ class TestAssemblyGuardrails:
             fresh_tail_count=10,
             database_path=str(tmp_path / "lcm_guardrail_irreducible.db"),
             max_assembly_tokens=70,
+            emergency_pressure_ratio=0.90,
         )
         instance = LCMEngine(config=config)
         instance._session_id = "guardrail-session"
         instance.compression_count = 1
+        instance.context_length = 120
 
         lcm_engine_module = importlib.import_module("hermes_lcm.engine")
         monkeypatch.setattr(
@@ -20725,10 +20863,12 @@ class TestAssemblyGuardrails:
             leaf_chunk_tokens=100,
             database_path=str(tmp_path / "lcm_guardrail_flag_reset.db"),
             max_assembly_tokens=70,
+            emergency_pressure_ratio=0.75,
         )
         instance = LCMEngine(config=config)
         instance._session_id = "guardrail-session"
         instance.compression_count = 1
+        instance.context_length = 120
 
         lcm_engine_module = importlib.import_module("hermes_lcm.engine")
         monkeypatch.setattr(

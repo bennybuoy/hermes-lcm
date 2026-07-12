@@ -2885,6 +2885,14 @@ def test_dynamic_quarantined_assistant_pressure_continues_after_first_leaf_pass(
         context_threshold=0.10,
         large_output_externalization_path=str(tmp_path / "externalized"),
     )
+    # This test exercises ingest-protection quarantine dynamics, not emergency
+    # recovery. Its broken-assistant fixture is ~26K tokens against a 10K context
+    # window, which triggers the independent emergency threshold (9500). Disable
+    # emergency so the normal leaf-compaction path is exercised.
+    monkeypatch.setattr(
+        LCMEngine, "_should_force_overflow_recovery",
+        lambda self, observed_tokens=None, messages=None: False,
+    )
     engine = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
     engine.on_session_start(
         "dynamic-quarantine-pressure-session",
@@ -3188,13 +3196,19 @@ class _NeverMatchesPattern:
         return None
 
 
-def test_ignore_message_patterns_match_original_suspicious_assistant_before_storage(tmp_path):
+def test_ignore_message_patterns_match_original_suspicious_assistant_before_storage(tmp_path, monkeypatch):
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
         fresh_tail_count=10,
         leaf_chunk_tokens=10_000,
         context_threshold=0.95,
         large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+    # See test_dynamic_quarantined_assistant_pressure_continues_after_first_leaf_pass
+    # for the rationale on isolating emergency recovery.
+    monkeypatch.setattr(
+        LCMEngine, "_should_force_overflow_recovery",
+        lambda self, observed_tokens=None, messages=None: False,
     )
     engine = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
     engine._compiled_ignore_message_patterns = [_ContainsBrokenAssistantPattern()]
@@ -3459,13 +3473,19 @@ def test_fresh_singleton_quarantined_assistant_delta_after_rebind_is_stored(tmp_
     assert second._last_ingest_reconciliation["action"] == "persisted batch"
 
 
-def test_no_system_ignored_quarantined_assistant_rebind_does_not_duplicate_tail(tmp_path):
+def test_no_system_ignored_quarantined_assistant_rebind_does_not_duplicate_tail(tmp_path, monkeypatch):
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
         fresh_tail_count=10,
         leaf_chunk_tokens=10_000,
         context_threshold=0.95,
         large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+    # See test_dynamic_quarantined_assistant_pressure_continues_after_first_leaf_pass
+    # for the rationale on isolating emergency recovery.
+    monkeypatch.setattr(
+        LCMEngine, "_should_force_overflow_recovery",
+        lambda self, observed_tokens=None, messages=None: False,
     )
     messages = [
         {"role": "assistant", "content": _broken_assistant_output()},
@@ -3791,13 +3811,19 @@ def test_rebind_does_not_skip_literal_quarantine_placeholder_without_ignore_patt
     assert [row["content"] for row in rows] == ["seed", literal]
 
 
-def test_no_system_raw_ignored_quarantined_assistant_rebind_preserves_repeated_tail_delta(tmp_path):
+def test_no_system_raw_ignored_quarantined_assistant_rebind_preserves_repeated_tail_delta(tmp_path, monkeypatch):
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
         fresh_tail_count=10,
         leaf_chunk_tokens=10_000,
         context_threshold=0.95,
         large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+    # See test_dynamic_quarantined_assistant_pressure_continues_after_first_leaf_pass
+    # for the rationale on isolating emergency recovery.
+    monkeypatch.setattr(
+        LCMEngine, "_should_force_overflow_recovery",
+        lambda self, observed_tokens=None, messages=None: False,
     )
     messages = [
         {"role": "assistant", "content": _broken_assistant_output()},

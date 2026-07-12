@@ -285,6 +285,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("deferred_maintenance_enabled", "LCM_DEFERRED_MAINTENANCE_ENABLED", bool),
     _EnvFieldSpec("deferred_maintenance_max_passes", "LCM_DEFERRED_MAINTENANCE_MAX_PASSES", int),
     _EnvFieldSpec("critical_budget_pressure_ratio", "LCM_CRITICAL_BUDGET_PRESSURE_RATIO", float),
+    _EnvFieldSpec("emergency_pressure_ratio", "LCM_EMERGENCY_PRESSURE_RATIO", float),
     _EnvFieldSpec("l2_budget_ratio", "LCM_L2_BUDGET_RATIO", float),
     _EnvFieldSpec("l3_truncate_tokens", "LCM_L3_TRUNCATE_TOKENS", int),
     _EnvFieldSpec("max_assembly_tokens", "LCM_MAX_ASSEMBLY_TOKENS", int),
@@ -440,6 +441,9 @@ class LCMConfig:
     # Disabled at 0.0. When set, only bypass cache-friendly/deferred polite
     # gates once prompt pressure reaches this fraction of the context window.
     critical_budget_pressure_ratio: float = 0.0
+    # Provider-window pressure that permits deterministic emergency recovery.
+    # Independent from both the normal cutover and post-compaction target.
+    emergency_pressure_ratio: float = 0.95
 
     # -- Escalation ---
     # L2 bullet budget as fraction of L1
@@ -555,6 +559,10 @@ class LCMConfig:
     config_source_warnings: list[str] = field(default_factory=list)
     ignored_config_yaml_lcm_keys: list[str] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        if not 0.0 < float(self.emergency_pressure_ratio) <= 1.0:
+            raise ValueError("emergency_pressure_ratio must be greater than 0 and at most 1")
+
     @classmethod
     def from_env(cls) -> "LCMConfig":
         """Build config from environment variables (LCM_ prefix)."""
@@ -656,6 +664,7 @@ class LCMConfig:
             c.ignore_message_patterns = _parse_pattern_list(raw_ignore_messages)
             c.ignore_message_patterns_source = "env"
 
+        c.__post_init__()
         c.config_sources = config_sources
         c.config_source_warnings = config_source_warnings
         return c

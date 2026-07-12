@@ -636,6 +636,54 @@ class TestConfig:
         assert c.large_output_externalization_path == "/tmp/lcm-large-outputs"
         assert c.large_output_transcript_gc_enabled is True
 
+    def test_from_env_loads_independent_emergency_pressure_ratio(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "lcm:\n  emergency_pressure_ratio: 0.94\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("LCM_EMERGENCY_PRESSURE_RATIO", "0.97")
+
+        c = LCMConfig.from_env()
+
+        assert c.emergency_pressure_ratio == 0.97
+        assert c.config_sources["emergency_pressure_ratio"] == "env:LCM_EMERGENCY_PRESSURE_RATIO"
+        assert c.ignored_config_yaml_lcm_keys == []
+
+    def test_from_env_loads_yaml_only_emergency_pressure_ratio(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "lcm:\n  emergency_pressure_ratio: 0.94\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_EMERGENCY_PRESSURE_RATIO", raising=False)
+
+        c = LCMConfig.from_env()
+
+        assert c.emergency_pressure_ratio == 0.94
+        assert c.config_sources["emergency_pressure_ratio"] == "config_yaml:lcm.emergency_pressure_ratio"
+        assert c.ignored_config_yaml_lcm_keys == []
+
+    def test_emergency_pressure_ratio_defaults_to_provider_safe_boundary(self):
+        c = LCMConfig()
+
+        assert c.emergency_pressure_ratio == 0.95
+        assert "emergency_pressure_ratio" not in c.config_sources
+
+    @pytest.mark.parametrize("ratio", [0.0, -0.1, 1.01])
+    def test_rejects_invalid_emergency_pressure_ratio(self, ratio):
+        with pytest.raises(ValueError, match="emergency_pressure_ratio"):
+            LCMConfig(emergency_pressure_ratio=ratio)
+
+    def test_from_env_rejects_out_of_range_emergency_pressure_ratio(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-hermes-home"))
+        monkeypatch.setenv("LCM_EMERGENCY_PRESSURE_RATIO", "1.2")
+
+        with pytest.raises(ValueError, match="emergency_pressure_ratio"):
+            LCMConfig.from_env()
+
     def test_from_env_invalid_numeric_values_fall_back_to_defaults(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-hermes-home"))
         monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "not-a-number")
@@ -696,6 +744,21 @@ class TestConfig:
         assert c.summary_timeout_ms == 120_000
 
     def test_from_env_reads_lcm_yaml_scalar_settings(self, monkeypatch, tmp_path):
+        for env_name in (
+            "LCM_FRESH_TAIL_COUNT",
+            "LCM_LEAF_CHUNK_TOKENS",
+            "LCM_DYNAMIC_LEAF_CHUNK_ENABLED",
+            "LCM_DYNAMIC_LEAF_CHUNK_MAX",
+            "LCM_CACHE_FRIENDLY_CONDENSATION_ENABLED",
+            "LCM_CACHE_FRIENDLY_MIN_DEBT_GROUPS",
+            "LCM_DEFERRED_MAINTENANCE_ENABLED",
+            "LCM_DEFERRED_MAINTENANCE_MAX_PASSES",
+            "LCM_CRITICAL_BUDGET_PRESSURE_RATIO",
+            "LCM_SUMMARY_TIMEOUT_MS",
+            "LCM_EXPANSION_CONTEXT_TOKENS",
+            "LCM_CUSTOM_INSTRUCTIONS",
+        ):
+            monkeypatch.delenv(env_name, raising=False)
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
         (hermes_home / "config.yaml").write_text("""lcm:
@@ -774,6 +837,8 @@ class TestConfig:
         assert "invalid env LCM_DYNAMIC_LEAF_CHUNK_ENABLED='maybe' ignored" in c.config_source_warnings
 
     def test_from_env_invalid_lcm_yaml_scalar_falls_back_with_warning(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("LCM_FRESH_TAIL_COUNT", raising=False)
+        monkeypatch.delenv("LCM_DYNAMIC_LEAF_CHUNK_ENABLED", raising=False)
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
         (hermes_home / "config.yaml").write_text("""lcm:
@@ -794,6 +859,9 @@ class TestConfig:
     def test_from_env_reads_lcm_yaml_scalar_settings_without_pyyaml(self, monkeypatch, tmp_path):
         import hermes_lcm.config as config_mod
 
+        monkeypatch.delenv("LCM_FRESH_TAIL_COUNT", raising=False)
+        monkeypatch.delenv("LCM_DYNAMIC_LEAF_CHUNK_ENABLED", raising=False)
+        monkeypatch.delenv("LCM_CRITICAL_BUDGET_PRESSURE_RATIO", raising=False)
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
         (hermes_home / "config.yaml").write_text(

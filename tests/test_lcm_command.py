@@ -298,6 +298,24 @@ def test_lcm_status_text_reports_config_source_for_context_threshold(tmp_path, m
     assert "context_threshold_source: config_yaml:compression.threshold" in result
 
 
+def test_lcm_status_text_reports_independent_compaction_policy_boundaries(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm_independent_policy_status.db"),
+        context_threshold=0.8,
+        max_assembly_tokens=300,
+        emergency_pressure_ratio=0.95,
+    )
+    engine = LCMEngine(config=config)
+    engine.on_session_start("independent-policy-status", platform="cli", context_length=1000)
+
+    result = handle_lcm_command("status", engine)
+
+    assert "threshold_tokens: 800" in result
+    assert "post_compaction_target_tokens: 300" in result
+    assert "emergency_pressure_ratio: 0.95" in result
+    assert "emergency_threshold_tokens: 950" in result
+
+
 def test_lcm_doctor_warns_about_ignored_lcm_config_yaml_keys(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes_home"
     hermes_home.mkdir()
