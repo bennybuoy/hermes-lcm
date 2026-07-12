@@ -350,6 +350,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._async_worker_thread: Optional[threading.Thread] = None
         self._async_worker_stop: Optional[threading.Event] = None
         self._async_worker_lock = threading.Lock()
+        # Circuit breaker: consecutive prepare failures → cooldown.
+        self._async_worker_consecutive_failures: int = 0
+        self._async_worker_cooldown_until: float = 0.0
+        # After a cooldown period the next failure re-trips immediately
+        # (half-open). Cleared on a successful prepare.
+        self._async_worker_half_open: bool = False
+        # Telemetry / metrics for get_async_compaction_status().
+        self._async_worker_last_tick_at: Optional[float] = None
+        self._async_worker_last_tick_duration_ms: Optional[float] = None
+        self._async_last_prepare_at: Optional[float] = None
+        self._async_last_promote_at: Optional[float] = None
+        self._async_total_prepare_attempts: int = 0
+        self._async_total_promote_attempts: int = 0
+        self._async_total_promote_succeeded: int = 0
 
     def clone_for_agent(self) -> "LCMEngine":
         """Return a fresh runtime engine for one AIAgent instance.
@@ -5116,6 +5130,32 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def get_async_compaction_status(self) -> dict[str, Any]:
         """Return counts of prepared batches by state for the active conversation."""
+        now = time.time()
+        cooldown_until = float(getattr(self, "_async_worker_cooldown_until", 0.0) or 0.0)
+        in_cooldown = now < cooldown_until
+        cooldown_remaining = max(0.0, cooldown_until - now) if in_cooldown else 0.0
+        telemetry = {
+            "worker_last_tick_at": getattr(self, "_async_worker_last_tick_at", None),
+            "worker_last_tick_duration_ms": getattr(
+                self, "_async_worker_last_tick_duration_ms", None
+            ),
+            "worker_consecutive_failures": int(
+                getattr(self, "_async_worker_consecutive_failures", 0) or 0
+            ),
+            "worker_in_cooldown": in_cooldown,
+            "worker_cooldown_remaining_seconds": cooldown_remaining,
+            "last_prepare_at": getattr(self, "_async_last_prepare_at", None),
+            "last_promote_at": getattr(self, "_async_last_promote_at", None),
+            "total_prepare_attempts": int(
+                getattr(self, "_async_total_prepare_attempts", 0) or 0
+            ),
+            "total_promote_attempts": int(
+                getattr(self, "_async_total_promote_attempts", 0) or 0
+            ),
+            "total_promote_succeeded": int(
+                getattr(self, "_async_total_promote_succeeded", 0) or 0
+            ),
+        }
         conv_id = self.current_conversation_id
         if not conv_id:
             return {
@@ -5127,6 +5167,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 "rejected_batches": 0,
                 "failed_batches": 0,
                 "superseded_batches": 0,
+                **telemetry,
             }
         counts = self._frontier.get_batch_counts_by_state(conv_id)
         return {
@@ -5138,6 +5179,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "rejected_batches": counts.get("rejected", 0),
             "failed_batches": counts.get("failed", 0),
             "superseded_batches": counts.get("superseded", 0),
+            **telemetry,
         }
 
     def prepare_background_compaction_once(
@@ -5161,6 +5203,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         conv_id = self.current_conversation_id
         if not session_id or not conv_id:
             return None
+
+        self._async_total_prepare_attempts = (
+            int(getattr(self, "_async_total_prepare_attempts", 0) or 0) + 1
+        )
 
         policy_fp = self._async_policy_fingerprint()
         route_fp = self._async_route_fingerprint()
@@ -5234,6 +5280,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 expected_leaf_count=leaf_count,
                 frontier_end_store_id=actual_source_end,
             )
+            self._async_last_prepare_at = time.time()
         except Exception as exc:
             logger.warning("LCM background compaction prep failed: %s", exc)
             self._frontier.update_batch_state(
@@ -5260,6 +5307,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         mark batch as promoted.  On failure: mark batch as rejected (except
         injected mid-publish failures, which roll back and re-raise).
         """
+        self._async_total_promote_attempts = (
+            int(getattr(self, "_async_total_promote_attempts", 0) or 0) + 1
+        )
+
         batch = self._frontier.get_batch(batch_id)
         if batch is None:
             return PromotionResult(promoted=False, reason="batch_not_found", batch_id=batch_id)
@@ -5392,6 +5443,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 batch.frontier_end_store_id,
             )
 
+            self._async_last_promote_at = time.time()
+            self._async_total_promote_succeeded = (
+                int(getattr(self, "_async_total_promote_succeeded", 0) or 0) + 1
+            )
             return PromotionResult(promoted=True, batch_id=batch_id)
 
         except Exception as exc:
@@ -5522,28 +5577,90 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if stop_event.wait(timeout=interval):
                 break
             try:
-                self._async_worker_tick()
+                # True = prepare succeeded, False = prepare failed,
+                # None = intentional skip (no prepare attempted).
+                outcome = self._async_worker_tick()
             except Exception:
                 logger.warning(
                     "LCM async background compaction worker tick failed",
                     exc_info=True,
                 )
+                outcome = False
+            if outcome is not None:
+                self._async_worker_note_tick_outcome(bool(outcome))
 
-    def _async_worker_tick(self) -> None:
-        """One preparation attempt if the session is idle and has backlog."""
+    def _async_worker_note_tick_outcome(self, success: bool) -> None:
+        """Update consecutive-failure circuit breaker after a prepare attempt."""
+        if success:
+            self._async_worker_consecutive_failures = 0
+            self._async_worker_half_open = False
+            return
+        self._async_worker_consecutive_failures = (
+            int(getattr(self, "_async_worker_consecutive_failures", 0) or 0) + 1
+        )
+        max_failures = int(
+            getattr(
+                self._config,
+                "async_background_compaction_worker_max_consecutive_failures",
+                3,
+            )
+            or 3
+        )
+        # Half-open after a prior cooldown: a single failure re-trips.
+        threshold = 1 if getattr(self, "_async_worker_half_open", False) else max_failures
+        if threshold < 1:
+            threshold = 1
+        if self._async_worker_consecutive_failures >= threshold:
+            cooldown = float(
+                getattr(
+                    self._config,
+                    "async_background_compaction_worker_cooldown_seconds",
+                    60.0,
+                )
+                or 60.0
+            )
+            self._async_worker_cooldown_until = time.time() + max(0.0, cooldown)
+            self._async_worker_consecutive_failures = 0
+            self._async_worker_half_open = True
+            logger.info(
+                "LCM async worker entering cooldown for %.1fs after prepare failures",
+                cooldown,
+            )
+
+    def _async_worker_tick(self) -> Optional[bool]:
+        """One preparation attempt if the session is idle and has backlog.
+
+        Returns:
+            True — prepare succeeded
+            False — prepare failed (or unrecoverable load error)
+            None — intentional skip (cooldown / no work / already ready)
+        """
+        tick_started = time.perf_counter()
+        self._async_worker_last_tick_at = time.time()
+        try:
+            return self._async_worker_tick_body()
+        finally:
+            self._async_worker_last_tick_duration_ms = (
+                time.perf_counter() - tick_started
+            ) * 1000.0
+
+    def _async_worker_tick_body(self) -> Optional[bool]:
+        """Core worker tick logic without timing bookkeeping."""
+        if time.time() < float(getattr(self, "_async_worker_cooldown_until", 0.0) or 0.0):
+            return None
         if not getattr(self._config, "async_background_compaction_enabled", False):
-            return
+            return None
         if not getattr(self._config, "async_background_compaction_worker_enabled", False):
-            return
+            return None
         if getattr(self, "_last_compression_status", "") == "running":
-            return
+            return None
         session_id = self.current_session_id
         conv_id = self.current_conversation_id
         if not session_id or not conv_id:
-            return
+            return None
         counts = self._frontier.get_batch_counts_by_state(conv_id)
         if counts.get("ready", 0) > 0 or counts.get("preparing", 0) > 0:
-            return
+            return None
         fresh_tail = int(getattr(self._config, "fresh_tail_count", 0) or 0)
         try:
             stored = self._store.get_session_messages(session_id)
@@ -5552,12 +5669,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 "LCM async worker failed to load session messages",
                 exc_info=True,
             )
-            return
+            return False
         if not stored or len(stored) <= fresh_tail:
-            return
+            return None
         # prepare_background_compaction_once snapshots from the store; the
         # messages argument is only needed for API compatibility.
-        self.prepare_background_compaction_once([])
+        batch = self.prepare_background_compaction_once([])
+        if batch is None:
+            return None
+        if batch.state == "failed":
+            return False
+        return True
 
     # -- Internal: helpers -------------------------------------------------
 

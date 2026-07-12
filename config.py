@@ -326,6 +326,16 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
         "LCM_ASYNC_BACKGROUND_COMPACTION_PROMOTE_ON_COMPRESS",
         bool,
     ),
+    _EnvFieldSpec(
+        "async_background_compaction_worker_max_consecutive_failures",
+        "LCM_ASYNC_BACKGROUND_COMPACTION_WORKER_MAX_CONSECUTIVE_FAILURES",
+        int,
+    ),
+    _EnvFieldSpec(
+        "async_background_compaction_worker_cooldown_seconds",
+        "LCM_ASYNC_BACKGROUND_COMPACTION_WORKER_COOLDOWN_SECONDS",
+        float,
+    ),
 )
 
 def _coerce_yaml_value(field: str, raw: Any, py_type: type):
@@ -451,6 +461,11 @@ class LCMConfig:
     # When enabled, compress() tries to promote a ready prepared batch before
     # running the expensive foreground leaf-summarization path.
     async_background_compaction_promote_on_compress: bool = True
+    # After this many consecutive prepare failures the worker enters cooldown.
+    async_background_compaction_worker_max_consecutive_failures: int = 3
+    # Seconds to wait after tripping the consecutive-failure circuit breaker
+    # before the worker attempts prepare again.
+    async_background_compaction_worker_cooldown_seconds: float = 60.0
     # Minimum number of same-depth fanin groups before one follow-on
     # condensation pass is allowed in cache-friendly mode
     cache_friendly_min_debt_groups: int = 2
