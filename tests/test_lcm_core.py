@@ -2892,7 +2892,7 @@ class TestLifecycleStateStore:
         version = state._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()[0]
-        assert version == "5"
+        assert version == "6"
 
         tables = {
             row[0]
