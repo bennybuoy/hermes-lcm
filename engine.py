@@ -5261,6 +5261,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Summaries stay private to this path — they are NOT inserted into the
         # canonical DAG (or FTS). Promotion is the only path that publishes.
         try:
+            # Bail out early if shutdown was signaled while we were setting up.
+            stop_event = self._async_worker_stop
+            if stop_event is not None and stop_event.is_set():
+                self._frontier.update_batch_state(
+                    batch_id, "failed", failure_reason="shutdown_signaled",
+                )
+                return None
+
             # Convert stored messages to OpenAI format for the summarizer
             candidate_messages = [
                 {"role": m["role"], "content": m.get("content") or ""}
@@ -5271,6 +5279,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             _compacted_chunk, source_tokens, summary_text, _level, _attempts = (
                 self._summarize_leaf_chunk_with_rescue(candidate_messages)
             )
+
+            # Check stop event again after the LLM call — if shutdown
+            # was signaled during the API call, abandon the batch.
+            if stop_event is not None and stop_event.is_set():
+                self._frontier.update_batch_state(
+                    batch_id, "failed", failure_reason="shutdown_signaled",
+                )
+                return None
+
             leaf_count = 1  # One leaf from one chunk
             leaf_tokens = count_messages_tokens([{"role": "assistant", "content": summary_text}])
             del leaf_tokens  # summary text is re-derived at promote for v1
@@ -5542,7 +5559,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             logger.debug("LCM async background compaction worker started")
 
     def _stop_async_worker(self) -> None:
-        """Signal the preparer thread to stop and join with a short timeout."""
+        """Signal the preparer thread to stop and join with a generous timeout.
+
+        The worker may be blocked inside a multi-second LLM summarization
+        call.  We wait up to 35 s (enough for one typical summarization) so
+        the worker exits cleanly before callers close SQLite connections.
+        If it still hasn't stopped, we log a warning — the daemon flag ensures
+        it won't block process exit, but callers should not close the DB
+        while the thread is alive.
+        """
         with self._async_worker_lock:
             stop_event = self._async_worker_stop
             thread = self._async_worker_thread
@@ -5551,10 +5576,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if stop_event is not None:
             stop_event.set()
         if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
+            thread.join(timeout=35.0)
             if thread.is_alive():
                 logger.warning(
-                    "LCM async background compaction worker did not stop within timeout"
+                    "LCM async background compaction worker did not stop within 35s "
+                    "— it may still be blocked in an LLM call; "
+                    "storage cleanup may race with the worker thread"
                 )
 
     def _async_worker_loop(self) -> None:

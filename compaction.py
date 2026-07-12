@@ -668,11 +668,19 @@ class CompactionMixin:
             self._persist_frontier_marker()
             # Foreground leaf publish wins the async CAS race: advance the
             # generation counter and supersede any pending prepared batches.
+            # Wrapped in try/except — a DB error here must not abort the
+            # remaining compaction pipeline after the leaf is already published.
             note_async = getattr(self, "_note_foreground_async_frontier_advance", None)
             if callable(note_async):
-                note_async(
-                    source_end_store_id=self._last_compacted_store_id,
-                )
+                try:
+                    note_async(
+                        source_end_store_id=self._last_compacted_store_id,
+                    )
+                except Exception:
+                    logger.debug(
+                        "LCM foreground async frontier advance failed",
+                        exc_info=True,
+                    )
 
             pressure_remaining_messages = pressure_messages[leading_anchor_count + selected_raw_len:]
             working_messages = working_messages[:leading_anchor_count] + remaining_messages
