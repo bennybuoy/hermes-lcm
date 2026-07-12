@@ -778,10 +778,6 @@ class TestPolicyFingerprintContract:
     """RED tests for the typed ModelCompactionPolicy that doesn't exist yet.
     These are xfail(strict=True) until P0.2 is implemented."""
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="ModelCompactionPolicy dataclass not yet implemented (P0.2)",
-    )
     def test_policy_dataclass_exists(self, tmp_path):
         from hermes_lcm.policy import ModelCompactionPolicy
         policy = ModelCompactionPolicy(
@@ -793,10 +789,6 @@ class TestPolicyFingerprintContract:
         assert policy.cutover_threshold == 0.50
         assert policy.post_compaction_target == 0.25
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Policy resolver not yet implemented (P0.2)",
-    )
     def test_policy_resolver_normalizes_model_name(self, tmp_path):
         from hermes_lcm.policy import resolve_policy
         # Case-insensitive normalized matching
@@ -808,10 +800,6 @@ class TestPolicyFingerprintContract:
         assert policy is not None
         assert policy.cutover_threshold > 0
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Policy fingerprint not yet implemented (P0.2)",
-    )
     def test_policy_has_stable_fingerprint(self, tmp_path):
         from hermes_lcm.policy import resolve_policy
         p1 = resolve_policy(model="glm-5.2", provider="ollama", context_length=262_144)
@@ -821,10 +809,6 @@ class TestPolicyFingerprintContract:
         p3 = resolve_policy(model="deepseek-v4", provider="ollama", context_length=262_144)
         assert p1.fingerprint != p3.fingerprint
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Policy reporting in lcm_status not yet implemented (P0.2)",
-    )
     def test_status_reports_selected_policy(self, tmp_path):
         engine = _make_engine(
             tmp_path,
@@ -846,10 +830,6 @@ class TestPolicyFingerprintContract:
         finally:
             engine.shutdown()
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Policy invariant validation not yet implemented (P0.2)",
-    )
     def test_policy_invariant_violation_raises(self, tmp_path):
         from hermes_lcm.policy import ModelCompactionPolicy
         with pytest.raises(ValueError, match="invariant"):
@@ -860,10 +840,6 @@ class TestPolicyFingerprintContract:
                 preparation_threshold=0.40,
             )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Per-model policy resolution not yet implemented (P0.2)",
-    )
     def test_per_model_policy_overrides_default(self, tmp_path):
         from hermes_lcm.policy import resolve_policy
         # MiniMax M3 should get 0.48 cutover (below 512K cliff)

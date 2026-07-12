@@ -25,6 +25,7 @@ from .codex_routing import (
 )
 from .config import LCMConfig
 from .dag import SummaryDAG, SummaryNode
+from .policy import ModelCompactionPolicy, resolve_policy
 from .diagnostics import _enforce_state_db_containment
 from .engine_registry import (
     _ACTIVE_ENGINE_REGISTRY_LOCK,
@@ -244,6 +245,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             else "manual_or_default"
         )
         self._context_threshold_autoraised: dict[str, float] | None = None
+        self._compaction_policy: Optional[ModelCompactionPolicy] = None
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
@@ -3211,6 +3213,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "context_threshold": self.context_threshold,
             "context_threshold_source": self._context_threshold_source,
             "context_threshold_autoraised": self._context_threshold_autoraised,
+            "compaction_policy": (
+                self._compaction_policy.to_status_dict(self.context_length)
+                if self._compaction_policy is not None
+                else None
+            ),
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),
@@ -3334,6 +3341,33 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self.provider = str(provider or "")
         self.api_mode = str(api_mode or "")
         self._set_context_length(context_length, source="update_model")
+        # Resolve typed compaction policy for this model/provider/context.
+        self._compaction_policy = resolve_policy(
+            model=self.model,
+            provider=self.provider,
+            context_length=self.context_length,
+            context_threshold=self._config.context_threshold,
+            model_thresholds=self._config.model_thresholds,
+            emergency_pressure_ratio=self._config.emergency_pressure_ratio,
+            max_assembly_tokens=self._config.max_assembly_tokens,
+            reserve_tokens_floor=self._config.reserve_tokens_floor,
+            summary_model=self._config.summary_model,
+            summary_fallback_models=tuple(self._config.summary_fallback_models) if self._config.summary_fallback_models else (),
+            leaf_chunk_tokens=self._config.leaf_chunk_tokens,
+            dynamic_leaf_chunk_enabled=self._config.dynamic_leaf_chunk_enabled,
+            dynamic_leaf_chunk_max=self._config.dynamic_leaf_chunk_max,
+            condensation_fanin=self._config.condensation_fanin,
+            incremental_max_depth=self._config.incremental_max_depth,
+            cache_friendly_condensation_enabled=self._config.cache_friendly_condensation_enabled,
+            context_threshold_source=self._context_threshold_source,
+            config_sources=getattr(self._config, "config_sources", None),
+        )
+        logger.debug(
+            "LCM resolved compaction policy: model=%s cutover=%.4f fingerprint=%s",
+            self.model,
+            self._compaction_policy.cutover_threshold,
+            self._compaction_policy.fingerprint,
+        )
         self._update_model_pending_session_start = True
 
     def _refresh_session_filters(self) -> None:
