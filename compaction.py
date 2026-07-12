@@ -626,6 +626,13 @@ class CompactionMixin:
             self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
             self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
             self._persist_frontier_marker()
+            # Foreground leaf publish wins the async CAS race: advance the
+            # generation counter and supersede any pending prepared batches.
+            note_async = getattr(self, "_note_foreground_async_frontier_advance", None)
+            if callable(note_async):
+                note_async(
+                    source_end_store_id=self._last_compacted_store_id,
+                )
 
             pressure_remaining_messages = pressure_messages[leading_anchor_count + selected_raw_len:]
             working_messages = working_messages[:leading_anchor_count] + remaining_messages

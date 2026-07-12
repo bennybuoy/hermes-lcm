@@ -1,8 +1,7 @@
-"""RED spike tests for opt-in async/background compaction.
+"""Design-gate tests for opt-in async/background compaction.
 
-These tests intentionally describe the desired public/private contract before
-implementation exists. Tests that now pass have been converted to normal
-gates; tests still needing implementation remain xfail(strict=True).
+These tests lock the public/private contract for prepare → promote CAS
+validation, pending-summary invisibility, and status/doctor reporting.
 """
 
 from __future__ import annotations
@@ -13,8 +12,6 @@ import pytest
 
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
-
-# Module-level xfail removed — per-test xfail markers on still-failing tests.
 
 
 def _engine(tmp_path, *, session_id="async-session", conversation_id="async-conversation"):
@@ -51,7 +48,6 @@ def _messages(count=10, *, prefix="message"):
     return messages
 
 
-@pytest.mark.xfail(strict=True, reason="lcm_status tool output does not yet include async_compaction key")
 def test_default_disabled_async_compaction_is_inert(tmp_path):
     """Given default config, background prep is disabled and reports zero async debt."""
     config = LCMConfig(
@@ -83,7 +79,6 @@ def test_default_disabled_async_compaction_is_inert(tmp_path):
         engine.shutdown()
 
 
-@pytest.mark.xfail(strict=True, reason="lcm_grep does not yet filter pending summaries")
 def test_pending_summaries_are_invisible_until_atomic_promotion(tmp_path):
     """Given prepared pending leaves, active context/readers ignore them until promotion."""
     engine = _engine(tmp_path)
@@ -129,7 +124,6 @@ def test_atomic_promotion_rejects_stale_source_identity(tmp_path):
         engine.shutdown()
 
 
-@pytest.mark.xfail(strict=True, reason="live config change detection needs _config mutation tracking")
 def test_atomic_promotion_rejects_live_config_change(tmp_path):
     """Given live config changes after prep, live policy wins over stale persisted metadata."""
     engine = _engine(tmp_path)
@@ -168,7 +162,6 @@ def test_atomic_promotion_rejects_summary_route_change(tmp_path):
         engine.shutdown()
 
 
-@pytest.mark.xfail(strict=True, reason="threshold change detection needs _config mutation tracking")
 def test_atomic_promotion_rejects_live_threshold_policy_change(tmp_path):
     """Given threshold changes after prep, live config beats persisted batch policy."""
     engine = _engine(tmp_path)
@@ -188,7 +181,6 @@ def test_atomic_promotion_rejects_live_threshold_policy_change(tmp_path):
         engine.shutdown()
 
 
-@pytest.mark.xfail(strict=True, reason="foreground race supersede detection not yet implemented")
 def test_foreground_compaction_race_supersedes_pending_batch(tmp_path, monkeypatch):
     """Given foreground compaction lands first, stale pending work is rejected/superseded."""
     engine = _engine(tmp_path)
@@ -289,7 +281,6 @@ def test_successful_atomic_promotion_is_all_or_nothing(tmp_path):
         engine.shutdown()
 
 
-@pytest.mark.xfail(strict=True, reason="rollback hook not yet implemented")
 def test_atomic_promotion_rolls_back_partial_publish_failure(tmp_path):
     """Given a mid-promotion failure, no canonical node/frontier/batch half-state remains."""
     engine = _engine(tmp_path)
@@ -313,7 +304,6 @@ def test_atomic_promotion_rolls_back_partial_publish_failure(tmp_path):
         engine.shutdown()
 
 
-@pytest.mark.xfail(strict=True, reason="lcm_doctor does not yet report async_compaction checks")
 def test_status_and_doctor_report_async_compaction_counts(tmp_path):
     """Given mixed async states, status and doctor expose pending/prepared/promoted/rejected counts."""
     engine = _engine(tmp_path)

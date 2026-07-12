@@ -2592,6 +2592,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "runtime_identity": runtime_identity,
         "lifecycle": lifecycle,
         "lifecycle_fragmentation": lifecycle_fragmentation,
+        "async_compaction": full_status.get("async_compaction") or engine.get_async_compaction_status(),
     })
 
 
@@ -2924,6 +2925,53 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             "check": "context_pressure",
             "status": "pass" if usage_pct < threshold_pct else "warn",
             "detail": f"{usage_pct}% used, compaction triggers at {threshold_pct}%",
+        })
+
+    # 8. Async/background compaction batch hygiene
+    try:
+        async_status = engine.get_async_compaction_status()
+        prepared = int(async_status.get("prepared_batches", 0) or 0)
+        preparing = int(async_status.get("preparing_batches", 0) or 0)
+        rejected = int(async_status.get("rejected_batches", 0) or 0)
+        failed = int(async_status.get("failed_batches", 0) or 0)
+        promoted = int(async_status.get("promoted_batches", 0) or 0)
+        superseded = int(async_status.get("superseded_batches", 0) or 0)
+        pending = int(async_status.get("pending_batches", 0) or 0)
+        enabled = bool(async_status.get("enabled", False))
+        # Stale preparing rows indicate a crash mid-prep; surface as warn.
+        async_status_level = "pass"
+        if preparing > 0:
+            async_status_level = "warn"
+        elif enabled and (failed > 0 or rejected > 0):
+            async_status_level = "pass"  # counts are informational
+        checks.append({
+            "check": "async_compaction_batches",
+            "status": async_status_level,
+            "detail": {
+                "enabled": enabled,
+                "prepared_batches": prepared,
+                "pending_batches": pending,
+                "preparing_batches": preparing,
+                "promoted_batches": promoted,
+                "rejected_batches": rejected,
+                "failed_batches": failed,
+                "superseded_batches": superseded,
+            },
+        })
+        checks.append({
+            "check": "async_compaction_enabled",
+            "status": "pass",
+            "detail": (
+                f"async background compaction enabled={enabled}; "
+                f"prepared_batches={prepared} rejected_batches={rejected} "
+                f"promoted_batches={promoted}"
+            ),
+        })
+    except Exception as e:
+        checks.append({
+            "check": "async_compaction_batches",
+            "status": "fail",
+            "detail": str(e),
         })
 
     overall = "healthy"

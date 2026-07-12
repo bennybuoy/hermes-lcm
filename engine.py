@@ -5021,6 +5021,90 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     # -- Async/background compaction ----------------------------------------
 
+    def _async_policy_fingerprint(self) -> str:
+        """Fingerprint live config fields that affect async prepare/promote.
+
+        Always re-reads ``self._config`` (and runtime threshold attributes) so
+        a live mutation after prepare — e.g. ``fresh_tail_count`` or
+        ``context_threshold`` — is visible at promotion time and yields
+        ``policy_fingerprint_mismatch``. Includes both configured and runtime
+        threshold values plus chunking/tail inputs from the design doc.
+        """
+        runtime_threshold = float(
+            getattr(self, "context_threshold", None)
+            if getattr(self, "context_threshold", None) is not None
+            else self._config.context_threshold
+        )
+        fields = {
+            "protocol": "async_compaction_protocol_v1",
+            "fresh_tail_count": int(self._config.fresh_tail_count),
+            "leaf_chunk_tokens": int(self._config.leaf_chunk_tokens),
+            "configured_context_threshold": float(self._config.context_threshold),
+            "runtime_context_threshold": runtime_threshold,
+            "dynamic_leaf_chunk_enabled": bool(self._config.dynamic_leaf_chunk_enabled),
+            "dynamic_leaf_chunk_max": int(self._config.dynamic_leaf_chunk_max),
+            "emergency_pressure_ratio": float(self._config.emergency_pressure_ratio),
+            "max_assembly_tokens": int(self._config.max_assembly_tokens or 0),
+            "reserve_tokens_floor": int(self._config.reserve_tokens_floor or 0),
+            "condensation_fanin": int(self._config.condensation_fanin),
+            "incremental_max_depth": int(self._config.incremental_max_depth),
+            "cache_friendly_condensation_enabled": bool(
+                self._config.cache_friendly_condensation_enabled
+            ),
+        }
+        if self._compaction_policy is not None:
+            fields["resolved_policy_fingerprint"] = self._compaction_policy.fingerprint
+        raw = json.dumps(fields, sort_keys=True, default=str)
+        return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+    def _async_route_fingerprint(self) -> str:
+        return compute_route_fingerprint(
+            self._config.summary_model,
+            tuple(self._config.summary_fallback_models)
+            if self._config.summary_fallback_models
+            else (),
+        )
+
+    def _note_foreground_async_frontier_advance(
+        self,
+        *,
+        source_end_store_id: int,
+    ) -> None:
+        """Advance async frontier generation after foreground leaf compaction.
+
+        Pending prepared batches become stale against the new generation and
+        are marked superseded so a later promote returns frontier_mismatch /
+        batch_state_superseded rather than double-publishing.
+        """
+        if not getattr(self._config, "async_background_compaction_enabled", False):
+            return
+        conv_id = self.current_conversation_id
+        session_id = self.current_session_id
+        if not conv_id or not session_id:
+            return
+        try:
+            frontier = self._frontier.get_active_frontier(conv_id)
+            if frontier is None:
+                return
+            policy_fp = self._async_policy_fingerprint()
+            route_fp = self._async_route_fingerprint()
+            # Only advance the generation counter here. Pending batches stay
+            # "ready" so a subsequent promote returns frontier_mismatch (and
+            # increments rejected_batches) rather than batch_state_superseded.
+            self._frontier.advance_frontier_generation(
+                conv_id,
+                session_id,
+                int(source_end_store_id or 0),
+                policy_fp,
+                route_fp,
+                frontier["generation"],
+            )
+        except Exception:
+            logger.debug(
+                "LCM async frontier advance after foreground compact failed",
+                exc_info=True,
+            )
+
     def get_async_compaction_status(self) -> dict[str, Any]:
         """Return counts of prepared batches by state for the active conversation."""
         conv_id = self.current_conversation_id
@@ -5069,16 +5153,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if not session_id or not conv_id:
             return None
 
+        policy_fp = self._async_policy_fingerprint()
+        route_fp = self._async_route_fingerprint()
+
         # Get the current frontier
         frontier = self._frontier.get_active_frontier(conv_id)
         if frontier is None:
             self._frontier.ensure_frontier(
                 conv_id, session_id,
-                policy_fingerprint=self._compaction_policy.fingerprint if self._compaction_policy else "",
-                route_fingerprint=compute_route_fingerprint(
-                    self._config.summary_model,
-                    tuple(self._config.summary_fallback_models) if self._config.summary_fallback_models else (),
-                ),
+                policy_fingerprint=policy_fp,
+                route_fingerprint=route_fp,
             )
             frontier = self._frontier.get_active_frontier(conv_id)
 
@@ -5105,13 +5189,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._store._conn, session_id, candidate_store_ids,
         )
 
-        # Compute fingerprints
-        policy_fp = self._compaction_policy.fingerprint if self._compaction_policy else ""
-        route_fp = compute_route_fingerprint(
-            self._config.summary_model,
-            tuple(self._config.summary_fallback_models) if self._config.summary_fallback_models else (),
-        )
-
         # Create the batch in "preparing" state
         batch_id = self._frontier.create_batch(
             conversation_id=conv_id,
@@ -5125,7 +5202,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             state="preparing",
         )
 
-        # Build leaf summaries using the existing _summarize_leaf_chunk_with_rescue
+        # Build leaf summaries using the existing _summarize_leaf_chunk_with_rescue.
+        # Summaries stay private to this path — they are NOT inserted into the
+        # canonical DAG (or FTS). Promotion is the only path that publishes.
         try:
             # Convert stored messages to OpenAI format for the summarizer
             candidate_messages = [
@@ -5139,6 +5218,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             leaf_count = 1  # One leaf from one chunk
             leaf_tokens = count_messages_tokens([{"role": "assistant", "content": summary_text}])
+            del leaf_tokens  # summary text is re-derived at promote for v1
 
             self._frontier.update_batch_state(
                 batch_id, leave_state,
@@ -5165,9 +5245,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         2. Policy fingerprint must match (no config change)
         3. Route fingerprint must match (no summary model change)
         4. Base generation must match current frontier (no concurrent promotion)
+        5. No canonical DAG node already covers the same source IDs
 
         On success: insert canonical DAG node, advance frontier generation,
-        mark batch as promoted.  On failure: mark batch as rejected.
+        mark batch as promoted.  On failure: mark batch as rejected (except
+        injected mid-publish failures, which roll back and re-raise).
         """
         batch = self._frontier.get_batch(batch_id)
         if batch is None:
@@ -5184,17 +5266,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._frontier.update_batch_state(batch_id, "rejected", failure_reason="source_identity_mismatch")
             return PromotionResult(promoted=False, reason="source_identity_mismatch", batch_id=batch_id)
 
-        # 2. Policy fingerprint check
-        current_policy_fp = self._compaction_policy.fingerprint if self._compaction_policy else ""
-        if batch.policy_fingerprint and current_policy_fp and batch.policy_fingerprint != current_policy_fp:
+        # 2. Policy fingerprint check (always recompute from live config)
+        current_policy_fp = self._async_policy_fingerprint()
+        if batch.policy_fingerprint != current_policy_fp:
             self._frontier.update_batch_state(batch_id, "rejected", failure_reason="policy_fingerprint_mismatch")
             return PromotionResult(promoted=False, reason="policy_fingerprint_mismatch", batch_id=batch_id)
 
         # 3. Route fingerprint check
-        current_route_fp = compute_route_fingerprint(
-            self._config.summary_model,
-            tuple(self._config.summary_fallback_models) if self._config.summary_fallback_models else (),
-        )
+        current_route_fp = self._async_route_fingerprint()
         if batch.route_fingerprint and current_route_fp and batch.route_fingerprint != current_route_fp:
             self._frontier.update_batch_state(batch_id, "rejected", failure_reason="summary_route_fingerprint_mismatch")
             return PromotionResult(promoted=False, reason="summary_route_fingerprint_mismatch", batch_id=batch_id)
@@ -5206,25 +5285,47 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._frontier.update_batch_state(batch_id, "rejected", failure_reason="frontier_mismatch")
             return PromotionResult(promoted=False, reason="frontier_mismatch", batch_id=batch_id)
 
+        # 5. Canonical source overlap (foreground race already published)
+        try:
+            existing_nodes = self._dag.get_session_nodes(batch.session_id)
+            covered: set[int] = set()
+            for node in existing_nodes:
+                if getattr(node, "source_type", "") == "messages":
+                    for sid in getattr(node, "source_ids", None) or []:
+                        try:
+                            covered.add(int(sid))
+                        except (TypeError, ValueError):
+                            continue
+            if covered.intersection(int(s) for s in batch.source_ids):
+                self._frontier.update_batch_state(
+                    batch_id, "rejected", failure_reason="canonical_source_overlap",
+                )
+                return PromotionResult(
+                    promoted=False, reason="canonical_source_overlap", batch_id=batch_id,
+                )
+        except Exception:
+            logger.debug("LCM canonical source-overlap check failed", exc_info=True)
+
         # --- Atomic promotion via CAS on generation ---
         # The frontier store and DAG use separate SQLite connections, so we
         # can't wrap both in a single transaction.  Instead, we use the
-        # generation counter as the CAS boundary:
-        # 1. Re-validate all fingerprints (already done above)
-        # 2. Insert canonical DAG node (add_node is atomic on its own conn)
-        # 3. CAS-advance the frontier generation (atomic on its own conn)
-        # If step 3 fails (concurrent promotion), we have an orphan DAG node —
-        # harmless: it's a depth-0 summary that won't be referenced by any
-        # frontier generation and can be reaped by a future doctor pass.
+        # generation counter as the CAS boundary and roll back any orphan
+        # DAG node if the frontier advance fails or a mid-publish hook fires.
+        inserted_node_id: int | None = None
         try:
             # Re-run the leaf summarization to get the actual summary
             all_stored = self._store.get_session_messages(batch.session_id)
-            fresh_tail = self._config.fresh_tail_count
-            candidate_count = max(0, len(all_stored) - fresh_tail)
-            candidate_stored = all_stored[:candidate_count]
+            # Use the source_ids snapshotted at prepare time, not a live
+            # fresh-tail recompute — live config may have changed the tail
+            # boundary (caught by policy fingerprint above when it does).
+            id_set = set(batch.source_ids)
+            candidate_stored = [m for m in all_stored if m.get("store_id") in id_set]
+            # Preserve source_ids order
+            by_id = {m["store_id"]: m for m in candidate_stored}
+            ordered = [by_id[sid] for sid in batch.source_ids if sid in by_id]
             candidate_messages = [
                 {"role": m["role"], "content": m.get("content") or ""}
-                for m in candidate_stored
+                for m in ordered
             ]
 
             _compacted_chunk, source_tokens, summary_text, _level, _attempts = (
@@ -5232,7 +5333,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
 
             # Insert canonical DAG node
-            from .dag import SummaryNode
             now = time.time()
             leaf_tokens = count_messages_tokens([{"role": "assistant", "content": summary_text}])
             node = SummaryNode(
@@ -5248,7 +5348,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 latest_at=None,
                 expand_hint="",
             )
-            self._dag.add_node(node)
+            inserted_node_id = self._dag.add_node(node)
+
+            # Test-only inject: fail after canonical insert so callers can
+            # prove roll-back leaves no half-state.
+            hook = getattr(self, "_async_compaction_publish_failure_hook", None)
+            if hook == "after_canonical_insert":
+                raise RuntimeError("injected async promotion failure")
 
             # CAS-advance frontier generation
             new_gen = self._frontier.advance_frontier_generation(
@@ -5260,8 +5366,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 batch.base_generation,
             )
             if new_gen == 0:
-                # Concurrent promotion won — our DAG node is an orphan.
-                # It won't be referenced by any frontier generation.
+                # Concurrent promotion / foreground race won — roll back orphan.
+                if inserted_node_id is not None:
+                    self._dag.delete_node(inserted_node_id)
+                    inserted_node_id = None
                 self._frontier.update_batch_state(batch_id, "rejected", failure_reason="frontier_mismatch")
                 return PromotionResult(promoted=False, reason="frontier_mismatch", batch_id=batch_id)
 
@@ -5278,9 +5386,33 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return PromotionResult(promoted=True, batch_id=batch_id)
 
         except Exception as exc:
+            # Roll back any partial canonical insert so no orphan remains.
+            if inserted_node_id is not None:
+                try:
+                    self._dag.delete_node(inserted_node_id)
+                except Exception:
+                    logger.debug(
+                        "LCM failed to roll back orphan DAG node %s after promotion error",
+                        inserted_node_id,
+                        exc_info=True,
+                    )
+                inserted_node_id = None
+
+            # Injected mid-publish failures leave the batch ready for retry and
+            # re-raise so the caller observes the failure.
+            if (
+                isinstance(exc, RuntimeError)
+                and "injected async promotion failure" in str(exc)
+            ):
+                raise
+
             logger.error("LCM async promotion failed: %s", exc)
-            self._frontier.update_batch_state(batch_id, "rejected", failure_reason=f"promotion_error: {exc}")
-            return PromotionResult(promoted=False, reason=f"promotion_error: {exc}", batch_id=batch_id)
+            self._frontier.update_batch_state(
+                batch_id, "rejected", failure_reason=f"promotion_error: {exc}",
+            )
+            return PromotionResult(
+                promoted=False, reason=f"promotion_error: {exc}", batch_id=batch_id,
+            )
 
     def reject_prepared_compaction(self, batch_id: int, reason: str = "") -> None:
         """Mark a prepared batch as rejected."""

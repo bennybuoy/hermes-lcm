@@ -252,6 +252,23 @@ class SummaryDAG:
             node.node_id = cur.lastrowid
             return node.node_id
 
+    def delete_node(self, node_id: int) -> bool:
+        """Delete a single summary node by id. Returns True if a row was removed.
+
+        Used to roll back a partial async-promotion publish when the frontier
+        CAS fails after a canonical insert, or when a test injects a mid-publish
+        failure hook.
+        """
+        if not node_id:
+            return False
+        with self._db_lock:
+            cur = self._conn.execute(
+                "DELETE FROM summary_nodes WHERE node_id = ?",
+                (int(node_id),),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
     def delete_below_depth(self, session_id: str, min_depth: int) -> int:
         """Delete all nodes for a session with depth < min_depth.
 

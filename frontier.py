@@ -344,6 +344,25 @@ class FrontierStore:
             self._conn.commit()
             return cur.rowcount
 
+    def supersede_pending_batches(
+        self,
+        conversation_id: str,
+        *,
+        reason: str = "foreground_compaction",
+    ) -> int:
+        """Mark ready/preparing batches as superseded (foreground race won)."""
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                UPDATE lcm_prepared_batches
+                SET state = 'superseded', failure_reason = ?, updated_at = ?
+                WHERE conversation_id = ? AND state IN ('ready', 'preparing')
+                """,
+                (reason, time.time(), conversation_id),
+            )
+            self._conn.commit()
+            return cur.rowcount
+
     def close(self) -> None:
         with self._lock:
             if self._conn is not None:
