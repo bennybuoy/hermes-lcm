@@ -314,6 +314,18 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("doctor_clean_apply_enabled", "LCM_DOCTOR_CLEAN_APPLY_ENABLED", bool),
     _EnvFieldSpec("empty_lifecycle_gc_enabled", "LCM_EMPTY_LIFECYCLE_GC_ENABLED", bool),
     _EnvFieldSpec("empty_lifecycle_gc_threshold", "LCM_EMPTY_LIFECYCLE_GC_THRESHOLD", int),
+    _EnvFieldSpec("async_background_compaction_enabled", "LCM_ASYNC_BACKGROUND_COMPACTION_ENABLED", bool),
+    _EnvFieldSpec("async_background_compaction_worker_enabled", "LCM_ASYNC_BACKGROUND_COMPACTION_WORKER_ENABLED", bool),
+    _EnvFieldSpec(
+        "async_background_compaction_worker_interval_seconds",
+        "LCM_ASYNC_BACKGROUND_COMPACTION_WORKER_INTERVAL_SECONDS",
+        float,
+    ),
+    _EnvFieldSpec(
+        "async_background_compaction_promote_on_compress",
+        "LCM_ASYNC_BACKGROUND_COMPACTION_PROMOTE_ON_COMPRESS",
+        bool,
+    ),
 )
 
 def _coerce_yaml_value(field: str, raw: Any, py_type: type):
@@ -434,6 +446,11 @@ class LCMConfig:
     async_background_compaction_enabled: bool = False
     # When enabled, a background worker thread runs preparation periodically.
     async_background_compaction_worker_enabled: bool = False
+    # How often the background worker attempts prepare_background_compaction_once.
+    async_background_compaction_worker_interval_seconds: float = 30.0
+    # When enabled, compress() tries to promote a ready prepared batch before
+    # running the expensive foreground leaf-summarization path.
+    async_background_compaction_promote_on_compress: bool = True
     # Minimum number of same-depth fanin groups before one follow-on
     # condensation pass is allowed in cache-friendly mode
     cache_friendly_min_debt_groups: int = 2

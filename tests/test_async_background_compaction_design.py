@@ -185,6 +185,9 @@ def test_foreground_compaction_race_supersedes_pending_batch(tmp_path, monkeypat
     """Given foreground compaction lands first, stale pending work is rejected/superseded."""
     engine = _engine(tmp_path)
     try:
+        # Force the leaf-compaction race: disable turn-boundary auto-promote so
+        # compress() takes the synchronous path and invalidates the ready batch.
+        engine._config.async_background_compaction_promote_on_compress = False
         monkeypatch.setattr(
             "hermes_lcm.engine.summarize_with_escalation",
             lambda **kwargs: ("foreground summary", 0),

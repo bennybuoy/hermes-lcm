@@ -323,6 +323,46 @@ class CompactionMixin:
             self._last_compression_noop_reason = "empty message list"
             return messages
 
+        # Try to promote a prepared async batch before running foreground
+        # compaction. On success, skip the leaf summarization path and
+        # reassemble active context from the (now-canonical) DAG.
+        promote_hook = getattr(self, "_try_promote_prepared_batch", None)
+        if callable(promote_hook):
+            try:
+                promoted = promote_hook(messages)
+                if promoted:
+                    _compress_started = time.perf_counter()
+                    self._last_compression_status = "running"
+                    self._last_compression_noop_reason = ""
+                    working_messages = list(messages)
+                    leading_anchor_count = self._leading_anchor_count(working_messages)
+                    anchor_source_messages = list(working_messages)
+                    anchor_leading_count = self._leading_anchor_count(anchor_source_messages)
+                    self._pending_context_anchor_messages = anchor_source_messages[
+                        anchor_leading_count:
+                    ]
+                    try:
+                        compressed = self._assemble_context(
+                            working_messages[0] if leading_anchor_count else None,
+                            working_messages[leading_anchor_count:],
+                        )
+                    finally:
+                        self._pending_context_anchor_messages = None
+                    self.compression_count += 1
+                    self._last_compaction_duration_ms = (
+                        time.perf_counter() - _compress_started
+                    ) * 1000.0
+                    self._ingest_cursor = len(compressed)
+                    self._last_compression_status = "compacted"
+                    self._last_compression_noop_reason = ""
+                    logger.info(
+                        "LCM async promote-on-compress finished in %.1fms",
+                        self._last_compaction_duration_ms,
+                    )
+                    return compressed
+            except Exception:
+                logger.debug("LCM async promote hook failed", exc_info=True)
+
         self._last_compression_status = "running"
         self._last_compression_noop_reason = ""
         _compress_started = time.perf_counter()

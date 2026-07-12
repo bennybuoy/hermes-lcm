@@ -329,6 +329,40 @@ class FrontierStore:
             ).fetchall()
         return {r[0]: r[1] for r in rows}
 
+    def get_ready_batch(self, conversation_id: str) -> PreparedBatch | None:
+        """Return the most recent ready batch for a conversation, if any."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT batch_id, conversation_id, session_id, base_generation,
+                       source_end_store_id, source_identity_hash, source_ids,
+                       policy_fingerprint, route_fingerprint, state,
+                       expected_leaf_count, frontier_end_store_id, failure_reason
+                FROM lcm_prepared_batches
+                WHERE conversation_id = ? AND state = 'ready'
+                ORDER BY batch_id DESC
+                LIMIT 1
+                """,
+                (conversation_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return PreparedBatch(
+            batch_id=row[0],
+            conversation_id=row[1],
+            session_id=row[2],
+            base_generation=row[3],
+            source_end_store_id=row[4],
+            source_identity_hash=row[5],
+            source_ids=json.loads(row[6]) if row[6] else [],
+            policy_fingerprint=row[7],
+            route_fingerprint=row[8],
+            state=row[9],
+            expected_leaf_count=row[10],
+            frontier_end_store_id=row[11],
+            failure_reason=row[12] or "",
+        )
+
     def reap_stale_preparing(self, conversation_id: str) -> int:
         """Mark any 'preparing' batches as 'failed' (for restart recovery)."""
         with self._lock:

@@ -346,6 +346,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._host_fallback_compressor: Any = None
         self._host_fallback_session_id = ""
         self._host_fallback_import_warning_logged = False
+        # Async background preparation worker (opt-in, daemon thread).
+        self._async_worker_thread: Optional[threading.Thread] = None
+        self._async_worker_stop: Optional[threading.Event] = None
+        self._async_worker_lock = threading.Lock()
 
     def clone_for_agent(self) -> "LCMEngine":
         """Return a fresh runtime engine for one AIAgent instance.
@@ -2297,6 +2301,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         self._schedule_ingest_cursor_reconciliation()
         self._log_session_filter_diagnostics()
+        self._start_async_worker()
 
     def _session_end_matches_current_store_prefix(
         self,
@@ -2644,6 +2649,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+        # Stop the background preparer before any session-end ingest/finalize so
+        # it cannot race with teardown or rebind on the same conversation.
+        if session_id == self._session_id:
+            self._stop_async_worker()
         ended_generation = self._in_process_auxiliary_caller_generation(session_id)
         active_auxiliary_end = session_id in self._active_auxiliary_session_ids()
         if (
@@ -5418,6 +5427,138 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Mark a prepared batch as rejected."""
         self._frontier.update_batch_state(batch_id, "rejected", failure_reason=reason)
 
+    def _try_promote_prepared_batch(self, messages: List[Dict[str, Any]]) -> bool:
+        """Promote a ready async batch at the turn boundary if possible.
+
+        Returns True when a batch was promoted so ``compress()`` can skip the
+        foreground leaf summarization path and reassemble from the DAG.
+        """
+        if not getattr(self._config, "async_background_compaction_enabled", False):
+            return False
+        if not getattr(self._config, "async_background_compaction_promote_on_compress", True):
+            return False
+        conv_id = self.current_conversation_id
+        if not conv_id:
+            return False
+        batch = self._frontier.get_ready_batch(conv_id)
+        if batch is None:
+            return False
+        result = self.promote_prepared_compaction(batch.batch_id, messages)
+        if not result.promoted:
+            return False
+        # Keep in-process frontier marker aligned with the promoted end.
+        end_id = int(batch.frontier_end_store_id or batch.source_end_store_id or 0)
+        if end_id > 0:
+            self._last_compacted_store_id = max(
+                int(self._last_compacted_store_id or 0),
+                end_id,
+            )
+            try:
+                self._persist_frontier_marker()
+            except Exception:
+                logger.debug(
+                    "LCM persist frontier after async promote failed",
+                    exc_info=True,
+                )
+        return True
+
+    # -- Async background worker -------------------------------------------
+
+    def _start_async_worker(self) -> None:
+        """Start the daemon preparer thread when both async flags are enabled."""
+        if not getattr(self._config, "async_background_compaction_enabled", False):
+            self._stop_async_worker()
+            return
+        if not getattr(self._config, "async_background_compaction_worker_enabled", False):
+            self._stop_async_worker()
+            return
+        with self._async_worker_lock:
+            if self._async_worker_thread is not None and self._async_worker_thread.is_alive():
+                return
+            stop_event = threading.Event()
+            self._async_worker_stop = stop_event
+            thread = threading.Thread(
+                target=self._async_worker_loop,
+                name="lcm-async-compaction-worker",
+                daemon=True,
+            )
+            self._async_worker_thread = thread
+            thread.start()
+            logger.debug("LCM async background compaction worker started")
+
+    def _stop_async_worker(self) -> None:
+        """Signal the preparer thread to stop and join with a short timeout."""
+        with self._async_worker_lock:
+            stop_event = self._async_worker_stop
+            thread = self._async_worker_thread
+            self._async_worker_stop = None
+            self._async_worker_thread = None
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                logger.warning(
+                    "LCM async background compaction worker did not stop within timeout"
+                )
+
+    def _async_worker_loop(self) -> None:
+        """Periodic prepare loop. Never raises out of the thread."""
+        stop_event = self._async_worker_stop
+        if stop_event is None:
+            return
+        interval = float(
+            getattr(
+                self._config,
+                "async_background_compaction_worker_interval_seconds",
+                30.0,
+            )
+            or 30.0
+        )
+        if interval <= 0:
+            interval = 30.0
+        while not stop_event.is_set():
+            # Event.wait is cancellable — avoids uninterruptible sleep.
+            if stop_event.wait(timeout=interval):
+                break
+            try:
+                self._async_worker_tick()
+            except Exception:
+                logger.warning(
+                    "LCM async background compaction worker tick failed",
+                    exc_info=True,
+                )
+
+    def _async_worker_tick(self) -> None:
+        """One preparation attempt if the session is idle and has backlog."""
+        if not getattr(self._config, "async_background_compaction_enabled", False):
+            return
+        if not getattr(self._config, "async_background_compaction_worker_enabled", False):
+            return
+        if getattr(self, "_last_compression_status", "") == "running":
+            return
+        session_id = self.current_session_id
+        conv_id = self.current_conversation_id
+        if not session_id or not conv_id:
+            return
+        counts = self._frontier.get_batch_counts_by_state(conv_id)
+        if counts.get("ready", 0) > 0 or counts.get("preparing", 0) > 0:
+            return
+        fresh_tail = int(getattr(self._config, "fresh_tail_count", 0) or 0)
+        try:
+            stored = self._store.get_session_messages(session_id)
+        except Exception:
+            logger.warning(
+                "LCM async worker failed to load session messages",
+                exc_info=True,
+            )
+            return
+        if not stored or len(stored) <= fresh_tail:
+            return
+        # prepare_background_compaction_once snapshots from the store; the
+        # messages argument is only needed for API compatibility.
+        self.prepare_background_compaction_once([])
+
     # -- Internal: helpers -------------------------------------------------
 
     def _assemble_overflow_recovery_context(
@@ -5750,7 +5891,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     # -- Lifecycle ---------------------------------------------------------
 
     def shutdown(self):
+        self._stop_async_worker()
         self._unregister_active_engine_binding()
-        self._store.close()
-        self._dag.close()
-        self._lifecycle.close()
+        self._close_storage()
