@@ -26,6 +26,7 @@ from .codex_routing import (
 from .config import LCMConfig
 from .dag import SummaryDAG, SummaryNode
 from .policy import ModelCompactionPolicy, resolve_policy
+from .frontier import FrontierStore, PreparedBatch, PromotionResult, compute_source_identity_hash, compute_route_fingerprint
 from .diagnostics import _enforce_state_db_containment
 from .engine_registry import (
     _ACTIVE_ENGINE_REGISTRY_LOCK,
@@ -415,7 +416,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return Path.home() / ".hermes" / "lcm.db"
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
-        """Bind store/DAG/lifecycle helpers to one SQLite database."""
+        """Bind store/DAG/lifecycle/frontier helpers to one SQLite database."""
         self._store = MessageStore(
             db_path,
             ingest_protection_config=self._config,
@@ -423,10 +424,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         self._dag = SummaryDAG(db_path)
         self._lifecycle = LifecycleStateStore(db_path)
+        self._frontier = FrontierStore(str(db_path))
 
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
-        for attr in ("_store", "_dag", "_lifecycle"):
+        for attr in ("_store", "_dag", "_lifecycle", "_frontier"):
             helper = getattr(self, attr, None)
             close = getattr(helper, "close", None)
             if callable(close):
@@ -1349,6 +1351,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     deleted,
                     self._config.empty_lifecycle_gc_threshold,
                 )
+
+        # Reap any stale "preparing" batches from a crashed/restarted session.
+        if self._conversation_id:
+            try:
+                reaped = self._frontier.reap_stale_preparing(self._conversation_id)
+                if reaped:
+                    logger.info("LCM reaped %d stale preparing batches on session start", reaped)
+            except Exception:
+                logger.debug("LCM stale preparing reap failed", exc_info=True)
 
     def _register_active_engine_binding(self) -> None:
         session_id = str(self._session_id or "")
@@ -3221,6 +3232,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),
+            "async_compaction": self.get_async_compaction_status(),
         })
         session_id = self.current_session_id
         conversation_id = self.current_conversation_id
@@ -5006,6 +5018,273 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return None
 
         return max(1, min(caps))
+
+    # -- Async/background compaction ----------------------------------------
+
+    def get_async_compaction_status(self) -> dict[str, Any]:
+        """Return counts of prepared batches by state for the active conversation."""
+        conv_id = self.current_conversation_id
+        if not conv_id:
+            return {
+                "enabled": False,
+                "preparing_batches": 0,
+                "pending_batches": 0,
+                "prepared_batches": 0,
+                "promoted_batches": 0,
+                "rejected_batches": 0,
+                "failed_batches": 0,
+                "superseded_batches": 0,
+            }
+        counts = self._frontier.get_batch_counts_by_state(conv_id)
+        return {
+            "enabled": getattr(self._config, "async_background_compaction_enabled", False),
+            "preparing_batches": counts.get("preparing", 0),
+            "pending_batches": counts.get("ready", 0),
+            "prepared_batches": counts.get("ready", 0),
+            "promoted_batches": counts.get("promoted", 0),
+            "rejected_batches": counts.get("rejected", 0),
+            "failed_batches": counts.get("failed", 0),
+            "superseded_batches": counts.get("superseded", 0),
+        }
+
+    def prepare_background_compaction_once(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        leave_state: str = "ready",
+    ) -> PreparedBatch | None:
+        """Build a prepared compaction batch off-context.
+
+        Snapshots the current source boundary, builds leaf summaries
+        privately (without inserting into the canonical DAG), and stores
+        a batch in the ``lcm_prepared_batches`` table.
+
+        Returns the ``PreparedBatch`` or ``None`` if disabled or no work.
+        """
+        if not getattr(self._config, "async_background_compaction_enabled", False):
+            return None
+
+        session_id = self.current_session_id
+        conv_id = self.current_conversation_id
+        if not session_id or not conv_id:
+            return None
+
+        # Get the current frontier
+        frontier = self._frontier.get_active_frontier(conv_id)
+        if frontier is None:
+            self._frontier.ensure_frontier(
+                conv_id, session_id,
+                policy_fingerprint=self._compaction_policy.fingerprint if self._compaction_policy else "",
+                route_fingerprint=compute_route_fingerprint(
+                    self._config.summary_model,
+                    tuple(self._config.summary_fallback_models) if self._config.summary_fallback_models else (),
+                ),
+            )
+            frontier = self._frontier.get_active_frontier(conv_id)
+
+        base_generation = frontier["generation"] if frontier else 1
+        source_end = frontier["source_end_store_id"] if frontier else 0
+
+        # Get the raw messages that are candidates for compaction.
+        fresh_tail = self._config.fresh_tail_count
+        all_stored = self._store.get_session_messages(session_id)
+        if not all_stored:
+            return None
+
+        # Determine which messages are candidates (exclude fresh tail)
+        candidate_count = max(0, len(all_stored) - fresh_tail)
+        if candidate_count <= 0:
+            return None
+
+        candidate_stored = all_stored[:candidate_count]
+        candidate_store_ids = [m["store_id"] for m in candidate_stored]
+        actual_source_end = candidate_store_ids[-1] if candidate_store_ids else source_end
+
+        # Compute source identity hash for CAS validation
+        source_hash = compute_source_identity_hash(
+            self._store._conn, session_id, candidate_store_ids,
+        )
+
+        # Compute fingerprints
+        policy_fp = self._compaction_policy.fingerprint if self._compaction_policy else ""
+        route_fp = compute_route_fingerprint(
+            self._config.summary_model,
+            tuple(self._config.summary_fallback_models) if self._config.summary_fallback_models else (),
+        )
+
+        # Create the batch in "preparing" state
+        batch_id = self._frontier.create_batch(
+            conversation_id=conv_id,
+            session_id=session_id,
+            base_generation=base_generation,
+            source_end_store_id=actual_source_end,
+            source_identity_hash=source_hash,
+            source_ids=candidate_store_ids,
+            policy_fingerprint=policy_fp,
+            route_fingerprint=route_fp,
+            state="preparing",
+        )
+
+        # Build leaf summaries using the existing _summarize_leaf_chunk_with_rescue
+        try:
+            # Convert stored messages to OpenAI format for the summarizer
+            candidate_messages = [
+                {"role": m["role"], "content": m.get("content") or ""}
+                for m in candidate_stored
+            ]
+
+            # Use the engine's existing leaf summarization path
+            _compacted_chunk, source_tokens, summary_text, _level, _attempts = (
+                self._summarize_leaf_chunk_with_rescue(candidate_messages)
+            )
+            leaf_count = 1  # One leaf from one chunk
+            leaf_tokens = count_messages_tokens([{"role": "assistant", "content": summary_text}])
+
+            self._frontier.update_batch_state(
+                batch_id, leave_state,
+                expected_leaf_count=leaf_count,
+                frontier_end_store_id=actual_source_end,
+            )
+        except Exception as exc:
+            logger.warning("LCM background compaction prep failed: %s", exc)
+            self._frontier.update_batch_state(
+                batch_id, "failed", failure_reason=str(exc),
+            )
+
+        return self._frontier.get_batch(batch_id)
+
+    def promote_prepared_compaction(
+        self,
+        batch_id: int,
+        messages: List[Dict[str, Any]],
+    ) -> PromotionResult:
+        """Atomically promote a prepared batch to the canonical DAG.
+
+        CAS validation:
+        1. Source identity hash must match (no raw messages changed)
+        2. Policy fingerprint must match (no config change)
+        3. Route fingerprint must match (no summary model change)
+        4. Base generation must match current frontier (no concurrent promotion)
+
+        On success: insert canonical DAG node, advance frontier generation,
+        mark batch as promoted.  On failure: mark batch as rejected.
+        """
+        batch = self._frontier.get_batch(batch_id)
+        if batch is None:
+            return PromotionResult(promoted=False, reason="batch_not_found", batch_id=batch_id)
+
+        if batch.state not in ("ready", "preparing"):
+            return PromotionResult(promoted=False, reason=f"batch_state_{batch.state}", batch_id=batch_id)
+
+        # 1. Source identity check
+        current_source_hash = compute_source_identity_hash(
+            self._store._conn, batch.session_id, batch.source_ids,
+        )
+        if current_source_hash != batch.source_identity_hash:
+            self._frontier.update_batch_state(batch_id, "rejected", failure_reason="source_identity_mismatch")
+            return PromotionResult(promoted=False, reason="source_identity_mismatch", batch_id=batch_id)
+
+        # 2. Policy fingerprint check
+        current_policy_fp = self._compaction_policy.fingerprint if self._compaction_policy else ""
+        if batch.policy_fingerprint and current_policy_fp and batch.policy_fingerprint != current_policy_fp:
+            self._frontier.update_batch_state(batch_id, "rejected", failure_reason="policy_fingerprint_mismatch")
+            return PromotionResult(promoted=False, reason="policy_fingerprint_mismatch", batch_id=batch_id)
+
+        # 3. Route fingerprint check
+        current_route_fp = compute_route_fingerprint(
+            self._config.summary_model,
+            tuple(self._config.summary_fallback_models) if self._config.summary_fallback_models else (),
+        )
+        if batch.route_fingerprint and current_route_fp and batch.route_fingerprint != current_route_fp:
+            self._frontier.update_batch_state(batch_id, "rejected", failure_reason="summary_route_fingerprint_mismatch")
+            return PromotionResult(promoted=False, reason="summary_route_fingerprint_mismatch", batch_id=batch_id)
+
+        # 4. CAS on base generation
+        frontier = self._frontier.get_active_frontier(batch.conversation_id)
+        current_gen = frontier["generation"] if frontier else 0
+        if current_gen != batch.base_generation:
+            self._frontier.update_batch_state(batch_id, "rejected", failure_reason="frontier_mismatch")
+            return PromotionResult(promoted=False, reason="frontier_mismatch", batch_id=batch_id)
+
+        # --- Atomic promotion via CAS on generation ---
+        # The frontier store and DAG use separate SQLite connections, so we
+        # can't wrap both in a single transaction.  Instead, we use the
+        # generation counter as the CAS boundary:
+        # 1. Re-validate all fingerprints (already done above)
+        # 2. Insert canonical DAG node (add_node is atomic on its own conn)
+        # 3. CAS-advance the frontier generation (atomic on its own conn)
+        # If step 3 fails (concurrent promotion), we have an orphan DAG node —
+        # harmless: it's a depth-0 summary that won't be referenced by any
+        # frontier generation and can be reaped by a future doctor pass.
+        try:
+            # Re-run the leaf summarization to get the actual summary
+            all_stored = self._store.get_session_messages(batch.session_id)
+            fresh_tail = self._config.fresh_tail_count
+            candidate_count = max(0, len(all_stored) - fresh_tail)
+            candidate_stored = all_stored[:candidate_count]
+            candidate_messages = [
+                {"role": m["role"], "content": m.get("content") or ""}
+                for m in candidate_stored
+            ]
+
+            _compacted_chunk, source_tokens, summary_text, _level, _attempts = (
+                self._summarize_leaf_chunk_with_rescue(candidate_messages)
+            )
+
+            # Insert canonical DAG node
+            from .dag import SummaryNode
+            now = time.time()
+            leaf_tokens = count_messages_tokens([{"role": "assistant", "content": summary_text}])
+            node = SummaryNode(
+                session_id=batch.session_id,
+                depth=0,
+                summary=summary_text,
+                token_count=leaf_tokens,
+                source_token_count=source_tokens,
+                source_ids=list(batch.source_ids),
+                source_type="messages",
+                created_at=now,
+                earliest_at=None,
+                latest_at=None,
+                expand_hint="",
+            )
+            self._dag.add_node(node)
+
+            # CAS-advance frontier generation
+            new_gen = self._frontier.advance_frontier_generation(
+                batch.conversation_id,
+                batch.session_id,
+                batch.frontier_end_store_id,
+                current_policy_fp,
+                current_route_fp,
+                batch.base_generation,
+            )
+            if new_gen == 0:
+                # Concurrent promotion won — our DAG node is an orphan.
+                # It won't be referenced by any frontier generation.
+                self._frontier.update_batch_state(batch_id, "rejected", failure_reason="frontier_mismatch")
+                return PromotionResult(promoted=False, reason="frontier_mismatch", batch_id=batch_id)
+
+            # Mark batch as promoted
+            self._frontier.update_batch_state(batch_id, "promoted")
+
+            # Also advance lifecycle frontier
+            self._lifecycle.advance_frontier(
+                batch.conversation_id,
+                batch.session_id,
+                batch.frontier_end_store_id,
+            )
+
+            return PromotionResult(promoted=True, batch_id=batch_id)
+
+        except Exception as exc:
+            logger.error("LCM async promotion failed: %s", exc)
+            self._frontier.update_batch_state(batch_id, "rejected", failure_reason=f"promotion_error: {exc}")
+            return PromotionResult(promoted=False, reason=f"promotion_error: {exc}", batch_id=batch_id)
+
+    def reject_prepared_compaction(self, batch_id: int, reason: str = "") -> None:
+        """Mark a prepared batch as rejected."""
+        self._frontier.update_batch_state(batch_id, "rejected", failure_reason=reason)
 
     # -- Internal: helpers -------------------------------------------------
 

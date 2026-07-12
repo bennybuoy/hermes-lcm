@@ -429,6 +429,11 @@ class LCMConfig:
     # When enabled, suppress follow-on condensation after a leaf pass unless
     # debt/pressure says the extra churn is worth it
     cache_friendly_condensation_enabled: bool = False
+    # When enabled, background compaction prepares candidates off-context
+    # and atomically promotes them at turn boundaries.
+    async_background_compaction_enabled: bool = False
+    # When enabled, a background worker thread runs preparation periodically.
+    async_background_compaction_worker_enabled: bool = False
     # Minimum number of same-depth fanin groups before one follow-on
     # condensation pass is allowed in cache-friendly mode
     cache_friendly_min_debt_groups: int = 2

@@ -866,10 +866,6 @@ class TestActiveFrontierContract:
     """RED tests for the persistent ordered active frontier. These are
     xfail(strict=True) until P0.3 is implemented."""
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Active frontier schema not yet implemented (P0.3)",
-    )
     def test_frontier_schema_exists(self, tmp_path):
         from hermes_lcm.db_bootstrap import run_versioned_migrations
         import sqlite3
@@ -884,10 +880,6 @@ class TestActiveFrontierContract:
         assert "lcm_frontier_items" in tables
         assert "lcm_prepared_batches" in tables
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Background compaction not yet implemented (P0.3)",
-    )
     def test_prepare_background_compaction_returns_batch(self, tmp_path, monkeypatch):
         engine = _make_engine(
             tmp_path,
@@ -896,6 +888,7 @@ class TestActiveFrontierContract:
             fresh_tail_count=2,
             leaf_chunk_tokens=20,
             session_id="bg-prep-session",
+            async_background_compaction_enabled=True,
         )
         _stub_summary(monkeypatch, engine)
         try:
@@ -907,10 +900,6 @@ class TestActiveFrontierContract:
         finally:
             engine.shutdown()
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Atomic promotion not yet implemented (P0.3)",
-    )
     def test_atomic_promotion_advances_frontier(self, tmp_path, monkeypatch):
         engine = _make_engine(
             tmp_path,
@@ -919,6 +908,7 @@ class TestActiveFrontierContract:
             fresh_tail_count=2,
             leaf_chunk_tokens=20,
             session_id="promote-session",
+            async_background_compaction_enabled=True,
         )
         _stub_summary(monkeypatch, engine)
         try:

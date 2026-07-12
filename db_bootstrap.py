@@ -27,7 +27,7 @@ class SchemaVersionTooNewError(RuntimeError):
     """
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
 REQUIRED_CORE_TABLES = (
@@ -266,6 +266,97 @@ def ensure_message_origin_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_msg_conversation_session ON messages(conversation_id, session_id, store_id)"
+    )
+
+
+def ensure_frontier_tables(conn: sqlite3.Connection) -> None:
+    """Create the persistent ordered active frontier tables (schema v6).
+
+    Three tables implement the candidate-based async compaction workflow:
+
+    - ``lcm_active_frontiers`` — one row per conversation per generation.
+      Tracks the current canonical frontier (source boundary, policy
+      fingerprint, generation counter).
+
+    - ``lcm_frontier_items`` — ordered items in a frontier generation.
+      Each item references either a raw message store_id or a DAG node_id,
+      with an ordinal for deterministic ordering.
+
+    - ``lcm_prepared_batches`` — candidate compaction results built
+      off-context.  Each batch references the base generation it was
+      prepared against, carries source identity hashes and policy/route
+      fingerprints for CAS validation at promotion time, and transitions
+      through states: preparing → ready → promoted | rejected | failed.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_active_frontiers (
+            conversation_id TEXT NOT NULL,
+            generation INTEGER NOT NULL DEFAULT 1,
+            session_id TEXT NOT NULL,
+            source_end_store_id INTEGER NOT NULL DEFAULT 0,
+            policy_fingerprint TEXT NOT NULL DEFAULT '',
+            route_fingerprint TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (conversation_id, generation)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_frontiers_conversation
+            ON lcm_active_frontiers(conversation_id, generation DESC)
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_frontier_items (
+            conversation_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            ordinal INTEGER NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'message',
+            ref_id INTEGER NOT NULL,
+            source_start INTEGER NOT NULL DEFAULT 0,
+            source_end INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (conversation_id, generation, ordinal)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_frontier_items_gen
+            ON lcm_frontier_items(conversation_id, generation, ordinal)
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_prepared_batches (
+            batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            base_generation INTEGER NOT NULL,
+            source_end_store_id INTEGER NOT NULL,
+            source_identity_hash TEXT NOT NULL DEFAULT '',
+            source_ids TEXT NOT NULL DEFAULT '[]',
+            policy_fingerprint TEXT NOT NULL DEFAULT '',
+            route_fingerprint TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL DEFAULT 'preparing',
+            expected_leaf_count INTEGER NOT NULL DEFAULT 0,
+            frontier_end_store_id INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            failure_reason TEXT DEFAULT ''
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_batches_conv_state
+            ON lcm_prepared_batches(conversation_id, state)
+        """
     )
 
 
@@ -699,5 +790,10 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
     if current_version < 5:
         mark_migration_step_complete(conn, "v5_message_conversation_id")
         current_version = 5
+
+    ensure_frontier_tables(conn)
+    if current_version < 6:
+        mark_migration_step_complete(conn, "v6_active_frontier_tables")
+        current_version = 6
 
     set_schema_version(conn, current_version)
