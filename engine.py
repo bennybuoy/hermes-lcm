@@ -15,7 +15,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from agent.context_engine import ContextEngine
 
@@ -26,7 +26,14 @@ from .codex_routing import (
 from .config import LCMConfig
 from .dag import SummaryDAG, SummaryNode
 from .policy import ModelCompactionPolicy, resolve_policy
-from .frontier import FrontierStore, PreparedBatch, PromotionResult, compute_source_identity_hash, compute_route_fingerprint
+from .frontier import (
+    FrontierStore,
+    PREPARED_PAYLOAD_VERSION,
+    PreparedBatch,
+    PromotionResult,
+    compute_source_identity_hash,
+    compute_route_fingerprint,
+)
 from .diagnostics import _enforce_state_db_containment
 from .engine_registry import (
     _ACTIVE_ENGINE_REGISTRY_LOCK,
@@ -386,6 +393,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._async_worker_last_tick_duration_ms: Optional[float] = None
         self._async_last_prepare_at: Optional[float] = None
         self._async_last_promote_at: Optional[float] = None
+        # Last successful promote telemetry (ms) — validation / publication / wall.
+        self._async_last_promote_validation_ms: Optional[float] = None
+        self._async_last_promote_publication_ms: Optional[float] = None
+        self._async_last_promote_wall_ms: Optional[float] = None
+        # Source store_ids covered by the most recent successful promote (for
+        # host-side active-context replacement so covered raw rows are dropped).
+        self._async_last_promoted_source_ids: list[int] = []
+        self._async_last_promoted_node_id: int = 0
+        # Foreground cutover priority: set while compress() is in the critical
+        # path so the background worker must not enter LLM/SQLite work.
+        self._foreground_compress_active = threading.Event()
         self._async_total_prepare_attempts: int = 0
         self._async_total_promote_attempts: int = 0
         self._async_total_promote_succeeded: int = 0
@@ -1442,6 +1460,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     logger.info("LCM reaped %d stale preparing batches on session start", reaped)
             except Exception:
                 logger.debug("LCM stale preparing reap failed", exc_info=True)
+            # Repair itemless active frontier tips left by older builds (issue #4).
+            try:
+                repaired = self.reconcile_itemless_frontier_generations(
+                    self._conversation_id
+                )
+                if repaired:
+                    logger.info(
+                        "LCM reconciled %d itemless frontier generation(s) on session start",
+                        repaired,
+                    )
+            except Exception:
+                logger.debug("LCM frontier item reconciliation failed", exc_info=True)
 
     def _register_active_engine_binding(self) -> None:
         session_id = str(self._session_id or "")
@@ -5238,12 +5268,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         *,
         source_end_store_id: int,
+        node_id: int = 0,
+        covered_source_ids: Optional[List[int]] = None,
     ) -> None:
         """Advance async frontier generation after foreground leaf compaction.
 
         Pending prepared batches become stale against the new generation and
         are marked superseded so a later promote returns frontier_mismatch /
         batch_state_superseded rather than double-publishing.
+
+        Also writes ordered frontier items so an active generation with
+        ``source_end_store_id > 0`` is never itemless (issue #4).
         """
         if not getattr(self._config, "async_background_compaction_enabled", False):
             return
@@ -5260,7 +5295,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             # Only advance the generation counter here. Pending batches stay
             # "ready" so a subsequent promote returns frontier_mismatch (and
             # increments rejected_batches) rather than batch_state_superseded.
-            self._frontier.advance_frontier_generation(
+            new_gen = self._frontier.advance_frontier_generation(
                 conv_id,
                 session_id,
                 int(source_end_store_id or 0),
@@ -5268,6 +5303,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 route_fp,
                 frontier["generation"],
             )
+            if new_gen and int(source_end_store_id or 0) > 0:
+                items = self._build_promoted_frontier_items(
+                    session_id=session_id,
+                    node_id=int(node_id or 0),
+                    covered_source_ids=[int(s) for s in (covered_source_ids or [])],
+                    frontier_end_store_id=int(source_end_store_id or 0),
+                )
+                if items:
+                    self._frontier.set_frontier_items(conv_id, new_gen, items)
         except Exception:
             logger.debug(
                 "LCM async frontier advance after foreground compact failed",
@@ -5292,6 +5336,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "worker_cooldown_remaining_seconds": cooldown_remaining,
             "last_prepare_at": getattr(self, "_async_last_prepare_at", None),
             "last_promote_at": getattr(self, "_async_last_promote_at", None),
+            "last_promote_validation_ms": getattr(
+                self, "_async_last_promote_validation_ms", None
+            ),
+            "last_promote_publication_ms": getattr(
+                self, "_async_last_promote_publication_ms", None
+            ),
+            "last_promote_wall_ms": getattr(self, "_async_last_promote_wall_ms", None),
             "total_prepare_attempts": int(
                 getattr(self, "_async_total_prepare_attempts", 0) or 0
             ),
@@ -5300,6 +5351,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             ),
             "total_promote_succeeded": int(
                 getattr(self, "_async_total_promote_succeeded", 0) or 0
+            ),
+            "foreground_compress_active": bool(
+                getattr(self, "_foreground_compress_active", None)
+                and self._foreground_compress_active.is_set()
             ),
         }
         conv_id = self.current_conversation_id
@@ -5406,12 +5461,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Build leaf summaries using the existing _summarize_leaf_chunk_with_rescue.
         # Summaries stay private to this path — they are NOT inserted into the
         # canonical DAG (or FTS). Promotion is the only path that publishes.
+        # The summary payload IS persisted on the batch so promote is zero-LLM.
         try:
             # Bail out early if shutdown was signaled while we were setting up.
             stop_event = self._async_worker_stop
             if stop_event is not None and stop_event.is_set():
                 self._frontier.update_batch_state(
                     batch_id, "failed", failure_reason="shutdown_signaled",
+                )
+                return None
+            # Foreground cutover has priority: do not start expensive LLM work
+            # once compress() has claimed the critical section.
+            if self._foreground_compress_active.is_set():
+                self._frontier.update_batch_state(
+                    batch_id, "failed", failure_reason="foreground_compress_priority",
                 )
                 return None
 
@@ -5422,7 +5485,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             ]
 
             # Use the engine's existing leaf summarization path
-            _compacted_chunk, source_tokens, summary_text, _level, _attempts = (
+            _compacted_chunk, source_tokens, summary_text, level, attempts = (
                 self._summarize_leaf_chunk_with_rescue(candidate_messages)
             )
 
@@ -5433,15 +5496,39 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     batch_id, "failed", failure_reason="shutdown_signaled",
                 )
                 return None
+            if self._foreground_compress_active.is_set():
+                self._frontier.update_batch_state(
+                    batch_id, "failed", failure_reason="foreground_compress_priority",
+                )
+                return None
 
             leaf_count = 1  # One leaf from one chunk
-            leaf_tokens = count_messages_tokens([{"role": "assistant", "content": summary_text}])
-            del leaf_tokens  # summary text is re-derived at promote for v1
+            leaf_tokens = count_messages_tokens(
+                [{"role": "assistant", "content": summary_text}]
+            )
+            # Persist the full publishable payload so promote never re-runs
+            # the summarizer (issue #1). payload_version=2 marks a complete
+            # private leaf ready for CAS publish.
+            summary_payload = json.dumps(
+                {
+                    "summary_text": summary_text,
+                    "source_tokens": int(source_tokens),
+                    "token_count": int(leaf_tokens),
+                    "level": int(level),
+                    "attempts": int(attempts),
+                    "source_ids": list(candidate_store_ids),
+                    "expand_hint": self._extract_expand_hint(summary_text),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
 
             self._frontier.update_batch_state(
                 batch_id, leave_state,
                 expected_leaf_count=leaf_count,
                 frontier_end_store_id=actual_source_end,
+                summary_payload=summary_payload,
+                payload_version=PREPARED_PAYLOAD_VERSION,
             )
             self._async_last_prepare_at = time.time()
         except Exception as exc:
@@ -5460,26 +5547,76 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Atomically promote a prepared batch to the canonical DAG.
 
         CAS validation:
-        1. Source identity hash must match (no raw messages changed)
-        2. Policy fingerprint must match (no config change)
-        3. Route fingerprint must match (no summary model change)
-        4. Base generation must match current frontier (no concurrent promotion)
-        5. No canonical DAG node already covers the same source IDs
+        1. Batch must carry a persisted summary payload (payload_version >= 2)
+        2. Source identity hash must match (no raw messages changed)
+        3. Policy fingerprint must match (no config change)
+        4. Route fingerprint must match (no summary model change)
+        5. Base generation must match current frontier (no concurrent promotion)
+        6. No canonical DAG node already covers the same source IDs
 
-        On success: insert canonical DAG node, advance frontier generation,
-        mark batch as promoted.  On failure: mark batch as rejected (except
-        injected mid-publish failures, which roll back and re-raise).
+        On success: insert canonical DAG node from the *persisted* payload
+        (ZERO LLM calls), write ordered frontier items, advance frontier
+        generation, mark batch as promoted.  On failure: mark batch as
+        rejected (except injected mid-publish failures, which roll back and
+        re-raise).
         """
+        wall_started = time.perf_counter()
+        validation_ms = 0.0
+        publication_ms = 0.0
         self._async_total_promote_attempts = (
             int(getattr(self, "_async_total_promote_attempts", 0) or 0) + 1
         )
 
+        def _result(
+            *,
+            promoted: bool,
+            reason: str = "",
+            node_id: int = 0,
+            covered: list[int] | None = None,
+        ) -> PromotionResult:
+            wall_ms = (time.perf_counter() - wall_started) * 1000.0
+            return PromotionResult(
+                promoted=promoted,
+                reason=reason,
+                batch_id=batch_id,
+                node_id=node_id,
+                covered_source_ids=list(covered or []),
+                validation_ms=validation_ms,
+                publication_ms=publication_ms,
+                wall_ms=wall_ms,
+            )
+
+        validation_started = time.perf_counter()
         batch = self._frontier.get_batch(batch_id)
         if batch is None:
-            return PromotionResult(promoted=False, reason="batch_not_found", batch_id=batch_id)
+            validation_ms = (time.perf_counter() - validation_started) * 1000.0
+            return _result(promoted=False, reason="batch_not_found")
 
         if batch.state not in ("ready", "preparing"):
-            return PromotionResult(promoted=False, reason=f"batch_state_{batch.state}", batch_id=batch_id)
+            validation_ms = (time.perf_counter() - validation_started) * 1000.0
+            return _result(promoted=False, reason=f"batch_state_{batch.state}")
+
+        # 0. Persisted payload required — never re-summarize at promote.
+        payload = batch.parsed_summary_payload()
+        if payload is None:
+            self._frontier.update_batch_state(
+                batch_id,
+                "superseded",
+                failure_reason="legacy_v1_batch_without_payload",
+            )
+            validation_ms = (time.perf_counter() - validation_started) * 1000.0
+            return _result(promoted=False, reason="legacy_v1_batch_without_payload")
+
+        summary_text = str(payload.get("summary_text") or "")
+        source_tokens = int(payload.get("source_tokens") or 0)
+        leaf_tokens = int(
+            payload.get("token_count")
+            or count_messages_tokens([{"role": "assistant", "content": summary_text}])
+        )
+        expand_hint = str(
+            payload.get("expand_hint") or self._extract_expand_hint(summary_text)
+        )
+        covered_source_ids = [int(s) for s in (batch.source_ids or [])]
 
         # 1. Source identity check
         current_source_hash = compute_source_identity_hash(
@@ -5487,26 +5624,30 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         if current_source_hash != batch.source_identity_hash:
             self._frontier.update_batch_state(batch_id, "rejected", failure_reason="source_identity_mismatch")
-            return PromotionResult(promoted=False, reason="source_identity_mismatch", batch_id=batch_id)
+            validation_ms = (time.perf_counter() - validation_started) * 1000.0
+            return _result(promoted=False, reason="source_identity_mismatch")
 
         # 2. Policy fingerprint check (always recompute from live config)
         current_policy_fp = self._async_policy_fingerprint()
         if batch.policy_fingerprint != current_policy_fp:
             self._frontier.update_batch_state(batch_id, "rejected", failure_reason="policy_fingerprint_mismatch")
-            return PromotionResult(promoted=False, reason="policy_fingerprint_mismatch", batch_id=batch_id)
+            validation_ms = (time.perf_counter() - validation_started) * 1000.0
+            return _result(promoted=False, reason="policy_fingerprint_mismatch")
 
         # 3. Route fingerprint check
         current_route_fp = self._async_route_fingerprint()
         if batch.route_fingerprint and current_route_fp and batch.route_fingerprint != current_route_fp:
             self._frontier.update_batch_state(batch_id, "rejected", failure_reason="summary_route_fingerprint_mismatch")
-            return PromotionResult(promoted=False, reason="summary_route_fingerprint_mismatch", batch_id=batch_id)
+            validation_ms = (time.perf_counter() - validation_started) * 1000.0
+            return _result(promoted=False, reason="summary_route_fingerprint_mismatch")
 
         # 4. CAS on base generation
         frontier = self._frontier.get_active_frontier(batch.conversation_id)
         current_gen = frontier["generation"] if frontier else 0
         if current_gen != batch.base_generation:
             self._frontier.update_batch_state(batch_id, "rejected", failure_reason="frontier_mismatch")
-            return PromotionResult(promoted=False, reason="frontier_mismatch", batch_id=batch_id)
+            validation_ms = (time.perf_counter() - validation_started) * 1000.0
+            return _result(promoted=False, reason="frontier_mismatch")
 
         # 5. Canonical source overlap (foreground race already published)
         try:
@@ -5519,46 +5660,30 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                             covered.add(int(sid))
                         except (TypeError, ValueError):
                             continue
-            if covered.intersection(int(s) for s in batch.source_ids):
+            if covered.intersection(covered_source_ids):
                 self._frontier.update_batch_state(
                     batch_id, "rejected", failure_reason="canonical_source_overlap",
                 )
-                return PromotionResult(
-                    promoted=False, reason="canonical_source_overlap", batch_id=batch_id,
-                )
+                validation_ms = (time.perf_counter() - validation_started) * 1000.0
+                return _result(promoted=False, reason="canonical_source_overlap")
         except Exception:
             logger.debug("LCM canonical source-overlap check failed", exc_info=True)
+
+        validation_ms = (time.perf_counter() - validation_started) * 1000.0
 
         # --- Atomic promotion via CAS on generation ---
         # The frontier store and DAG use separate SQLite connections, so we
         # can't wrap both in a single transaction.  Instead, we use the
         # generation counter as the CAS boundary and roll back any orphan
         # DAG node if the frontier advance fails or a mid-publish hook fires.
+        # CRITICAL: publication uses the prepared payload only — zero LLM calls.
         inserted_node_id: int | None = None
         advanced_frontier_generation = 0
+        frontier_items_written = False
         try:
-            # Re-run the leaf summarization to get the actual summary
-            all_stored = self._store.get_session_messages(batch.session_id)
-            # Use the source_ids snapshotted at prepare time, not a live
-            # fresh-tail recompute — live config may have changed the tail
-            # boundary (caught by policy fingerprint above when it does).
-            id_set = set(batch.source_ids)
-            candidate_stored = [m for m in all_stored if m.get("store_id") in id_set]
-            # Preserve source_ids order
-            by_id = {m["store_id"]: m for m in candidate_stored}
-            ordered = [by_id[sid] for sid in batch.source_ids if sid in by_id]
-            candidate_messages = [
-                {"role": m["role"], "content": m.get("content") or ""}
-                for m in ordered
-            ]
-
-            _compacted_chunk, source_tokens, summary_text, _level, _attempts = (
-                self._summarize_leaf_chunk_with_rescue(candidate_messages)
-            )
-
-            # Insert canonical DAG node
+            publication_started = time.perf_counter()
+            earliest_at, latest_at = self._store.get_time_bounds(covered_source_ids)
             now = time.time()
-            leaf_tokens = count_messages_tokens([{"role": "assistant", "content": summary_text}])
             node = SummaryNode(
                 session_id=batch.session_id,
                 depth=0,
@@ -5568,9 +5693,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 source_ids=list(batch.source_ids),
                 source_type="messages",
                 created_at=now,
-                earliest_at=None,
-                latest_at=None,
-                expand_hint="",
+                earliest_at=earliest_at,
+                latest_at=latest_at,
+                expand_hint=expand_hint,
             )
             inserted_node_id = self._dag.add_node(node)
 
@@ -5595,11 +5720,35 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     self._dag.delete_node(inserted_node_id)
                     inserted_node_id = None
                 self._frontier.update_batch_state(batch_id, "rejected", failure_reason="frontier_mismatch")
-                return PromotionResult(promoted=False, reason="frontier_mismatch", batch_id=batch_id)
+                publication_ms = (time.perf_counter() - publication_started) * 1000.0
+                return _result(promoted=False, reason="frontier_mismatch")
 
             advanced_frontier_generation = new_gen
+
+            # Write ordered frontier items BEFORE marking the batch promoted.
+            # A generation tip with source_end > 0 must never be itemless.
+            frontier_items = self._build_promoted_frontier_items(
+                session_id=batch.session_id,
+                node_id=int(inserted_node_id),
+                covered_source_ids=covered_source_ids,
+                frontier_end_store_id=int(batch.frontier_end_store_id or 0),
+            )
+            if not frontier_items:
+                raise RuntimeError("frontier_items_empty_after_promotion")
+            self._frontier.set_frontier_items(
+                batch.conversation_id, new_gen, frontier_items,
+            )
+            frontier_items_written = True
+
+            # Fault-injection points after items / generation CAS.
+            if hook == "after_frontier_items":
+                raise RuntimeError("injected async promotion failure")
+
             # Mark batch as promoted
             self._frontier.update_batch_state(batch_id, "promoted")
+
+            if hook == "after_batch_promoted":
+                raise RuntimeError("injected async promotion failure")
 
             # Also advance lifecycle frontier. A stale session returns an
             # unchanged state instead of raising, so verify the checkpoint
@@ -5617,11 +5766,30 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             ):
                 raise RuntimeError("lifecycle_frontier_not_advanced")
 
+            publication_ms = (time.perf_counter() - publication_started) * 1000.0
+            wall_ms = (time.perf_counter() - wall_started) * 1000.0
             self._async_last_promote_at = time.time()
+            self._async_last_promote_validation_ms = validation_ms
+            self._async_last_promote_publication_ms = publication_ms
+            self._async_last_promote_wall_ms = wall_ms
+            self._async_last_promoted_source_ids = list(covered_source_ids)
+            self._async_last_promoted_node_id = int(inserted_node_id or 0)
             self._async_total_promote_succeeded = (
                 int(getattr(self, "_async_total_promote_succeeded", 0) or 0) + 1
             )
-            return PromotionResult(promoted=True, batch_id=batch_id)
+            logger.info(
+                "LCM async promote batch=%s node=%s validation=%.1fms publication=%.1fms wall=%.1fms",
+                batch_id,
+                inserted_node_id,
+                validation_ms,
+                publication_ms,
+                wall_ms,
+            )
+            return _result(
+                promoted=True,
+                node_id=int(inserted_node_id or 0),
+                covered=covered_source_ids,
+            )
 
         except Exception as exc:
             # Compensate the committed frontier CAS before removing the DAG node.
@@ -5637,6 +5805,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                             "LCM could not roll back frontier generation %s after promotion error",
                             advanced_frontier_generation,
                         )
+                    else:
+                        frontier_items_written = False
                 except Exception:
                     logger.error(
                         "LCM frontier rollback failed after promotion error",
@@ -5666,9 +5836,156 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._frontier.update_batch_state(
                 batch_id, "rejected", failure_reason=f"promotion_error: {exc}",
             )
-            return PromotionResult(
-                promoted=False, reason=f"promotion_error: {exc}", batch_id=batch_id,
+            return _result(promoted=False, reason=f"promotion_error: {exc}")
+
+    def _build_promoted_frontier_items(
+        self,
+        *,
+        session_id: str,
+        node_id: int,
+        covered_source_ids: list[int],
+        frontier_end_store_id: int,
+    ) -> list[dict[str, Any]]:
+        """Build ordered frontier items for a just-promoted generation.
+
+        Layout:
+        1. One ``node`` item for the newly published DAG leaf, covering the
+           prepared source range.
+        2. Ordered ``message`` items for the uncovered raw tail (store_ids
+           strictly after the promoted frontier end), preserving monotonic
+           non-overlapping ranges.
+        """
+        items: list[dict[str, Any]] = []
+        if covered_source_ids and node_id > 0:
+            items.append(
+                {
+                    "kind": "node",
+                    "ref_id": int(node_id),
+                    "source_start": int(min(covered_source_ids)),
+                    "source_end": int(max(covered_source_ids)),
+                }
             )
+        # Uncovered fresh-tail raw messages after the promoted end.
+        try:
+            all_stored = self._store.get_session_messages(session_id)
+        except Exception:
+            all_stored = []
+        end_id = int(frontier_end_store_id or 0)
+        covered_set = {int(s) for s in covered_source_ids}
+        for row in all_stored:
+            try:
+                sid = int(row.get("store_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if sid <= 0 or sid in covered_set:
+                continue
+            if end_id > 0 and sid <= end_id:
+                continue
+            items.append(
+                {
+                    "kind": "message",
+                    "ref_id": sid,
+                    "source_start": sid,
+                    "source_end": sid,
+                }
+            )
+        # If there is no uncovered tail (empty session after full cover), the
+        # node item alone still satisfies non-empty for source_end > 0.
+        return items
+
+    def reconcile_itemless_frontier_generations(
+        self,
+        conversation_id: str | None = None,
+    ) -> int:
+        """Repair active generations that have source_end > 0 but no items.
+
+        Rebuilds items from current canonical DAG leaves + uncovered raw
+        tail. Returns the number of generations repaired.
+        """
+        conv_id = conversation_id or self.current_conversation_id
+        if not conv_id:
+            return 0
+        itemless = self._frontier.list_itemless_active_generations(conv_id)
+        repaired = 0
+        for row in itemless:
+            session_id = str(row.get("session_id") or "")
+            generation = int(row.get("generation") or 0)
+            source_end = int(row.get("source_end_store_id") or 0)
+            if not session_id or generation <= 0 or source_end <= 0:
+                continue
+            try:
+                nodes = self._dag.get_session_nodes(session_id)
+            except Exception:
+                nodes = []
+            # Prefer uncondensed depth-0 leaves whose source range ends at or
+            # before the generation's source_end.
+            node_items: list[dict[str, Any]] = []
+            covered: set[int] = set()
+            for node in nodes:
+                if getattr(node, "depth", 0) != 0:
+                    continue
+                if getattr(node, "source_type", "") != "messages":
+                    continue
+                sids = [int(s) for s in (getattr(node, "source_ids", None) or [])]
+                if not sids:
+                    continue
+                if max(sids) > source_end:
+                    continue
+                covered.update(sids)
+                node_items.append(
+                    {
+                        "kind": "node",
+                        "ref_id": int(node.node_id),
+                        "source_start": min(sids),
+                        "source_end": max(sids),
+                    }
+                )
+            # Sort node items by source_start for monotonic ordering.
+            node_items.sort(key=lambda it: (it["source_start"], it["ref_id"]))
+            items = list(node_items)
+            try:
+                stored = self._store.get_session_messages(session_id)
+            except Exception:
+                stored = []
+            for msg in stored:
+                try:
+                    sid = int(msg.get("store_id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if sid <= 0 or sid in covered:
+                    continue
+                if sid <= source_end and any(
+                    it["source_start"] <= sid <= it["source_end"] for it in node_items
+                ):
+                    continue
+                if sid <= source_end and node_items:
+                    # Covered by the frontier end via raw-only generations:
+                    # skip messages already inside a node range.
+                    continue
+                if sid > source_end:
+                    items.append(
+                        {
+                            "kind": "message",
+                            "ref_id": sid,
+                            "source_start": sid,
+                            "source_end": sid,
+                        }
+                    )
+            if not items and source_end > 0:
+                # Last resort: single message range marker so the tip is not
+                # itemless (doctor can still flag sparse content later).
+                items.append(
+                    {
+                        "kind": "message",
+                        "ref_id": source_end,
+                        "source_start": source_end,
+                        "source_end": source_end,
+                    }
+                )
+            if items:
+                self._frontier.set_frontier_items(conv_id, generation, items)
+                repaired += 1
+        return repaired
 
     def reject_prepared_compaction(self, batch_id: int, reason: str = "") -> None:
         """Mark a prepared batch as rejected."""
@@ -5679,6 +5996,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         Returns True when a batch was promoted so ``compress()`` can skip the
         foreground leaf summarization path and reassemble from the DAG.
+        On success, ``_async_last_promoted_source_ids`` holds the covered
+        store_ids so the host replacement path can drop those raw rows.
         """
         if not getattr(self._config, "async_background_compaction_enabled", False):
             return False
@@ -5707,7 +6026,59 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     "LCM persist frontier after async promote failed",
                     exc_info=True,
                 )
+        # Stash covered IDs for compress() host replacement (issue #2).
+        if result.covered_source_ids:
+            self._async_last_promoted_source_ids = list(result.covered_source_ids)
+        elif batch.source_ids:
+            self._async_last_promoted_source_ids = [int(s) for s in batch.source_ids]
+        if result.node_id:
+            self._async_last_promoted_node_id = int(result.node_id)
         return True
+
+    def _filter_messages_excluding_covered_store_ids(
+        self,
+        messages: List[Dict[str, Any]],
+        covered_store_ids: Sequence[int] | set[int],
+    ) -> List[Dict[str, Any]]:
+        """Drop host messages whose durable store_id is in *covered_store_ids*.
+
+        Used after async promote so the returned active context does not
+        replay raw rows already published into a DAG leaf. Messages without
+        a resolvable store_id are kept (e.g. pure system anchors).
+
+        Mapping deliberately ignores ``_last_compacted_store_id``: after
+        promote that marker already points at the covered end, so the normal
+        compress map would skip every covered row and leave them active.
+        """
+        if not messages or not covered_store_ids:
+            return list(messages)
+        covered = {int(s) for s in covered_store_ids}
+        # Temporarily clear the compacted frontier so identity mapping can
+        # resolve covered rows that were just published.
+        previous_marker = int(getattr(self, "_last_compacted_store_id", 0) or 0)
+        try:
+            self._last_compacted_store_id = 0
+            id_map = self._get_store_id_map_for_messages(messages)
+        finally:
+            self._last_compacted_store_id = previous_marker
+        kept: list[Dict[str, Any]] = []
+        any_mapped_covered = False
+        for msg in messages:
+            store_id = id_map.get(id(msg))
+            if store_id is not None and int(store_id) in covered:
+                any_mapped_covered = True
+                continue
+            kept.append(msg)
+        if any_mapped_covered:
+            return kept
+        # Fallback when identity mapping fails (e.g. host payload drift): keep
+        # leading anchors + the configured fresh tail only.
+        leading = self._leading_anchor_count(messages)
+        fresh_tail = int(getattr(self._config, "fresh_tail_count", 0) or 0)
+        if fresh_tail <= 0:
+            return list(messages[:leading]) if leading else []
+        tail_start = max(leading, len(messages) - fresh_tail)
+        return list(messages[:leading]) + list(messages[tail_start:])
 
     # -- Async background worker -------------------------------------------
 
@@ -5869,6 +6240,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if not getattr(self._config, "async_background_compaction_enabled", False):
             return None
         if not getattr(self._config, "async_background_compaction_worker_enabled", False):
+            return None
+        # Foreground cutover has absolute priority (issue #3): never enter
+        # prepare LLM / SQLite critical sections while compress() is running.
+        if self._foreground_compress_active.is_set():
             return None
         if getattr(self, "_last_compression_status", "") == "running":
             return None
