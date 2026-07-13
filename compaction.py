@@ -20,8 +20,13 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .dag import SummaryNode
+from .db_bootstrap import (
+    FOREGROUND_COMPRESS_BUSY_TIMEOUT_MS,
+    FOREGROUND_COMPRESS_DEADLINE_SECONDS,
+)
 from .message_content import text_content_for_pattern_matching
 from .sanitize import _contains_sensitive_redaction
+from .sqlite_util import _is_sqlite_locked_error, _temporary_sqlite_busy_timeout
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 
 logger = logging.getLogger(__name__)
@@ -317,27 +322,192 @@ class CompactionMixin:
         3. Summarize them into DAG leaf nodes
         4. Check if condensation is needed
         5. Assemble new active context: summaries + fresh tail
+
+        Foreground cutover claims ``_foreground_compress_active`` so the
+        background preparer cannot enter LLM/SQLite critical sections while
+        this path runs. Every DB wait is bounded; on timeout or deadline the
+        call returns a clear failure/cooldown state instead of hanging while
+        the host holds ``compression_locks``.
         """
         if not messages:
             self._last_compression_status = "noop"
             self._last_compression_noop_reason = "empty message list"
             return messages
 
+        # Phase timing bookkeeping for operator diagnostics (issue #3).
+        phase_timings: dict[str, float] = {}
+        deadline_seconds = float(
+            getattr(
+                self._config,
+                "foreground_compress_deadline_seconds",
+                FOREGROUND_COMPRESS_DEADLINE_SECONDS,
+            )
+            or FOREGROUND_COMPRESS_DEADLINE_SECONDS
+        )
+        busy_timeout_ms = int(
+            getattr(
+                self._config,
+                "foreground_compress_busy_timeout_ms",
+                FOREGROUND_COMPRESS_BUSY_TIMEOUT_MS,
+            )
+            or FOREGROUND_COMPRESS_BUSY_TIMEOUT_MS
+        )
+        _compress_started = time.perf_counter()
+        deadline_at = _compress_started + max(1.0, deadline_seconds)
+        self._last_compression_status = "running"
+        self._last_compression_noop_reason = ""
+        self._last_compress_phase_timings_ms = phase_timings
+        # Signal background worker to yield (issue #3 priority).
+        fg_event = getattr(self, "_foreground_compress_active", None)
+        if fg_event is not None:
+            fg_event.set()
+
+        def _phase(name: str, started: float) -> None:
+            phase_timings[name] = (time.perf_counter() - started) * 1000.0
+
+        def _deadline_exceeded() -> bool:
+            return time.perf_counter() >= deadline_at
+
+        def _fail_timeout(reason: str) -> List[Dict[str, Any]]:
+            self._last_compression_status = "failed"
+            self._last_compression_noop_reason = reason
+            self._last_compaction_duration_ms = (
+                time.perf_counter() - _compress_started
+            ) * 1000.0
+            # Cooldown so an immediate second pre-API pass does not re-enter
+            # a hang loop while the host still owns compression_locks.
+            try:
+                self._last_boundary_skip_time = time.time()
+            except Exception:
+                logger.debug("LCM failed to arm compression cooldown", exc_info=True)
+            logger.warning(
+                "LCM compress aborted: %s (wall=%.1fms phases=%s)",
+                reason,
+                self._last_compaction_duration_ms,
+                phase_timings,
+            )
+            return messages
+
+        try:
+            return self._compress_body(
+                messages,
+                current_tokens=current_tokens,
+                focus_topic=focus_topic,
+                force=force,
+                phase_timings=phase_timings,
+                phase=_phase,
+                deadline_exceeded=_deadline_exceeded,
+                fail_timeout=_fail_timeout,
+                busy_timeout_ms=busy_timeout_ms,
+                compress_started=_compress_started,
+            )
+        except Exception as exc:
+            if _is_sqlite_locked_error(exc):
+                return _fail_timeout(f"sqlite_locked: {exc}")
+            # Unexpected errors must still release host lock ownership by
+            # returning; re-raise after marking status so callers see failure.
+            self._last_compression_status = "failed"
+            self._last_compression_noop_reason = f"compress_error: {exc}"
+            self._last_compaction_duration_ms = (
+                time.perf_counter() - _compress_started
+            ) * 1000.0
+            logger.error(
+                "LCM compress failed after %.1fms: %s",
+                self._last_compaction_duration_ms,
+                exc,
+                exc_info=True,
+            )
+            raise
+        finally:
+            if fg_event is not None:
+                fg_event.clear()
+            self._last_compress_phase_timings_ms = dict(phase_timings)
+            # Never leave status stuck at "running" — that wedges the async
+            # worker and confuses host lock owners on force-exit.
+            if getattr(self, "_last_compression_status", "") == "running":
+                self._last_compression_status = "failed"
+                self._last_compression_noop_reason = (
+                    self._last_compression_noop_reason
+                    or "compress_exited_while_running"
+                )
+
+    def _compress_body(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        current_tokens: int = None,
+        focus_topic: Optional[str] = None,
+        force: bool = False,
+        phase_timings: dict[str, float],
+        phase,
+        deadline_exceeded,
+        fail_timeout,
+        busy_timeout_ms: int,
+        compress_started: float,
+    ) -> List[Dict[str, Any]]:
+        """Inner compress pipeline (runs under foreground-priority + deadline)."""
+
         # Try to promote a prepared async batch before running foreground
         # compaction. On success, skip the leaf summarization path and
-        # reassemble active context from the (now-canonical) DAG.
+        # reassemble active context from the (now-canonical) DAG, dropping
+        # covered raw messages from the returned host context (issue #2).
         promote_hook = getattr(self, "_try_promote_prepared_batch", None)
         if callable(promote_hook):
             try:
-                promoted = promote_hook(messages)
+                t0 = time.perf_counter()
+                if deadline_exceeded():
+                    return fail_timeout("deadline_before_promote")
+                lock_wait_started = time.perf_counter()
+                with _temporary_sqlite_busy_timeout(
+                    [
+                        getattr(getattr(self, "_store", None), "_conn", None),
+                        getattr(getattr(self, "_dag", None), "_conn", None),
+                        getattr(getattr(self, "_frontier", None), "_conn", None),
+                        getattr(getattr(self, "_lifecycle", None), "_conn", None),
+                    ],
+                    busy_timeout_ms,
+                ):
+                    lock_wait_ms = (time.perf_counter() - lock_wait_started) * 1000.0
+                    if lock_wait_ms > 5.0:
+                        logger.info(
+                            "LCM compress promote path lock-wait setup %.1fms (busy_timeout=%dms)",
+                            lock_wait_ms,
+                            busy_timeout_ms,
+                        )
+                    promoted = promote_hook(messages)
+                phase("promotion_lookup", t0)
                 if promoted:
-                    _compress_started = time.perf_counter()
-                    self._last_compression_status = "running"
-                    self._last_compression_noop_reason = ""
-                    working_messages = list(messages)
+                    t_asm = time.perf_counter()
+                    covered = list(
+                        getattr(self, "_async_last_promoted_source_ids", None) or []
+                    )
+                    # Host replacement: strip covered raw messages so the
+                    # returned prompt is under cutover threshold and does not
+                    # immediately re-trigger compression (issue #2).
+                    filter_fn = getattr(
+                        self, "_filter_messages_excluding_covered_store_ids", None
+                    )
+                    if callable(filter_fn) and covered:
+                        working_messages = filter_fn(list(messages), covered)
+                    else:
+                        # Fallback: keep only leading anchor + fresh tail.
+                        n = len(messages)
+                        fresh_tail = int(
+                            getattr(self._config, "fresh_tail_count", 0) or 0
+                        )
+                        leading = self._leading_anchor_count(messages)
+                        tail_start = max(leading, n - fresh_tail)
+                        working_messages = list(messages[:leading]) + list(
+                            messages[tail_start:]
+                        )
                     leading_anchor_count = self._leading_anchor_count(working_messages)
-                    anchor_source_messages = list(working_messages)
-                    anchor_leading_count = self._leading_anchor_count(anchor_source_messages)
+                    # Anchor text comes from the pre-filter host view so the
+                    # latest user objective is preserved even when its raw
+                    # row was covered by the promoted leaf.
+                    anchor_source_messages = list(messages)
+                    anchor_leading_count = self._leading_anchor_count(
+                        anchor_source_messages
+                    )
                     self._pending_context_anchor_messages = anchor_source_messages[
                         anchor_leading_count:
                     ]
@@ -348,24 +518,33 @@ class CompactionMixin:
                         )
                     finally:
                         self._pending_context_anchor_messages = None
+                    phase("assembly", t_asm)
                     self.compression_count += 1
                     self._last_compaction_duration_ms = (
-                        time.perf_counter() - _compress_started
+                        time.perf_counter() - compress_started
                     ) * 1000.0
                     self._ingest_cursor = len(compressed)
                     self._last_compression_status = "compacted"
                     self._last_compression_noop_reason = ""
+                    # Clear covered-id stash so a later compress cannot reuse it.
+                    self._async_last_promoted_source_ids = []
                     logger.info(
-                        "LCM async promote-on-compress finished in %.1fms",
+                        "LCM async promote-on-compress finished in %.1fms "
+                        "(%d→%d msgs, covered=%d, phases=%s)",
                         self._last_compaction_duration_ms,
+                        len(messages),
+                        len(compressed),
+                        len(covered),
+                        phase_timings,
                     )
                     return compressed
-            except Exception:
+            except Exception as exc:
+                if _is_sqlite_locked_error(exc):
+                    return fail_timeout(f"sqlite_locked_during_promote: {exc}")
                 logger.debug("LCM async promote hook failed", exc_info=True)
 
-        self._last_compression_status = "running"
-        self._last_compression_noop_reason = ""
-        _compress_started = time.perf_counter()
+        if deadline_exceeded():
+            return fail_timeout("deadline_before_foreground")
 
         self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
@@ -408,7 +587,25 @@ class CompactionMixin:
         # Step 1: Ingest new messages into the immutable store. Work from a
         # replay-safe view so quarantined assistant loops do not enter summaries
         # or provider context after the durable row has been written.
-        working_messages = self._ingest_messages(messages)
+        # Bound SQLite lock waits so a concurrent writer cannot hang compress
+        # while the host holds compression_locks (issue #3).
+        t_ingest = time.perf_counter()
+        try:
+            with _temporary_sqlite_busy_timeout(
+                [
+                    getattr(getattr(self, "_store", None), "_conn", None),
+                    getattr(getattr(self, "_lifecycle", None), "_conn", None),
+                ],
+                busy_timeout_ms,
+            ):
+                working_messages = self._ingest_messages(messages)
+        except Exception as exc:
+            if _is_sqlite_locked_error(exc):
+                return fail_timeout(f"sqlite_locked_during_ingest: {exc}")
+            raise
+        phase("ingest", t_ingest)
+        if deadline_exceeded():
+            return fail_timeout("deadline_after_ingest")
         ingest_cleanup_changed_active_context = working_messages != messages
         anchor_source_messages = list(working_messages)
         pressure_messages = messages if len(messages) == len(working_messages) else working_messages
@@ -445,6 +642,8 @@ class CompactionMixin:
         preexisting_dependent_reply_records = self._load_generated_ignored_dependent_reply_records()
 
         while leaf_passes < max_leaf_passes:
+            if deadline_exceeded():
+                return fail_timeout("deadline_during_leaf_selection")
             n = len(working_messages)
             fresh_tail_start = max(0, n - self._config.fresh_tail_count)
 
@@ -619,10 +818,14 @@ class CompactionMixin:
                 if self._config.extraction_enabled:
                     self._run_pre_compaction_extraction(summary_input_chunk)
 
+                if deadline_exceeded():
+                    return fail_timeout("deadline_before_summarization")
+                t_sum = time.perf_counter()
                 compacted_chunk, source_tokens, summary_text, _level, _rescue_attempts = self._summarize_leaf_chunk_with_rescue(
                     summary_input_chunk,
                     focus_topic=focus_topic,
                 )
+                phase("summarization", t_sum)
             compacted_summary_ids = {id(message) for message in compacted_chunk}
             compacted_positions = [
                 idx for idx, message in enumerate(selected_raw_chunk) if id(message) in compacted_summary_ids
@@ -662,25 +865,42 @@ class CompactionMixin:
                 latest_at=latest_at,
                 expand_hint=self._extract_expand_hint(summary_text),
             )
-            self._dag.add_node(node)
-            self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
-            self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
-            self._persist_frontier_marker()
-            # Foreground leaf publish wins the async CAS race: advance the
-            # generation counter and supersede any pending prepared batches.
-            # Wrapped in try/except — a DB error here must not abort the
-            # remaining compaction pipeline after the leaf is already published.
-            note_async = getattr(self, "_note_foreground_async_frontier_advance", None)
-            if callable(note_async):
-                try:
-                    note_async(
-                        source_end_store_id=self._last_compacted_store_id,
-                    )
-                except Exception:
-                    logger.debug(
-                        "LCM foreground async frontier advance failed",
-                        exc_info=True,
-                    )
+            t_pub = time.perf_counter()
+            try:
+                with _temporary_sqlite_busy_timeout(
+                    [
+                        getattr(getattr(self, "_dag", None), "_conn", None),
+                        getattr(getattr(self, "_frontier", None), "_conn", None),
+                        getattr(getattr(self, "_lifecycle", None), "_conn", None),
+                        getattr(getattr(self, "_store", None), "_conn", None),
+                    ],
+                    busy_timeout_ms,
+                ):
+                    published_node_id = self._dag.add_node(node)
+                    self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
+                    self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
+                    self._persist_frontier_marker()
+                    # Foreground leaf publish wins the async CAS race: advance the
+                    # generation counter and write frontier items so the tip is
+                    # never itemless (issue #4).
+                    note_async = getattr(self, "_note_foreground_async_frontier_advance", None)
+                    if callable(note_async):
+                        try:
+                            note_async(
+                                source_end_store_id=self._last_compacted_store_id,
+                                node_id=int(published_node_id or 0),
+                                covered_source_ids=list(source_store_ids),
+                            )
+                        except Exception:
+                            logger.debug(
+                                "LCM foreground async frontier advance failed",
+                                exc_info=True,
+                            )
+            except Exception as exc:
+                if _is_sqlite_locked_error(exc):
+                    return fail_timeout(f"sqlite_locked_during_publication: {exc}")
+                raise
+            phase("dag_publication", t_pub)
 
             pressure_remaining_messages = pressure_messages[leading_anchor_count + selected_raw_len:]
             working_messages = working_messages[:leading_anchor_count] + remaining_messages
@@ -799,9 +1019,11 @@ class CompactionMixin:
         finally:
             self._pending_context_anchor_messages = None
         self.compression_count += 1
-        self._last_compaction_duration_ms = (time.perf_counter() - _compress_started) * 1000.0
+        self._last_compaction_duration_ms = (time.perf_counter() - compress_started) * 1000.0
         logger.info(
-            "LCM leaf compaction finished in %.1fms", self._last_compaction_duration_ms
+            "LCM leaf compaction finished in %.1fms phases=%s",
+            self._last_compaction_duration_ms,
+            phase_timings,
         )
         self._last_compression_status = "compacted"
         self._last_compression_noop_reason = ""
