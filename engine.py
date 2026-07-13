@@ -529,6 +529,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if current_db == db_path and str(self._hermes_home or "") == str(hermes_home):
             return False
 
+        if not self._stop_async_worker():
+            logger.warning("LCM deferred profile storage rebind until async worker exits")
+            return False
         self._close_storage()
         self._hermes_home = hermes_home
         self._bind_storage(db_path, hermes_home)
@@ -5455,12 +5458,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             # Mark batch as promoted
             self._frontier.update_batch_state(batch_id, "promoted")
 
-            # Also advance lifecycle frontier
-            self._lifecycle.advance_frontier(
+            # Also advance lifecycle frontier. A stale session returns an
+            # unchanged state instead of raising, so verify the checkpoint
+            # actually acknowledges this batch before declaring promotion.
+            lifecycle_state = self._lifecycle.advance_frontier(
                 batch.conversation_id,
                 batch.session_id,
                 batch.frontier_end_store_id,
             )
+            if (
+                lifecycle_state is None
+                or lifecycle_state.current_session_id != batch.session_id
+                or int(lifecycle_state.current_frontier_store_id or 0)
+                < int(batch.frontier_end_store_id or 0)
+            ):
+                raise RuntimeError("lifecycle_frontier_not_advanced")
 
             self._async_last_promote_at = time.time()
             self._async_total_promote_succeeded = (

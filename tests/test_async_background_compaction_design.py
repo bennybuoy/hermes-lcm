@@ -355,6 +355,57 @@ def test_shutdown_keeps_storage_open_until_worker_has_exited(tmp_path):
     assert engine._frontier._conn is None
 
 
+def test_promotion_rejects_lifecycle_noop_after_frontier_cas(tmp_path, monkeypatch):
+    """A stale lifecycle session result must compensate the CAS frontier."""
+    engine = _engine(tmp_path)
+    try:
+        messages = _messages()
+        engine.ingest(messages)
+        batch = engine.prepare_background_compaction_once(messages)
+        before = engine._frontier.get_active_frontier(batch.conversation_id)["generation"]
+        original = engine._lifecycle.advance_frontier
+
+        def stale_lifecycle(conversation_id, _session_id, frontier_store_id):
+            return original(conversation_id, "wrong-session", frontier_store_id)
+
+        monkeypatch.setattr(engine._lifecycle, "advance_frontier", stale_lifecycle)
+        result = engine.promote_prepared_compaction(batch.batch_id, messages)
+
+        assert result.promoted is False
+        assert engine._frontier.get_active_frontier(batch.conversation_id)["generation"] == before
+        assert engine._dag.get_session_node_count(engine.current_session_id) == 0
+    finally:
+        engine.shutdown()
+
+
+def test_rebind_defers_storage_close_while_worker_is_alive(tmp_path):
+    """A profile rebind cannot close SQLite while a timed-out worker may resume."""
+    home_a, home_b = tmp_path / "home-a", tmp_path / "home-b"
+    engine = LCMEngine(config=LCMConfig(database_path=""), hermes_home=str(home_a))
+
+    class StuckWorker:
+        alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            return None
+
+    worker = StuckWorker()
+    engine._async_worker_thread = worker
+    engine._async_worker_stop = threading.Event()
+    original_db = engine._store.db_path
+    assert engine._rebind_storage_for_home(str(home_b)) is False
+    assert engine._store.db_path == original_db
+    assert engine._frontier._conn is not None
+
+    worker.alive = False
+    assert engine._rebind_storage_for_home(str(home_b)) is True
+    assert engine._store.db_path != original_db
+    engine.shutdown()
+
+
 def test_status_and_doctor_report_async_compaction_counts(tmp_path):
     """Given mixed async states, status and doctor expose pending/prepared/promoted/rejected counts."""
     engine = _engine(tmp_path)
