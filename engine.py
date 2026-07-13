@@ -350,6 +350,31 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._async_worker_thread: Optional[threading.Thread] = None
         self._async_worker_stop: Optional[threading.Event] = None
         self._async_worker_lock = threading.Lock()
+        # Storage / worker lifetime ownership.
+        #
+        # Architecture: a single reentrant lifetime mutex serializes every
+        # storage-consuming session lifecycle critical section with
+        # stop→close→rebind and stop→close transitions. RLock is intentional so
+        # on_session_start → rebind → start (and start → stop when flags are
+        # off) re-enter safely. Never introduce a non-reentrant lock that is
+        # acquired on a path already holding this one.
+        #
+        # Lock hierarchy (only this order; never reverse):
+        #   1. ``_storage_lifetime_lock`` — session start/end bodies, rebind,
+        #      shutdown close, and worker install/stop decisions.
+        #   2. ``_async_worker_lock`` — worker thread / stop-event fields only.
+        # Join waits for the worker may run while holding (1); they must not
+        # attempt to re-acquire a non-reentrant outer lock. The worker loop
+        # itself must not acquire (1), or stop-under-(1) would deadlock.
+        #
+        # ``_storage_lifetime_state``:
+        #   "bound"    — helpers usable; worker starts allowed.
+        #   "unusable" — rebind closed helpers then failed to bind; starts
+        #                refused until a successful rebind recovers.
+        #   "closed"   — terminal after successful shutdown close; starts
+        #                refused until a successful rebind re-opens.
+        self._storage_lifetime_lock = threading.RLock()
+        self._storage_lifetime_state: str = "bound"
         # Circuit breaker: consecutive prepare failures → cooldown.
         self._async_worker_consecutive_failures: int = 0
         self._async_worker_cooldown_until: float = 0.0
@@ -508,36 +533,72 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         Hermes versions may still reuse the same plugin/context-engine object
         after ``HERMES_HOME`` changes, so the plugin must not assume the store
         captured during ``register()`` is still correct.
+
+        Owns the full stop→close→bind transition under ``_storage_lifetime_lock``
+        so concurrent session lifecycle, shutdown, and late worker starts cannot
+        interleave with closed helpers. A bind failure after close leaves the
+        engine ``unusable`` (non-startable) rather than ``bound`` over dead
+        connections.
         """
-        if not hermes_home:
-            return False
-        if self._config.database_path:
-            current_home = str(self._hermes_home or "")
-            current_store_home = str(getattr(getattr(self, "_store", None), "_hermes_home", "") or "")
-            if current_home == str(hermes_home) and current_store_home == str(hermes_home):
+        with self._storage_lifetime_lock:
+            if not hermes_home:
                 return False
-            self._hermes_home = hermes_home
-            store = getattr(self, "_store", None)
-            if store is not None:
-                store._hermes_home = hermes_home
+            if self._config.database_path:
+                current_home = str(self._hermes_home or "")
+                current_store_home = str(
+                    getattr(getattr(self, "_store", None), "_hermes_home", "") or ""
+                )
+                if current_home == str(hermes_home) and current_store_home == str(hermes_home):
+                    return False
+                self._hermes_home = hermes_home
+                store = getattr(self, "_store", None)
+                if store is not None:
+                    store._hermes_home = hermes_home
+                # Configured DB path does not close/reopen SQLite helpers, so it
+                # cannot recover ``unusable``/``closed``; leave state unchanged.
+                self._reset_profile_runtime_state()
+                logger.info(
+                    "LCM rebound Hermes home for configured database path %s", hermes_home
+                )
+                return True
+
+            db_path = self._resolve_db_path(hermes_home)
+            current_db = Path(getattr(getattr(self, "_store", None), "db_path", ""))
+            if (
+                current_db == db_path
+                and str(self._hermes_home or "") == str(hermes_home)
+                and self._storage_lifetime_state == "bound"
+            ):
+                return False
+
+            if not self._stop_async_worker():
+                logger.warning(
+                    "LCM deferred profile storage rebind until async worker exits"
+                )
+                return False
+            self._close_storage()
+            try:
+                self._hermes_home = hermes_home
+                self._bind_storage(db_path, hermes_home)
+            except Exception:
+                # Close any partial bind so we never retain open handles under
+                # a non-startable state (or half-open mixed helper sets).
+                try:
+                    self._close_storage()
+                except Exception:
+                    logger.debug(
+                        "LCM secondary close after rebind failure failed",
+                        exc_info=True,
+                    )
+                self._storage_lifetime_state = "unusable"
+                logger.exception(
+                    "LCM storage rebind failed after close; engine left non-startable"
+                )
+                return False
+            self._storage_lifetime_state = "bound"
             self._reset_profile_runtime_state()
-            logger.info("LCM rebound Hermes home for configured database path %s", hermes_home)
+            logger.info("LCM rebound storage for Hermes home %s", hermes_home)
             return True
-
-        db_path = self._resolve_db_path(hermes_home)
-        current_db = Path(getattr(getattr(self, "_store", None), "db_path", ""))
-        if current_db == db_path and str(self._hermes_home or "") == str(hermes_home):
-            return False
-
-        if not self._stop_async_worker():
-            logger.warning("LCM deferred profile storage rebind until async worker exits")
-            return False
-        self._close_storage()
-        self._hermes_home = hermes_home
-        self._bind_storage(db_path, hermes_home)
-        self._reset_profile_runtime_state()
-        logger.info("LCM rebound storage for Hermes home %s", hermes_home)
-        return True
 
     def _runtime_context_threshold(
         self,
@@ -2050,8 +2111,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._log_session_filter_diagnostics()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
+        # Entire storage-consuming start path holds the lifetime lock so it
+        # serializes with rebind/shutdown and cannot observe half-closed helpers.
+        with self._storage_lifetime_lock:
+            self._on_session_start_locked(session_id, **kwargs)
+
+    def _on_session_start_locked(self, session_id: str, **kwargs) -> None:
         if "hermes_home" in kwargs:
             self._rebind_storage_for_home(str(kwargs.get("hermes_home") or ""))
+
+        if self._storage_lifetime_state != "bound":
+            logger.warning(
+                "LCM refusing on_session_start while storage is %s",
+                self._storage_lifetime_state,
+            )
+            return
 
         boundary_reason = str(kwargs.get("boundary_reason") or "")
         old_session_id = str(kwargs.get("old_session_id") or "")
@@ -2666,8 +2740,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
-        # Stop the background preparer before any session-end ingest/finalize so
-        # it cannot race with teardown or rebind on the same conversation.
+        # Entire storage-consuming end path holds the lifetime lock so final
+        # ingest/finalize cannot race shutdown/rebind close. Stopping the
+        # worker alone does not close storage; full stop→close ownership
+        # remains with shutdown / profile rebind under the same lock.
+        with self._storage_lifetime_lock:
+            self._on_session_end_locked(session_id, messages)
+
+    def _on_session_end_locked(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+        if self._storage_lifetime_state != "bound":
+            logger.warning(
+                "LCM refusing on_session_end storage work while storage is %s",
+                self._storage_lifetime_state,
+            )
+            return
         if session_id == self._session_id:
             self._stop_async_worker()
         ended_generation = self._in_process_auxiliary_caller_generation(session_id)
@@ -2999,6 +3085,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             raise
 
     def on_session_reset(self) -> None:
+        # Storage-consuming reset (lifecycle record + DAG prune) holds the
+        # lifetime lock so concurrent shutdown/rebind cannot close helpers mid-write.
+        with self._storage_lifetime_lock:
+            self._on_session_reset_locked()
+
+    def _on_session_reset_locked(self) -> None:
         if self._host_fallback_compressor is not None:
             compressor = self._host_fallback_compressor
             on_session_reset = getattr(compressor, "on_session_reset", None)
@@ -3013,6 +3105,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._pending_reset_conversation_id = self._conversation_id
         self._pending_reset_frontier_store_id = self._last_compacted_store_id
         super().on_session_reset()
+        # Process-local runtime always clears; storage writes require bound helpers.
+        if self._storage_lifetime_state != "bound":
+            logger.warning(
+                "LCM refusing on_session_reset storage work while storage is %s",
+                self._storage_lifetime_state,
+            )
+            self._reset_session_scoped_runtime_state()
+            return
         self._lifecycle.record_reset(self._conversation_id)
         self._reset_session_scoped_runtime_state()
 
@@ -3036,12 +3136,26 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         the new session, while ``source`` filtering still evaluates against the
         node's original descendant message sources.
         """
+        with self._storage_lifetime_lock:
+            return self._carry_over_new_session_context_locked(
+                old_session_id, new_session_id
+            )
+
+    def _carry_over_new_session_context_locked(
+        self, old_session_id: str, new_session_id: str
+    ) -> int:
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
         if self._session_ignored and new_session_id == self._session_id:
             logger.debug(
                 "LCM carry-over skipped for ignored session %s",
                 new_session_id,
+            )
+            return 0
+        if self._storage_lifetime_state != "bound":
+            logger.warning(
+                "LCM refusing carry_over_new_session_context while storage is %s",
+                self._storage_lifetime_state,
             )
             return 0
         return self._dag.reassign_session_nodes(old_session_id, new_session_id)
@@ -3062,7 +3176,28 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         2. prune/reset retained DAG state on the old session
         3. bind the engine to the new session
         4. optionally move retained summaries into the new session
+
+        The full rollover (including nested session end/reset/start/carry-over)
+        holds ``_storage_lifetime_lock`` so shutdown/rebind cannot interleave
+        between steps or against direct DAG reads in this helper.
         """
+        with self._storage_lifetime_lock:
+            return self._rollover_session_locked(
+                old_session_id,
+                new_session_id,
+                previous_messages=previous_messages,
+                carry_over_context=carry_over_context,
+                **kwargs,
+            )
+
+    def _rollover_session_locked(
+        self,
+        old_session_id: str,
+        new_session_id: str,
+        previous_messages: List[Dict[str, Any]] | None = None,
+        carry_over_context: bool = True,
+        **kwargs,
+    ) -> int:
         previous_messages = previous_messages or []
         boundary_reason = str(kwargs.get("boundary_reason") or "")
         conversation_id = self._conversation_id or old_session_id or new_session_id
@@ -3072,6 +3207,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
 
         if carry_over_context and boundary_reason == "compression" and old_session_id and old_session_id != new_session_id:
+            if self._storage_lifetime_state != "bound":
+                logger.warning(
+                    "LCM refusing compression rollover while storage is %s",
+                    self._storage_lifetime_state,
+                )
+                return 0
             before_node_ids = {node.node_id for node in self._dag.get_session_nodes(new_session_id)}
             if can_carry_over:
                 self.on_session_end(old_session_id, previous_messages)
@@ -3086,6 +3227,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 old_session_id=old_session_id,
                 **kwargs,
             )
+            if self._storage_lifetime_state != "bound":
+                return 0
             after_node_ids = {node.node_id for node in self._dag.get_session_nodes(new_session_id)}
             return len(after_node_ids - before_node_ids)
 
@@ -5569,26 +5712,34 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     # -- Async background worker -------------------------------------------
 
     def _start_async_worker(self) -> None:
-        """Start the daemon preparer thread when both async flags are enabled."""
-        if not getattr(self._config, "async_background_compaction_enabled", False):
-            self._stop_async_worker()
-            return
-        if not getattr(self._config, "async_background_compaction_worker_enabled", False):
-            self._stop_async_worker()
-            return
-        with self._async_worker_lock:
-            if self._async_worker_thread is not None and self._async_worker_thread.is_alive():
+        """Start the daemon preparer thread when both async flags are enabled.
+
+        Install is refused unless storage lifetime state is ``bound``. The
+        lifetime lock serializes install with stop→close→rebind / stop→close
+        so a replacement cannot be started against closing or closed helpers.
+        """
+        with self._storage_lifetime_lock:
+            if self._storage_lifetime_state != "bound":
                 return
-            stop_event = threading.Event()
-            self._async_worker_stop = stop_event
-            thread = threading.Thread(
-                target=self._async_worker_loop,
-                name="lcm-async-compaction-worker",
-                daemon=True,
-            )
-            self._async_worker_thread = thread
-            thread.start()
-            logger.debug("LCM async background compaction worker started")
+            if not getattr(self._config, "async_background_compaction_enabled", False):
+                self._stop_async_worker()
+                return
+            if not getattr(self._config, "async_background_compaction_worker_enabled", False):
+                self._stop_async_worker()
+                return
+            with self._async_worker_lock:
+                if self._async_worker_thread is not None and self._async_worker_thread.is_alive():
+                    return
+                stop_event = threading.Event()
+                self._async_worker_stop = stop_event
+                thread = threading.Thread(
+                    target=self._async_worker_loop,
+                    name="lcm-async-compaction-worker",
+                    daemon=True,
+                )
+                self._async_worker_thread = thread
+                thread.start()
+                logger.debug("LCM async background compaction worker started")
 
     def _stop_async_worker(self) -> bool:
         """Signal the preparer thread to stop; return whether it has exited.
@@ -5596,25 +5747,33 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         A stop event cannot cancel an in-flight LLM request.  Keeping the
         storage helpers alive until the worker exits prevents its post-request
         state update from racing a closed SQLite connection.
+
+        Runs under ``_storage_lifetime_lock`` so install cannot slip into the
+        join gap. Returns True only when no live worker remains in the owned
+        slot.
         """
-        with self._async_worker_lock:
-            stop_event = self._async_worker_stop
-            thread = self._async_worker_thread
-        if stop_event is not None:
-            stop_event.set()
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=35.0)
-            if thread.is_alive():
-                logger.warning(
-                    "LCM async background compaction worker did not stop within 35s; "
-                    "deferring storage cleanup until it exits"
-                )
-                return False
-        with self._async_worker_lock:
-            if self._async_worker_thread is thread:
-                self._async_worker_stop = None
-                self._async_worker_thread = None
-        return True
+        with self._storage_lifetime_lock:
+            with self._async_worker_lock:
+                stop_event = self._async_worker_stop
+                thread = self._async_worker_thread
+            if stop_event is not None:
+                stop_event.set()
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=35.0)
+                if thread.is_alive():
+                    logger.warning(
+                        "LCM async background compaction worker did not stop within 35s; "
+                        "deferring storage cleanup until it exits"
+                    )
+                    return False
+            with self._async_worker_lock:
+                if self._async_worker_thread is thread:
+                    self._async_worker_stop = None
+                    self._async_worker_thread = None
+                remaining = self._async_worker_thread
+                if remaining is not None and remaining.is_alive():
+                    return False
+            return True
 
     def _async_worker_loop(self) -> None:
         """Periodic prepare loop. Never raises out of the thread."""
@@ -6072,9 +6231,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     # -- Lifecycle ---------------------------------------------------------
 
     def shutdown(self):
-        worker_stopped = self._stop_async_worker()
-        self._unregister_active_engine_binding()
-        if worker_stopped:
-            self._close_storage()
-        else:
-            logger.warning("LCM deferred SQLite storage cleanup until async worker exits")
+        # Own the full stop→close transition under the lifetime lock so
+        # concurrent session start/end, rebind, and late worker starts cannot
+        # install or use helpers against storage that is closing.
+        with self._storage_lifetime_lock:
+            worker_stopped = self._stop_async_worker()
+            self._unregister_active_engine_binding()
+            if worker_stopped:
+                self._close_storage()
+                self._storage_lifetime_state = "closed"
+            else:
+                logger.warning(
+                    "LCM deferred SQLite storage cleanup until async worker exits"
+                )
