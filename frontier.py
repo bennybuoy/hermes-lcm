@@ -403,6 +403,12 @@ class FrontierStore:
                 self._conn.close()
                 self._conn = None
 
+    def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
 
 # -- Helpers ---------------------------------------------------------------
 
