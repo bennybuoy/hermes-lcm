@@ -7,6 +7,7 @@ validation, pending-summary invisibility, and status/doctor reporting.
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
 
@@ -305,6 +306,53 @@ def test_atomic_promotion_rolls_back_partial_publish_failure(tmp_path):
         assert async_status["prepared_batches"] == 1
     finally:
         engine.shutdown()
+
+
+def test_promotion_rolls_back_frontier_when_lifecycle_persist_fails(tmp_path, monkeypatch):
+    """A lifecycle write failure must not leave a committed frontier generation."""
+    engine = _engine(tmp_path)
+    try:
+        messages = _messages()
+        engine.ingest(messages)
+        batch = engine.prepare_background_compaction_once(messages)
+        before = engine._frontier.get_active_frontier(batch.conversation_id)["generation"]
+
+        def fail_lifecycle(*_args, **_kwargs):
+            raise RuntimeError("injected lifecycle persist failure")
+
+        monkeypatch.setattr(engine._lifecycle, "advance_frontier", fail_lifecycle)
+        result = engine.promote_prepared_compaction(batch.batch_id, messages)
+
+        assert result.promoted is False
+        assert engine._frontier.get_active_frontier(batch.conversation_id)["generation"] == before
+        assert engine._dag.get_session_node_count(engine.current_session_id) == 0
+        assert engine._frontier.get_batch(batch.batch_id).state == "rejected"
+    finally:
+        engine.shutdown()
+
+
+def test_shutdown_keeps_storage_open_until_worker_has_exited(tmp_path):
+    """A timed-out worker must never resume against already-closed SQLite handles."""
+    engine = _engine(tmp_path)
+
+    class StuckWorker:
+        alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            return None
+
+    worker = StuckWorker()
+    engine._async_worker_thread = worker
+    engine._async_worker_stop = threading.Event()
+    engine.shutdown()
+
+    assert engine._frontier._conn is not None
+    worker.alive = False
+    engine.shutdown()
+    assert engine._frontier._conn is None
 
 
 def test_status_and_doctor_report_async_compaction_counts(tmp_path):

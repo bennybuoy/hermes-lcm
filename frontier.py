@@ -172,6 +172,29 @@ class FrontierStore:
             self._conn.commit()
             return new_gen
 
+    def rollback_frontier_generation(self, conversation_id: str, generation: int) -> bool:
+        """Remove the just-published generation when a later publish step fails.
+
+        The rollback is deliberately conditional: it only removes ``generation``
+        when it is still the active tip, so a concurrent promotion can never be
+        erased by an older failing caller.
+        """
+        with self._lock:
+            current = self.get_active_frontier(conversation_id)
+            conn = self._conn
+            if current is None or conn is None or int(current["generation"]) != int(generation):
+                return False
+            conn.execute(
+                "DELETE FROM lcm_frontier_items WHERE conversation_id = ? AND generation = ?",
+                (conversation_id, generation),
+            )
+            conn.execute(
+                "DELETE FROM lcm_active_frontiers WHERE conversation_id = ? AND generation = ?",
+                (conversation_id, generation),
+            )
+            conn.commit()
+            return True
+
     # -- Frontier items ---------------------------------------------------
 
     def set_frontier_items(

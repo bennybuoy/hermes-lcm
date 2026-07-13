@@ -5389,6 +5389,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # generation counter as the CAS boundary and roll back any orphan
         # DAG node if the frontier advance fails or a mid-publish hook fires.
         inserted_node_id: int | None = None
+        advanced_frontier_generation = 0
         try:
             # Re-run the leaf summarization to get the actual summary
             all_stored = self._store.get_session_messages(batch.session_id)
@@ -5450,6 +5451,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._frontier.update_batch_state(batch_id, "rejected", failure_reason="frontier_mismatch")
                 return PromotionResult(promoted=False, reason="frontier_mismatch", batch_id=batch_id)
 
+            advanced_frontier_generation = new_gen
             # Mark batch as promoted
             self._frontier.update_batch_state(batch_id, "promoted")
 
@@ -5467,6 +5469,24 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return PromotionResult(promoted=True, batch_id=batch_id)
 
         except Exception as exc:
+            # Compensate the committed frontier CAS before removing the DAG node.
+            # Frontier/DAG/lifecycle have separate connections, so this keeps a
+            # later lifecycle or batch-state failure from publishing a phantom tip.
+            if advanced_frontier_generation:
+                try:
+                    rolled_back = self._frontier.rollback_frontier_generation(
+                        batch.conversation_id, advanced_frontier_generation
+                    )
+                    if not rolled_back:
+                        logger.error(
+                            "LCM could not roll back frontier generation %s after promotion error",
+                            advanced_frontier_generation,
+                        )
+                except Exception:
+                    logger.error(
+                        "LCM frontier rollback failed after promotion error",
+                        exc_info=True,
+                    )
             # Roll back any partial canonical insert so no orphan remains.
             if inserted_node_id is not None:
                 try:
@@ -5558,31 +5578,31 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             thread.start()
             logger.debug("LCM async background compaction worker started")
 
-    def _stop_async_worker(self) -> None:
-        """Signal the preparer thread to stop and join with a generous timeout.
+    def _stop_async_worker(self) -> bool:
+        """Signal the preparer thread to stop; return whether it has exited.
 
-        The worker may be blocked inside a multi-second LLM summarization
-        call.  We wait up to 35 s (enough for one typical summarization) so
-        the worker exits cleanly before callers close SQLite connections.
-        If it still hasn't stopped, we log a warning — the daemon flag ensures
-        it won't block process exit, but callers should not close the DB
-        while the thread is alive.
+        A stop event cannot cancel an in-flight LLM request.  Keeping the
+        storage helpers alive until the worker exits prevents its post-request
+        state update from racing a closed SQLite connection.
         """
         with self._async_worker_lock:
             stop_event = self._async_worker_stop
             thread = self._async_worker_thread
-            self._async_worker_stop = None
-            self._async_worker_thread = None
         if stop_event is not None:
             stop_event.set()
         if thread is not None and thread.is_alive():
             thread.join(timeout=35.0)
             if thread.is_alive():
                 logger.warning(
-                    "LCM async background compaction worker did not stop within 35s "
-                    "— it may still be blocked in an LLM call; "
-                    "storage cleanup may race with the worker thread"
+                    "LCM async background compaction worker did not stop within 35s; "
+                    "deferring storage cleanup until it exits"
                 )
+                return False
+        with self._async_worker_lock:
+            if self._async_worker_thread is thread:
+                self._async_worker_stop = None
+                self._async_worker_thread = None
+        return True
 
     def _async_worker_loop(self) -> None:
         """Periodic prepare loop. Never raises out of the thread."""
@@ -6040,6 +6060,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     # -- Lifecycle ---------------------------------------------------------
 
     def shutdown(self):
-        self._stop_async_worker()
+        worker_stopped = self._stop_async_worker()
         self._unregister_active_engine_binding()
-        self._close_storage()
+        if worker_stopped:
+            self._close_storage()
+        else:
+            logger.warning("LCM deferred SQLite storage cleanup until async worker exits")
