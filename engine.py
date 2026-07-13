@@ -5866,12 +5866,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 }
             )
         # Uncovered fresh-tail raw messages after the promoted end.
-        try:
-            all_stored = self._store.get_session_messages(session_id)
-        except Exception:
-            all_stored = []
         end_id = int(frontier_end_store_id or 0)
         covered_set = {int(s) for s in covered_source_ids}
+        try:
+            all_stored = self._store.get_session_messages_after(
+                session_id, after_store_id=end_id,
+            )
+        except Exception:
+            all_stored = []
         for row in all_stored:
             try:
                 sid = int(row.get("store_id") or 0)

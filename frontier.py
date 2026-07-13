@@ -113,7 +113,6 @@ class FrontierStore:
         configure_connection(self._conn)
         run_versioned_migrations(self._conn)
         ensure_frontier_tables(self._conn)
-        ensure_prepared_batch_payload_columns(self._conn)
         self._conn.commit()
 
     @property
@@ -374,8 +373,8 @@ class FrontierStore:
             expected_leaf_count=row[10],
             frontier_end_store_id=row[11],
             failure_reason=row[12] or "",
-            summary_payload=row[13] or "" if len(row) > 13 else "",
-            payload_version=int(row[14] or 0) if len(row) > 14 else 0,
+            summary_payload=(row[13] if len(row) > 13 else "") or "",
+            payload_version=int(row[14]) if len(row) > 14 else 0,
         )
 
     def get_batch(self, batch_id: int) -> PreparedBatch | None:

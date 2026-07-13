@@ -863,7 +863,6 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
         mark_migration_step_complete(conn, "v6_active_frontier_tables")
         current_version = 6
 
-    ensure_prepared_batch_payload_columns(conn)
     if current_version < 7:
         supersede_legacy_v1_ready_batches(conn)
         mark_migration_step_complete(conn, "v7_prepared_batch_summary_payload")
