@@ -231,6 +231,20 @@ class TestIssue2HostReplacementDropsCovered:
             assert covered
 
             before_tokens = count_messages_tokens(msgs)
+
+            # Capture covered message contents BEFORE compress — compress advances
+            # _last_compacted_store_id, which makes _get_store_id_map_for_messages
+            # skip already-compacted store IDs and return an empty mapping.
+            pre_compress_id_map = engine._get_store_id_map_for_messages(msgs)
+            covered_contents = [
+                m.get("content")
+                for m in msgs
+                if pre_compress_id_map.get(id(m)) in covered
+            ]
+            assert covered_contents, (
+                "no covered message contents captured — id_map mapping failed before compress"
+            )
+
             result = engine.compress(msgs, current_tokens=engine.threshold_tokens + 1)
 
             assert engine._last_compression_status == "compacted"
@@ -246,12 +260,6 @@ class TestIssue2HostReplacementDropsCovered:
             assert summary_hits == 1
 
             # Covered raw contents absent from active context.
-            id_map = engine._get_store_id_map_for_messages(msgs)
-            covered_contents = [
-                m.get("content")
-                for m in msgs
-                if id_map.get(id(m)) in covered
-            ]
             result_blob = " ".join(str(m.get("content") or "") for m in result)
             for content in covered_contents:
                 assert content not in result_blob
