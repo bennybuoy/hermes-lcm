@@ -24,9 +24,18 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
-from .db_bootstrap import ensure_frontier_tables, configure_connection, run_versioned_migrations
+from .db_bootstrap import (
+    ensure_frontier_tables,
+    ensure_prepared_batch_payload_columns,
+    configure_connection,
+    run_versioned_migrations,
+)
 
 logger = logging.getLogger(__name__)
+
+# payload_version >= PREPARED_PAYLOAD_VERSION means prepare stored a full
+# summary payload and promote must not re-run the summarizer.
+PREPARED_PAYLOAD_VERSION = 2
 
 
 @dataclass
@@ -41,10 +50,34 @@ class PreparedBatch:
     source_ids: list[int]
     policy_fingerprint: str
     route_fingerprint: str
-    state: str  # preparing | ready | promoted | rejected | failed
+    state: str  # preparing | ready | promoted | rejected | failed | superseded
     expected_leaf_count: int
     frontier_end_store_id: int
     failure_reason: str = ""
+    summary_payload: str = ""
+    payload_version: int = 0
+
+    @property
+    def has_summary_payload(self) -> bool:
+        """True when prepare stored a publishable summary (promote is zero-LLM)."""
+        if int(self.payload_version or 0) < PREPARED_PAYLOAD_VERSION:
+            return False
+        if not (self.summary_payload or "").strip():
+            return False
+        try:
+            data = json.loads(self.summary_payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        return bool(isinstance(data, dict) and (data.get("summary_text") or "").strip())
+
+    def parsed_summary_payload(self) -> dict[str, Any] | None:
+        if not self.has_summary_payload:
+            return None
+        try:
+            data = json.loads(self.summary_payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
 
 
 @dataclass
@@ -53,6 +86,13 @@ class PromotionResult:
     promoted: bool
     reason: str = ""
     batch_id: int = 0
+    node_id: int = 0
+    covered_source_ids: list[int] = field(default_factory=list)
+    # Wall-clock telemetry (milliseconds). validation = CAS checks only;
+    # publication = DAG insert + frontier advance + lifecycle; wall = total.
+    validation_ms: float = 0.0
+    publication_ms: float = 0.0
+    wall_ms: float = 0.0
 
 
 class FrontierStore:
@@ -73,6 +113,7 @@ class FrontierStore:
         configure_connection(self._conn)
         run_versioned_migrations(self._conn)
         ensure_frontier_tables(self._conn)
+        ensure_prepared_batch_payload_columns(self._conn)
         self._conn.commit()
 
     @property
@@ -290,6 +331,8 @@ class FrontierStore:
         expected_leaf_count: Optional[int] = None,
         frontier_end_store_id: Optional[int] = None,
         failure_reason: str = "",
+        summary_payload: Optional[str] = None,
+        payload_version: Optional[int] = None,
     ) -> None:
         with self._lock:
             sets = ["state = ?", "updated_at = ?"]
@@ -303,6 +346,12 @@ class FrontierStore:
             if failure_reason:
                 sets.append("failure_reason = ?")
                 params.append(failure_reason)
+            if summary_payload is not None:
+                sets.append("summary_payload = ?")
+                params.append(summary_payload)
+            if payload_version is not None:
+                sets.append("payload_version = ?")
+                params.append(int(payload_version))
             params.append(batch_id)
             self._conn.execute(
                 f"UPDATE lcm_prepared_batches SET {', '.join(sets)} WHERE batch_id = ?",
@@ -310,20 +359,7 @@ class FrontierStore:
             )
             self._conn.commit()
 
-    def get_batch(self, batch_id: int) -> PreparedBatch | None:
-        with self._lock:
-            row = self._conn.execute(
-                """
-                SELECT batch_id, conversation_id, session_id, base_generation,
-                       source_end_store_id, source_identity_hash, source_ids,
-                       policy_fingerprint, route_fingerprint, state,
-                       expected_leaf_count, frontier_end_store_id, failure_reason
-                FROM lcm_prepared_batches WHERE batch_id = ?
-                """,
-                (batch_id,),
-            ).fetchone()
-        if not row:
-            return None
+    def _row_to_batch(self, row: Sequence[Any]) -> PreparedBatch:
         return PreparedBatch(
             batch_id=row[0],
             conversation_id=row[1],
@@ -338,7 +374,26 @@ class FrontierStore:
             expected_leaf_count=row[10],
             frontier_end_store_id=row[11],
             failure_reason=row[12] or "",
+            summary_payload=row[13] or "" if len(row) > 13 else "",
+            payload_version=int(row[14] or 0) if len(row) > 14 else 0,
         )
+
+    def get_batch(self, batch_id: int) -> PreparedBatch | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT batch_id, conversation_id, session_id, base_generation,
+                       source_end_store_id, source_identity_hash, source_ids,
+                       policy_fingerprint, route_fingerprint, state,
+                       expected_leaf_count, frontier_end_store_id, failure_reason,
+                       COALESCE(summary_payload, ''), COALESCE(payload_version, 0)
+                FROM lcm_prepared_batches WHERE batch_id = ?
+                """,
+                (batch_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return self._row_to_batch(row)
 
     def get_batch_counts_by_state(self, conversation_id: str) -> dict[str, int]:
         with self._lock:
@@ -353,14 +408,19 @@ class FrontierStore:
         return {r[0]: r[1] for r in rows}
 
     def get_ready_batch(self, conversation_id: str) -> PreparedBatch | None:
-        """Return the most recent ready batch for a conversation, if any."""
+        """Return the most recent ready batch for a conversation, if any.
+
+        Prefers payload-bearing (v2+) batches. Legacy v1 ready rows without a
+        summary payload are superseded in place so promote never re-summarizes.
+        """
         with self._lock:
             row = self._conn.execute(
                 """
                 SELECT batch_id, conversation_id, session_id, base_generation,
                        source_end_store_id, source_identity_hash, source_ids,
                        policy_fingerprint, route_fingerprint, state,
-                       expected_leaf_count, frontier_end_store_id, failure_reason
+                       expected_leaf_count, frontier_end_store_id, failure_reason,
+                       COALESCE(summary_payload, ''), COALESCE(payload_version, 0)
                 FROM lcm_prepared_batches
                 WHERE conversation_id = ? AND state = 'ready'
                 ORDER BY batch_id DESC
@@ -370,21 +430,17 @@ class FrontierStore:
             ).fetchone()
         if not row:
             return None
-        return PreparedBatch(
-            batch_id=row[0],
-            conversation_id=row[1],
-            session_id=row[2],
-            base_generation=row[3],
-            source_end_store_id=row[4],
-            source_identity_hash=row[5],
-            source_ids=json.loads(row[6]) if row[6] else [],
-            policy_fingerprint=row[7],
-            route_fingerprint=row[8],
-            state=row[9],
-            expected_leaf_count=row[10],
-            frontier_end_store_id=row[11],
-            failure_reason=row[12] or "",
-        )
+        batch = self._row_to_batch(row)
+        if not batch.has_summary_payload:
+            # Reject silently at the ready-lookup boundary so callers fall back
+            # to foreground compaction instead of re-running the LLM.
+            self.update_batch_state(
+                batch.batch_id,
+                "superseded",
+                failure_reason="legacy_v1_batch_without_payload",
+            )
+            return None
+        return batch
 
     def reap_stale_preparing(self, conversation_id: str) -> int:
         """Mark any 'preparing' batches as 'failed' (for restart recovery)."""
@@ -419,6 +475,57 @@ class FrontierStore:
             )
             self._conn.commit()
             return cur.rowcount
+
+    def list_itemless_active_generations(
+        self,
+        conversation_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return active frontier generations that have no frontier items.
+
+        Used by promotion compensation reconciliation and doctor-style repair.
+        """
+        with self._lock:
+            if conversation_id:
+                rows = self._conn.execute(
+                    """
+                    SELECT f.conversation_id, f.generation, f.session_id,
+                           f.source_end_store_id
+                    FROM lcm_active_frontiers f
+                    WHERE f.conversation_id = ?
+                      AND f.source_end_store_id > 0
+                      AND NOT EXISTS (
+                          SELECT 1 FROM lcm_frontier_items i
+                          WHERE i.conversation_id = f.conversation_id
+                            AND i.generation = f.generation
+                      )
+                    ORDER BY f.generation
+                    """,
+                    (conversation_id,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT f.conversation_id, f.generation, f.session_id,
+                           f.source_end_store_id
+                    FROM lcm_active_frontiers f
+                    WHERE f.source_end_store_id > 0
+                      AND NOT EXISTS (
+                          SELECT 1 FROM lcm_frontier_items i
+                          WHERE i.conversation_id = f.conversation_id
+                            AND i.generation = f.generation
+                      )
+                    ORDER BY f.conversation_id, f.generation
+                    """
+                ).fetchall()
+        return [
+            {
+                "conversation_id": r[0],
+                "generation": r[1],
+                "session_id": r[2],
+                "source_end_store_id": r[3],
+            }
+            for r in rows
+        ]
 
     def close(self) -> None:
         with self._lock:

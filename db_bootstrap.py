@@ -27,8 +27,13 @@ class SchemaVersionTooNewError(RuntimeError):
     """
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 SQLITE_BUSY_TIMEOUT_MS = 30_000
+# Bounded busy wait for foreground cutover so compress() cannot hang
+# indefinitely behind a concurrent writer (gateway host holds compression_locks).
+FOREGROUND_COMPRESS_BUSY_TIMEOUT_MS = 2_000
+# Hard wall-clock budget for a single compress() invocation.
+FOREGROUND_COMPRESS_DEADLINE_SECONDS = 45.0
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
 REQUIRED_CORE_TABLES = (
     "messages",
@@ -348,7 +353,9 @@ def ensure_frontier_tables(conn: sqlite3.Connection) -> None:
             frontier_end_store_id INTEGER NOT NULL DEFAULT 0,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL,
-            failure_reason TEXT DEFAULT ''
+            failure_reason TEXT DEFAULT '',
+            summary_payload TEXT NOT NULL DEFAULT '',
+            payload_version INTEGER NOT NULL DEFAULT 0
         )
         """
     )
@@ -358,6 +365,66 @@ def ensure_frontier_tables(conn: sqlite3.Connection) -> None:
             ON lcm_prepared_batches(conversation_id, state)
         """
     )
+    ensure_prepared_batch_payload_columns(conn)
+
+
+def ensure_prepared_batch_payload_columns(conn: sqlite3.Connection) -> None:
+    """Add prepared-summary payload columns (schema v7) when missing.
+
+    ``payload_version`` 0/1 = legacy v1 batches without a persisted summary
+    (must be rejected/superseded, never re-summarized at promote).
+    ``payload_version`` 2 = prepare stored the full summary payload so promote
+    is a pure publish path with zero LLM calls.
+    """
+    table_row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='lcm_prepared_batches'"
+    ).fetchone()
+    if not table_row:
+        return
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(lcm_prepared_batches)").fetchall()
+    }
+    add_column_if_missing(
+        conn, columns, "summary_payload",
+        "ALTER TABLE lcm_prepared_batches ADD COLUMN summary_payload TEXT NOT NULL DEFAULT ''",
+    )
+    add_column_if_missing(
+        conn, columns, "payload_version",
+        "ALTER TABLE lcm_prepared_batches ADD COLUMN payload_version INTEGER NOT NULL DEFAULT 0",
+    )
+
+
+def supersede_legacy_v1_ready_batches(conn: sqlite3.Connection) -> int:
+    """Mark ready/preparing batches that lack a summary payload as superseded.
+
+    v1 batches discarded the LLM result at prepare time and re-ran summarization
+    at promote. After the v7 payload migration those rows must not silently
+    re-summarize — supersede them so the next prepare builds a payload-bearing
+    batch.
+    """
+    table_row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='lcm_prepared_batches'"
+    ).fetchone()
+    if not table_row:
+        return 0
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(lcm_prepared_batches)").fetchall()
+    }
+    if "payload_version" not in columns or "summary_payload" not in columns:
+        return 0
+    cur = conn.execute(
+        """
+        UPDATE lcm_prepared_batches
+        SET state = 'superseded',
+            failure_reason = 'legacy_v1_batch_without_payload',
+            updated_at = ?
+        WHERE state IN ('ready', 'preparing')
+          AND (COALESCE(payload_version, 0) < 2
+               OR COALESCE(summary_payload, '') = '')
+        """,
+        (time.time(),),
+    )
+    return int(cur.rowcount or 0)
 
 
 def mark_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> None:
@@ -795,5 +862,11 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
     if current_version < 6:
         mark_migration_step_complete(conn, "v6_active_frontier_tables")
         current_version = 6
+
+    ensure_prepared_batch_payload_columns(conn)
+    if current_version < 7:
+        supersede_legacy_v1_ready_batches(conn)
+        mark_migration_step_complete(conn, "v7_prepared_batch_summary_payload")
+        current_version = 7
 
     set_schema_version(conn, current_version)
