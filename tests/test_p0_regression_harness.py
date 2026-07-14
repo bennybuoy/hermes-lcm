@@ -613,6 +613,158 @@ class TestThresholdIndependence:
         finally:
             engine.shutdown()
 
+    def test_partial_rescue_does_not_trim_unsummarized_raw_to_policy_target(
+        self, tmp_path, monkeypatch
+    ):
+        """A partial rescue pass must not evict raw content it did not cover."""
+        engine = _make_engine(
+            tmp_path,
+            context_length=20_000,
+            context_threshold=0.75,
+            model_thresholds={"rescue-model": 0.10},
+            fresh_tail_count=2,
+            leaf_chunk_tokens=100,
+            dynamic_leaf_chunk_enabled=False,
+            session_id="partial-rescue-lossless-session",
+        )
+        try:
+            engine.update_model(
+                model="rescue-model",
+                context_length=20_000,
+                provider="test",
+            )
+            assert engine.threshold_tokens == 2_000
+            assert engine._post_compaction_target_tokens() == 1_000
+
+            messages = [
+                {"role": "system", "content": "system prompt"},
+                *_messages(22, prefix="lossless", tokens_each=180),
+            ]
+            leading = engine._leading_anchor_count(messages)
+            fresh_start = len(messages) - engine._config.fresh_tail_count
+            raw_outside_tail = messages[leading:fresh_start]
+            assert len(raw_outside_tail) > 4
+
+            def partial_rescue(chunk, focus_topic=None):
+                compacted = list(chunk[:2])
+                source_tokens = count_messages_tokens(compacted)
+                return (
+                    compacted,
+                    source_tokens,
+                    "Partial rescue summary.\nExpand for details about: rescued prefix",
+                    1,
+                    1,
+                )
+
+            monkeypatch.setattr(
+                engine,
+                "_summarize_leaf_chunk_with_rescue",
+                partial_rescue,
+            )
+
+            result = engine.compress(messages, current_tokens=engine.threshold_tokens)
+
+            nodes = engine._dag.get_session_nodes(engine.current_session_id, depth=0)
+            assert len(nodes) == 1
+            covered_contents = {
+                engine._store.get(store_id)["content"]
+                for store_id in nodes[0].source_ids
+            }
+            returned_contents = {
+                msg.get("content")
+                for msg in result
+                if isinstance(msg, dict)
+            }
+            unsummarized = [
+                msg["content"]
+                for msg in raw_outside_tail
+                if msg["content"] not in covered_contents
+            ]
+            assert unsummarized
+            assert set(unsummarized).issubset(returned_contents), (
+                "policy-target assembly silently dropped raw messages that the "
+                "partial rescue leaf did not cover"
+            )
+        finally:
+            engine.shutdown()
+
+    def test_deadline_after_leaf_publication_returns_canonical_replacement(
+        self, tmp_path, monkeypatch
+    ):
+        """Timeout after publish must not replay raw rows already covered by DAG."""
+
+        engine = _make_engine(
+            tmp_path,
+            context_length=20_000,
+            context_threshold=0.75,
+            model_thresholds={"deadline-model": 0.10},
+            fresh_tail_count=2,
+            leaf_chunk_tokens=120,
+            dynamic_leaf_chunk_enabled=True,
+            dynamic_leaf_chunk_max=180,
+            condensation_fanin=100,
+            async_background_compaction_enabled=True,
+            async_background_compaction_worker_enabled=False,
+            session_id="deadline-after-publication-session",
+        )
+        try:
+            engine.update_model(
+                model="deadline-model",
+                context_length=20_000,
+                provider="test",
+            )
+            engine._config.foreground_compress_deadline_seconds = 1.0
+            messages = [
+                {"role": "system", "content": "system prompt"},
+                *_messages(28, prefix="deadline", tokens_each=100),
+            ]
+
+            def expire_after_summary(chunk, focus_topic=None):
+                compacted = list(chunk)
+                source_tokens = count_messages_tokens(compacted)
+                time.sleep(1.05)
+                return (
+                    compacted,
+                    source_tokens,
+                    "Published before deadline.\nExpand for details about: first leaf",
+                    0,
+                    0,
+                )
+
+            monkeypatch.setattr(
+                engine,
+                "_summarize_leaf_chunk_with_rescue",
+                expire_after_summary,
+            )
+
+            result = engine.compress(messages, current_tokens=engine.threshold_tokens)
+
+            nodes = engine._dag.get_session_nodes(engine.current_session_id, depth=0)
+            assert len(nodes) == 1, "fixture must publish one canonical leaf before timeout"
+            covered_contents = {
+                engine._store.get(store_id)["content"]
+                for store_id in nodes[0].source_ids
+            }
+            returned_contents = {
+                msg.get("content")
+                for msg in result
+                if isinstance(msg, dict)
+            }
+            assert covered_contents
+            assert covered_contents.isdisjoint(returned_contents), (
+                "deadline returned stale host input containing raw rows already "
+                "published into the canonical DAG"
+            )
+            assert any(
+                "Published before deadline" in str(msg.get("content", ""))
+                for msg in result
+                if isinstance(msg, dict)
+            )
+            assert result[-1]["content"] == messages[-1]["content"]
+            assert engine._last_compression_status != "running"
+        finally:
+            engine.shutdown()
+
     def test_emergency_threshold_is_independent_of_cutover_and_target(self, tmp_path):
         """Emergency threshold uses emergency_pressure_ratio, not cutover or target."""
         engine = _make_engine(
