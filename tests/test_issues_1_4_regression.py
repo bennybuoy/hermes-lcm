@@ -20,7 +20,6 @@ from hermes_lcm.config import LCMConfig
 from hermes_lcm.db_bootstrap import (
     SCHEMA_VERSION,
     run_versioned_migrations,
-    supersede_legacy_v1_ready_batches,
 )
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.frontier import PREPARED_PAYLOAD_VERSION, FrontierStore
@@ -212,9 +211,13 @@ class TestIssue1PersistSummaryPayload:
     def test_migration_supersedes_legacy_v1_ready_batches(self, tmp_path):
         db = tmp_path / "legacy.db"
         conn = sqlite3.connect(str(db))
-        # Bootstrap to v6-style tables then insert a payload-less ready batch.
+        # Build the table set, then mark the fixture as a v6 database before
+        # inserting a payload-less ready batch. The next migration call must
+        # perform the v6→v7 cleanup itself.
         run_versioned_migrations(conn)
-        # Force a v1-shaped row by clearing payload.
+        conn.execute(
+            "UPDATE metadata SET value = '6' WHERE key = 'schema_version'"
+        )
         now = time.time()
         conn.execute(
             """
@@ -228,15 +231,14 @@ class TestIssue1PersistSummaryPayload:
             ("c1", "s1", now, now),
         )
         conn.commit()
-        n = supersede_legacy_v1_ready_batches(conn)
-        conn.commit()
-        assert n >= 1
+
+        run_versioned_migrations(conn)
+
         state = conn.execute(
             "SELECT state, failure_reason FROM lcm_prepared_batches"
         ).fetchone()
         assert state[0] == "superseded"
         assert "legacy_v1" in state[1]
-        run_versioned_migrations(conn)
         version = conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
