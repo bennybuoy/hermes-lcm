@@ -24,7 +24,7 @@ from hermes_lcm.db_bootstrap import (
 )
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.frontier import PREPARED_PAYLOAD_VERSION, FrontierStore
-from hermes_lcm.tokens import count_messages_tokens
+from hermes_lcm.tokens import count_messages_tokens, count_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +104,7 @@ class TestIssue1PersistSummaryPayload:
             assert payload is not None
             assert "prepared leaf summary" in payload["summary_text"]
             assert payload["source_ids"] == batch.source_ids
+            assert payload["token_count"] == count_tokens(payload["summary_text"])
             assert calls["n"] == 1
         finally:
             engine.shutdown()
@@ -125,6 +126,34 @@ class TestIssue1PersistSummaryPayload:
             assert engine._dag.get_session_node_count(engine.current_session_id) == 1
             node = engine._dag.get_session_nodes(engine.current_session_id)[0]
             assert "prepared leaf summary" in node.summary
+        finally:
+            engine.shutdown()
+
+    def test_promote_missing_payload_token_count_uses_text_tokens(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path)
+        _stub_summarize(monkeypatch, engine)
+        try:
+            msgs = _messages()
+            engine.ingest(msgs)
+            batch = engine.prepare_background_compaction_once(msgs)
+            payload = batch.parsed_summary_payload()
+            assert payload is not None
+            summary_text = payload["summary_text"]
+            payload.pop("token_count", None)
+            engine._frontier.update_batch_state(
+                batch.batch_id,
+                "ready",
+                summary_payload=json.dumps(payload),
+                payload_version=PREPARED_PAYLOAD_VERSION,
+            )
+
+            result = engine.promote_prepared_compaction(batch.batch_id, msgs)
+
+            assert result.promoted is True
+            node = engine._dag.get_session_nodes(engine.current_session_id)[0]
+            assert node.token_count == count_tokens(summary_text)
         finally:
             engine.shutdown()
 
@@ -207,8 +236,11 @@ class TestIssue1PersistSummaryPayload:
         ).fetchone()
         assert state[0] == "superseded"
         assert "legacy_v1" in state[1]
-        assert run_versioned_migrations(conn) is None or True
-        assert SCHEMA_VERSION >= 7
+        run_versioned_migrations(conn)
+        version = conn.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()
+        assert version == (str(SCHEMA_VERSION),)
         conn.close()
 
 
@@ -505,7 +537,7 @@ class TestIssue4FrontierItems:
             for item in items:
                 assert item["source_start"] <= item["source_end"]
                 if ends:
-                    assert item["source_start"] > ends[-1] or item["kind"] == "message"
+                    assert item["source_start"] > ends[-1]
                 ends.append(item["source_end"])
             # Message items only for uncovered tail.
             msg_items = [i for i in items if i["kind"] == "message"]
