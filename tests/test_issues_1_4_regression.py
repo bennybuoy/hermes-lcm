@@ -350,6 +350,63 @@ class TestIssue2HostReplacementDropsCovered:
         finally:
             engine.shutdown()
 
+    def test_partial_promote_ingest_lock_returns_canonical_replacement(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path, fresh_tail_count=2)
+        _stub_summarize(monkeypatch, engine, text="partial promote summary")
+        try:
+            engine.update_model(
+                model="partial-promote-model",
+                context_length=50_000,
+                provider="test",
+            )
+            prepared_messages = _messages(16, tokens_each=40)
+            engine.ingest(prepared_messages)
+            batch = engine.prepare_background_compaction_once(prepared_messages)
+            assert batch is not None and batch.state == "ready"
+            covered = set(int(s) for s in batch.source_ids)
+            pre_compress_id_map = engine._get_store_id_map_for_messages(
+                prepared_messages
+            )
+            covered_contents = {
+                msg["content"]
+                for msg in prepared_messages
+                if pre_compress_id_map.get(id(msg)) in covered
+            }
+            assert covered_contents
+
+            later_messages = _messages(
+                8,
+                prefix="arrived-after-prepare",
+                tokens_each=40,
+            )[1:]
+            current_messages = prepared_messages + later_messages
+
+            def locked_ingest(_messages):
+                raise sqlite3.OperationalError("database is locked")
+
+            monkeypatch.setattr(engine, "_ingest_messages", locked_ingest)
+
+            result = engine.compress(
+                current_messages,
+                current_tokens=engine.threshold_tokens + 5_000,
+            )
+
+            assert engine._last_compression_status == "failed"
+            assert "sqlite_locked_during_ingest" in engine._last_compression_noop_reason
+            assert engine._dag.get_session_node_count(engine.current_session_id) == 1
+            result_blob = "\n".join(
+                str(msg.get("content") or "") for msg in result
+            )
+            assert "partial promote summary" in result_blob
+            for content in covered_contents:
+                assert content not in result_blob
+            for tail_message in current_messages[-2:]:
+                assert tail_message["content"] in result_blob
+        finally:
+            engine.shutdown()
+
     def test_full_host_replacement_seam_survives_session_reload(
         self, tmp_path, monkeypatch
     ):
