@@ -5570,9 +5570,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 return None
 
             leaf_count = 1  # One leaf from one chunk
-            leaf_tokens = count_messages_tokens(
-                [{"role": "assistant", "content": summary_text}]
-            )
+            leaf_tokens = count_tokens(summary_text)
             # Persist the full publishable payload so promote never re-runs
             # the summarizer (issue #1). payload_version=2 marks a complete
             # private leaf ready for CAS publish.
@@ -5678,7 +5676,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         source_tokens = int(payload.get("source_tokens") or 0)
         leaf_tokens = int(
             payload.get("token_count")
-            or count_messages_tokens([{"role": "assistant", "content": summary_text}])
+            or count_tokens(summary_text)
         )
         expand_hint = str(
             payload.get("expand_hint") or self._extract_expand_hint(summary_text)
