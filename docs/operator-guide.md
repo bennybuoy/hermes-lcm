@@ -180,6 +180,16 @@ reports the effective source.
 | `LCM_EMPTY_LIFECYCLE_GC_THRESHOLD` | `200` | Number of lifecycle rows at which the GC pass fires (default 200 so fresh installs skip the work) |
 | `LCM_EMPTY_LIFECYCLE_GC_MAX_AGE_HOURS` | `24` | Automatic GC only deletes empty lifecycle rows at least this old; set `0` only in trusted/test environments that intentionally want immediate empty-row pruning |
 
+Summary routes can cross providers. Use `custom:<name>/<model>` for a named
+custom provider and `provider:<provider-id>/<model>` for a built-in Hermes
+provider. The explicit `provider:` prefix avoids confusing provider selection
+with aggregator model namespaces. Example:
+
+```dotenv
+LCM_SUMMARY_MODEL=deepseek-v4-flash
+LCM_SUMMARY_FALLBACK_MODELS=custom:llamaherd-compression/glm-5.2,provider:openai-codex/gpt-5.3-codex-spark
+```
+
 Advanced compaction, assembly, and extraction knobs are defined in `config.py`.
 
 Sensitive-pattern handling is disabled by default so ordinary LCM storage and

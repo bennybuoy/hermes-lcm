@@ -369,6 +369,16 @@ Environment variables still take precedence over YAML, and
 | `LCM_EXPANSION_TIMEOUT_MS` | `120000` | Timeout for one `lcm_expand_query` synthesis call |
 | `LCM_CRITICAL_BUDGET_PRESSURE_RATIO` | `0.0` | Disabled at `0.0`; when set, permits critical-pressure bypasses for bounded deferred catch-up and cache-friendly follow-on condensation only |
 
+Summary routes can select different Hermes providers. Named custom providers use
+`custom:<name>/<model>`. Built-in providers use the unambiguous
+`provider:<provider-id>/<model>` form so aggregator model slugs such as
+`anthropic/claude-...` remain model-only values. For example:
+
+```dotenv
+LCM_SUMMARY_MODEL=deepseek-v4-flash
+LCM_SUMMARY_FALLBACK_MODELS=custom:llamaherd-compression/glm-5.2,provider:openai-codex/gpt-5.3-codex-spark
+```
+
 Advanced compaction, assembly, and extraction knobs are defined in `config.py`.
 
 ### Sensitive-pattern redaction

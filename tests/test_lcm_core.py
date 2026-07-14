@@ -128,6 +128,16 @@ class TestModelRouting:
         assert route.provider is None
         assert route.model == "openai-codex/gpt-5.4-mini"
 
+    def test_explicit_builtin_provider_route_is_split(self):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        route = parse_lcm_model_override(
+            "provider:openai-codex/gpt-5.3-codex-spark"
+        )
+
+        assert route.provider == "openai-codex"
+        assert route.model == "gpt-5.3-codex-spark"
+
     def test_custom_prefixed_canonical_provider_stays_model_only(self, monkeypatch):
         from hermes_lcm.model_routing import parse_lcm_model_override
 
@@ -315,6 +325,27 @@ class TestProviderPrefixedAuxiliaryCalls:
         assert result == "summary"
         assert seen["provider"] == "lcpp"
         assert seen["model"] == "4B-Qwen3-2507-compressor"
+
+    def test_summary_call_passes_explicit_builtin_provider_and_model(self, monkeypatch):
+        from hermes_lcm.escalation import _call_llm_for_summary
+
+        seen = {}
+
+        def fake_call_llm(**kwargs):
+            seen.update(kwargs)
+            return self._fake_response("summary")
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+
+        result = _call_llm_for_summary(
+            "summarize",
+            200,
+            model="provider:openai-codex/gpt-5.3-codex-spark",
+        )
+
+        assert result == "summary"
+        assert seen["provider"] == "openai-codex"
+        assert seen["model"] == "gpt-5.3-codex-spark"
 
     def test_summary_fallback_chain_uses_next_model_after_primary_failure(self, monkeypatch):
         from hermes_lcm import escalation

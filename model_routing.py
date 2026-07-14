@@ -18,6 +18,13 @@ class ModelRoute:
 ProviderResolver = Callable[[str], bool]
 
 
+# ``provider:<provider-id>/<model>`` is the unambiguous form for a built-in
+# Hermes provider. The prefix is intentionally explicit because bare values
+# such as ``anthropic/claude-sonnet-4`` and ``google/gemini-...`` are also valid
+# model slugs on aggregators and must remain model-only overrides.
+_EXPLICIT_PROVIDER_PREFIX = "provider:"
+
+
 # Conservative allowlist for built-in provider registry fallbacks. Non-canonical
 # named custom providers from the Hermes config are safe to split; registry-only
 # providers still need an allowlist because many provider IDs are also valid
@@ -65,11 +72,12 @@ def parse_lcm_model_override(
 ) -> ModelRoute:
     """Parse an LCM model override into explicit provider/model routing.
 
-    Values whose first path segment is resolvable by the Hermes host are split
-    into ``provider=<prefix>`` and ``model=<rest>``. The default resolver only
-    treats non-canonical named custom providers (plus conservative registry
-    allowlist entries) as resolvable so OpenRouter-style model slugs and
-    canonical built-in provider names remain model-only overrides.
+    ``provider:<provider-id>/<model>`` always selects the explicit Hermes
+    provider. Other values whose first path segment is resolvable by the Hermes
+    host are split into ``provider=<prefix>`` and ``model=<rest>``. The default
+    resolver only treats non-canonical named custom providers (plus conservative
+    registry allowlist entries) as resolvable so OpenRouter-style model slugs and
+    bare canonical built-in provider names remain model-only overrides.
     """
     model = (value or "").strip()
     if not model:
@@ -78,6 +86,11 @@ def parse_lcm_model_override(
     provider, sep, rest = model.partition("/")
     provider = provider.strip().lower()
     rest = rest.strip()
+    if provider.startswith(_EXPLICIT_PROVIDER_PREFIX):
+        route_provider = provider.removeprefix(_EXPLICIT_PROVIDER_PREFIX).strip()
+        if sep and rest and route_provider:
+            return ModelRoute(provider=route_provider, model=rest)
+
     route_provider = provider
     if provider.startswith("custom:"):
         route_provider = provider.split(":", 1)[1].strip()
