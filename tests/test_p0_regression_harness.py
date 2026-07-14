@@ -544,6 +544,66 @@ class TestThresholdIndependence:
         finally:
             engine.shutdown()
 
+    def test_ordinary_cutover_converges_to_resolved_policy_target(
+        self, tmp_path, monkeypatch
+    ):
+        """A 128K cutover must keep compacting toward its 64K policy target.
+
+        This reproduces the production GLM-5.2 failure where one bounded leaf
+        pass reduced a roughly 128K provider prompt only to roughly 100K and
+        then stopped because the loop compared against cutover, not target.
+        """
+        engine = _make_engine(
+            tmp_path,
+            context_length=1_000_000,
+            context_threshold=0.75,
+            model_thresholds={"glm-5.2": 0.128},
+            fresh_tail_count=24,
+            leaf_chunk_tokens=8_000,
+            dynamic_leaf_chunk_enabled=True,
+            dynamic_leaf_chunk_max=24_000,
+            session_id="glm-target-convergence-session",
+        )
+        _stub_summary(monkeypatch, engine, text_prefix="bounded leaf")
+        try:
+            engine.update_model(
+                model="glm-5.2",
+                context_length=1_000_000,
+                provider="ollama-cloud",
+            )
+            assert engine.threshold_tokens == 128_000
+            assert engine._post_compaction_target_tokens() == 64_000
+
+            messages = [
+                {"role": "system", "content": "system prompt"},
+                *_messages(120, tokens_each=1_500),
+            ]
+            message_tokens_before = count_messages_tokens(messages)
+            observed_prompt_tokens = engine.threshold_tokens
+            provider_overhead_tokens = observed_prompt_tokens - message_tokens_before
+            assert 0 < provider_overhead_tokens < observed_prompt_tokens
+
+            result = engine.compress(
+                messages,
+                current_tokens=observed_prompt_tokens,
+            )
+
+            estimated_prompt_tokens_after = (
+                provider_overhead_tokens + count_messages_tokens(result)
+            )
+            assert estimated_prompt_tokens_after <= 64_000, (
+                "ordinary cutover stopped above the resolved policy target: "
+                f"{estimated_prompt_tokens_after} > 64000"
+            )
+            depth0_nodes = engine._dag.get_session_nodes(
+                engine.current_session_id, depth=0
+            )
+            assert len(depth0_nodes) >= 3, (
+                "128K→64K convergence should require multiple bounded leaf passes"
+            )
+        finally:
+            engine.shutdown()
+
     def test_emergency_threshold_is_independent_of_cutover_and_target(self, tmp_path):
         """Emergency threshold uses emergency_pressure_ratio, not cutover or target."""
         engine = _make_engine(
