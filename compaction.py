@@ -949,6 +949,19 @@ class CompactionMixin:
                     self._run_pre_compaction_extraction(summary_input_chunk)
 
                 if deadline_exceeded():
+                    if leaf_compacted_this_turn:
+                        partial_completion_reason = (
+                            "post_compaction_target_not_reached: "
+                            "deadline_before_later_summarization"
+                        )
+                        logger.warning(
+                            "LCM compaction deadline reached before a later "
+                            "summary after %d published leaf pass%s; returning "
+                            "canonical best-effort replacement",
+                            leaf_passes,
+                            "es" if leaf_passes != 1 else "",
+                        )
+                        break
                     return fail_timeout("deadline_before_summarization")
                 t_sum = time.perf_counter()
                 compacted_chunk, source_tokens, summary_text, _level, _rescue_attempts = self._summarize_leaf_chunk_with_rescue(
