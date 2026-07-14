@@ -383,6 +383,8 @@ class TestIssue2HostReplacementDropsCovered:
             )[1:]
             current_messages = prepared_messages + later_messages
 
+            original_ingest = engine._ingest_messages
+
             def locked_ingest(_messages):
                 raise sqlite3.OperationalError("database is locked")
 
@@ -404,6 +406,127 @@ class TestIssue2HostReplacementDropsCovered:
                 assert content not in result_blob
             for tail_message in current_messages[-2:]:
                 assert tail_message["content"] in result_blob
+
+            assert engine._ingest_cursor == len(result)
+            monkeypatch.setattr(engine, "_ingest_messages", original_ingest)
+            store_count = engine._store.get_session_count(engine.current_session_id)
+            appended = {
+                "role": "user",
+                "content": "first message after bounded promotion failure",
+            }
+            engine._ingest_messages(result + [appended])
+            assert (
+                engine._store.get_session_count(engine.current_session_id)
+                == store_count + 1
+            )
+            assert engine._store.get_session_messages(engine.current_session_id)[-1][
+                "content"
+            ] == appended["content"]
+        finally:
+            engine.shutdown()
+
+    def test_partial_promote_outer_sqlite_lock_uses_canonical_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path, fresh_tail_count=2)
+        _stub_summarize(monkeypatch, engine, text="outer lock promote summary")
+        try:
+            engine.update_model(
+                model="partial-promote-model",
+                context_length=50_000,
+                provider="test",
+            )
+            prepared_messages = _messages(16, tokens_each=40)
+            engine.ingest(prepared_messages)
+            batch = engine.prepare_background_compaction_once(prepared_messages)
+            covered = set(int(store_id) for store_id in batch.source_ids)
+            id_map = engine._get_store_id_map_for_messages(prepared_messages)
+            covered_contents = {
+                message["content"]
+                for message in prepared_messages
+                if id_map.get(id(message)) in covered
+            }
+            assert covered_contents
+            current_messages = prepared_messages + _messages(
+                8,
+                prefix="outer-lock-later",
+                tokens_each=40,
+            )[1:]
+
+            def locked_reclassification():
+                raise sqlite3.OperationalError("database is locked outside body wrappers")
+
+            monkeypatch.setattr(
+                engine,
+                "_maybe_reclassify_late_auxiliary_before_compaction_write",
+                locked_reclassification,
+            )
+
+            result = engine.compress(
+                current_messages,
+                current_tokens=engine.threshold_tokens + 5_000,
+            )
+
+            assert engine._last_compression_status == "failed"
+            assert "sqlite_locked:" in engine._last_compression_noop_reason
+            assert engine._dag.get_session_node_count(engine.current_session_id) == 1
+            result_blob = "\n".join(
+                str(message.get("content") or "") for message in result
+            )
+            assert "outer lock promote summary" in result_blob
+            for content in covered_contents:
+                assert content not in result_blob
+            assert engine._ingest_cursor == len(result)
+        finally:
+            engine.shutdown()
+
+    def test_lock_after_leaf_commit_consumes_covered_raw_before_assembly(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(
+            tmp_path,
+            fresh_tail_count=2,
+            async_enabled=False,
+        )
+        _stub_summarize(monkeypatch, engine, text="committed foreground leaf")
+        try:
+            messages = _messages(16, tokens_each=40)
+
+            def lock_after_node_commit(_chunk, _source_ids):
+                raise sqlite3.OperationalError("database is locked after add_node")
+
+            monkeypatch.setattr(
+                engine,
+                "_maybe_gc_compacted_tool_results",
+                lock_after_node_commit,
+            )
+
+            result = engine.compress(
+                messages,
+                current_tokens=engine.threshold_tokens + 1,
+            )
+
+            nodes = engine._dag.get_session_nodes(engine.current_session_id, depth=0)
+            assert len(nodes) == 1, "fixture must commit the leaf before locking"
+            covered_contents = {
+                engine._store.get(store_id)["content"]
+                for store_id in nodes[0].source_ids
+            }
+            assert covered_contents
+            result_blob = "\n".join(
+                str(message.get("content") or "") for message in result
+            )
+            assert "committed foreground leaf" in result_blob
+            for content in covered_contents:
+                assert content not in result_blob
+            for tail_message in messages[-2:]:
+                assert tail_message["content"] in result_blob
+            assert engine._ingest_cursor == len(result)
+            assert engine._last_compression_status == "compacted"
+            assert (
+                "publication_followup_error_after_leaf"
+                in engine._last_compression_noop_reason
+            )
         finally:
             engine.shutdown()
 

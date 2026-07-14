@@ -368,10 +368,19 @@ class CompactionMixin:
         def _deadline_exceeded() -> bool:
             return time.perf_counter() >= deadline_at
 
+        canonical_fallback_state: dict[
+            str, Optional[List[Dict[str, Any]]]
+        ] = {"messages": None}
+
         def _fail_timeout(
             reason: str,
             return_messages: Optional[List[Dict[str, Any]]] = None,
         ) -> List[Dict[str, Any]]:
+            fallback_messages = (
+                return_messages
+                if return_messages is not None
+                else canonical_fallback_state["messages"]
+            )
             self._last_compression_status = "failed"
             self._last_compression_noop_reason = reason
             self._last_compaction_duration_ms = (
@@ -389,7 +398,14 @@ class CompactionMixin:
                 self._last_compaction_duration_ms,
                 phase_timings,
             )
-            return messages if return_messages is None else return_messages
+            if fallback_messages is not None:
+                # Successful compaction/promotion paths reset this cursor to
+                # the host replacement length. Bounded exits after publication
+                # must do the same or the next appended raw message can be
+                # skipped when the stale cursor is clamped.
+                self._ingest_cursor = len(fallback_messages)
+                return fallback_messages
+            return messages
 
         try:
             return self._compress_body(
@@ -401,14 +417,22 @@ class CompactionMixin:
                 phase=_phase,
                 deadline_exceeded=_deadline_exceeded,
                 fail_timeout=_fail_timeout,
+                canonical_fallback_state=canonical_fallback_state,
                 busy_timeout_ms=busy_timeout_ms,
                 compress_started=_compress_started,
             )
         except Exception as exc:
             if _is_sqlite_locked_error(exc):
                 return _fail_timeout(f"sqlite_locked: {exc}")
-            # Unexpected errors must still release host lock ownership by
-            # returning; re-raise after marking status so callers see failure.
+            if canonical_fallback_state["messages"] is not None:
+                logger.error(
+                    "LCM compress failed after async publication; returning "
+                    "canonical best-effort replacement",
+                    exc_info=True,
+                )
+                return _fail_timeout(f"compress_error_after_publication: {exc}")
+            # Unexpected errors before publication must still release host lock
+            # ownership by marking failure, then re-raise for caller visibility.
             self._last_compression_status = "failed"
             self._last_compression_noop_reason = f"compress_error: {exc}"
             self._last_compaction_duration_ms = (
@@ -445,6 +469,9 @@ class CompactionMixin:
         phase,
         deadline_exceeded,
         fail_timeout,
+        canonical_fallback_state: dict[
+            str, Optional[List[Dict[str, Any]]]
+        ],
         busy_timeout_ms: int,
         compress_started: float,
     ) -> List[Dict[str, Any]]:
@@ -528,6 +555,7 @@ class CompactionMixin:
                         self._pending_context_anchor_messages = None
                     phase("assembly", t_asm)
                     canonical_fallback_messages = compressed
+                    canonical_fallback_state["messages"] = compressed
 
                     # Partial promote may still leave the provider prompt above
                     # the post-compaction target. When eligible raw remains,
@@ -1041,6 +1069,7 @@ class CompactionMixin:
                 expand_hint=self._extract_expand_hint(summary_text),
             )
             t_pub = time.perf_counter()
+            published_node_id = 0
             try:
                 with _temporary_sqlite_busy_timeout(
                     [
@@ -1072,6 +1101,41 @@ class CompactionMixin:
                                 exc_info=True,
                             )
             except Exception as exc:
+                if published_node_id:
+                    # add_node() commits on its own connection. If a later
+                    # store/frontier operation fails, the leaf is canonical and
+                    # its covered raw chunk must be consumed before assembly.
+                    self._last_compacted_store_id = (
+                        max(consumed_store_ids) if consumed_store_ids else 0
+                    )
+                    pressure_remaining_messages = pressure_messages[
+                        leading_anchor_count + selected_raw_len:
+                    ]
+                    working_messages = (
+                        working_messages[:leading_anchor_count]
+                        + remaining_messages
+                    )
+                    pressure_messages = (
+                        pressure_messages[:leading_anchor_count]
+                        + pressure_remaining_messages
+                    )
+                    leaf_compacted_this_turn = True
+                    leaf_passes += 1
+                    estimated_active_tokens = max(
+                        0,
+                        estimated_active_tokens - source_tokens + summary_tokens,
+                    )
+                    partial_completion_reason = (
+                        "post_compaction_target_not_reached: "
+                        "publication_followup_error_after_leaf"
+                    )
+                    logger.warning(
+                        "LCM publication follow-up failed after committed leaf "
+                        "%d; returning canonical best-effort replacement: %s",
+                        published_node_id,
+                        exc,
+                    )
+                    break
                 if _is_sqlite_locked_error(exc):
                     if leaf_compacted_this_turn:
                         partial_completion_reason = (
