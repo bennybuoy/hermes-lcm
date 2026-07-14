@@ -1070,6 +1070,7 @@ class CompactionMixin:
             )
             t_pub = time.perf_counter()
             published_node_id = 0
+            previous_last_compacted_store_id = self._last_compacted_store_id
             try:
                 with _temporary_sqlite_busy_timeout(
                     [
@@ -1090,16 +1091,21 @@ class CompactionMixin:
                     note_async = getattr(self, "_note_foreground_async_frontier_advance", None)
                     if callable(note_async):
                         try:
-                            note_async(
+                            frontier_advanced = note_async(
                                 source_end_store_id=self._last_compacted_store_id,
                                 node_id=int(published_node_id or 0),
                                 covered_source_ids=list(source_store_ids),
                             )
+                            if frontier_advanced is False:
+                                raise RuntimeError(
+                                    "foreground async frontier advance failed"
+                                )
                         except Exception:
                             logger.debug(
                                 "LCM foreground async frontier advance failed",
                                 exc_info=True,
                             )
+                            raise
             except Exception as exc:
                 if published_node_id:
                     # add_node() commits on its own connection. If a later
@@ -1116,19 +1122,65 @@ class CompactionMixin:
                         "_note_foreground_async_frontier_advance",
                         None,
                     )
+                    recovery_frontier_ok = True
                     if callable(recovery_note_async):
                         try:
-                            recovery_note_async(
-                                source_end_store_id=self._last_compacted_store_id,
-                                node_id=int(published_node_id),
-                                covered_source_ids=list(source_store_ids),
+                            recovery_frontier_ok = bool(
+                                recovery_note_async(
+                                    source_end_store_id=self._last_compacted_store_id,
+                                    node_id=int(published_node_id),
+                                    covered_source_ids=list(source_store_ids),
+                                )
                             )
                         except Exception:
+                            recovery_frontier_ok = False
                             logger.debug(
                                 "LCM recovery frontier advance failed after "
                                 "committed foreground leaf",
                                 exc_info=True,
                             )
+                    if not recovery_frontier_ok:
+                        # Atomic frontier publication failed, so the overlapping
+                        # ready batch was not invalidated. Roll back this DAG leaf
+                        # and leave its raw chunk active rather than risk two
+                        # canonical summaries for the same lineage.
+                        rolled_back = False
+                        try:
+                            rolled_back = bool(
+                                self._dag.delete_node(int(published_node_id))
+                            )
+                        except Exception:
+                            logger.error(
+                                "LCM could not roll back foreground leaf %d after "
+                                "frontier publication failure",
+                                published_node_id,
+                                exc_info=True,
+                            )
+                        if not rolled_back:
+                            raise RuntimeError(
+                                "frontier publication and DAG rollback both failed"
+                            ) from exc
+                        self._last_compacted_store_id = (
+                            previous_last_compacted_store_id
+                        )
+                        try:
+                            self._persist_frontier_marker()
+                        except Exception:
+                            logger.debug(
+                                "LCM could not restore frontier marker after "
+                                "foreground leaf rollback",
+                                exc_info=True,
+                            )
+                        if leaf_compacted_this_turn:
+                            partial_completion_reason = (
+                                "post_compaction_target_not_reached: "
+                                "frontier_advance_failed_leaf_rolled_back"
+                            )
+                            break
+                        return fail_timeout(
+                            "frontier_advance_failed_leaf_rolled_back",
+                            canonical_fallback_messages,
+                        )
                     pressure_remaining_messages = pressure_messages[
                         leading_anchor_count + selected_raw_len:
                     ]

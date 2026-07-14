@@ -212,6 +212,89 @@ class FrontierStore:
             self._conn.commit()
             return new_gen
 
+    def advance_frontier_generation_with_items(
+        self,
+        conversation_id: str,
+        session_id: str,
+        new_source_end: int,
+        policy_fingerprint: str,
+        route_fingerprint: str,
+        base_generation: int,
+        items: list[dict[str, Any]],
+    ) -> int:
+        """CAS-advance a generation and publish its items atomically.
+
+        Both tables live on this FrontierStore connection, so one SQLite write
+        transaction can guarantee that an active generation with a positive
+        source boundary is never committed without its ordered items.
+        Returns the new generation, or 0 on CAS mismatch.
+        """
+        if new_source_end > 0 and not items:
+            raise ValueError("frontier items required for positive source boundary")
+        with self._lock:
+            conn = self.conn
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    """
+                    SELECT generation
+                    FROM lcm_active_frontiers
+                    WHERE conversation_id = ?
+                    ORDER BY generation DESC
+                    LIMIT 1
+                    """,
+                    (conversation_id,),
+                ).fetchone()
+                current_gen = int(row[0]) if row else 0
+                if current_gen != int(base_generation):
+                    conn.rollback()
+                    return 0
+
+                now = time.time()
+                new_gen = int(base_generation) + 1
+                conn.execute(
+                    """
+                    INSERT INTO lcm_active_frontiers
+                        (conversation_id, generation, session_id,
+                         source_end_store_id, policy_fingerprint,
+                         route_fingerprint, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        conversation_id,
+                        new_gen,
+                        session_id,
+                        new_source_end,
+                        policy_fingerprint,
+                        route_fingerprint,
+                        now,
+                        now,
+                    ),
+                )
+                for ordinal, item in enumerate(items):
+                    conn.execute(
+                        """
+                        INSERT INTO lcm_frontier_items
+                            (conversation_id, generation, ordinal, kind,
+                             ref_id, source_start, source_end)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            conversation_id,
+                            new_gen,
+                            ordinal,
+                            item.get("kind", "message"),
+                            item.get("ref_id", 0),
+                            item.get("source_start", 0),
+                            item.get("source_end", 0),
+                        ),
+                    )
+                conn.commit()
+                return new_gen
+            except Exception:
+                conn.rollback()
+                raise
+
     def rollback_frontier_generation(self, conversation_id: str, generation: int) -> bool:
         """Remove the just-published generation when a later publish step fails.
 

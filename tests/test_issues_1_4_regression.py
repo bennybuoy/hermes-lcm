@@ -552,6 +552,75 @@ class TestIssue2HostReplacementDropsCovered:
         finally:
             engine.shutdown()
 
+    def test_recovery_frontier_failure_rolls_back_committed_leaf(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path, fresh_tail_count=2)
+        _stub_summarize(monkeypatch, engine, text="rolled back foreground leaf")
+        try:
+            messages = _messages(16, tokens_each=40)
+            engine.ingest(messages)
+            prepared = engine.prepare_background_compaction_once(messages)
+            assert prepared is not None and prepared.state == "ready"
+            engine._config.async_background_compaction_promote_on_compress = False
+            frontier_before = engine._frontier.get_active_frontier(
+                prepared.conversation_id
+            )
+            assert frontier_before is not None
+
+            engine._frontier.conn.execute(
+                """
+                CREATE TRIGGER fail_recovery_frontier_item
+                BEFORE INSERT ON lcm_frontier_items
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected recovery frontier failure');
+                END
+                """
+            )
+            engine._frontier.conn.commit()
+
+            def lock_after_node_commit(_chunk, _source_ids):
+                raise sqlite3.OperationalError("database is locked after add_node")
+
+            monkeypatch.setattr(
+                engine,
+                "_maybe_gc_compacted_tool_results",
+                lock_after_node_commit,
+            )
+
+            result = engine.compress(
+                messages,
+                current_tokens=engine.threshold_tokens + 1,
+            )
+
+            assert result == messages
+            assert engine._dag.get_session_node_count(engine.current_session_id) == 0
+            frontier_after = engine._frontier.get_active_frontier(
+                prepared.conversation_id
+            )
+            assert frontier_after is not None
+            assert frontier_after["generation"] == frontier_before["generation"]
+            assert engine._frontier.list_itemless_active_generations(
+                prepared.conversation_id
+            ) == []
+            assert (
+                engine._last_compression_noop_reason
+                == "frontier_advance_failed_leaf_rolled_back"
+            )
+
+            engine._frontier.conn.execute(
+                "DROP TRIGGER fail_recovery_frontier_item"
+            )
+            engine._frontier.conn.commit()
+            promoted = engine.promote_prepared_compaction(
+                prepared.batch_id,
+                messages,
+            )
+            assert promoted.promoted is True
+            assert engine._dag.get_session_node_count(engine.current_session_id) == 1
+        finally:
+            engine.shutdown()
+
     def test_full_host_replacement_seam_survives_session_reload(
         self, tmp_path, monkeypatch
     ):
@@ -754,6 +823,61 @@ class TestIssue3BoundedForegroundCompress:
 # ===========================================================================
 
 class TestIssue4FrontierItems:
+    def test_atomic_frontier_advance_rolls_back_generation_when_item_insert_fails(
+        self, tmp_path
+    ):
+        engine = _engine(tmp_path)
+        try:
+            engine._frontier.ensure_frontier(
+                engine.current_conversation_id,
+                engine.current_session_id,
+            )
+            frontier = engine._frontier.get_active_frontier(
+                engine.current_conversation_id
+            )
+            assert frontier is not None
+            before_generation = frontier["generation"]
+            engine._frontier.conn.execute(
+                """
+                CREATE TRIGGER fail_frontier_item_insert
+                BEFORE INSERT ON lcm_frontier_items
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected frontier item failure');
+                END
+                """
+            )
+            engine._frontier.conn.commit()
+
+            with pytest.raises(sqlite3.DatabaseError, match="injected frontier"):
+                engine._frontier.advance_frontier_generation_with_items(
+                    engine.current_conversation_id,
+                    engine.current_session_id,
+                    10,
+                    "policy",
+                    "route",
+                    before_generation,
+                    [
+                        {
+                            "kind": "message",
+                            "ref_id": 10,
+                            "source_start": 10,
+                            "source_end": 10,
+                        }
+                    ],
+                )
+
+            after = engine._frontier.get_active_frontier(
+                engine.current_conversation_id
+            )
+            assert after is not None
+            assert after["generation"] == before_generation
+            assert engine._frontier.get_frontier_items(
+                engine.current_conversation_id,
+                before_generation + 1,
+            ) == []
+        finally:
+            engine.shutdown()
+
     def test_promote_writes_nonempty_frontier_items(self, tmp_path, monkeypatch):
         engine = _engine(tmp_path, fresh_tail_count=2)
         _stub_summarize(monkeypatch, engine)

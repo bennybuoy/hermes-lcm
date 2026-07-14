@@ -5337,53 +5337,60 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         source_end_store_id: int,
         node_id: int = 0,
         covered_source_ids: Optional[List[int]] = None,
-    ) -> None:
-        """Advance async frontier generation after foreground leaf compaction.
+    ) -> bool:
+        """Atomically advance async frontier after foreground compaction.
 
-        Pending prepared batches become stale against the new generation and
-        are marked superseded so a later promote returns frontier_mismatch /
-        batch_state_superseded rather than double-publishing.
-
-        Also writes ordered frontier items so an active generation with
-        ``source_end_store_id > 0`` is never itemless (issue #4).
+        Pending prepared batches stay ``ready`` but become stale against the
+        new generation, so later promotion returns ``frontier_mismatch`` rather
+        than double-publishing. Generation and ordered items are committed in
+        one FrontierStore transaction; callers can detect failure and roll back
+        a just-published DAG leaf when this safety boundary cannot be written.
         """
         if not getattr(self._config, "async_background_compaction_enabled", False):
-            return
+            return True
         conv_id = self.current_conversation_id
         session_id = self.current_session_id
         if not conv_id or not session_id:
-            return
+            return False
         try:
-            frontier = self._frontier.get_active_frontier(conv_id)
-            if frontier is None:
-                return
             policy_fp = self._async_policy_fingerprint()
             route_fp = self._async_route_fingerprint()
-            # Only advance the generation counter here. Pending batches stay
-            # "ready" so a subsequent promote returns frontier_mismatch (and
-            # increments rejected_batches) rather than batch_state_superseded.
-            new_gen = self._frontier.advance_frontier_generation(
+            frontier = self._frontier.get_active_frontier(conv_id)
+            if frontier is None:
+                self._frontier.ensure_frontier(
+                    conv_id,
+                    session_id,
+                    policy_fingerprint=policy_fp,
+                    route_fingerprint=route_fp,
+                )
+                frontier = self._frontier.get_active_frontier(conv_id)
+            if frontier is None:
+                return False
+            source_end = int(source_end_store_id or 0)
+            items = self._build_promoted_frontier_items(
+                session_id=session_id,
+                node_id=int(node_id or 0),
+                covered_source_ids=[int(s) for s in (covered_source_ids or [])],
+                frontier_end_store_id=source_end,
+            )
+            if source_end > 0 and not items:
+                return False
+            new_gen = self._frontier.advance_frontier_generation_with_items(
                 conv_id,
                 session_id,
-                int(source_end_store_id or 0),
+                source_end,
                 policy_fp,
                 route_fp,
                 frontier["generation"],
+                items,
             )
-            if new_gen and int(source_end_store_id or 0) > 0:
-                items = self._build_promoted_frontier_items(
-                    session_id=session_id,
-                    node_id=int(node_id or 0),
-                    covered_source_ids=[int(s) for s in (covered_source_ids or [])],
-                    frontier_end_store_id=int(source_end_store_id or 0),
-                )
-                if items:
-                    self._frontier.set_frontier_items(conv_id, new_gen, items)
+            return bool(new_gen)
         except Exception:
             logger.debug(
                 "LCM async frontier advance after foreground compact failed",
                 exc_info=True,
             )
+            return False
 
     def get_async_compaction_status(self) -> dict[str, Any]:
         """Return counts of prepared batches by state for the active conversation."""
