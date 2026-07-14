@@ -1070,6 +1070,8 @@ class CompactionMixin:
             )
             t_pub = time.perf_counter()
             published_node_id = 0
+            advanced_frontier_generation = 0
+            frontier_publication_ready = False
             previous_last_compacted_store_id = self._last_compacted_store_id
             try:
                 with _temporary_sqlite_busy_timeout(
@@ -1084,28 +1086,39 @@ class CompactionMixin:
                     published_node_id = self._dag.add_node(node)
                     self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
                     self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
-                    self._persist_frontier_marker()
-                    # Foreground leaf publish wins the async CAS race: advance the
-                    # generation counter and write frontier items so the tip is
-                    # never itemless (issue #4).
+                    # Foreground leaf publish wins the async CAS race before the
+                    # monotonic lifecycle marker advances. If this atomic
+                    # generation+items write fails, the lifecycle checkpoint is
+                    # still unchanged and the leaf can be deleted losslessly.
                     note_async = getattr(self, "_note_foreground_async_frontier_advance", None)
                     if callable(note_async):
                         try:
-                            frontier_advanced = note_async(
+                            frontier_result: Any = note_async(
                                 source_end_store_id=self._last_compacted_store_id,
                                 node_id=int(published_node_id or 0),
                                 covered_source_ids=list(source_store_ids),
                             )
-                            if frontier_advanced is False:
+                            frontier_generation = (
+                                frontier_result
+                                if isinstance(frontier_result, int)
+                                else 0
+                            )
+                            if not frontier_generation:
                                 raise RuntimeError(
                                     "foreground async frontier advance failed"
                                 )
+                            frontier_publication_ready = True
+                            if frontier_generation > 0:
+                                advanced_frontier_generation = frontier_generation
                         except Exception:
                             logger.debug(
                                 "LCM foreground async frontier advance failed",
                                 exc_info=True,
                             )
                             raise
+                    else:
+                        frontier_publication_ready = True
+                    self._persist_frontier_marker()
             except Exception as exc:
                 if published_node_id:
                     # add_node() commits on its own connection. If a later
@@ -1114,24 +1127,31 @@ class CompactionMixin:
                     self._last_compacted_store_id = (
                         max(consumed_store_ids) if consumed_store_ids else 0
                     )
-                    # The committed foreground leaf must still win the async
-                    # generation race. Otherwise an overlapping ready batch
-                    # prepared against the old generation can promote later.
+                    # The committed leaf must publish the async frontier before
+                    # the monotonic lifecycle marker. Retry only whichever stage
+                    # did not already succeed; never create a second generation
+                    # after a post-frontier lifecycle error.
                     recovery_note_async = getattr(
                         self,
                         "_note_foreground_async_frontier_advance",
                         None,
                     )
-                    recovery_frontier_ok = True
-                    if callable(recovery_note_async):
+                    recovery_frontier_ok = frontier_publication_ready
+                    if not recovery_frontier_ok and callable(recovery_note_async):
                         try:
-                            recovery_frontier_ok = bool(
-                                recovery_note_async(
-                                    source_end_store_id=self._last_compacted_store_id,
-                                    node_id=int(published_node_id),
-                                    covered_source_ids=list(source_store_ids),
-                                )
+                            recovery_result: Any = recovery_note_async(
+                                source_end_store_id=self._last_compacted_store_id,
+                                node_id=int(published_node_id),
+                                covered_source_ids=list(source_store_ids),
                             )
+                            recovery_generation = (
+                                recovery_result
+                                if isinstance(recovery_result, int)
+                                else 0
+                            )
+                            recovery_frontier_ok = bool(recovery_generation)
+                            if recovery_generation > 0:
+                                advanced_frontier_generation = recovery_generation
                         except Exception:
                             recovery_frontier_ok = False
                             logger.debug(
@@ -1139,11 +1159,67 @@ class CompactionMixin:
                                 "committed foreground leaf",
                                 exc_info=True,
                             )
-                    if not recovery_frontier_ok:
-                        # Atomic frontier publication failed, so the overlapping
-                        # ready batch was not invalidated. Roll back this DAG leaf
-                        # and leave its raw chunk active rather than risk two
-                        # canonical summaries for the same lineage.
+                    elif not callable(recovery_note_async):
+                        recovery_frontier_ok = True
+
+                    recovery_lifecycle_ok = False
+                    if recovery_frontier_ok:
+                        try:
+                            self._persist_frontier_marker()
+                        except Exception:
+                            logger.debug(
+                                "LCM recovery lifecycle advance failed after "
+                                "committed foreground leaf",
+                                exc_info=True,
+                            )
+                        try:
+                            lifecycle_state = self._lifecycle.get_by_conversation(
+                                self._conversation_id
+                            )
+                            recovery_lifecycle_ok = bool(
+                                lifecycle_state is not None
+                                and lifecycle_state.current_session_id
+                                == self._session_id
+                                and int(
+                                    lifecycle_state.current_frontier_store_id or 0
+                                )
+                                >= int(self._last_compacted_store_id or 0)
+                            )
+                        except Exception:
+                            logger.debug(
+                                "LCM could not verify lifecycle frontier after "
+                                "committed foreground leaf",
+                                exc_info=True,
+                            )
+
+                    if not (recovery_frontier_ok and recovery_lifecycle_ok):
+                        # Publication is incomplete. Roll back an exact frontier
+                        # generation before deleting the DAG leaf; if a concurrent
+                        # writer has superseded it, keep the leaf and fail closed
+                        # rather than create a frontier that references no node.
+                        frontier_rolled_back = True
+                        if advanced_frontier_generation > 0:
+                            try:
+                                frontier_rolled_back = bool(
+                                    self._frontier.rollback_frontier_generation(
+                                        self._conversation_id,
+                                        advanced_frontier_generation,
+                                    )
+                                )
+                            except Exception:
+                                frontier_rolled_back = False
+                                logger.error(
+                                    "LCM could not roll back foreground frontier "
+                                    "generation %d",
+                                    advanced_frontier_generation,
+                                    exc_info=True,
+                                )
+                        if not frontier_rolled_back:
+                            raise RuntimeError(
+                                "foreground frontier rollback failed after "
+                                "incomplete publication"
+                            ) from exc
+
                         rolled_back = False
                         try:
                             rolled_back = bool(
@@ -1163,14 +1239,6 @@ class CompactionMixin:
                         self._last_compacted_store_id = (
                             previous_last_compacted_store_id
                         )
-                        try:
-                            self._persist_frontier_marker()
-                        except Exception:
-                            logger.debug(
-                                "LCM could not restore frontier marker after "
-                                "foreground leaf rollback",
-                                exc_info=True,
-                            )
                         if leaf_compacted_this_turn:
                             partial_completion_reason = (
                                 "post_compaction_target_not_reached: "

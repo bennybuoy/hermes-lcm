@@ -579,14 +579,9 @@ class TestIssue2HostReplacementDropsCovered:
             )
             engine._frontier.conn.commit()
 
-            def lock_after_node_commit(_chunk, _source_ids):
-                raise sqlite3.OperationalError("database is locked after add_node")
-
-            monkeypatch.setattr(
-                engine,
-                "_maybe_gc_compacted_tool_results",
-                lock_after_node_commit,
-            )
+            lifecycle_before = engine.get_status()["lifecycle"][
+                "current_frontier_store_id"
+            ]
 
             result = engine.compress(
                 messages,
@@ -595,6 +590,10 @@ class TestIssue2HostReplacementDropsCovered:
 
             assert result == messages
             assert engine._dag.get_session_node_count(engine.current_session_id) == 0
+            lifecycle_after = engine.get_status()["lifecycle"][
+                "current_frontier_store_id"
+            ]
+            assert lifecycle_after == lifecycle_before
             frontier_after = engine._frontier.get_active_frontier(
                 prepared.conversation_id
             )
@@ -612,12 +611,103 @@ class TestIssue2HostReplacementDropsCovered:
                 "DROP TRIGGER fail_recovery_frontier_item"
             )
             engine._frontier.conn.commit()
+            engine.shutdown()
+
+            # A fresh engine must recover the same raw lineage, not the
+            # temporarily published leaf's covered checkpoint.
+            engine = _engine(tmp_path, fresh_tail_count=2)
+            assert engine._last_compacted_store_id == lifecycle_before
+            assert engine._dag.get_session_node_count(engine.current_session_id) == 0
             promoted = engine.promote_prepared_compaction(
                 prepared.batch_id,
                 messages,
             )
             assert promoted.promoted is True
             assert engine._dag.get_session_node_count(engine.current_session_id) == 1
+        finally:
+            engine.shutdown()
+
+    def test_lifecycle_failure_after_frontier_publish_compensates_generation_and_leaf(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path, fresh_tail_count=2)
+        _stub_summarize(monkeypatch, engine, text="lifecycle rollback leaf")
+        try:
+            messages = _messages(16, tokens_each=40)
+            engine.ingest(messages)
+            prepared = engine.prepare_background_compaction_once(messages)
+            assert prepared is not None and prepared.state == "ready"
+            engine._config.async_background_compaction_promote_on_compress = False
+            frontier_before = engine._frontier.get_active_frontier(
+                prepared.conversation_id
+            )
+            lifecycle_before = engine.get_status()["lifecycle"][
+                "current_frontier_store_id"
+            ]
+
+            def fail_lifecycle(*_args, **_kwargs):
+                raise RuntimeError("injected foreground lifecycle failure")
+
+            monkeypatch.setattr(
+                engine._lifecycle,
+                "advance_frontier",
+                fail_lifecycle,
+            )
+            result = engine.compress(
+                messages,
+                current_tokens=engine.threshold_tokens + 1,
+            )
+
+            assert result == messages
+            assert engine._dag.get_session_node_count(engine.current_session_id) == 0
+            frontier_after = engine._frontier.get_active_frontier(
+                prepared.conversation_id
+            )
+            assert frontier_after["generation"] == frontier_before["generation"]
+            assert (
+                engine.get_status()["lifecycle"]["current_frontier_store_id"]
+                == lifecycle_before
+            )
+        finally:
+            engine.shutdown()
+
+    def test_committed_lifecycle_marker_survives_post_commit_exception_without_double_advance(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path, fresh_tail_count=2)
+        _stub_summarize(monkeypatch, engine, text="acknowledged lifecycle leaf")
+        try:
+            messages = _messages(16, tokens_each=40)
+            engine.ingest(messages)
+            prepared = engine.prepare_background_compaction_once(messages)
+            assert prepared is not None and prepared.state == "ready"
+            engine._config.async_background_compaction_promote_on_compress = False
+            frontier_before = engine._frontier.get_active_frontier(
+                prepared.conversation_id
+            )
+            original_advance = engine._lifecycle.advance_frontier
+
+            def commit_then_raise(*args, **kwargs):
+                original_advance(*args, **kwargs)
+                raise RuntimeError("injected post-commit lifecycle exception")
+
+            monkeypatch.setattr(
+                engine._lifecycle,
+                "advance_frontier",
+                commit_then_raise,
+            )
+            result = engine.compress(
+                messages,
+                current_tokens=engine.threshold_tokens + 1,
+            )
+
+            assert result != messages
+            assert engine._dag.get_session_node_count(engine.current_session_id) == 1
+            frontier_after = engine._frontier.get_active_frontier(
+                prepared.conversation_id
+            )
+            assert frontier_after["generation"] == frontier_before["generation"] + 1
+            assert engine.get_status()["lifecycle"]["current_frontier_store_id"] > 0
         finally:
             engine.shutdown()
 

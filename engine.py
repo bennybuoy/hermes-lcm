@@ -5337,17 +5337,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         source_end_store_id: int,
         node_id: int = 0,
         covered_source_ids: Optional[List[int]] = None,
-    ) -> bool:
+    ) -> int:
         """Atomically advance async frontier after foreground compaction.
 
-        Pending prepared batches stay ``ready`` but become stale against the
-        new generation, so later promotion returns ``frontier_mismatch`` rather
-        than double-publishing. Generation and ordered items are committed in
-        one FrontierStore transaction; callers can detect failure and roll back
-        a just-published DAG leaf when this safety boundary cannot be written.
+        Returns the committed generation, ``-1`` when async compaction is
+        disabled (a successful no-op), or ``0`` on failure. Pending prepared
+        batches stay ``ready`` but become stale against the new generation, so
+        later promotion returns ``frontier_mismatch`` rather than
+        double-publishing. Generation and ordered items are committed in one
+        FrontierStore transaction; callers can roll back the exact generation
+        if a later lifecycle write fails.
         """
         if not getattr(self._config, "async_background_compaction_enabled", False):
-            return True
+            return -1
         conv_id = self.current_conversation_id
         session_id = self.current_session_id
         if not conv_id or not session_id:
@@ -5384,7 +5386,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 frontier["generation"],
                 items,
             )
-            return bool(new_gen)
+            return int(new_gen or 0)
         except Exception:
             logger.debug(
                 "LCM async frontier advance after foreground compact failed",
