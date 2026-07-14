@@ -368,7 +368,10 @@ class CompactionMixin:
         def _deadline_exceeded() -> bool:
             return time.perf_counter() >= deadline_at
 
-        def _fail_timeout(reason: str) -> List[Dict[str, Any]]:
+        def _fail_timeout(
+            reason: str,
+            return_messages: Optional[List[Dict[str, Any]]] = None,
+        ) -> List[Dict[str, Any]]:
             self._last_compression_status = "failed"
             self._last_compression_noop_reason = reason
             self._last_compaction_duration_ms = (
@@ -386,7 +389,7 @@ class CompactionMixin:
                 self._last_compaction_duration_ms,
                 phase_timings,
             )
-            return messages
+            return messages if return_messages is None else return_messages
 
         try:
             return self._compress_body(
@@ -446,6 +449,11 @@ class CompactionMixin:
         compress_started: float,
     ) -> List[Dict[str, Any]]:
         """Inner compress pipeline (runs under foreground-priority + deadline)."""
+
+        # Once async promotion publishes a canonical leaf, any later bounded
+        # failure must return the assembled replacement rather than replaying
+        # the original host input that still contains covered raw rows.
+        canonical_fallback_messages: Optional[List[Dict[str, Any]]] = None
 
         # Try to promote a prepared async batch before running foreground
         # compaction. On success, skip the leaf summarization path and
@@ -519,6 +527,7 @@ class CompactionMixin:
                     finally:
                         self._pending_context_anchor_messages = None
                     phase("assembly", t_asm)
+                    canonical_fallback_messages = compressed
 
                     # Partial promote may still leave the provider prompt above
                     # the post-compaction target. When eligible raw remains,
@@ -598,11 +607,22 @@ class CompactionMixin:
                         return compressed
             except Exception as exc:
                 if _is_sqlite_locked_error(exc):
-                    return fail_timeout(f"sqlite_locked_during_promote: {exc}")
+                    return fail_timeout(
+                        f"sqlite_locked_during_promote: {exc}",
+                        canonical_fallback_messages,
+                    )
+                if canonical_fallback_messages is not None:
+                    return fail_timeout(
+                        f"post_promotion_error: {exc}",
+                        canonical_fallback_messages,
+                    )
                 logger.debug("LCM async promote hook failed", exc_info=True)
 
         if deadline_exceeded():
-            return fail_timeout("deadline_before_foreground")
+            return fail_timeout(
+                "deadline_before_foreground",
+                canonical_fallback_messages,
+            )
 
         self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
@@ -659,11 +679,17 @@ class CompactionMixin:
                 working_messages = self._ingest_messages(messages)
         except Exception as exc:
             if _is_sqlite_locked_error(exc):
-                return fail_timeout(f"sqlite_locked_during_ingest: {exc}")
+                return fail_timeout(
+                    f"sqlite_locked_during_ingest: {exc}",
+                    canonical_fallback_messages,
+                )
             raise
         phase("ingest", t_ingest)
         if deadline_exceeded():
-            return fail_timeout("deadline_after_ingest")
+            return fail_timeout(
+                "deadline_after_ingest",
+                canonical_fallback_messages,
+            )
         ingest_cleanup_changed_active_context = working_messages != messages
         anchor_source_messages = list(working_messages)
         pressure_messages = messages if len(messages) == len(working_messages) else working_messages
@@ -758,7 +784,10 @@ class CompactionMixin:
                         "es" if leaf_passes != 1 else "",
                     )
                     break
-                return fail_timeout("deadline_during_leaf_selection")
+                return fail_timeout(
+                    "deadline_during_leaf_selection",
+                    canonical_fallback_messages,
+                )
             n = len(working_messages)
             fresh_tail_start = max(0, n - self._config.fresh_tail_count)
 
@@ -962,7 +991,10 @@ class CompactionMixin:
                             "es" if leaf_passes != 1 else "",
                         )
                         break
-                    return fail_timeout("deadline_before_summarization")
+                    return fail_timeout(
+                        "deadline_before_summarization",
+                        canonical_fallback_messages,
+                    )
                 t_sum = time.perf_counter()
                 compacted_chunk, source_tokens, summary_text, _level, _rescue_attempts = self._summarize_leaf_chunk_with_rescue(
                     summary_input_chunk,
@@ -1041,7 +1073,22 @@ class CompactionMixin:
                             )
             except Exception as exc:
                 if _is_sqlite_locked_error(exc):
-                    return fail_timeout(f"sqlite_locked_during_publication: {exc}")
+                    if leaf_compacted_this_turn:
+                        partial_completion_reason = (
+                            "post_compaction_target_not_reached: "
+                            "sqlite_lock_after_leaf_publication"
+                        )
+                        logger.warning(
+                            "LCM SQLite lock reached after %d published leaf "
+                            "pass%s; returning canonical best-effort replacement",
+                            leaf_passes,
+                            "es" if leaf_passes != 1 else "",
+                        )
+                        break
+                    return fail_timeout(
+                        f"sqlite_locked_during_publication: {exc}",
+                        canonical_fallback_messages,
+                    )
                 raise
             phase("dag_publication", t_pub)
 
