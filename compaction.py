@@ -519,25 +519,75 @@ class CompactionMixin:
                     finally:
                         self._pending_context_anchor_messages = None
                     phase("assembly", t_asm)
-                    self.compression_count += 1
-                    self._last_compaction_duration_ms = (
-                        time.perf_counter() - compress_started
-                    ) * 1000.0
-                    self._ingest_cursor = len(compressed)
-                    self._last_compression_status = "compacted"
-                    self._last_compression_noop_reason = ""
+
+                    # Partial promote may still leave the provider prompt above
+                    # the post-compaction target. When eligible raw remains,
+                    # fall through to foreground leaf compaction in this same
+                    # cutover without re-running the already-promoted summary.
+                    post_target = None
+                    target_fn = getattr(self, "_post_compaction_target_tokens", None)
+                    if callable(target_fn):
+                        try:
+                            post_target = target_fn()
+                        except Exception:
+                            post_target = None
+                    pre_msg_tokens = count_messages_tokens(messages)
+                    assembled_tokens = count_messages_tokens(compressed)
+                    if current_tokens is not None and current_tokens > 0:
+                        overhead = max(0, int(current_tokens) - pre_msg_tokens)
+                        estimated_after_promote = overhead + assembled_tokens
+                    else:
+                        estimated_after_promote = assembled_tokens
+                    remaining_leading = self._leading_anchor_count(working_messages)
+                    remaining_fresh_start = max(
+                        0, len(working_messages) - self._config.fresh_tail_count
+                    )
+                    remaining_raw = (
+                        working_messages[remaining_leading:remaining_fresh_start]
+                        if remaining_fresh_start > remaining_leading
+                        else []
+                    )
+                    continue_toward_target = (
+                        post_target is not None
+                        and post_target > 0
+                        and estimated_after_promote > post_target
+                        and bool(remaining_raw)
+                        and not deadline_exceeded()
+                    )
                     # Clear covered-id stash so a later compress cannot reuse it.
                     self._async_last_promoted_source_ids = []
-                    logger.info(
-                        "LCM async promote-on-compress finished in %.1fms "
-                        "(%d→%d msgs, covered=%d, phases=%s)",
-                        self._last_compaction_duration_ms,
-                        len(messages),
-                        len(compressed),
-                        len(covered),
-                        phase_timings,
-                    )
-                    return compressed
+                    if continue_toward_target:
+                        logger.info(
+                            "LCM async promote partial: prompt still above target "
+                            "(%d > %d); continuing foreground leaf compaction "
+                            "(%d remaining raw msgs, covered=%d)",
+                            estimated_after_promote,
+                            post_target,
+                            len(remaining_raw),
+                            len(covered),
+                        )
+                        # Host context for further leaves is the filtered view;
+                        # the promoted leaf is already canonical in the DAG.
+                        messages = working_messages
+                        current_tokens = estimated_after_promote
+                    else:
+                        self.compression_count += 1
+                        self._last_compaction_duration_ms = (
+                            time.perf_counter() - compress_started
+                        ) * 1000.0
+                        self._ingest_cursor = len(compressed)
+                        self._last_compression_status = "compacted"
+                        self._last_compression_noop_reason = ""
+                        logger.info(
+                            "LCM async promote-on-compress finished in %.1fms "
+                            "(%d→%d msgs, covered=%d, phases=%s)",
+                            self._last_compaction_duration_ms,
+                            len(messages),
+                            len(compressed),
+                            len(covered),
+                            phase_timings,
+                        )
+                        return compressed
             except Exception as exc:
                 if _is_sqlite_locked_error(exc):
                     return fail_timeout(f"sqlite_locked_during_promote: {exc}")
@@ -634,6 +684,44 @@ class CompactionMixin:
             if observed_prompt_tokens is not None and observed_prompt_tokens > 0
             else count_messages_tokens(messages)
         )
+
+        def _resolved_post_compaction_target() -> Optional[int]:
+            target_fn = getattr(self, "_post_compaction_target_tokens", None)
+            if not callable(target_fn):
+                return None
+            try:
+                value = target_fn()
+            except Exception:
+                return None
+            if value is None:
+                return None
+            try:
+                tokens = int(value)
+            except (TypeError, ValueError):
+                return None
+            return tokens if tokens > 0 else None
+
+        post_compaction_target = _resolved_post_compaction_target()
+        # When converging from cutover toward an independent target, allow
+        # enough bounded leaf passes to close the gap (still hard-capped).
+        if (
+            self._config.dynamic_leaf_chunk_enabled
+            and not force_overflow
+            and not deferred_maintenance_active
+            and post_compaction_target is not None
+            and estimated_active_tokens > post_compaction_target
+        ):
+            chunk_hint = max(
+                1,
+                int(
+                    self._config.dynamic_leaf_chunk_max
+                    or self._config.leaf_chunk_tokens
+                    or 1
+                ),
+            )
+            gap = int(estimated_active_tokens) - int(post_compaction_target)
+            needed = (gap // chunk_hint) + 2
+            max_leaf_passes = max(base_max_leaf_passes, min(16, needed))
 
         explicit_focus_topic = focus_topic is not None
 
@@ -773,10 +861,22 @@ class CompactionMixin:
 
             pressure_candidate_raw = pressure_messages[leading_anchor_count:fresh_tail_start]
             raw_tokens_outside_tail = count_messages_tokens(pressure_candidate_raw)
+            # Once cutover has started, keep compacting remaining raw toward
+            # the post-compaction target even when the backlog is smaller than
+            # the normal leaf chunk threshold (bounded by max_leaf_passes).
+            converging_to_target = (
+                not force_overflow
+                and not deferred_maintenance_active
+                and post_compaction_target is not None
+                and estimated_active_tokens >= post_compaction_target
+            )
             if self._config.dynamic_leaf_chunk_enabled:
                 working_leaf_chunk_tokens = self._working_leaf_chunk_tokens(raw_tokens_outside_tail)
                 if raw_tokens_outside_tail < working_leaf_chunk_tokens and not force_overflow:
-                    if not (deferred_maintenance_active and critical_budget_pressure):
+                    if not (
+                        (deferred_maintenance_active and critical_budget_pressure)
+                        or converging_to_target
+                    ):
                         noop_reason = (
                             "raw backlog outside fresh tail is below leaf chunk threshold"
                         )
@@ -787,7 +887,10 @@ class CompactionMixin:
                     to_compact = self._select_oldest_leaf_chunk(candidate_raw, working_leaf_chunk_tokens)
             else:
                 if raw_tokens_outside_tail < self._config.leaf_chunk_tokens and not force_overflow:
-                    if not (deferred_maintenance_active and critical_budget_pressure):
+                    if not (
+                        (deferred_maintenance_active and critical_budget_pressure)
+                        or converging_to_target
+                    ):
                         noop_reason = (
                             "raw backlog outside fresh tail is below leaf chunk threshold"
                         )
@@ -913,7 +1016,22 @@ class CompactionMixin:
                 break
 
             if not force_overflow:
-                if (not deferred_maintenance_active) and self.threshold_tokens > 0 and estimated_active_tokens < self.threshold_tokens:
+                # Ordinary cutover is the sole preflight trigger, but once a
+                # cutover starts the leaf loop must converge toward the
+                # independent post-compaction target (provider-prompt scale),
+                # not stop as soon as estimated tokens fall below cutover.
+                post_target = post_compaction_target or _resolved_post_compaction_target()
+                stop_tokens = (
+                    post_target
+                    if post_target is not None and post_target > 0
+                    else self.threshold_tokens
+                )
+                if (
+                    (not deferred_maintenance_active)
+                    and stop_tokens is not None
+                    and stop_tokens > 0
+                    and estimated_active_tokens < stop_tokens
+                ):
                     break
                 leading_anchor_count = self._leading_anchor_count(working_messages)
                 remaining_raw = working_messages[
@@ -926,8 +1044,15 @@ class CompactionMixin:
                 ]
                 remaining_raw_tokens = count_messages_tokens(pressure_remaining_raw)
                 remaining_threshold = self._working_leaf_chunk_tokens(remaining_raw_tokens)
+                still_above_target = (
+                    post_target is not None
+                    and estimated_active_tokens >= post_target
+                )
                 if remaining_raw_tokens < remaining_threshold:
-                    if not (deferred_maintenance_active and critical_budget_pressure):
+                    if not (
+                        (deferred_maintenance_active and critical_budget_pressure)
+                        or still_above_target
+                    ):
                         break
 
         if not leaf_compacted_this_turn:

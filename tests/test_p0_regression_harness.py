@@ -574,14 +574,23 @@ class TestThresholdIndependence:
             assert engine.threshold_tokens == 128_000
             assert engine._post_compaction_target_tokens() == 64_000
 
+            # Size conversation tokens near the live GLM-5.2 shape (~90K
+            # messages + ~38K fixed provider/system/tool overhead ≈ 128K).
+            # tokens_each is approximate under the plugin tokenizer; assert
+            # the resulting overhead stays below the 64K target so convergence
+            # is physically reachable after fresh-tail preservation.
             messages = [
                 {"role": "system", "content": "system prompt"},
-                *_messages(120, tokens_each=1_500),
+                *_messages(120, tokens_each=3_000),
             ]
             message_tokens_before = count_messages_tokens(messages)
             observed_prompt_tokens = engine.threshold_tokens
             provider_overhead_tokens = observed_prompt_tokens - message_tokens_before
             assert 0 < provider_overhead_tokens < observed_prompt_tokens
+            assert provider_overhead_tokens < 64_000, (
+                "fixture overhead must leave room under the 64K target: "
+                f"overhead={provider_overhead_tokens}, messages={message_tokens_before}"
+            )
 
             result = engine.compress(
                 messages,

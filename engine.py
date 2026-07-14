@@ -25,7 +25,7 @@ from .codex_routing import (
 )
 from .config import LCMConfig
 from .dag import SummaryDAG, SummaryNode
-from .policy import ModelCompactionPolicy, resolve_policy
+from .policy import DEFAULT_TARGET_RATIO, ModelCompactionPolicy, resolve_policy
 from .frontier import (
     FrontierStore,
     PREPARED_PAYLOAD_VERSION,
@@ -4950,7 +4950,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         assembly_cap = (
             assembly_cap_override
             if assembly_cap_override is not None
-            else self._effective_assembly_token_cap()
+            else self._assembly_token_budget()
         )
 
         tail_selected = tail_messages
@@ -5187,15 +5187,69 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return max(1, recovery_cap - overhead_tokens)
 
     def _post_compaction_target_tokens(self) -> Optional[int]:
-        """Return the independent target used when assembling compacted context."""
+        """Return the independent post-compaction target (provider-prompt scale).
+
+        The host-visible cutover (``threshold_tokens``) remains the sole
+        ordinary preflight trigger. Once cutover fires, leaf compaction
+        converges toward this target.
+
+        Sources (most restrictive wins):
+        - typed policy target when a policy is resolved
+        - half of the live cutover (``DEFAULT_TARGET_RATIO``) when cutover > 0
+        - explicit max_assembly_tokens / reserve_tokens_floor rails
+
+        Zero legacy assembly caps must not hide the half-cutover target.
+        """
+        caps: list[int] = []
+
+        if self._compaction_policy is not None and self.context_length > 0:
+            policy_target = self._compaction_policy.post_compaction_target_tokens(
+                self.context_length
+            )
+            if policy_target is not None:
+                caps.append(int(policy_target))
+
+        # Always honour the live host cutover: target is half cutover by
+        # default. This stays correct even if policy resolution and
+        # threshold resolution temporarily disagree on the cutover ratio.
+        if self.threshold_tokens > 0:
+            caps.append(max(1, int(self.threshold_tokens * DEFAULT_TARGET_RATIO)))
+
+        assembly_cap = self._effective_assembly_token_cap()
+        if assembly_cap is not None:
+            caps.append(assembly_cap)
+
+        if not caps:
+            return None
+        return max(1, min(caps))
+
+    def _assembly_token_budget(self) -> Optional[int]:
+        """Default budget for ``_assemble_context`` (message-token scale).
+
+        Prefer the resolved typed policy target (which already folds explicit
+        assembly hard caps / reserve floors). Without a policy, fall back to
+        explicit assembly rails only — do not invent a hard trim budget from a
+        bare half-cutover threshold alone, so pathological low cutover test
+        fixtures and bypassed paths are not over-trimmed. Leaf-loop
+        convergence still uses ``_post_compaction_target_tokens``.
+        """
+        if self._compaction_policy is not None and self.context_length > 0:
+            policy_target = self._compaction_policy.post_compaction_target_tokens(
+                self.context_length
+            )
+            if policy_target is not None:
+                return int(policy_target)
         return self._effective_assembly_token_cap()
 
     def _effective_assembly_token_cap(self) -> Optional[int]:
-        """Return the active assembly cap, if any.
+        """Return the active assembly hard-cap rails only (not the policy target).
 
         Two knobs can constrain the assembled active context:
         - max_assembly_tokens: explicit hard cap
         - reserve_tokens_floor: keep headroom inside context_length
+
+        These are safety rails independent of the typed post-compaction
+        target. Ordinary assembly defaults to ``_assembly_token_budget``.
         """
         caps: list[int] = []
 

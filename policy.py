@@ -344,16 +344,24 @@ def resolve_policy(
     # --- Cutover resolution -----------------------------------------------
     cutover_ratio = float(context_threshold)
     cutover_source = context_threshold_source
+    matched_explicit_model_threshold = False
 
-    # Priority 1: explicit model_thresholds (legacy dict)
+    # Priority 1: explicit model_thresholds (legacy dict). Wins over builtins
+    # even when the engine already stamped context_threshold_source as
+    # model_thresholds:* (update_model resolves threshold before policy).
     if model_thresholds:
         match = _longest_match(model, model_thresholds)
         if match:
             cutover_ratio = match[1]
             cutover_source = f"model_thresholds:{match[0]}"
+            matched_explicit_model_threshold = True
 
-    # Priority 2: built-in default overrides
-    if cutover_source == context_threshold_source or cutover_source == "manual_or_default":
+    # Priority 2: built-in default overrides — only when no explicit
+    # model_thresholds entry selected the cutover.
+    if not matched_explicit_model_threshold and (
+        cutover_source == context_threshold_source
+        or cutover_source == "manual_or_default"
+    ):
         match = _longest_match(alias, _DEFAULT_CUTOVER_OVERRIDES)
         if match:
             cutover_ratio = match[1]

@@ -20636,7 +20636,9 @@ class TestAssemblyGuardrails:
         status = instance.get_status()
 
         assert status["threshold_tokens"] == 150
-        assert status["post_compaction_target_tokens"] == 90
+        # Independent target: half of live cutover (150*0.5=75), with
+        # max_assembly_tokens=90 as an additional rail (min → 75).
+        assert status["post_compaction_target_tokens"] == 75
         assert status["emergency_pressure_ratio"] == 0.95
         assert status["emergency_threshold_tokens"] == 190
 
