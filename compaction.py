@@ -1108,6 +1108,27 @@ class CompactionMixin:
                     self._last_compacted_store_id = (
                         max(consumed_store_ids) if consumed_store_ids else 0
                     )
+                    # The committed foreground leaf must still win the async
+                    # generation race. Otherwise an overlapping ready batch
+                    # prepared against the old generation can promote later.
+                    recovery_note_async = getattr(
+                        self,
+                        "_note_foreground_async_frontier_advance",
+                        None,
+                    )
+                    if callable(recovery_note_async):
+                        try:
+                            recovery_note_async(
+                                source_end_store_id=self._last_compacted_store_id,
+                                node_id=int(published_node_id),
+                                covered_source_ids=list(source_store_ids),
+                            )
+                        except Exception:
+                            logger.debug(
+                                "LCM recovery frontier advance failed after "
+                                "committed foreground leaf",
+                                exc_info=True,
+                            )
                     pressure_remaining_messages = pressure_messages[
                         leading_anchor_count + selected_raw_len:
                     ]

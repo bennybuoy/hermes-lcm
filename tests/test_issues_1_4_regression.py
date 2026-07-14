@@ -486,11 +486,18 @@ class TestIssue2HostReplacementDropsCovered:
         engine = _engine(
             tmp_path,
             fresh_tail_count=2,
-            async_enabled=False,
         )
         _stub_summarize(monkeypatch, engine, text="committed foreground leaf")
         try:
             messages = _messages(16, tokens_each=40)
+            engine.ingest(messages)
+            prepared = engine.prepare_background_compaction_once(messages)
+            assert prepared is not None and prepared.state == "ready"
+            engine._config.async_background_compaction_promote_on_compress = False
+            frontier_before = engine._frontier.get_active_frontier(
+                prepared.conversation_id
+            )
+            assert frontier_before is not None
 
             def lock_after_node_commit(_chunk, _source_ids):
                 raise sqlite3.OperationalError("database is locked after add_node")
@@ -527,6 +534,21 @@ class TestIssue2HostReplacementDropsCovered:
                 "publication_followup_error_after_leaf"
                 in engine._last_compression_noop_reason
             )
+            frontier_after = engine._frontier.get_active_frontier(
+                prepared.conversation_id
+            )
+            assert frontier_after is not None
+            assert frontier_after["generation"] > frontier_before["generation"]
+            assert engine._frontier.get_frontier_items(
+                prepared.conversation_id,
+                frontier_after["generation"],
+            )
+            stale_result = engine.promote_prepared_compaction(
+                prepared.batch_id,
+                messages,
+            )
+            assert stale_result.promoted is False
+            assert stale_result.reason == "frontier_mismatch"
         finally:
             engine.shutdown()
 
