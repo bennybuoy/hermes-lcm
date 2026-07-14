@@ -4952,6 +4952,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if assembly_cap_override is not None
             else self._assembly_token_budget()
         )
+        # The typed post-compaction target is a convergence goal, not
+        # permission to discard raw messages that have not been published into
+        # the DAG. Only an explicit hard rail (or emergency override) may evict
+        # tail messages during assembly. The softer policy target still limits
+        # how many summaries are inserted around the lossless raw tail.
+        tail_cap = (
+            assembly_cap_override
+            if assembly_cap_override is not None
+            else self._effective_assembly_token_cap()
+        )
 
         tail_selected = tail_messages
         anchor_source = getattr(self, "_pending_context_anchor_messages", None)
@@ -4959,8 +4969,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             anchor_source = tail_messages
         anchor_part: Optional[str] = None
         summary_budget = None
-        if assembly_cap is not None:
-            used = count_message_tokens(leading_msg) if leading_msg is not None else 0
+        used = count_message_tokens(leading_msg) if leading_msg is not None else 0
+        if tail_cap is not None:
             kept_tail_reversed: list[Dict[str, Any]] = []
             tail_token_total = 0
             tail_for_selection = self._sanitize_active_context_messages(
@@ -4970,7 +4980,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             skipped_tail_gap = False
             for msg in reversed(tail_for_selection):
                 msg_tokens = count_message_tokens(msg)
-                if used + tail_token_total + msg_tokens > assembly_cap:
+                if used + tail_token_total + msg_tokens > tail_cap:
                     if self._is_budget_droppable_tail_message(msg):
                         skipped_tail_gap = True
                         continue
@@ -4980,6 +4990,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 kept_tail_reversed.append(msg)
                 tail_token_total += msg_tokens
             tail_selected = list(reversed(kept_tail_reversed))
+        else:
+            tail_token_total = count_messages_tokens(tail_selected)
+        if assembly_cap is not None:
             summary_budget = max(0, assembly_cap - used - tail_token_total)
         if anchor_source is not None:
             anchor_part = self._latest_user_context_anchor(anchor_source, tail_selected)

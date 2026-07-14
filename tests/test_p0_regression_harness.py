@@ -638,7 +638,7 @@ class TestThresholdIndependence:
 
             messages = [
                 {"role": "system", "content": "system prompt"},
-                *_messages(22, prefix="lossless", tokens_each=180),
+                *_messages(52, prefix="lossless", tokens_each=180),
             ]
             leading = engine._leading_anchor_count(messages)
             fresh_start = len(messages) - engine._config.fresh_tail_count
@@ -662,13 +662,17 @@ class TestThresholdIndependence:
                 partial_rescue,
             )
 
-            result = engine.compress(messages, current_tokens=engine.threshold_tokens)
+            result = engine.compress(
+                messages,
+                current_tokens=count_messages_tokens(messages),
+            )
 
             nodes = engine._dag.get_session_nodes(engine.current_session_id, depth=0)
-            assert len(nodes) == 1
+            assert nodes
             covered_contents = {
                 engine._store.get(store_id)["content"]
-                for store_id in nodes[0].source_ids
+                for node in nodes
+                for store_id in node.source_ids
             }
             returned_contents = {
                 msg.get("content")

@@ -547,11 +547,14 @@ class CompactionMixin:
                         if remaining_fresh_start > remaining_leading
                         else []
                     )
-                    continue_toward_target = (
+                    target_unreached_after_promote = (
                         post_target is not None
                         and post_target > 0
                         and estimated_after_promote > post_target
                         and bool(remaining_raw)
+                    )
+                    continue_toward_target = (
+                        target_unreached_after_promote
                         and not deadline_exceeded()
                     )
                     # Clear covered-id stash so a later compress cannot reuse it.
@@ -577,7 +580,12 @@ class CompactionMixin:
                         ) * 1000.0
                         self._ingest_cursor = len(compressed)
                         self._last_compression_status = "compacted"
-                        self._last_compression_noop_reason = ""
+                        self._last_compression_noop_reason = (
+                            "post_compaction_target_not_reached: "
+                            "deadline_after_async_promotion"
+                            if target_unreached_after_promote and deadline_exceeded()
+                            else ""
+                        )
                         logger.info(
                             "LCM async promote-on-compress finished in %.1fms "
                             "(%d→%d msgs, covered=%d, phases=%s)",
@@ -704,21 +712,27 @@ class CompactionMixin:
         post_compaction_target = _resolved_post_compaction_target()
         # When converging from cutover toward an independent target, allow
         # enough bounded leaf passes to close the gap (still hard-capped).
+        # Non-dynamic mode normally consumes the whole backlog in one pass,
+        # but adaptive rescue can publish only a prefix; that partial publish
+        # must be allowed to continue rather than leaving target convergence
+        # to a lossy assembly trim.
         if (
-            self._config.dynamic_leaf_chunk_enabled
-            and not force_overflow
+            not force_overflow
             and not deferred_maintenance_active
             and post_compaction_target is not None
             and estimated_active_tokens > post_compaction_target
         ):
-            chunk_hint = max(
-                1,
-                int(
-                    self._config.dynamic_leaf_chunk_max
-                    or self._config.leaf_chunk_tokens
-                    or 1
-                ),
-            )
+            if self._config.dynamic_leaf_chunk_enabled:
+                chunk_hint = max(
+                    1,
+                    int(
+                        self._config.dynamic_leaf_chunk_max
+                        or self._config.leaf_chunk_tokens
+                        or 1
+                    ),
+                )
+            else:
+                chunk_hint = max(1, int(self._config.leaf_chunk_tokens or 1))
             gap = int(estimated_active_tokens) - int(post_compaction_target)
             needed = (gap // chunk_hint) + 2
             max_leaf_passes = max(base_max_leaf_passes, min(16, needed))
@@ -726,11 +740,24 @@ class CompactionMixin:
         explicit_focus_topic = focus_topic is not None
 
         noop_reason = "no eligible raw backlog outside fresh tail"
+        partial_completion_reason = ""
         dependent_reply_message_ids: set[int] = set()
         preexisting_dependent_reply_records = self._load_generated_ignored_dependent_reply_records()
 
         while leaf_passes < max_leaf_passes:
             if deadline_exceeded():
+                if leaf_compacted_this_turn:
+                    partial_completion_reason = (
+                        "post_compaction_target_not_reached: "
+                        "deadline_after_leaf_publication"
+                    )
+                    logger.warning(
+                        "LCM compaction deadline reached after %d published leaf "
+                        "pass%s; returning canonical best-effort replacement",
+                        leaf_passes,
+                        "es" if leaf_passes != 1 else "",
+                    )
+                    break
                 return fail_timeout("deadline_during_leaf_selection")
             n = len(working_messages)
             fresh_tail_start = max(0, n - self._config.fresh_tail_count)
@@ -1012,9 +1039,6 @@ class CompactionMixin:
             leaf_passes += 1
             estimated_active_tokens = max(0, estimated_active_tokens - source_tokens + summary_tokens)
 
-            if not self._config.dynamic_leaf_chunk_enabled:
-                break
-
             if not force_overflow:
                 # Ordinary cutover is the sole preflight trigger, but once a
                 # cutover starts the leaf loop must converge toward the
@@ -1119,13 +1143,22 @@ class CompactionMixin:
             )
             return sanitized_messages
 
-        # Step 6: Check if condensation is needed
-        self._maybe_condense(
-            focus_topic=focus_topic,
-            leaf_compacted_this_turn=True,
-            force_overflow=force_overflow,
-            critical_budget_pressure=critical_budget_pressure,
-        )
+        # Step 6: Check if condensation is needed. A deadline that expires
+        # after publication cannot roll back the committed leaf; return a
+        # canonical best-effort host replacement and avoid starting another
+        # LLM call for condensation.
+        if deadline_exceeded() and not partial_completion_reason:
+            partial_completion_reason = (
+                "post_compaction_target_not_reached: "
+                "deadline_after_leaf_publication"
+            )
+        if not partial_completion_reason:
+            self._maybe_condense(
+                focus_topic=focus_topic,
+                leaf_compacted_this_turn=True,
+                force_overflow=force_overflow,
+                critical_budget_pressure=critical_budget_pressure,
+            )
 
         # Step 7: Assemble new active context
         self._refresh_raw_backlog_debt(
@@ -1151,7 +1184,7 @@ class CompactionMixin:
             phase_timings,
         )
         self._last_compression_status = "compacted"
-        self._last_compression_noop_reason = ""
+        self._last_compression_noop_reason = partial_completion_reason
         if recovery_assembly_cap is None:
             self._last_overflow_recovery_failed = False
         else:
