@@ -671,6 +671,138 @@ class TestIssue2HostReplacementDropsCovered:
         finally:
             engine.shutdown()
 
+    def test_lifecycle_failure_preserves_leaf_when_newer_generation_reuses_it(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path, fresh_tail_count=2)
+        _stub_summarize(monkeypatch, engine, text="concurrent lifecycle leaf")
+        concurrent_frontier = FrontierStore(str(engine._store.db_path))
+        rollback_outcomes: list[bool] = []
+        original_rollback = engine._frontier.rollback_frontier_generation
+        try:
+            messages = _messages(16, tokens_each=40)
+            engine.ingest(messages)
+            prepared = engine.prepare_background_compaction_once(messages)
+            assert prepared is not None and prepared.state == "ready"
+
+            def record_rollback(conversation_id, generation):
+                result = original_rollback(conversation_id, generation)
+                rollback_outcomes.append(result)
+                return result
+
+            monkeypatch.setattr(
+                engine._frontier,
+                "rollback_frontier_generation",
+                record_rollback,
+            )
+
+            def publish_newer_generation_then_fail(*_args, **_kwargs):
+                # Promotion has already committed G and its ordered item set.
+                # A separate connection publishes G+1 reusing that valid
+                # layout before the original caller begins compensation.
+                published = concurrent_frontier.get_active_frontier(
+                    prepared.conversation_id
+                )
+                assert published is not None
+                generation = int(published["generation"])
+                items = concurrent_frontier.get_frontier_items(
+                    prepared.conversation_id,
+                    generation,
+                )
+                assert items and items[0]["kind"] == "node"
+                newer_generation = (
+                    concurrent_frontier.advance_frontier_generation_with_items(
+                        prepared.conversation_id,
+                        prepared.session_id,
+                        int(published["source_end_store_id"]),
+                        str(published["policy_fingerprint"]),
+                        str(published["route_fingerprint"]),
+                        generation,
+                        items,
+                    )
+                )
+                assert newer_generation == generation + 1
+                raise RuntimeError("injected lifecycle failure after G+1")
+
+            monkeypatch.setattr(
+                engine._lifecycle,
+                "advance_frontier",
+                publish_newer_generation_then_fail,
+            )
+
+            result = engine.promote_prepared_compaction(
+                prepared.batch_id,
+                messages,
+            )
+
+            assert result.promoted is False
+            assert rollback_outcomes == [False]
+            active = engine._frontier.get_active_frontier(
+                prepared.conversation_id
+            )
+            assert active is not None
+            active_items = engine._frontier.get_frontier_items(
+                prepared.conversation_id,
+                int(active["generation"]),
+            )
+            assert active_items
+            node_items = [item for item in active_items if item["kind"] == "node"]
+            assert node_items
+            for item in node_items:
+                assert engine._dag.get_node(int(item["ref_id"])) is not None
+        finally:
+            concurrent_frontier.close()
+            engine.shutdown()
+
+    def test_lifecycle_failure_preserves_leaf_when_frontier_rollback_raises(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path, fresh_tail_count=2)
+        _stub_summarize(monkeypatch, engine, text="rollback error leaf")
+        try:
+            messages = _messages(16, tokens_each=40)
+            engine.ingest(messages)
+            prepared = engine.prepare_background_compaction_once(messages)
+            assert prepared is not None and prepared.state == "ready"
+
+            def fail_lifecycle(*_args, **_kwargs):
+                raise RuntimeError("injected lifecycle failure")
+
+            def fail_rollback(*_args, **_kwargs):
+                raise sqlite3.OperationalError("injected rollback failure")
+
+            monkeypatch.setattr(
+                engine._lifecycle,
+                "advance_frontier",
+                fail_lifecycle,
+            )
+            monkeypatch.setattr(
+                engine._frontier,
+                "rollback_frontier_generation",
+                fail_rollback,
+            )
+
+            result = engine.promote_prepared_compaction(
+                prepared.batch_id,
+                messages,
+            )
+
+            assert result.promoted is False
+            active = engine._frontier.get_active_frontier(
+                prepared.conversation_id
+            )
+            assert active is not None
+            active_items = engine._frontier.get_frontier_items(
+                prepared.conversation_id,
+                int(active["generation"]),
+            )
+            assert active_items
+            for item in active_items:
+                if item["kind"] == "node":
+                    assert engine._dag.get_node(int(item["ref_id"])) is not None
+        finally:
+            engine.shutdown()
+
     def test_committed_lifecycle_marker_survives_post_commit_exception_without_double_advance(
         self, tmp_path, monkeypatch
     ):

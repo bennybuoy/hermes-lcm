@@ -5869,6 +5869,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             # Compensate the committed frontier CAS before removing the DAG node.
             # Frontier/DAG/lifecycle have separate connections, so this keeps a
             # later lifecycle or batch-state failure from publishing a phantom tip.
+            can_delete_inserted_node = not advanced_frontier_generation
             if advanced_frontier_generation:
                 try:
                     rolled_back = self._frontier.rollback_frontier_generation(
@@ -5881,13 +5882,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         )
                     else:
                         frontier_items_written = False
+                        can_delete_inserted_node = True
                 except Exception:
                     logger.error(
                         "LCM frontier rollback failed after promotion error",
                         exc_info=True,
                     )
-            # Roll back any partial canonical insert so no orphan remains.
-            if inserted_node_id is not None:
+            # Delete the canonical insert only when it was never frontier-visible
+            # or compensation removed the exact generation that published it.
+            # A newer generation may legitimately reuse G's node items; if G is
+            # no longer the tip (or rollback itself fails), preserving the node is
+            # the only fail-closed outcome that keeps that active frontier valid.
+            if inserted_node_id is not None and can_delete_inserted_node:
                 try:
                     self._dag.delete_node(inserted_node_id)
                 except Exception:
