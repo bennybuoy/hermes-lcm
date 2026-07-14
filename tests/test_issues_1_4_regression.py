@@ -211,22 +211,56 @@ class TestIssue1PersistSummaryPayload:
     def test_migration_supersedes_legacy_v1_ready_batches(self, tmp_path):
         db = tmp_path / "legacy.db"
         conn = sqlite3.connect(str(db))
-        # Build the table set, then mark the fixture as a v6 database before
-        # inserting a payload-less ready batch. The next migration call must
-        # perform the v6→v7 cleanup itself.
+        # Build the shared tables, then recreate lcm_prepared_batches in its
+        # genuine v6 shape (no summary_payload or payload_version columns).
         run_versioned_migrations(conn)
+        conn.execute("DROP INDEX IF EXISTS idx_batches_conv_state")
+        conn.execute("DROP TABLE lcm_prepared_batches")
+        conn.execute(
+            """
+            CREATE TABLE lcm_prepared_batches (
+                batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                base_generation INTEGER NOT NULL,
+                source_end_store_id INTEGER NOT NULL,
+                source_identity_hash TEXT NOT NULL DEFAULT '',
+                source_ids TEXT NOT NULL DEFAULT '[]',
+                policy_fingerprint TEXT NOT NULL DEFAULT '',
+                route_fingerprint TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT 'preparing',
+                expected_leaf_count INTEGER NOT NULL DEFAULT 0,
+                frontier_end_store_id INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                failure_reason TEXT DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX idx_batches_conv_state
+                ON lcm_prepared_batches(conversation_id, state)
+            """
+        )
         conn.execute(
             "UPDATE metadata SET value = '6' WHERE key = 'schema_version'"
         )
+        before_columns = {
+            row[1] for row in conn.execute(
+                "PRAGMA table_info(lcm_prepared_batches)"
+            ).fetchall()
+        }
+        assert "summary_payload" not in before_columns
+        assert "payload_version" not in before_columns
         now = time.time()
         conn.execute(
             """
             INSERT INTO lcm_prepared_batches
                 (conversation_id, session_id, base_generation, source_end_store_id,
                  source_identity_hash, source_ids, policy_fingerprint, route_fingerprint,
-                 state, expected_leaf_count, frontier_end_store_id, created_at, updated_at,
-                 summary_payload, payload_version)
-            VALUES (?, ?, 1, 10, 'hash', '[]', 'pol', 'route', 'ready', 1, 10, ?, ?, '', 0)
+                 state, expected_leaf_count, frontier_end_store_id, created_at, updated_at)
+            VALUES (?, ?, 1, 10, 'hash', '[]', 'pol', 'route', 'ready', 1, 10, ?, ?)
             """,
             ("c1", "s1", now, now),
         )
@@ -234,6 +268,12 @@ class TestIssue1PersistSummaryPayload:
 
         run_versioned_migrations(conn)
 
+        after_columns = {
+            row[1] for row in conn.execute(
+                "PRAGMA table_info(lcm_prepared_batches)"
+            ).fetchall()
+        }
+        assert {"summary_payload", "payload_version"}.issubset(after_columns)
         state = conn.execute(
             "SELECT state, failure_reason FROM lcm_prepared_batches"
         ).fetchone()
