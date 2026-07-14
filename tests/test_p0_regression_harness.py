@@ -769,6 +769,93 @@ class TestThresholdIndependence:
         finally:
             engine.shutdown()
 
+    def test_deadline_before_later_summary_returns_canonical_replacement(
+        self, tmp_path, monkeypatch
+    ):
+        """An intra-pass timeout after an earlier publish must not replay it."""
+        engine = _make_engine(
+            tmp_path,
+            context_length=20_000,
+            context_threshold=0.75,
+            model_thresholds={"intra-deadline-model": 0.10},
+            fresh_tail_count=2,
+            leaf_chunk_tokens=120,
+            dynamic_leaf_chunk_enabled=True,
+            dynamic_leaf_chunk_max=180,
+            condensation_fanin=100,
+            extraction_enabled=True,
+            session_id="deadline-before-later-summary-session",
+        )
+        try:
+            engine.update_model(
+                model="intra-deadline-model",
+                context_length=20_000,
+                provider="test",
+            )
+            engine._config.foreground_compress_deadline_seconds = 1.0
+            messages = [
+                {"role": "system", "content": "system prompt"},
+                *_messages(28, prefix="intra-deadline", tokens_each=100),
+            ]
+
+            extraction_calls = [0]
+
+            def expire_during_second_extraction(_chunk):
+                extraction_calls[0] += 1
+                if extraction_calls[0] == 2:
+                    time.sleep(1.05)
+
+            def fast_summary(chunk, focus_topic=None):
+                compacted = list(chunk)
+                source_tokens = count_messages_tokens(compacted)
+                return (
+                    compacted,
+                    source_tokens,
+                    "Published first leaf.\nExpand for details about: canonical prefix",
+                    0,
+                    0,
+                )
+
+            monkeypatch.setattr(
+                engine,
+                "_run_pre_compaction_extraction",
+                expire_during_second_extraction,
+            )
+            monkeypatch.setattr(
+                engine,
+                "_summarize_leaf_chunk_with_rescue",
+                fast_summary,
+            )
+
+            result = engine.compress(messages, current_tokens=engine.threshold_tokens)
+
+            assert extraction_calls[0] == 2, "fixture must expire inside pass two"
+            nodes = engine._dag.get_session_nodes(engine.current_session_id, depth=0)
+            assert len(nodes) == 1, "only the first leaf should publish before timeout"
+            covered_contents = {
+                engine._store.get(store_id)["content"]
+                for store_id in nodes[0].source_ids
+            }
+            returned_contents = {
+                msg.get("content")
+                for msg in result
+                if isinstance(msg, dict)
+            }
+            assert covered_contents
+            assert covered_contents.isdisjoint(returned_contents), (
+                "intra-pass deadline returned stale host input containing raw "
+                "rows already published by an earlier pass"
+            )
+            assert any(
+                "Published first leaf" in str(msg.get("content", ""))
+                for msg in result
+                if isinstance(msg, dict)
+            )
+            assert result[-1]["content"] == messages[-1]["content"]
+            assert engine._last_compression_status != "running"
+        finally:
+            engine.shutdown()
+
     def test_emergency_threshold_is_independent_of_cutover_and_target(self, tmp_path):
         """Emergency threshold uses emergency_pressure_ratio, not cutover or target."""
         engine = _make_engine(
