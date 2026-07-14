@@ -913,6 +913,113 @@ class TestIssue3BoundedForegroundCompress:
 # ===========================================================================
 
 class TestIssue4FrontierItems:
+    def test_frontier_rollback_rechecks_tip_inside_write_transaction(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "rollback-race.db"
+        frontier = FrontierStore(str(db_path))
+        writer = sqlite3.connect(
+            str(db_path), timeout=5.0, check_same_thread=False
+        )
+        writer.execute("PRAGMA journal_mode=WAL")
+        try:
+            conversation_id = "rollback-race-conversation"
+            session_id = "rollback-race-session"
+            base_generation = frontier.ensure_frontier(
+                conversation_id,
+                session_id,
+            )
+            target_generation = frontier.advance_frontier_generation_with_items(
+                conversation_id,
+                session_id,
+                10,
+                "policy",
+                "route",
+                base_generation,
+                [
+                    {
+                        "kind": "node",
+                        "ref_id": 10,
+                        "source_start": 1,
+                        "source_end": 10,
+                    }
+                ],
+            )
+            assert target_generation == base_generation + 1
+
+            # Publish G+1 on another connection but hold its write transaction
+            # open. Safe rollback must wait for this writer, then re-read the
+            # committed tip and refuse to delete G.
+            newer_generation = target_generation + 1
+            now = time.time()
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute(
+                """
+                INSERT INTO lcm_active_frontiers
+                    (conversation_id, generation, session_id,
+                     source_end_store_id, policy_fingerprint,
+                     route_fingerprint, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    newer_generation,
+                    session_id,
+                    20,
+                    "policy",
+                    "route",
+                    now,
+                    now,
+                ),
+            )
+            writer.execute(
+                """
+                INSERT INTO lcm_frontier_items
+                    (conversation_id, generation, ordinal, kind,
+                     ref_id, source_start, source_end)
+                VALUES (?, ?, 0, 'node', 20, 11, 20)
+                """,
+                (conversation_id, newer_generation),
+            )
+
+            outcome: dict[str, Any] = {}
+
+            def rollback_target():
+                try:
+                    outcome["result"] = frontier.rollback_frontier_generation(
+                        conversation_id,
+                        target_generation,
+                    )
+                except Exception as exc:  # regression records unsafe BUSY snapshot
+                    outcome["error"] = exc
+
+            thread = threading.Thread(target=rollback_target)
+            thread.start()
+            time.sleep(0.1)
+            assert thread.is_alive(), "rollback must wait for the active writer"
+            writer.commit()
+            thread.join(timeout=5.0)
+
+            assert not thread.is_alive()
+            assert "error" not in outcome
+            assert outcome["result"] is False
+            active = frontier.get_active_frontier(conversation_id)
+            assert active is not None
+            assert active["generation"] == newer_generation
+            assert frontier.get_frontier_items(
+                conversation_id,
+                target_generation,
+            )
+            assert frontier.get_frontier_items(
+                conversation_id,
+                newer_generation,
+            )
+        finally:
+            if writer.in_transaction:
+                writer.rollback()
+            writer.close()
+            frontier.close()
+
     def test_atomic_frontier_advance_rolls_back_generation_when_item_insert_fails(
         self, tmp_path
     ):

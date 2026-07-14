@@ -300,23 +300,42 @@ class FrontierStore:
 
         The rollback is deliberately conditional: it only removes ``generation``
         when it is still the active tip, so a concurrent promotion can never be
-        erased by an older failing caller.
+        erased by an older failing caller. The tip check and both deletions run
+        inside one ``BEGIN IMMEDIATE`` transaction; acquiring the write lock
+        before reading prevents a newer generation from committing between the
+        check and deletion.
         """
         with self._lock:
-            current = self.get_active_frontier(conversation_id)
-            conn = self._conn
-            if current is None or conn is None or int(current["generation"]) != int(generation):
-                return False
-            conn.execute(
-                "DELETE FROM lcm_frontier_items WHERE conversation_id = ? AND generation = ?",
-                (conversation_id, generation),
-            )
-            conn.execute(
-                "DELETE FROM lcm_active_frontiers WHERE conversation_id = ? AND generation = ?",
-                (conversation_id, generation),
-            )
-            conn.commit()
-            return True
+            conn = self.conn
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    """
+                    SELECT generation
+                    FROM lcm_active_frontiers
+                    WHERE conversation_id = ?
+                    ORDER BY generation DESC
+                    LIMIT 1
+                    """,
+                    (conversation_id,),
+                ).fetchone()
+                current_generation = int(row[0]) if row else 0
+                if current_generation != int(generation):
+                    conn.rollback()
+                    return False
+                conn.execute(
+                    "DELETE FROM lcm_frontier_items WHERE conversation_id = ? AND generation = ?",
+                    (conversation_id, generation),
+                )
+                conn.execute(
+                    "DELETE FROM lcm_active_frontiers WHERE conversation_id = ? AND generation = ?",
+                    (conversation_id, generation),
+                )
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                raise
 
     # -- Frontier items ---------------------------------------------------
 
