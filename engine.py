@@ -6244,6 +6244,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 node_id=int(node_id or 0),
                 covered_source_ids=[int(s) for s in (covered_source_ids or [])],
                 frontier_end_store_id=source_end,
+                base_generation=int(frontier["generation"]),
             )
             if source_end > 0 and not items:
                 return False
@@ -6455,9 +6456,10 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         if candidate_count <= 0:
             return None
 
+        candidate_start = self._leading_anchor_count(all_stored)
         candidate_stored = [
             row
-            for row in all_stored[:candidate_count]
+            for row in all_stored[candidate_start:candidate_count]
             if int(row.get("store_id") or 0) > int(source_end or 0)
         ]
         if not candidate_stored:
@@ -6642,8 +6644,32 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             ]
 
             # Use the engine's existing leaf summarization path
-            _compacted_chunk, source_tokens, summary_text, level, attempts = (
+            compacted_chunk, source_tokens, summary_text, level, attempts = (
                 self._summarize_leaf_chunk_with_rescue(candidate_messages)
+            )
+
+            # Adaptive rescue may summarize only an oldest prefix. Publish
+            # lineage for exactly that returned prefix; the unsummarized suffix
+            # remains raw and eligible for a later batch.
+            compacted_count = len(compacted_chunk)
+            if compacted_count <= 0 or compacted_count > len(candidate_messages):
+                raise RuntimeError("prepared summary returned invalid source coverage")
+            for expected, actual in zip(
+                candidate_messages[:compacted_count], compacted_chunk
+            ):
+                if actual is not expected and actual != expected:
+                    raise RuntimeError(
+                        "prepared summary rescue returned non-prefix source coverage"
+                    )
+            summarized_stored = candidate_stored[:compacted_count]
+            summarized_store_ids = [
+                int(row["store_id"]) for row in summarized_stored
+            ]
+            summarized_source_end = summarized_store_ids[-1]
+            summarized_source_hash = compute_source_identity_hash(
+                self._store._conn,
+                session_id,
+                summarized_store_ids,
             )
 
             # Check stop event again after the LLM call — if shutdown
@@ -6671,7 +6697,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     "token_count": int(leaf_tokens),
                     "level": int(level),
                     "attempts": int(attempts),
-                    "source_ids": list(candidate_store_ids),
+                    "source_ids": list(summarized_store_ids),
                     "expand_hint": self._extract_expand_hint(summary_text),
                 },
                 ensure_ascii=False,
@@ -6681,9 +6707,12 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             self._frontier.update_batch_state(
                 batch_id, leave_state,
                 expected_leaf_count=leaf_count,
-                frontier_end_store_id=actual_source_end,
+                frontier_end_store_id=summarized_source_end,
                 summary_payload=summary_payload,
                 payload_version=PREPARED_PAYLOAD_VERSION,
+                source_end_store_id=summarized_source_end,
+                source_identity_hash=summarized_source_hash,
+                source_ids=summarized_store_ids,
             )
             self._async_last_prepare_at = time.time()
             if leave_state == "ready":
@@ -6872,14 +6901,30 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             if hook == "after_canonical_insert":
                 raise RuntimeError("injected async promotion failure")
 
-            # CAS-advance frontier generation
-            new_gen = self._frontier.advance_frontier_generation(
+            # Build from the prepared batch's pre-CAS generation. Querying the
+            # active tip after advancing would see the new (still empty) layout
+            # and lose every canonical summary carried by the base generation.
+            frontier_items = self._build_promoted_frontier_items(
+                conversation_id=batch.conversation_id,
+                session_id=batch.session_id,
+                node_id=int(inserted_node_id),
+                covered_source_ids=covered_source_ids,
+                frontier_end_store_id=int(batch.frontier_end_store_id or 0),
+                base_generation=int(batch.base_generation),
+            )
+            if not frontier_items:
+                raise RuntimeError("frontier_items_empty_after_promotion")
+
+            # Publish the generation row and its ordered items in one SQLite
+            # transaction. Readers can never observe a positive itemless tip.
+            new_gen = self._frontier.advance_frontier_generation_with_items(
                 batch.conversation_id,
                 batch.session_id,
                 batch.frontier_end_store_id,
                 current_policy_fp,
                 current_route_fp,
                 batch.base_generation,
+                frontier_items,
             )
             if new_gen == 0:
                 # Concurrent promotion / foreground race won — roll back orphan.
@@ -6891,21 +6936,6 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 return _result(promoted=False, reason="frontier_mismatch")
 
             advanced_frontier_generation = new_gen
-
-            # Write ordered frontier items BEFORE marking the batch promoted.
-            # A generation tip with source_end > 0 must never be itemless.
-            frontier_items = self._build_promoted_frontier_items(
-                conversation_id=batch.conversation_id,
-                session_id=batch.session_id,
-                node_id=int(inserted_node_id),
-                covered_source_ids=covered_source_ids,
-                frontier_end_store_id=int(batch.frontier_end_store_id or 0),
-            )
-            if not frontier_items:
-                raise RuntimeError("frontier_items_empty_after_promotion")
-            self._frontier.set_frontier_items(
-                batch.conversation_id, new_gen, frontier_items,
-            )
             frontier_items_written = True
 
             # Fault-injection points after items / generation CAS.
@@ -6964,6 +6994,9 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             # Frontier/DAG/lifecycle have separate connections, so this keeps a
             # later lifecycle or batch-state failure from publishing a phantom tip.
             can_delete_inserted_node = not advanced_frontier_generation
+            rollback_lost_to_newer_generation = False
+            canonical_covered_source_ids: list[int] = []
+            canonical_node_ids: set[int] = set()
             if advanced_frontier_generation:
                 try:
                     rolled_back = self._frontier.rollback_frontier_generation(
@@ -6974,6 +7007,34 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                             "LCM could not roll back frontier generation %s after promotion error",
                             advanced_frontier_generation,
                         )
+                        active = self._frontier.get_active_frontier(
+                            batch.conversation_id
+                        )
+                        if (
+                            active is not None
+                            and int(active.get("generation") or 0)
+                            > int(advanced_frontier_generation)
+                        ):
+                            active_items = self._frontier.get_frontier_items(
+                                batch.conversation_id,
+                                int(active["generation"]),
+                            )
+                            rollback_lost_to_newer_generation = bool(active_items)
+                            for item in active_items:
+                                if item.get("kind") != "node":
+                                    continue
+                                node_id = int(item.get("ref_id") or 0)
+                                active_node = self._dag.get_node(node_id)
+                                if active_node is None:
+                                    rollback_lost_to_newer_generation = False
+                                    canonical_covered_source_ids = []
+                                    canonical_node_ids = set()
+                                    break
+                                canonical_node_ids.add(node_id)
+                                canonical_covered_source_ids.extend(
+                                    int(source_id)
+                                    for source_id in (active_node.source_ids or [])
+                                )
                     else:
                         frontier_items_written = False
                         can_delete_inserted_node = True
@@ -6998,6 +7059,27 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     )
                 inserted_node_id = None
 
+            if rollback_lost_to_newer_generation:
+                # Exact compensation lost to a valid superseding generation.
+                # That generation is now the canonical publication boundary;
+                # surface it to compress() so later failures cannot replay the
+                # stale host rows covered by its node layout.
+                self._frontier.update_batch_state(
+                    batch_id,
+                    "superseded",
+                    failure_reason=f"promotion_superseded_after_error: {exc}",
+                )
+                return _result(
+                    promoted=True,
+                    reason="superseded_by_canonical_generation_after_promotion_error",
+                    node_id=(
+                        int(inserted_node_id or 0)
+                        if int(inserted_node_id or 0) in canonical_node_ids
+                        else 0
+                    ),
+                    covered=sorted(dict.fromkeys(canonical_covered_source_ids)),
+                )
+
             # Injected mid-publish failures leave the batch ready for retry and
             # re-raise so the caller observes the failure.
             if (
@@ -7020,6 +7102,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         node_id: int,
         covered_source_ids: list[int],
         frontier_end_store_id: int,
+        base_generation: int,
     ) -> list[dict[str, Any]]:
         """Build ordered frontier items for a just-promoted generation.
 
@@ -7034,9 +7117,13 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         # Carry forward already-published canonical nodes. A new leaf replaces
         # only its covered raw range; it must not erase older summary members.
         active = self._frontier.get_active_frontier(conversation_id)
-        if active is not None and str(active.get("session_id") or "") == session_id:
+        if (
+            active is not None
+            and int(active.get("generation") or 0) == int(base_generation)
+            and str(active.get("session_id") or "") == session_id
+        ):
             for item in self._frontier.get_frontier_items(
-                conversation_id, int(active["generation"])
+                conversation_id, int(base_generation)
             ):
                 if item.get("kind") != "node":
                     continue
@@ -7233,7 +7320,13 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         if not result.promoted:
             return False
         # Keep in-process frontier marker aligned with the promoted end.
-        end_id = int(batch.frontier_end_store_id or batch.source_end_store_id or 0)
+        active = self._frontier.get_active_frontier(batch.conversation_id)
+        end_id = int(
+            (active or {}).get("source_end_store_id")
+            or batch.frontier_end_store_id
+            or batch.source_end_store_id
+            or 0
+        )
         if end_id > 0:
             self._last_compacted_store_id = max(
                 int(self._last_compacted_store_id or 0),
@@ -7249,8 +7342,6 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         # Stash covered IDs for compress() host replacement (issue #2).
         if result.covered_source_ids:
             self._async_last_promoted_source_ids = list(result.covered_source_ids)
-        elif batch.source_ids:
-            self._async_last_promoted_source_ids = [int(s) for s in batch.source_ids]
         if result.node_id:
             self._async_last_promoted_node_id = int(result.node_id)
         return True

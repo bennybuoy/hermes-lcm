@@ -511,6 +511,7 @@ def set_schema_version(conn: sqlite3.Connection, version: int = SCHEMA_VERSION) 
         INSERT INTO metadata(key, value)
         VALUES('schema_version', ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        WHERE CAST(metadata.value AS INTEGER) <= CAST(excluded.value AS INTEGER)
         """,
         (str(version),),
     )
@@ -895,47 +896,60 @@ def ensure_external_content_fts(
 
 
 def run_versioned_migrations(conn: sqlite3.Connection) -> None:
+    # Preserve the refusal-before-DDL contract for databases already marked by
+    # a newer build, then serialize the authoritative re-check, every migration
+    # step, and the marker update behind one SQLite writer lock. Without this,
+    # a base-version connection can cache the old marker while a newer writer
+    # migrates, wait, and then overwrite the committed marker with its stale
+    # version.
     refuse_schema_version_too_new(conn)
+    if conn.in_transaction:
+        raise RuntimeError("run_versioned_migrations requires no active transaction")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        refuse_schema_version_too_new(conn)
+        ensure_metadata_table(conn)
+        ensure_migration_state_table(conn)
 
-    ensure_metadata_table(conn)
-    ensure_migration_state_table(conn)
+        current_version = get_schema_version(conn)
+        if current_version < 2:
+            mark_migration_step_complete(conn, "v2_external_content_fts_triggers")
+            current_version = 2
 
-    refuse_schema_version_too_new(conn)
-    current_version = get_schema_version(conn)
-    if current_version < 2:
-        mark_migration_step_complete(conn, "v2_external_content_fts_triggers")
-        current_version = 2
+        if current_version < 3:
+            ensure_lifecycle_state_table(conn)
+            mark_migration_step_complete(conn, "v3_lifecycle_state")
+            current_version = 3
+        else:
+            ensure_lifecycle_state_table(conn)
 
-    if current_version < 3:
-        ensure_lifecycle_state_table(conn)
-        mark_migration_step_complete(conn, "v3_lifecycle_state")
-        current_version = 3
-    else:
-        ensure_lifecycle_state_table(conn)
+        ensure_lifecycle_state_columns(conn)
+        if current_version < 4:
+            mark_migration_step_complete(conn, "v4_lifecycle_debt_columns")
+            current_version = 4
 
-    ensure_lifecycle_state_columns(conn)
-    if current_version < 4:
-        mark_migration_step_complete(conn, "v4_lifecycle_debt_columns")
-        current_version = 4
+        ensure_message_origin_columns(conn)
+        if current_version < 5:
+            mark_migration_step_complete(conn, "v5_message_conversation_id")
+            current_version = 5
 
-    ensure_message_origin_columns(conn)
-    if current_version < 5:
-        mark_migration_step_complete(conn, "v5_message_conversation_id")
-        current_version = 5
+        ensure_frontier_tables(conn)
+        if current_version < 6:
+            mark_migration_step_complete(conn, "v6_active_frontier_tables")
+            current_version = 6
 
-    ensure_frontier_tables(conn)
-    if current_version < 6:
-        mark_migration_step_complete(conn, "v6_active_frontier_tables")
-        current_version = 6
+        if current_version < 7:
+            supersede_legacy_v1_ready_batches(conn)
+            mark_migration_step_complete(conn, "v7_prepared_batch_summary_payload")
+            current_version = 7
 
-    if current_version < 7:
-        supersede_legacy_v1_ready_batches(conn)
-        mark_migration_step_complete(conn, "v7_prepared_batch_summary_payload")
-        current_version = 7
+        ensure_focus_and_policy_metadata(conn)
+        if current_version < 8:
+            mark_migration_step_complete(conn, "v8_focus_and_resolved_policy_metadata")
+            current_version = 8
 
-    ensure_focus_and_policy_metadata(conn)
-    if current_version < 8:
-        mark_migration_step_complete(conn, "v8_focus_and_resolved_policy_metadata")
-        current_version = 8
-
-    set_schema_version(conn, current_version)
+        set_schema_version(conn, current_version)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise

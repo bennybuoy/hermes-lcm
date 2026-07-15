@@ -620,6 +620,9 @@ class FrontierStore:
         failure_reason: str = "",
         summary_payload: Optional[str] = None,
         payload_version: Optional[int] = None,
+        source_end_store_id: Optional[int] = None,
+        source_identity_hash: Optional[str] = None,
+        source_ids: Optional[Sequence[int]] = None,
     ) -> None:
         with self._lock:
             sets = ["state = ?", "updated_at = ?"]
@@ -639,6 +642,15 @@ class FrontierStore:
             if payload_version is not None:
                 sets.append("payload_version = ?")
                 params.append(int(payload_version))
+            if source_end_store_id is not None:
+                sets.append("source_end_store_id = ?")
+                params.append(int(source_end_store_id))
+            if source_identity_hash is not None:
+                sets.append("source_identity_hash = ?")
+                params.append(str(source_identity_hash))
+            if source_ids is not None:
+                sets.append("source_ids = ?")
+                params.append(json.dumps([int(source_id) for source_id in source_ids]))
             params.append(batch_id)
             self._conn.execute(
                 f"UPDATE lcm_prepared_batches SET {', '.join(sets)} WHERE batch_id = ?",

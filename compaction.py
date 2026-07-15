@@ -420,6 +420,7 @@ class CompactionMixin:
                 # must do the same or the next appended raw message can be
                 # skipped when the stale cursor is clamped.
                 self._ingest_cursor = len(fallback_messages)
+                self._ingest_cursor_needs_reconcile = False
                 return fallback_messages
             return messages
 
@@ -497,6 +498,7 @@ class CompactionMixin:
         # failure must return the assembled replacement rather than replaying
         # the original host input that still contains covered raw rows.
         canonical_fallback_messages: Optional[List[Dict[str, Any]]] = None
+        prepromotion_ingested = False
 
         # Try to promote a prepared async batch before running foreground
         # compaction. On success, skip the leaf summarization path and
@@ -508,6 +510,43 @@ class CompactionMixin:
                 t0 = time.perf_counter()
                 if deadline_exceeded():
                     return fail_timeout("deadline_before_promote")
+                # Once a ready batch exists, persist the complete current host
+                # view before promotion. Preparation may have finished several
+                # turns earlier; resetting the cursor to the replacement length
+                # after publication is only safe when every intervening message
+                # is already in the immutable store.
+                ready_batch = None
+                if (
+                    getattr(self._config, "async_background_compaction_enabled", False)
+                    and getattr(
+                        self._config,
+                        "async_background_compaction_promote_on_compress",
+                        True,
+                    )
+                    and self.current_conversation_id
+                ):
+                    ready_batch = self._frontier.get_ready_batch(
+                        self.current_conversation_id
+                    )
+                if ready_batch is not None:
+                    ingest_started = time.perf_counter()
+                    try:
+                        with _temporary_sqlite_busy_timeout(
+                            [
+                                getattr(getattr(self, "_store", None), "_conn", None),
+                                getattr(getattr(self, "_lifecycle", None), "_conn", None),
+                            ],
+                            busy_timeout_ms,
+                        ):
+                            messages = self._ingest_messages(messages)
+                    except Exception as exc:
+                        if _is_sqlite_locked_error(exc):
+                            return fail_timeout(
+                                f"sqlite_locked_during_ingest_before_promote: {exc}"
+                            )
+                        raise
+                    prepromotion_ingested = True
+                    phase("ingest_before_promotion", ingest_started)
                 lock_wait_started = time.perf_counter()
                 with _temporary_sqlite_busy_timeout(
                     [
@@ -626,6 +665,7 @@ class CompactionMixin:
                             time.perf_counter() - compress_started
                         ) * 1000.0
                         self._ingest_cursor = len(compressed)
+                        self._ingest_cursor_needs_reconcile = False
                         self._last_compression_status = "compacted"
                         self._last_compression_noop_reason = (
                             "post_compaction_target_not_reached: "
@@ -721,7 +761,11 @@ class CompactionMixin:
                 ],
                 busy_timeout_ms,
             ):
-                working_messages = self._ingest_messages(messages)
+                working_messages = (
+                    list(messages)
+                    if prepromotion_ingested
+                    else self._ingest_messages(messages)
+                )
         except Exception as exc:
             if _is_sqlite_locked_error(exc):
                 return fail_timeout(

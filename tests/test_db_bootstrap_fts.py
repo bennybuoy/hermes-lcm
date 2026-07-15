@@ -13,6 +13,7 @@ the index first, then exercise the existing-index path.
 """
 
 import sqlite3
+import threading
 import time
 import types
 
@@ -337,6 +338,86 @@ def test_run_versioned_migrations_accepts_current_schema(tmp_path):
         assert get_schema_version(conn) == SCHEMA_VERSION
     finally:
         conn.close()
+
+
+def test_migration_serializes_version_read_and_prevents_marker_downgrade(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "serialized-schema-migration.db"
+    setup = sqlite3.connect(db_path)
+    setup.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+    setup.execute(
+        "INSERT INTO metadata(key, value) VALUES ('schema_version', '7')"
+    )
+    setup.commit()
+    setup.close()
+
+    migrator = sqlite3.connect(db_path, timeout=5.0, check_same_thread=False)
+    older = sqlite3.connect(db_path, timeout=5.0, check_same_thread=False)
+    db_bootstrap.configure_connection(migrator)
+    db_bootstrap.configure_connection(older)
+    version_read_started = threading.Event()
+    allow_migration = threading.Event()
+    original_get_schema_version = db_bootstrap.get_schema_version
+
+    def pause_after_version_lock(conn):
+        value = original_get_schema_version(conn)
+        if conn is migrator:
+            version_read_started.set()
+            assert allow_migration.wait(timeout=5.0)
+        return value
+
+    monkeypatch.setattr(
+        db_bootstrap,
+        "get_schema_version",
+        pause_after_version_lock,
+    )
+    outcomes: dict[str, object] = {}
+
+    def migrate():
+        try:
+            db_bootstrap.run_versioned_migrations(migrator)
+        except Exception as exc:
+            outcomes["migration_error"] = exc
+
+    def stale_v7_marker_write():
+        try:
+            db_bootstrap.set_schema_version(older, 7)
+            older.commit()
+            outcomes["older_finished"] = True
+        except Exception as exc:
+            outcomes["older_error"] = exc
+
+    migration_thread = threading.Thread(target=migrate)
+    older_thread = threading.Thread(target=stale_v7_marker_write)
+    try:
+        migration_thread.start()
+        assert version_read_started.wait(timeout=5.0)
+        older_thread.start()
+        time.sleep(0.1)
+        assert older_thread.is_alive(), (
+            "schema marker writer must wait until the version check and migration commit"
+        )
+
+        allow_migration.set()
+        migration_thread.join(timeout=5.0)
+        older_thread.join(timeout=5.0)
+
+        assert not migration_thread.is_alive()
+        assert not older_thread.is_alive()
+        assert "migration_error" not in outcomes
+        assert "older_error" not in outcomes
+        check = sqlite3.connect(db_path)
+        try:
+            assert db_bootstrap.get_schema_version(check) == db_bootstrap.SCHEMA_VERSION
+        finally:
+            check.close()
+    finally:
+        allow_migration.set()
+        migration_thread.join(timeout=5.0)
+        older_thread.join(timeout=5.0)
+        migrator.close()
+        older.close()
 
 
 def test_message_store_refuses_newer_schema_before_startup_ddl(tmp_path):

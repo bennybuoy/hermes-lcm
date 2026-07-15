@@ -351,7 +351,7 @@ class TestIssue2HostReplacementDropsCovered:
         finally:
             engine.shutdown()
 
-    def test_partial_promote_ingest_lock_returns_canonical_replacement(
+    def test_pre_promotion_ingest_lock_prevents_publication_and_retries_suffix(
         self, tmp_path, monkeypatch
     ):
         engine = _engine(tmp_path, fresh_tail_count=2)
@@ -397,18 +397,13 @@ class TestIssue2HostReplacementDropsCovered:
             )
 
             assert engine._last_compression_status == "failed"
-            assert "sqlite_locked_during_ingest" in engine._last_compression_noop_reason
-            assert engine._dag.get_session_node_count(engine.current_session_id) == 1
-            result_blob = "\n".join(
-                str(msg.get("content") or "") for msg in result
+            assert (
+                "sqlite_locked_during_ingest_before_promote"
+                in engine._last_compression_noop_reason
             )
-            assert "partial promote summary" in result_blob
-            for content in covered_contents:
-                assert content not in result_blob
-            for tail_message in current_messages[-2:]:
-                assert tail_message["content"] in result_blob
-
-            assert engine._ingest_cursor == len(result)
+            assert engine._dag.get_session_node_count(engine.current_session_id) == 0
+            assert result == current_messages
+            assert engine._ingest_cursor == len(prepared_messages)
             monkeypatch.setattr(engine, "_ingest_messages", original_ingest)
             store_count = engine._store.get_session_count(engine.current_session_id)
             appended = {
@@ -418,8 +413,16 @@ class TestIssue2HostReplacementDropsCovered:
             engine._ingest_messages(result + [appended])
             assert (
                 engine._store.get_session_count(engine.current_session_id)
-                == store_count + 1
+                == store_count + len(later_messages) + 1
             )
+            stored_contents = {
+                row["content"]
+                for row in engine._store.get_session_messages(
+                    engine.current_session_id
+                )
+            }
+            for message in later_messages:
+                assert message["content"] in stored_contents
             assert engine._store.get_session_messages(engine.current_session_id)[-1][
                 "content"
             ] == appended["content"]
@@ -736,7 +739,11 @@ class TestIssue2HostReplacementDropsCovered:
                 messages,
             )
 
-            assert result.promoted is False
+            assert result.promoted is True
+            assert (
+                result.reason
+                == "superseded_by_canonical_generation_after_promotion_error"
+            )
             assert rollback_outcomes == [False]
             active = engine._frontier.get_active_frontier(
                 prepared.conversation_id
@@ -1474,4 +1481,280 @@ class TestIssue6AuthoritativeFrontierAssembly:
             with pytest.raises(RuntimeError, match="missing canonical node"):
                 engine._assemble_context(messages[0], messages[1:])
         finally:
+            engine.shutdown()
+
+
+# ===========================================================================
+# Final publication review blockers
+# ===========================================================================
+
+class TestFinalPublicationReviewBlockers:
+    def test_async_promotion_atomically_carries_base_generation_items(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path, fresh_tail_count=2)
+        _stub_summarize(monkeypatch, engine, text="generation carrying leaf")
+        atomic_calls: list[tuple[int, list[dict[str, Any]]]] = []
+        original_atomic = engine._frontier.advance_frontier_generation_with_items
+
+        def reject_split_advance(*_args, **_kwargs):
+            pytest.fail("async promotion used split generation publication")
+
+        def record_atomic(
+            conversation_id,
+            session_id,
+            new_source_end,
+            policy_fingerprint,
+            route_fingerprint,
+            base_generation,
+            items,
+        ):
+            atomic_calls.append((int(base_generation), list(items)))
+            return original_atomic(
+                conversation_id,
+                session_id,
+                new_source_end,
+                policy_fingerprint,
+                route_fingerprint,
+                base_generation,
+                items,
+            )
+
+        monkeypatch.setattr(
+            engine._frontier,
+            "advance_frontier_generation",
+            reject_split_advance,
+        )
+        monkeypatch.setattr(
+            engine._frontier,
+            "advance_frontier_generation_with_items",
+            record_atomic,
+        )
+        try:
+            first_messages = _messages(12, prefix="first generation")
+            engine.ingest(first_messages)
+            first_batch = engine.prepare_background_compaction_once(first_messages)
+            assert first_batch is not None
+            first_result = engine.promote_prepared_compaction(
+                first_batch.batch_id,
+                first_messages,
+            )
+            assert first_result.promoted is True
+
+            later = _messages(6, prefix="second generation")[1:]
+            all_messages = first_messages + later
+            engine.ingest(all_messages)
+            second_batch = engine.prepare_background_compaction_once(all_messages)
+            assert second_batch is not None
+            second_result = engine.promote_prepared_compaction(
+                second_batch.batch_id,
+                all_messages,
+            )
+            assert second_result.promoted is True
+
+            assert len(atomic_calls) == 2
+            assert atomic_calls[0][0] == first_batch.base_generation
+            assert atomic_calls[1][0] == second_batch.base_generation
+            active = engine._frontier.get_active_frontier(
+                engine.current_conversation_id
+            )
+            assert active is not None
+            active_items = engine._frontier.get_frontier_items(
+                engine.current_conversation_id,
+                int(active["generation"]),
+            )
+            active_node_ids = {
+                int(item["ref_id"])
+                for item in active_items
+                if item["kind"] == "node"
+            }
+            assert active_node_ids == {
+                int(first_result.node_id),
+                int(second_result.node_id),
+            }
+        finally:
+            engine.shutdown()
+
+    def test_messages_arriving_after_prepare_are_durable_before_promotion(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path, fresh_tail_count=2)
+        _stub_summarize(monkeypatch, engine, text="post-prepare durable leaf")
+        try:
+            prepared_messages = _messages(12, prefix="prepared")
+            engine.ingest(prepared_messages)
+            batch = engine.prepare_background_compaction_once(prepared_messages)
+            assert batch is not None and batch.state == "ready"
+
+            arrived = {
+                "role": "user",
+                "content": "newest user message arrived after async preparation",
+            }
+            current_messages = prepared_messages + [arrived]
+            result = engine.compress(
+                current_messages,
+                current_tokens=engine.threshold_tokens + 1,
+            )
+
+            assert any(
+                row["content"] == arrived["content"]
+                for row in engine._store.get_session_messages(
+                    engine.current_session_id
+                )
+            )
+            assert any(
+                message.get("content") == arrived["content"]
+                for message in result
+            )
+            assert engine._ingest_cursor == len(result)
+            engine._ingest_messages(
+                result
+                + [{"role": "assistant", "content": "reply after promoted replacement"}]
+            )
+            stored = engine._store.get_session_messages(engine.current_session_id)
+            assert stored[-1]["content"] == "reply after promoted replacement"
+        finally:
+            engine.shutdown()
+
+    def test_adaptive_rescue_batch_covers_only_summarized_prefix(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path, fresh_tail_count=2)
+
+        def rescue_prefix(initial_chunk, focus_topic=None):
+            compacted = list(initial_chunk[:3])
+            assert len(initial_chunk) > len(compacted)
+            return compacted, count_messages_tokens(compacted), "rescued prefix only", 1, 2
+
+        monkeypatch.setattr(
+            engine,
+            "_summarize_leaf_chunk_with_rescue",
+            rescue_prefix,
+        )
+        try:
+            messages = _messages(12, prefix="rescue source")
+            engine.ingest(messages)
+            stored = engine._store.get_session_messages(engine.current_session_id)
+            system_id = int(stored[0]["store_id"])
+
+            batch = engine.prepare_background_compaction_once(messages)
+
+            assert batch is not None and batch.state == "ready"
+            assert len(batch.source_ids) == 3
+            assert system_id not in batch.source_ids
+            payload = batch.parsed_summary_payload()
+            assert payload is not None
+            assert payload["source_ids"] == batch.source_ids
+            assert batch.source_end_store_id == batch.source_ids[-1]
+            assert batch.frontier_end_store_id == batch.source_ids[-1]
+
+            result = engine.promote_prepared_compaction(batch.batch_id, messages)
+            assert result.promoted is True
+            node = engine._dag.get_node(result.node_id)
+            assert node is not None
+            assert node.source_ids == batch.source_ids
+            unsummarized_ids = {
+                int(row["store_id"])
+                for row in stored
+                if int(row["store_id"]) > batch.source_ids[-1]
+            }
+            assert unsummarized_ids
+            assert unsummarized_ids.isdisjoint(result.covered_source_ids)
+        finally:
+            engine.shutdown()
+
+    def test_async_prepare_and_promotion_preserve_leading_system_anchor(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path, fresh_tail_count=2)
+        _stub_summarize(monkeypatch, engine, text="anchor-safe leaf")
+        try:
+            messages = _messages(12, prefix="anchor source")
+            messages[0]["content"] = "immutable leading system anchor"
+            engine.ingest(messages)
+            stored = engine._store.get_session_messages(engine.current_session_id)
+            system_id = int(stored[0]["store_id"])
+
+            batch = engine.prepare_background_compaction_once(messages)
+
+            assert batch is not None
+            assert system_id not in batch.source_ids
+            result = engine.compress(
+                messages,
+                current_tokens=engine.threshold_tokens + 1,
+            )
+            assert result[0]["role"] == "system"
+            assert result[0]["content"].startswith(messages[0]["content"])
+            node = engine._dag.get_session_nodes(engine.current_session_id)[0]
+            assert system_id not in node.source_ids
+        finally:
+            engine.shutdown()
+
+    def test_superseded_rollback_returns_canonical_fallback_to_compress(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path, fresh_tail_count=2)
+        _stub_summarize(monkeypatch, engine, text="superseding canonical leaf")
+        concurrent_frontier = FrontierStore(str(engine._store.db_path))
+        try:
+            messages = _messages(16, prefix="superseded rollback")
+            engine.ingest(messages)
+            batch = engine.prepare_background_compaction_once(messages)
+            assert batch is not None and batch.state == "ready"
+            covered_contents = {
+                engine._store.get(store_id)["content"]
+                for store_id in batch.source_ids
+            }
+
+            def publish_newer_then_fail(*_args, **_kwargs):
+                published = concurrent_frontier.get_active_frontier(
+                    batch.conversation_id
+                )
+                assert published is not None
+                generation = int(published["generation"])
+                items = concurrent_frontier.get_frontier_items(
+                    batch.conversation_id,
+                    generation,
+                )
+                assert items
+                assert concurrent_frontier.advance_frontier_generation_with_items(
+                    batch.conversation_id,
+                    batch.session_id,
+                    int(published["source_end_store_id"]),
+                    str(published["policy_fingerprint"]),
+                    str(published["route_fingerprint"]),
+                    generation,
+                    items,
+                ) == generation + 1
+                raise RuntimeError("lifecycle failed after superseding generation")
+
+            monkeypatch.setattr(
+                engine._lifecycle,
+                "advance_frontier",
+                publish_newer_then_fail,
+            )
+
+            def later_sqlite_timeout():
+                raise sqlite3.OperationalError("database is locked after supersession")
+
+            monkeypatch.setattr(
+                engine,
+                "_maybe_reclassify_late_auxiliary_before_compaction_write",
+                later_sqlite_timeout,
+            )
+
+            result = engine.compress(
+                messages,
+                current_tokens=engine.threshold_tokens + 1,
+            )
+
+            result_blob = "\n".join(
+                str(message.get("content") or "") for message in result
+            )
+            assert "superseding canonical leaf" in result_blob
+            for content in covered_contents:
+                assert content not in result_blob
+            assert engine._ingest_cursor == len(result)
+        finally:
+            concurrent_frontier.close()
             engine.shutdown()
