@@ -14,6 +14,7 @@ import functools
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -63,6 +64,7 @@ class LifecycleStateStore:
         # Serialize read-modify-write flows so concurrent binds/frontier
         # advances cannot interleave and regress the checkpoint.
         self._lock = threading.RLock()
+        self._transaction_local = threading.local()
         self._init_db()
 
     def _init_db(self) -> None:
@@ -128,6 +130,16 @@ class LifecycleStateStore:
             last_reset_at=row["last_reset_at"],
             updated_at=float(row["updated_at"] or 0.0),
         )
+
+    @contextmanager
+    def publication_connection(self, conn: sqlite3.Connection):
+        """Route lifecycle writes to a caller-owned publication transaction."""
+        previous = getattr(self._transaction_local, "connection", None)
+        self._transaction_local.connection = conn
+        try:
+            yield
+        finally:
+            self._transaction_local.connection = previous
 
     def get_by_conversation(self, conversation_id: str | None) -> LifecycleState | None:
         if not conversation_id:
@@ -857,23 +869,73 @@ class LifecycleStateStore:
             state = self.get_by_conversation(conversation_id)
             if state is None or state.current_session_id != session_id:
                 return state
-            now = time.time()
-            conn = self._conn
-            assert conn is not None
-            # MAX() in SQL keeps the advance monotonic even if a concurrent
-            # writer bumped the frontier between the read above and this write.
-            # A Python-side max() over the stale read could otherwise regress
-            # the checkpoint and force the same range to be compacted twice.
-            cursor = conn.execute(
-                """
-                UPDATE lcm_lifecycle_state
-                SET current_frontier_store_id = MAX(current_frontier_store_id, ?),
-                    updated_at = ?
-                WHERE conversation_id = ? AND current_session_id = ?
-                """,
-                (int(frontier_store_id or 0), now, conversation_id, session_id),
+            conn = (
+                getattr(self._transaction_local, "connection", None)
+                or self._conn
             )
-            if cursor.rowcount == 0:
+            assert conn is not None
+            advanced = self.advance_frontier_no_commit(
+                conn,
+                conversation_id,
+                session_id,
+                frontier_store_id,
+            )
+            if conn is self._conn:
+                if advanced:
+                    conn.commit()
                 return self.get_by_conversation(conversation_id)
-            conn.commit()
-            return self.get_by_conversation(conversation_id)
+            if not advanced:
+                return self.get_by_conversation(conversation_id)
+            # The canonical row is uncommitted and therefore invisible to the
+            # lifecycle store's sibling connection. Return an acknowledgement
+            # with the fields publication validates; commit remains caller-owned.
+            state = self.get_by_conversation(conversation_id)
+            if state is None:
+                return None
+            return LifecycleState(
+                conversation_id=state.conversation_id,
+                current_session_id=session_id,
+                last_finalized_session_id=state.last_finalized_session_id,
+                current_frontier_store_id=max(
+                    state.current_frontier_store_id,
+                    int(frontier_store_id or 0),
+                ),
+                last_finalized_frontier_store_id=state.last_finalized_frontier_store_id,
+                debt_kind=state.debt_kind,
+                debt_size_estimate=state.debt_size_estimate,
+                current_bound_at=state.current_bound_at,
+                last_finalized_at=state.last_finalized_at,
+                debt_updated_at=state.debt_updated_at,
+                last_maintenance_attempt_at=state.last_maintenance_attempt_at,
+                last_rollover_at=state.last_rollover_at,
+                last_reset_at=state.last_reset_at,
+                updated_at=time.time(),
+            )
+
+    @staticmethod
+    def advance_frontier_no_commit(
+        conn: sqlite3.Connection,
+        conversation_id: str,
+        session_id: str,
+        frontier_store_id: int,
+    ) -> bool:
+        """Advance lifecycle on a caller-owned transaction, without commit.
+
+        Returns whether the currently-bound session acknowledged the marker.
+        SQL ``MAX`` preserves the normal method's monotonicity guarantee.
+        """
+        cursor = conn.execute(
+            """
+            UPDATE lcm_lifecycle_state
+            SET current_frontier_store_id = MAX(current_frontier_store_id, ?),
+                updated_at = ?
+            WHERE conversation_id = ? AND current_session_id = ?
+            """,
+            (
+                int(frontier_store_id or 0),
+                time.time(),
+                conversation_id,
+                session_id,
+            ),
+        )
+        return cursor.rowcount > 0

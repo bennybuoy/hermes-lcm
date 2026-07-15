@@ -226,31 +226,46 @@ class SummaryDAG:
 
     # -- Write --------------------------------------------------------------
 
+    @staticmethod
+    def add_node_no_commit(
+        conn: sqlite3.Connection,
+        node: SummaryNode,
+    ) -> int:
+        """Insert ``node`` on an existing transaction without committing.
+
+        Cross-table publication uses the frontier coordinator's connection so
+        the canonical row, FTS trigger, frontier, batch, and lifecycle changes
+        share one SQLite commit.  The caller owns the connection lock and the
+        transaction lifetime.
+        """
+        cur = conn.execute(
+            """INSERT INTO summary_nodes
+               (session_id, depth, summary, token_count, source_token_count,
+                source_ids, source_type, created_at, earliest_at, latest_at, expand_hint)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                node.session_id,
+                node.depth,
+                node.summary,
+                node.token_count,
+                node.source_token_count,
+                json.dumps(node.source_ids),
+                node.source_type,
+                node.created_at or time.time(),
+                node.earliest_at,
+                node.latest_at,
+                node.expand_hint,
+            ),
+        )
+        node.node_id = int(cur.lastrowid)
+        return node.node_id
+
     def add_node(self, node: SummaryNode) -> int:
         """Insert a summary node and return its node_id."""
         with self._db_lock:
-            cur = self._conn.execute(
-                """INSERT INTO summary_nodes
-                   (session_id, depth, summary, token_count, source_token_count,
-                    source_ids, source_type, created_at, earliest_at, latest_at, expand_hint)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    node.session_id,
-                    node.depth,
-                    node.summary,
-                    node.token_count,
-                    node.source_token_count,
-                    json.dumps(node.source_ids),
-                    node.source_type,
-                    node.created_at or time.time(),
-                    node.earliest_at,
-                    node.latest_at,
-                    node.expand_hint,
-                ),
-            )
+            node_id = self.add_node_no_commit(self._conn, node)
             self._conn.commit()
-            node.node_id = cur.lastrowid
-            return node.node_id
+            return node_id
 
     def delete_node(self, node_id: int) -> bool:
         """Delete a single summary node by id. Returns True if a row was removed.

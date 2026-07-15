@@ -21,6 +21,7 @@ import logging
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
@@ -127,6 +128,24 @@ class FrontierStore:
     def conn(self) -> sqlite3.Connection:
         assert self._conn is not None
         return self._conn
+
+    @contextmanager
+    def publication_transaction(self):
+        """Yield the coordinator connection inside one immediate transaction.
+
+        All LCM publication tables share this database.  Callers must use only
+        no-commit primitives while inside the context; normal return commits
+        the whole publication and every exception rolls it all back.
+        """
+        with self._lock:
+            conn = self.conn
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                yield conn
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
 
     # -- Active frontiers -------------------------------------------------
 
@@ -241,67 +260,105 @@ class FrontierStore:
             raise ValueError("frontier items required for positive source boundary")
         with self._lock:
             conn = self.conn
+            owns_transaction = not conn.in_transaction
             try:
-                conn.execute("BEGIN IMMEDIATE")
-                row = conn.execute(
-                    """
-                    SELECT generation
-                    FROM lcm_active_frontiers
-                    WHERE conversation_id = ?
-                    ORDER BY generation DESC
-                    LIMIT 1
-                    """,
-                    (conversation_id,),
-                ).fetchone()
-                current_gen = int(row[0]) if row else 0
-                if current_gen != int(base_generation):
-                    conn.rollback()
-                    return 0
-
-                now = time.time()
-                new_gen = int(base_generation) + 1
-                conn.execute(
-                    """
-                    INSERT INTO lcm_active_frontiers
-                        (conversation_id, generation, session_id,
-                         source_end_store_id, policy_fingerprint,
-                         route_fingerprint, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        conversation_id,
-                        new_gen,
-                        session_id,
-                        new_source_end,
-                        policy_fingerprint,
-                        route_fingerprint,
-                        now,
-                        now,
-                    ),
+                if owns_transaction:
+                    conn.execute("BEGIN IMMEDIATE")
+                new_gen = self.advance_frontier_generation_with_items_no_commit(
+                    conn,
+                    conversation_id,
+                    session_id,
+                    new_source_end,
+                    policy_fingerprint,
+                    route_fingerprint,
+                    base_generation,
+                    items,
                 )
-                for ordinal, item in enumerate(items):
-                    conn.execute(
-                        """
-                        INSERT INTO lcm_frontier_items
-                            (conversation_id, generation, ordinal, kind,
-                             ref_id, source_start, source_end)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            conversation_id,
-                            new_gen,
-                            ordinal,
-                            item.get("kind", "message"),
-                            item.get("ref_id", 0),
-                            item.get("source_start", 0),
-                            item.get("source_end", 0),
-                        ),
-                    )
-                conn.commit()
+                if new_gen == 0:
+                    if owns_transaction:
+                        conn.rollback()
+                    return 0
+                if owns_transaction:
+                    conn.commit()
                 return new_gen
             except Exception:
-                conn.rollback()
+                if owns_transaction:
+                    conn.rollback()
                 raise
+
+    def advance_frontier_generation_with_items_no_commit(
+        self,
+        conn: sqlite3.Connection,
+        conversation_id: str,
+        session_id: str,
+        new_source_end: int,
+        policy_fingerprint: str,
+        route_fingerprint: str,
+        base_generation: int,
+        items: list[dict[str, Any]],
+    ) -> int:
+        """CAS-publish a generation and items on a caller-owned transaction."""
+        if new_source_end > 0 and not items:
+            raise ValueError("frontier items required for positive source boundary")
+        row = conn.execute(
+            """
+            SELECT generation
+            FROM lcm_active_frontiers
+            WHERE conversation_id = ?
+            ORDER BY generation DESC
+            LIMIT 1
+            """,
+            (conversation_id,),
+        ).fetchone()
+        current_gen = int(row[0]) if row else 0
+        if current_gen != int(base_generation):
+            return 0
+
+        now = time.time()
+        new_gen = int(base_generation) + 1
+        conn.execute(
+            """
+            INSERT INTO lcm_active_frontiers
+                (conversation_id, generation, session_id,
+                 source_end_store_id, policy_fingerprint,
+                 route_fingerprint, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                conversation_id,
+                new_gen,
+                session_id,
+                new_source_end,
+                policy_fingerprint,
+                route_fingerprint,
+                now,
+                now,
+            ),
+        )
+        phase_hook = getattr(self, "_publication_phase_hook", None)
+        if callable(phase_hook):
+            phase_hook("after_frontier_generation")
+        for ordinal, item in enumerate(items):
+            conn.execute(
+                """
+                INSERT INTO lcm_frontier_items
+                    (conversation_id, generation, ordinal, kind,
+                     ref_id, source_start, source_end)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    new_gen,
+                    ordinal,
+                    item.get("kind", "message"),
+                    item.get("ref_id", 0),
+                    item.get("source_start", 0),
+                    item.get("source_end", 0),
+                ),
+            )
+        if callable(phase_hook):
+            phase_hook("after_frontier_items")
+        return new_gen
 
     def rollback_frontier_generation(self, conversation_id: str, generation: int) -> bool:
         """Remove the just-published generation when a later publish step fails.
@@ -625,38 +682,70 @@ class FrontierStore:
         source_ids: Optional[Sequence[int]] = None,
     ) -> None:
         with self._lock:
-            sets = ["state = ?", "updated_at = ?"]
-            params: list[Any] = [state, time.time()]
-            if expected_leaf_count is not None:
-                sets.append("expected_leaf_count = ?")
-                params.append(expected_leaf_count)
-            if frontier_end_store_id is not None:
-                sets.append("frontier_end_store_id = ?")
-                params.append(frontier_end_store_id)
-            if failure_reason:
-                sets.append("failure_reason = ?")
-                params.append(failure_reason)
-            if summary_payload is not None:
-                sets.append("summary_payload = ?")
-                params.append(summary_payload)
-            if payload_version is not None:
-                sets.append("payload_version = ?")
-                params.append(int(payload_version))
-            if source_end_store_id is not None:
-                sets.append("source_end_store_id = ?")
-                params.append(int(source_end_store_id))
-            if source_identity_hash is not None:
-                sets.append("source_identity_hash = ?")
-                params.append(str(source_identity_hash))
-            if source_ids is not None:
-                sets.append("source_ids = ?")
-                params.append(json.dumps([int(source_id) for source_id in source_ids]))
-            params.append(batch_id)
-            self._conn.execute(
-                f"UPDATE lcm_prepared_batches SET {', '.join(sets)} WHERE batch_id = ?",
-                params,
+            owns_transaction = not self._conn.in_transaction
+            self.update_batch_state_no_commit(
+                self._conn,
+                batch_id,
+                state,
+                expected_leaf_count=expected_leaf_count,
+                frontier_end_store_id=frontier_end_store_id,
+                failure_reason=failure_reason,
+                summary_payload=summary_payload,
+                payload_version=payload_version,
+                source_end_store_id=source_end_store_id,
+                source_identity_hash=source_identity_hash,
+                source_ids=source_ids,
             )
-            self._conn.commit()
+            if owns_transaction:
+                self._conn.commit()
+
+    @staticmethod
+    def update_batch_state_no_commit(
+        conn: sqlite3.Connection,
+        batch_id: int,
+        state: str,
+        *,
+        expected_leaf_count: Optional[int] = None,
+        frontier_end_store_id: Optional[int] = None,
+        failure_reason: str = "",
+        summary_payload: Optional[str] = None,
+        payload_version: Optional[int] = None,
+        source_end_store_id: Optional[int] = None,
+        source_identity_hash: Optional[str] = None,
+        source_ids: Optional[Sequence[int]] = None,
+    ) -> None:
+        """Update a prepared batch on a caller-owned transaction."""
+        sets = ["state = ?", "updated_at = ?"]
+        params: list[Any] = [state, time.time()]
+        if expected_leaf_count is not None:
+            sets.append("expected_leaf_count = ?")
+            params.append(expected_leaf_count)
+        if frontier_end_store_id is not None:
+            sets.append("frontier_end_store_id = ?")
+            params.append(frontier_end_store_id)
+        if failure_reason:
+            sets.append("failure_reason = ?")
+            params.append(failure_reason)
+        if summary_payload is not None:
+            sets.append("summary_payload = ?")
+            params.append(summary_payload)
+        if payload_version is not None:
+            sets.append("payload_version = ?")
+            params.append(int(payload_version))
+        if source_end_store_id is not None:
+            sets.append("source_end_store_id = ?")
+            params.append(int(source_end_store_id))
+        if source_identity_hash is not None:
+            sets.append("source_identity_hash = ?")
+            params.append(str(source_identity_hash))
+        if source_ids is not None:
+            sets.append("source_ids = ?")
+            params.append(json.dumps([int(source_id) for source_id in source_ids]))
+        params.append(batch_id)
+        conn.execute(
+            f"UPDATE lcm_prepared_batches SET {', '.join(sets)} WHERE batch_id = ?",
+            params,
+        )
 
     def _row_to_batch(self, row: Sequence[Any]) -> PreparedBatch:
         return PreparedBatch(

@@ -6856,37 +6856,33 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             validation_ms = (time.perf_counter() - validation_started) * 1000.0
             return _result(promoted=False, reason="frontier_mismatch")
 
-        # 5. Canonical source overlap (foreground race already published)
-        try:
-            existing_nodes = self._dag.get_session_nodes(batch.session_id)
-            covered: set[int] = set()
-            for node in existing_nodes:
-                if getattr(node, "source_type", "") == "messages":
-                    for sid in getattr(node, "source_ids", None) or []:
-                        try:
-                            covered.add(int(sid))
-                        except (TypeError, ValueError):
-                            continue
-            if covered.intersection(covered_source_ids):
-                self._frontier.update_batch_state(
-                    batch_id, "rejected", failure_reason="canonical_source_overlap",
-                )
-                validation_ms = (time.perf_counter() - validation_started) * 1000.0
-                return _result(promoted=False, reason="canonical_source_overlap")
-        except Exception:
-            logger.debug("LCM canonical source-overlap check failed", exc_info=True)
-
         validation_ms = (time.perf_counter() - validation_started) * 1000.0
 
-        # --- Atomic promotion via CAS on generation ---
-        # The frontier store and DAG use separate SQLite connections, so we
-        # can't wrap both in a single transaction.  Instead, we use the
-        # generation counter as the CAS boundary and roll back any orphan
-        # DAG node if the frontier advance fails or a mid-publish hook fires.
-        # CRITICAL: publication uses the prepared payload only — zero LLM calls.
-        inserted_node_id: int | None = None
-        advanced_frontier_generation = 0
-        frontier_items_written = False
+        # --- One-connection atomic publication ---
+        # Every table below lives in the configured LCM database.  The frontier
+        # connection coordinates one BEGIN IMMEDIATE transaction so process
+        # death can expose only the old state or the complete new state.  The
+        # generation CAS and canonical overlap check are repeated under that
+        # write lock; preparation/validation above remains optimistic.
+        inserted_node_id = 0
+
+        def _publication_boundary(phase: str) -> None:
+            crash_hook = getattr(
+                self, "_async_compaction_publish_crash_hook", None
+            )
+            if callable(crash_hook):
+                crash_hook(phase)
+            elif crash_hook == phase:
+                os._exit(86)  # noqa: PLW1510 - deliberate subprocess crash injection
+
+            failure_hook = getattr(
+                self, "_async_compaction_publish_failure_hook", None
+            )
+            if callable(failure_hook):
+                failure_hook(phase)
+            elif failure_hook == phase:
+                raise RuntimeError("injected async promotion failure")
+
         try:
             publication_started = time.perf_counter()
             earliest_at, latest_at = self._store.get_time_bounds(covered_source_ids)
@@ -6904,76 +6900,131 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 latest_at=latest_at,
                 expand_hint=expand_hint,
             )
-            inserted_node_id = self._dag.add_node(node)
 
-            # Test-only inject: fail after canonical insert so callers can
-            # prove roll-back leaves no half-state.
-            hook = getattr(self, "_async_compaction_publish_failure_hook", None)
-            if hook == "after_canonical_insert":
-                raise RuntimeError("injected async promotion failure")
-
-            # Build from the prepared batch's pre-CAS generation. Querying the
-            # active tip after advancing would see the new (still empty) layout
-            # and lose every canonical summary carried by the base generation.
-            frontier_items = self._build_promoted_frontier_items(
+            # Build the immutable layout before acquiring the write lock.  The
+            # placeholder is replaced with the transaction-assigned node id.
+            # In-transaction CAS guarantees that the base layout did not change.
+            frontier_items_template = self._build_promoted_frontier_items(
                 conversation_id=batch.conversation_id,
                 session_id=batch.session_id,
-                node_id=int(inserted_node_id),
+                node_id=-1,
                 covered_source_ids=covered_source_ids,
                 frontier_end_store_id=int(batch.frontier_end_store_id or 0),
                 base_generation=int(batch.base_generation),
             )
-            if not frontier_items:
+            if not frontier_items_template:
                 raise RuntimeError("frontier_items_empty_after_promotion")
 
-            # Publish the generation row and its ordered items in one SQLite
-            # transaction. Readers can never observe a positive itemless tip.
-            new_gen = self._frontier.advance_frontier_generation_with_items(
-                batch.conversation_id,
-                batch.session_id,
-                batch.frontier_end_store_id,
-                current_policy_fp,
-                current_route_fp,
-                batch.base_generation,
-                frontier_items,
-            )
-            if new_gen == 0:
-                # Concurrent promotion / foreground race won — roll back orphan.
-                if inserted_node_id is not None:
-                    self._dag.delete_node(inserted_node_id)
-                    inserted_node_id = None
-                self._frontier.update_batch_state(batch_id, "rejected", failure_reason="frontier_mismatch")
-                publication_ms = (time.perf_counter() - publication_started) * 1000.0
-                return _result(promoted=False, reason="frontier_mismatch")
+            with self._frontier.publication_transaction() as publication_conn:
+                _publication_boundary("after_begin")
 
-            advanced_frontier_generation = new_gen
-            frontier_items_written = True
+                batch_row = publication_conn.execute(
+                    "SELECT state FROM lcm_prepared_batches WHERE batch_id = ?",
+                    (batch_id,),
+                ).fetchone()
+                if batch_row is None:
+                    return _result(promoted=False, reason="batch_not_found")
+                if str(batch_row[0]) not in ("ready", "preparing"):
+                    return _result(
+                        promoted=False,
+                        reason=f"batch_state_{batch_row[0]}",
+                    )
 
-            # Fault-injection points after items / generation CAS.
-            if hook == "after_frontier_items":
-                raise RuntimeError("injected async promotion failure")
+                generation_row = publication_conn.execute(
+                    """
+                    SELECT generation FROM lcm_active_frontiers
+                    WHERE conversation_id = ?
+                    ORDER BY generation DESC LIMIT 1
+                    """,
+                    (batch.conversation_id,),
+                ).fetchone()
+                locked_generation = int(generation_row[0]) if generation_row else 0
+                if locked_generation != int(batch.base_generation):
+                    self._frontier.update_batch_state_no_commit(
+                        publication_conn,
+                        batch_id,
+                        "rejected",
+                        failure_reason="frontier_mismatch",
+                    )
+                    return _result(promoted=False, reason="frontier_mismatch")
 
-            # Mark batch as promoted
-            self._frontier.update_batch_state(batch_id, "promoted")
+                # A foreground publisher can commit a canonical leaf before its
+                # frontier CAS. Recheck source coverage while holding SQLite's
+                # writer lock so async retry never creates duplicate lineage.
+                covered = set()
+                for source_row in publication_conn.execute(
+                    """
+                    SELECT source_ids FROM summary_nodes
+                    WHERE session_id = ? AND source_type = 'messages'
+                    """,
+                    (batch.session_id,),
+                ).fetchall():
+                    try:
+                        source_values = json.loads(source_row[0] or "[]")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    for source_id in source_values:
+                        try:
+                            covered.add(int(source_id))
+                        except (TypeError, ValueError):
+                            continue
+                if covered.intersection(covered_source_ids):
+                    self._frontier.update_batch_state_no_commit(
+                        publication_conn,
+                        batch_id,
+                        "rejected",
+                        failure_reason="canonical_source_overlap",
+                    )
+                    return _result(
+                        promoted=False,
+                        reason="canonical_source_overlap",
+                    )
 
-            if hook == "after_batch_promoted":
-                raise RuntimeError("injected async promotion failure")
+                inserted_node_id = self._dag.add_node_no_commit(
+                    publication_conn, node
+                )
+                _publication_boundary("after_canonical_insert")
 
-            # Also advance lifecycle frontier. A stale session returns an
-            # unchanged state instead of raising, so verify the checkpoint
-            # actually acknowledges this batch before declaring promotion.
-            lifecycle_state = self._lifecycle.advance_frontier(
-                batch.conversation_id,
-                batch.session_id,
-                batch.frontier_end_store_id,
-            )
-            if (
-                lifecycle_state is None
-                or lifecycle_state.current_session_id != batch.session_id
-                or int(lifecycle_state.current_frontier_store_id or 0)
-                < int(batch.frontier_end_store_id or 0)
-            ):
-                raise RuntimeError("lifecycle_frontier_not_advanced")
+                frontier_items = [dict(item) for item in frontier_items_template]
+                for item in frontier_items:
+                    if item.get("kind") == "node" and int(item.get("ref_id") or 0) == -1:
+                        item["ref_id"] = int(inserted_node_id)
+
+                self._frontier._publication_phase_hook = _publication_boundary
+                try:
+                    new_gen = self._frontier.advance_frontier_generation_with_items(
+                        batch.conversation_id,
+                        batch.session_id,
+                        batch.frontier_end_store_id,
+                        current_policy_fp,
+                        current_route_fp,
+                        batch.base_generation,
+                        frontier_items,
+                    )
+                finally:
+                    self._frontier._publication_phase_hook = None
+                if new_gen == 0:
+                    raise RuntimeError("frontier_changed_inside_publication_transaction")
+
+                self._frontier.update_batch_state(batch_id, "promoted")
+                _publication_boundary("after_batch_promoted")
+
+                with self._lifecycle.publication_connection(publication_conn):
+                    lifecycle_state = self._lifecycle.advance_frontier(
+                        batch.conversation_id,
+                        batch.session_id,
+                        batch.frontier_end_store_id,
+                    )
+                if (
+                    lifecycle_state is None
+                    or lifecycle_state.current_session_id != batch.session_id
+                    or int(lifecycle_state.current_frontier_store_id or 0)
+                    < int(batch.frontier_end_store_id or 0)
+                ):
+                    raise RuntimeError("lifecycle_frontier_not_advanced")
+                _publication_boundary("after_lifecycle_advanced")
+
+            _publication_boundary("after_commit")
 
             publication_ms = (time.perf_counter() - publication_started) * 1000.0
             wall_ms = (time.perf_counter() - wall_started) * 1000.0
@@ -7001,98 +7052,9 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             )
 
         except Exception as exc:
-            # Compensate the committed frontier CAS before removing the DAG node.
-            # Frontier/DAG/lifecycle have separate connections, so this keeps a
-            # later lifecycle or batch-state failure from publishing a phantom tip.
-            can_delete_inserted_node = not advanced_frontier_generation
-            rollback_lost_to_newer_generation = False
-            canonical_covered_source_ids: list[int] = []
-            canonical_node_ids: set[int] = set()
-            if advanced_frontier_generation:
-                try:
-                    rolled_back = self._frontier.rollback_frontier_generation(
-                        batch.conversation_id, advanced_frontier_generation
-                    )
-                    if not rolled_back:
-                        logger.error(
-                            "LCM could not roll back frontier generation %s after promotion error",
-                            advanced_frontier_generation,
-                        )
-                        active = self._frontier.get_active_frontier(
-                            batch.conversation_id
-                        )
-                        if (
-                            active is not None
-                            and int(active.get("generation") or 0)
-                            > int(advanced_frontier_generation)
-                        ):
-                            active_items = self._frontier.get_frontier_items(
-                                batch.conversation_id,
-                                int(active["generation"]),
-                            )
-                            rollback_lost_to_newer_generation = bool(active_items)
-                            for item in active_items:
-                                if item.get("kind") != "node":
-                                    continue
-                                node_id = int(item.get("ref_id") or 0)
-                                active_node = self._dag.get_node(node_id)
-                                if active_node is None:
-                                    rollback_lost_to_newer_generation = False
-                                    canonical_covered_source_ids = []
-                                    canonical_node_ids = set()
-                                    break
-                                canonical_node_ids.add(node_id)
-                                canonical_covered_source_ids.extend(
-                                    int(source_id)
-                                    for source_id in (active_node.source_ids or [])
-                                )
-                    else:
-                        frontier_items_written = False
-                        can_delete_inserted_node = True
-                except Exception:
-                    logger.error(
-                        "LCM frontier rollback failed after promotion error",
-                        exc_info=True,
-                    )
-            # Delete the canonical insert only when it was never frontier-visible
-            # or compensation removed the exact generation that published it.
-            # A newer generation may legitimately reuse G's node items; if G is
-            # no longer the tip (or rollback itself fails), preserving the node is
-            # the only fail-closed outcome that keeps that active frontier valid.
-            if inserted_node_id is not None and can_delete_inserted_node:
-                try:
-                    self._dag.delete_node(inserted_node_id)
-                except Exception:
-                    logger.debug(
-                        "LCM failed to roll back orphan DAG node %s after promotion error",
-                        inserted_node_id,
-                        exc_info=True,
-                    )
-                inserted_node_id = None
-
-            if rollback_lost_to_newer_generation:
-                # Exact compensation lost to a valid superseding generation.
-                # That generation is now the canonical publication boundary;
-                # surface it to compress() so later failures cannot replay the
-                # stale host rows covered by its node layout.
-                self._frontier.update_batch_state(
-                    batch_id,
-                    "superseded",
-                    failure_reason=f"promotion_superseded_after_error: {exc}",
-                )
-                return _result(
-                    promoted=True,
-                    reason="superseded_by_canonical_generation_after_promotion_error",
-                    node_id=(
-                        int(inserted_node_id or 0)
-                        if int(inserted_node_id or 0) in canonical_node_ids
-                        else 0
-                    ),
-                    covered=sorted(dict.fromkeys(canonical_covered_source_ids)),
-                )
-
-            # Injected mid-publish failures leave the batch ready for retry and
-            # re-raise so the caller observes the failure.
+            # Before commit, the transaction context has already rolled back
+            # every publication table and FTS side effect. Injected exception
+            # failures deliberately leave the ready batch retryable.
             if (
                 isinstance(exc, RuntimeError)
                 and "injected async promotion failure" in str(exc)
@@ -7100,8 +7062,20 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 raise
 
             logger.error("LCM async promotion failed: %s", exc)
+            # A failure from ``after_commit`` is observational only: durable
+            # state is already wholly new and must never be mislabeled rejected.
+            committed_batch = self._frontier.get_batch(batch_id)
+            if committed_batch is not None and committed_batch.state == "promoted":
+                return _result(
+                    promoted=True,
+                    reason="promotion_committed_before_observer_error",
+                    node_id=int(inserted_node_id or 0),
+                    covered=covered_source_ids,
+                )
             self._frontier.update_batch_state(
-                batch_id, "rejected", failure_reason=f"promotion_error: {exc}",
+                batch_id,
+                "rejected",
+                failure_reason=f"promotion_error: {exc}",
             )
             return _result(promoted=False, reason=f"promotion_error: {exc}")
 
@@ -7154,7 +7128,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                         "source_end": end,
                     }
                 )
-        if covered_source_ids and node_id > 0:
+        if covered_source_ids and node_id != 0:
             items.append(
                 {
                     "kind": "node",

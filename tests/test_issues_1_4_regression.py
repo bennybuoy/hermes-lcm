@@ -678,58 +678,31 @@ class TestIssue2HostReplacementDropsCovered:
         finally:
             engine.shutdown()
 
-    def test_lifecycle_failure_preserves_leaf_when_newer_generation_reuses_it(
+    def test_lifecycle_failure_rolls_back_before_newer_generation_can_reuse_leaf(
         self, tmp_path, monkeypatch
     ):
         engine = _engine(tmp_path, fresh_tail_count=2)
         _stub_summarize(monkeypatch, engine, text="concurrent lifecycle leaf")
         concurrent_frontier = FrontierStore(str(engine._store.db_path))
-        rollback_outcomes: list[bool] = []
-        original_rollback = engine._frontier.rollback_frontier_generation
         try:
             messages = _messages(16, tokens_each=40)
             engine.ingest(messages)
             prepared = engine.prepare_background_compaction_once(messages)
             assert prepared is not None and prepared.state == "ready"
 
-            def record_rollback(conversation_id, generation):
-                result = original_rollback(conversation_id, generation)
-                rollback_outcomes.append(result)
-                return result
-
-            monkeypatch.setattr(
-                engine._frontier,
-                "rollback_frontier_generation",
-                record_rollback,
-            )
-
             def publish_newer_generation_then_fail(*_args, **_kwargs):
-                # Promotion has already committed G and its ordered item set.
-                # A separate connection publishes G+1 reusing that valid
-                # layout before the original caller begins compensation.
+                # Publication is still uncommitted, so a sibling reader can
+                # observe only the complete base generation, never G's node.
                 published = concurrent_frontier.get_active_frontier(
                     prepared.conversation_id
                 )
                 assert published is not None
-                generation = int(published["generation"])
-                items = concurrent_frontier.get_frontier_items(
+                assert int(published["generation"]) == int(prepared.base_generation)
+                assert concurrent_frontier.get_frontier_items(
                     prepared.conversation_id,
-                    generation,
-                )
-                assert items and items[0]["kind"] == "node"
-                newer_generation = (
-                    concurrent_frontier.advance_frontier_generation_with_items(
-                        prepared.conversation_id,
-                        prepared.session_id,
-                        int(published["source_end_store_id"]),
-                        str(published["policy_fingerprint"]),
-                        str(published["route_fingerprint"]),
-                        generation,
-                        items,
-                    )
-                )
-                assert newer_generation == generation + 1
-                raise RuntimeError("injected lifecycle failure after G+1")
+                    int(prepared.base_generation) + 1,
+                ) == []
+                raise RuntimeError("injected lifecycle failure before commit")
 
             monkeypatch.setattr(
                 engine._lifecycle,
@@ -742,30 +715,17 @@ class TestIssue2HostReplacementDropsCovered:
                 messages,
             )
 
-            assert result.promoted is True
-            assert (
-                result.reason
-                == "superseded_by_canonical_generation_after_promotion_error"
-            )
-            assert rollback_outcomes == [False]
+            assert result.promoted is False
             active = engine._frontier.get_active_frontier(
                 prepared.conversation_id
             )
-            assert active is not None
-            active_items = engine._frontier.get_frontier_items(
-                prepared.conversation_id,
-                int(active["generation"]),
-            )
-            assert active_items
-            node_items = [item for item in active_items if item["kind"] == "node"]
-            assert node_items
-            for item in node_items:
-                assert engine._dag.get_node(int(item["ref_id"])) is not None
+            assert active is not None and int(active["generation"]) == int(prepared.base_generation)
+            assert engine._dag.get_session_node_count(prepared.session_id) == 0
         finally:
             concurrent_frontier.close()
             engine.shutdown()
 
-    def test_lifecycle_failure_preserves_leaf_when_frontier_rollback_raises(
+    def test_lifecycle_failure_needs_no_compensating_frontier_rollback(
         self, tmp_path, monkeypatch
     ):
         engine = _engine(tmp_path, fresh_tail_count=2)
@@ -803,14 +763,12 @@ class TestIssue2HostReplacementDropsCovered:
                 prepared.conversation_id
             )
             assert active is not None
-            active_items = engine._frontier.get_frontier_items(
+            assert int(active["generation"]) == int(prepared.base_generation)
+            assert engine._frontier.get_frontier_items(
                 prepared.conversation_id,
-                int(active["generation"]),
-            )
-            assert active_items
-            for item in active_items:
-                if item["kind"] == "node":
-                    assert engine._dag.get_node(int(item["ref_id"])) is not None
+                int(prepared.base_generation) + 1,
+            ) == []
+            assert engine._dag.get_session_node_count(prepared.session_id) == 0
         finally:
             engine.shutdown()
 
@@ -1756,7 +1714,7 @@ class TestFinalPublicationReviewBlockers:
         finally:
             engine.shutdown()
 
-    def test_superseded_rollback_returns_canonical_fallback_to_compress(
+    def test_atomic_rollback_returns_original_context_when_later_compress_fails(
         self, tmp_path, monkeypatch
     ):
         engine = _engine(tmp_path, fresh_tail_count=2)
@@ -1777,22 +1735,12 @@ class TestFinalPublicationReviewBlockers:
                     batch.conversation_id
                 )
                 assert published is not None
-                generation = int(published["generation"])
-                items = concurrent_frontier.get_frontier_items(
+                assert int(published["generation"]) == int(batch.base_generation)
+                assert concurrent_frontier.get_frontier_items(
                     batch.conversation_id,
-                    generation,
-                )
-                assert items
-                assert concurrent_frontier.advance_frontier_generation_with_items(
-                    batch.conversation_id,
-                    batch.session_id,
-                    int(published["source_end_store_id"]),
-                    str(published["policy_fingerprint"]),
-                    str(published["route_fingerprint"]),
-                    generation,
-                    items,
-                ) == generation + 1
-                raise RuntimeError("lifecycle failed after superseding generation")
+                    int(batch.base_generation) + 1,
+                ) == []
+                raise RuntimeError("lifecycle failed before atomic commit")
 
             monkeypatch.setattr(
                 engine._lifecycle,
@@ -1817,10 +1765,11 @@ class TestFinalPublicationReviewBlockers:
             result_blob = "\n".join(
                 str(message.get("content") or "") for message in result
             )
-            assert "superseding canonical leaf" in result_blob
+            assert "superseding canonical leaf" not in result_blob
             for content in covered_contents:
-                assert content not in result_blob
-            assert engine._ingest_cursor == len(result)
+                assert content in result_blob
+            assert result == messages
+            assert engine._dag.get_session_node_count(batch.session_id) == 0
         finally:
             concurrent_frontier.close()
             engine.shutdown()
