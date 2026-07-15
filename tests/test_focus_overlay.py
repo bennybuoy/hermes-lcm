@@ -264,6 +264,8 @@ def test_v7_fixture_migrates_to_v8_and_restarts_idempotently(tmp_path):
     conn.execute(
         "ALTER TABLE lcm_prepared_batches DROP COLUMN resolved_policy_json"
     )
+    # Remove the v8-only database guard while reconstructing this v7 fixture.
+    conn.execute("DROP TRIGGER lcm_schema_version_monotonic")
     conn.execute(
         "UPDATE metadata SET value = '7' WHERE key = 'schema_version'"
     )

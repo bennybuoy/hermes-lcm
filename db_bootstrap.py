@@ -142,6 +142,23 @@ def ensure_metadata_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def ensure_schema_version_monotonic_guard(conn: sqlite3.Connection) -> None:
+    """Prevent any writer, including older binaries, from lowering the marker."""
+    ensure_metadata_table(conn)
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS lcm_schema_version_monotonic
+        BEFORE UPDATE OF value ON metadata
+        WHEN OLD.key = 'schema_version'
+          AND NEW.key = 'schema_version'
+          AND CAST(NEW.value AS INTEGER) < CAST(OLD.value AS INTEGER)
+        BEGIN
+            SELECT RAISE(IGNORE);
+        END
+        """
+    )
+
+
 def get_schema_version(conn: sqlite3.Connection) -> int:
     ensure_metadata_table(conn)
     row = conn.execute(
@@ -909,6 +926,10 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
         conn.execute("BEGIN IMMEDIATE")
         refuse_schema_version_too_new(conn)
         ensure_metadata_table(conn)
+        # Install while the migration owns the writer lock, before publishing
+        # v8 and releasing older processes waiting to run unconditional marker
+        # UPSERTs. The trigger is durable database policy, not caller policy.
+        ensure_schema_version_monotonic_guard(conn)
         ensure_migration_state_table(conn)
 
         current_version = get_schema_version(conn)

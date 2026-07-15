@@ -244,6 +244,9 @@ class TestIssue1PersistSummaryPayload:
                 ON lcm_prepared_batches(conversation_id, state)
             """
         )
+        # This fixture intentionally reconstructs a genuine pre-v8 database
+        # after using current bootstrap DDL as a shortcut.
+        conn.execute("DROP TRIGGER lcm_schema_version_monotonic")
         conn.execute(
             "UPDATE metadata SET value = '6' WHERE key = 'schema_version'"
         )
@@ -1613,6 +1616,69 @@ class TestFinalPublicationReviewBlockers:
             )
             stored = engine._store.get_session_messages(engine.current_session_id)
             assert stored[-1]["content"] == "reply after promoted replacement"
+        finally:
+            engine.shutdown()
+
+    def test_ready_between_promotion_lookups_ingests_late_messages_and_next_append(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path, fresh_tail_count=2)
+        _stub_summarize(monkeypatch, engine, text="lookup race durable leaf")
+        try:
+            prepared_messages = _messages(12, prefix="prepared before lookup race")
+            engine.ingest(prepared_messages)
+            batch = engine.prepare_background_compaction_once(
+                prepared_messages,
+                leave_state="preparing",
+            )
+            assert batch is not None and batch.state == "preparing"
+
+            arrived = {
+                "role": "user",
+                "content": "host message arriving after preparation before readiness",
+            }
+            current_messages = prepared_messages + [arrived]
+            original_get_ready_batch = engine._frontier.get_ready_batch
+            lookup_count = 0
+
+            def become_ready_between_lookups(conversation_id):
+                nonlocal lookup_count
+                lookup_count += 1
+                if lookup_count == 1:
+                    assert original_get_ready_batch(conversation_id) is None
+                    engine._frontier.update_batch_state(batch.batch_id, "ready")
+                    return None
+                return original_get_ready_batch(conversation_id)
+
+            monkeypatch.setattr(
+                engine._frontier,
+                "get_ready_batch",
+                become_ready_between_lookups,
+            )
+
+            result = engine.compress(
+                current_messages,
+                current_tokens=engine.threshold_tokens + 1,
+            )
+
+            assert lookup_count == 2
+            assert engine._frontier.get_batch(batch.batch_id).state == "promoted"
+            stored = engine._store.get_session_messages(engine.current_session_id)
+            assert [row["content"] for row in stored].count(arrived["content"]) == 1
+            assert any(message.get("content") == arrived["content"] for message in result)
+            assert engine._ingest_cursor == len(result)
+
+            next_append = {
+                "role": "assistant",
+                "content": "first append after lookup-race promotion",
+            }
+            count_after_promotion = len(stored)
+            engine._ingest_messages(result + [next_append])
+            stored_after_append = engine._store.get_session_messages(
+                engine.current_session_id
+            )
+            assert len(stored_after_append) == count_after_promotion + 1
+            assert stored_after_append[-1]["content"] == next_append["content"]
         finally:
             engine.shutdown()
 

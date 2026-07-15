@@ -427,6 +427,9 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         # host-side active-context replacement so covered raw rows are dropped).
         self._async_last_promoted_source_ids: list[int] = []
         self._async_last_promoted_node_id: int = 0
+        self._async_promotion_ingested_messages: Optional[
+            List[Dict[str, Any]]
+        ] = None
         # Foreground cutover priority: set while compress() is in the critical
         # path so the background worker must not enter LLM/SQLite work.
         self._foreground_compress_active = threading.Event()
@@ -6754,6 +6757,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         wall_started = time.perf_counter()
         validation_ms = 0.0
         publication_ms = 0.0
+        self._async_promotion_ingested_messages = None
         self._async_total_promote_attempts = (
             int(getattr(self, "_async_total_promote_attempts", 0) or 0) + 1
         )
@@ -6786,6 +6790,13 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         if batch.state not in ("ready", "preparing"):
             validation_ms = (time.perf_counter() - validation_started) * 1000.0
             return _result(promoted=False, reason=f"batch_state_{batch.state}")
+
+        # This is the authoritative promotion boundary. A worker can make a
+        # batch ready after compress()'s optimistic lookup, and direct callers
+        # can bypass that lookup entirely. Persist the complete current host
+        # view before any validation path is allowed to publish the batch.
+        promotion_messages = self._ingest_messages(messages)
+        self._async_promotion_ingested_messages = promotion_messages
 
         # 0. Persisted payload required — never re-summarize at promote.
         payload = batch.parsed_summary_payload()
@@ -7306,6 +7317,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         On success, ``_async_last_promoted_source_ids`` holds the covered
         store_ids so the host replacement path can drop those raw rows.
         """
+        self._async_promotion_ingested_messages = None
         if not getattr(self._config, "async_background_compaction_enabled", False):
             return False
         if not getattr(self._config, "async_background_compaction_promote_on_compress", True):
@@ -7316,7 +7328,10 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         batch = self._frontier.get_ready_batch(conv_id)
         if batch is None:
             return False
-        result = self.promote_prepared_compaction(batch.batch_id, messages)
+        result = self.promote_prepared_compaction(
+            batch.batch_id,
+            messages,
+        )
         if not result.promoted:
             return False
         # Keep in-process frontier marker aligned with the promoted end.

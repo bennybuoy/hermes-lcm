@@ -565,6 +565,14 @@ class CompactionMixin:
                             busy_timeout_ms,
                         )
                     promoted = promote_hook(messages)
+                promotion_ingested_messages = getattr(
+                    self,
+                    "_async_promotion_ingested_messages",
+                    None,
+                )
+                if promotion_ingested_messages is not None:
+                    messages = promotion_ingested_messages
+                    prepromotion_ingested = True
                 phase("promotion_lookup", t0)
                 if promoted:
                     t_asm = time.perf_counter()

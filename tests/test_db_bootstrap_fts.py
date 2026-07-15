@@ -420,6 +420,113 @@ def test_migration_serializes_version_read_and_prevents_marker_downgrade(
         older.close()
 
 
+def test_v8_migration_blocks_base_v7_unconditional_schema_upsert(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "mixed-v7-v8-schema-migration.db"
+    setup = sqlite3.connect(db_path)
+    setup.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+    setup.execute(
+        "INSERT INTO metadata(key, value) VALUES ('schema_version', '7')"
+    )
+    setup.commit()
+    setup.close()
+
+    migrator = sqlite3.connect(db_path, timeout=5.0, check_same_thread=False)
+    base_v7 = sqlite3.connect(db_path, timeout=5.0, check_same_thread=False)
+    db_bootstrap.configure_connection(migrator)
+    db_bootstrap.configure_connection(base_v7)
+    cached_v7 = base_v7.execute(
+        "SELECT value FROM metadata WHERE key = 'schema_version'"
+    ).fetchone()[0]
+    assert cached_v7 == "7"
+
+    migration_holds_writer_lock = threading.Event()
+    allow_migration = threading.Event()
+    original_get_schema_version = db_bootstrap.get_schema_version
+
+    def pause_v8_after_locked_version_read(conn):
+        version = original_get_schema_version(conn)
+        if conn is migrator:
+            migration_holds_writer_lock.set()
+            assert allow_migration.wait(timeout=5.0)
+        return version
+
+    monkeypatch.setattr(
+        db_bootstrap,
+        "get_schema_version",
+        pause_v8_after_locked_version_read,
+    )
+    outcomes: dict[str, object] = {}
+
+    def migrate_to_v8():
+        try:
+            db_bootstrap.run_versioned_migrations(migrator)
+        except Exception as exc:
+            outcomes["migration_error"] = exc
+
+    def execute_base_v7_cached_marker_write():
+        try:
+            # This is the unconditional SQL shipped by the base-v7 process,
+            # deliberately not the current guarded set_schema_version().
+            base_v7.execute(
+                """
+                INSERT INTO metadata(key, value)
+                VALUES('schema_version', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (cached_v7,),
+            )
+            base_v7.commit()
+            outcomes["base_v7_finished"] = True
+        except Exception as exc:
+            outcomes["base_v7_error"] = exc
+
+    migration_thread = threading.Thread(target=migrate_to_v8)
+    base_v7_thread = threading.Thread(target=execute_base_v7_cached_marker_write)
+    try:
+        migration_thread.start()
+        assert migration_holds_writer_lock.wait(timeout=5.0)
+        base_v7_thread.start()
+        time.sleep(0.1)
+        assert base_v7_thread.is_alive(), (
+            "base-v7 UPSERT must wait behind the v8 migration writer lock"
+        )
+
+        allow_migration.set()
+        migration_thread.join(timeout=5.0)
+        base_v7_thread.join(timeout=5.0)
+
+        assert not migration_thread.is_alive()
+        assert not base_v7_thread.is_alive()
+        assert "migration_error" not in outcomes
+        assert "base_v7_error" not in outcomes
+        assert outcomes.get("base_v7_finished") is True
+
+        check = sqlite3.connect(db_path)
+        try:
+            assert db_bootstrap.get_schema_version(check) == 8
+            focus_table = check.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'lcm_focus_briefs'"
+            ).fetchone()
+            assert focus_table is not None
+            prepared_columns = {
+                row[1]
+                for row in check.execute(
+                    "PRAGMA table_info(lcm_prepared_batches)"
+                ).fetchall()
+            }
+            assert "resolved_policy_json" in prepared_columns
+        finally:
+            check.close()
+    finally:
+        allow_migration.set()
+        migration_thread.join(timeout=5.0)
+        base_v7_thread.join(timeout=5.0)
+        migrator.close()
+        base_v7.close()
+
+
 def test_message_store_refuses_newer_schema_before_startup_ddl(tmp_path):
     from hermes_lcm.store import MessageStore
 
