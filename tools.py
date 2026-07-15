@@ -59,6 +59,12 @@ _LCM_GREP_REGEX_OPERATION_DEADLINE_SECONDS = 1.0
 _LCM_GREP_REGEX_MAX_PATTERN_CHARS = 2_000
 _CROSS_SESSION_EXPANSION_GUARD = threading.Lock()
 _ACTIVE_CROSS_SESSION_EXPANSIONS: set[str] = set()
+_CROSS_SESSION_MAX_SESSIONS = 10
+_CROSS_SESSION_MAX_SUMMARIES_PER_SESSION = 20
+_CROSS_SESSION_MAX_RESULTS = 20
+_CROSS_SESSION_MAX_ANSWER_TOKENS = 8_192
+_CROSS_SESSION_MAX_CONTEXT_TOKENS = 65_536
+_CROSS_SESSION_MAX_DEADLINE_MS = 120_000
 
 
 def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
@@ -697,13 +703,11 @@ def _expand_message_sources(
             next_content_offset = 0
             has_more = next_source_offset < total_sources
             continue
-        # Authorization is established on the summary node before this helper
-        # is called.  Its exact source_ids are canonical provenance, and a
-        # retained rollover node intentionally keeps references to raw rows in
-        # the prior session.  Re-checking the row's session here breaks source
-        # closure and makes an authorized current-session node unexpandable.
-        # This does not enable archive discovery: callers still cannot select
-        # an arbitrary cross-session node without the explicit bounded gate.
+        if allowed_session_id is not None and stored.get("session_id", "") != allowed_session_id:
+            next_source_offset = source_index + 1
+            next_content_offset = 0
+            has_more = next_source_offset < total_sources
+            continue
         transcript_content = stored.get("content", "")
         content = transcript_content
         content_source = "message"
@@ -712,10 +716,15 @@ def _expand_message_sources(
         ingest_refs = extract_ingest_externalized_refs(transcript_content)
         ref = ingest_refs[0] if ingest_refs else extract_externalized_ref(transcript_content)
         if ref:
+            payload_allowed_sessions = (
+                {allowed_session_id}
+                if allowed_session_id is not None
+                else {engine.current_session_id, stored.get("session_id", "")}
+            )
             ref_payload = _get_externalized_payload(
                 engine,
                 ref,
-                allowed_session_ids={engine.current_session_id, stored.get("session_id", "")},
+                allowed_session_ids=payload_allowed_sessions,
             )
             if ref_payload is not None and ref_payload.get("kind") != "ingest_payload":
                 externalized = ref_payload
@@ -1227,30 +1236,12 @@ def _cross_session_expand_query(
     max_tokens: int,
     context_max_tokens: int,
     max_results: int,
+    allowed_session_ids: frozenset[str],
 ) -> str:
-    """Run one explicitly authorized, profile-bounded archive synthesis."""
+    """Run one trusted-capability-authorized, profile-bounded archive synthesis."""
     if not engine._config.cross_session_expansion_enabled:
         return json.dumps({"error": "cross-session expansion is disabled for this profile"})
-    if args.get("authorize_cross_session") is not True:
-        return json.dumps({
-            "error": "cross-session expansion requires authorize_cross_session=true",
-        })
-
-    scope = str(args.get("session_scope") or "").strip().lower()
-    raw_allowed = args.get("session_ids") or []
-    if not isinstance(raw_allowed, list) or any(not str(value or "").strip() for value in raw_allowed):
-        return json.dumps({"error": "session_ids must be an array of non-empty strings"})
-    allowed_session_ids = {str(value).strip() for value in raw_allowed}
-    if scope == "sessions":
-        if not allowed_session_ids:
-            return json.dumps({"error": "session_scope=sessions requires session_ids"})
-    elif scope == "all":
-        if allowed_session_ids:
-            return json.dumps({"error": "session_ids is not used with session_scope=all"})
-    else:
-        return json.dumps({
-            "error": "cross-session expansion requires explicit session_scope=all or sessions",
-        })
+    scope = "capability_allowlist"
 
     def _bounded_positive_int(name: str, default: int, hard_max: int) -> tuple[int | None, str | None]:
         try:
@@ -1264,14 +1255,19 @@ def _cross_session_expand_query(
     max_sessions, error = _bounded_positive_int(
         "max_sessions",
         engine._config.cross_session_max_sessions,
-        engine._config.cross_session_max_sessions,
+        min(engine._config.cross_session_max_sessions, _CROSS_SESSION_MAX_SESSIONS),
     )
     if error:
         return json.dumps({"error": error})
-    per_session_limit = min(max_results, engine._config.cross_session_max_summaries_per_session)
+    per_session_limit = min(
+        max_results,
+        engine._config.cross_session_max_summaries_per_session,
+        _CROSS_SESSION_MAX_SUMMARIES_PER_SESSION,
+    )
     configured_deadline_ms = min(
         int(engine._config.cross_session_expansion_deadline_ms),
         int(engine._config.expansion_timeout_ms),
+        _CROSS_SESSION_MAX_DEADLINE_MS,
     )
     deadline_ms, error = _bounded_positive_int(
         "deadline_ms",
@@ -1309,8 +1305,7 @@ def _cross_session_expand_query(
         else:
             return json.dumps({"error": "Provide either query or node_ids"})
 
-        if allowed_session_ids:
-            candidates = [node for node in candidates if node.session_id in allowed_session_ids]
+        candidates = [node for node in candidates if node.session_id in allowed_session_ids]
 
         # Search order is relevance order. First bucket occurrence therefore
         # ranks sessions before any source expansion occurs.
@@ -1486,7 +1481,12 @@ def _cross_session_expand_query(
                 "model": model,
             })
             return json.dumps(base_payload)
-        base_payload.update({"answer": answer, "model": model})
+        bounded_answer, answer_truncated = _truncate_text_to_token_budget(answer, max_tokens)
+        base_payload.update({
+            "answer": bounded_answer,
+            "answer_truncated": answer_truncated,
+            "model": model,
+        })
         return json.dumps(base_payload)
     finally:
         with _CROSS_SESSION_EXPANSION_GUARD:
@@ -2201,17 +2201,23 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     max_tokens, max_tokens_error = _parse_int_arg("max_tokens", 2000)
     if max_tokens_error:
         return json.dumps({"error": max_tokens_error})
-    max_tokens = max(1, max_tokens)
+    max_tokens = min(max(1, max_tokens), _CROSS_SESSION_MAX_ANSWER_TOKENS)
     context_default = max(max_tokens, int(getattr(engine._config, "expansion_context_tokens", 32_000) or 32_000))
     context_max_tokens, context_max_tokens_error = _parse_int_arg("context_max_tokens", context_default)
     if context_max_tokens_error:
         return json.dumps({"error": context_max_tokens_error})
-    context_max_tokens = max(1, context_max_tokens)
+    context_max_tokens = min(
+        max(1, context_max_tokens),
+        _CROSS_SESSION_MAX_CONTEXT_TOKENS,
+    )
 
     max_results, max_results_error = _parse_int_arg("max_results", 5)
     if max_results_error:
         return json.dumps({"error": max_results_error})
-    max_results = max(1, int(max_results or 5))
+    max_results = min(
+        max(1, int(max_results or 5)),
+        _CROSS_SESSION_MAX_RESULTS,
+    )
 
     query = str(args.get("query") or "").strip()
     raw_node_ids = args.get("node_ids") or []
@@ -2219,6 +2225,18 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
         return json.dumps({"error": "node_ids must be an array"})
 
     if args.get("cross_session") is True:
+        if len(prompt) > 20_000:
+            return json.dumps({"error": "cross-session prompt exceeds 20000 characters"})
+        if len(query) > 2_000:
+            return json.dumps({"error": "cross-session query exceeds 2000 characters"})
+        raw_node_ids = raw_node_ids[:_CROSS_SESSION_MAX_RESULTS]
+        allowed_session_ids = engine._authorized_cross_session_ids(
+            kwargs.get("cross_session_capability")
+        )
+        if not allowed_session_ids:
+            return json.dumps({
+                "error": "cross-session expansion requires a trusted host capability",
+            })
         return _cross_session_expand_query(
             engine,
             args,
@@ -2228,6 +2246,7 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             max_tokens=max_tokens,
             context_max_tokens=context_max_tokens,
             max_results=max_results,
+            allowed_session_ids=allowed_session_ids,
         )
 
     nodes = []

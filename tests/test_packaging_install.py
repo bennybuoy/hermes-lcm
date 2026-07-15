@@ -69,6 +69,32 @@ def test_standalone_install_scripts_exist_and_are_shell_scripts():
     assert validate_script.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash\n")
 
 
+def test_checkout_wrapper_loads_cli_as_package_for_maintenance(tmp_path):
+    repo_root = Path(__file__).resolve().parent.parent
+    missing_db = tmp_path / "missing.db"
+    result = subprocess.run(
+        [
+            str(repo_root / "scripts" / "hermes-lcm"),
+            "--database",
+            str(missing_db),
+            "maintenance",
+            "plan",
+            "dissolve",
+            "--conversation-id",
+            "conversation",
+            "--node-id",
+            "1",
+        ],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 5
+    assert "attempted relative import" not in result.stdout
+    assert "attempted relative import" not in result.stderr
+
+
 def test_validate_release_routes_cache_artifacts_outside_checkout():
     repo_root = Path(__file__).resolve().parent.parent
     validate_script = (repo_root / "scripts" / "validate_release.sh").read_text(encoding="utf-8")

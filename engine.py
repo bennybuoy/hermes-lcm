@@ -161,6 +161,16 @@ _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across co
 _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
 
 
+class _CrossSessionCapability:
+    """Opaque host-issued authorization for an explicit session allowlist."""
+
+    __slots__ = ("_issuer", "session_ids")
+
+    def __init__(self, issuer: object, session_ids: frozenset[str]):
+        self._issuer = issuer
+        self.session_ids = session_ids
+
+
 class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
     """Lossless Context Management engine.
 
@@ -268,6 +278,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         )
         self._context_threshold_autoraised: dict[str, float] | None = None
         self._compaction_policy: Optional[ModelCompactionPolicy] = None
+        self._cross_session_capability_issuer = object()
         self._cache_signal_tracker = CacheAwareSignalTracker()
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
@@ -3561,6 +3572,35 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             LCM_DOCTOR,
         ]
 
+    def issue_cross_session_capability(
+        self,
+        session_ids: Sequence[str],
+    ) -> _CrossSessionCapability:
+        """Mint a trusted, engine-bound capability outside model arguments.
+
+        Hosts may call this only after their own authorization decision. The
+        tool schema cannot construct or request this opaque object.
+        """
+        if isinstance(session_ids, (str, bytes)):
+            raise ValueError("cross-session capability requires a session-id sequence")
+        normalized = frozenset(str(value or "").strip() for value in session_ids)
+        if not normalized or "" in normalized:
+            raise ValueError("cross-session capability requires non-empty session ids")
+        if any(len(value) > 256 for value in normalized):
+            raise ValueError("cross-session capability session ids are limited to 256 characters")
+        if len(normalized) > lcm_tools._CROSS_SESSION_MAX_SESSIONS:
+            raise ValueError(
+                f"cross-session capability allows at most {lcm_tools._CROSS_SESSION_MAX_SESSIONS} sessions"
+            )
+        return _CrossSessionCapability(self._cross_session_capability_issuer, normalized)
+
+    def _authorized_cross_session_ids(self, capability: Any) -> frozenset[str] | None:
+        if not isinstance(capability, _CrossSessionCapability):
+            return None
+        if capability._issuer is not self._cross_session_capability_issuer:
+            return None
+        return capability.session_ids
+
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
         # Ingest live messages if passed (enables current-turn search)
         messages = kwargs.get("messages")
@@ -3591,7 +3631,10 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         }
         handler = handlers.get(name)
         if handler:
-            return handler(args, engine=self)
+            handler_kwargs = {"engine": self}
+            if name == "lcm_expand_query" and kwargs.get("cross_session_capability") is not None:
+                handler_kwargs["cross_session_capability"] = kwargs["cross_session_capability"]
+            return handler(args, **handler_kwargs)
         return json.dumps({"error": f"Unknown LCM tool: {name}"})
 
     def _database_path_source(self) -> str:
@@ -5302,6 +5345,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 prompt = previous.prompt
         elif not prompt:
             return {"error": "focus prompt is required"}
+        prompt = redact_sensitive_text(prompt, self._config)
 
         max_nodes = max(1, int(self._config.focus_max_source_nodes))
         if refocus:
@@ -5318,11 +5362,11 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 if self._focus_node_max_store_id(node) > int(previous.covered_store_id)
             ][:max_nodes]
             if not nodes:
-                return {
+                return redact_sensitive_value({
                     "error": "no post-focus DAG delta is available",
                     "previous_focus_preserved": True,
                     "focus": previous.metadata(),
-                }
+                }, self._config, parse_json_strings=True)
         else:
             nodes = self._dag.search(prompt, session_id=session_id, limit=max_nodes)
             if not nodes:
@@ -6081,6 +6125,21 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 logger.warning(
                     "LCM reserve_tokens_floor=%d disables reserve-based assembly cap because context_length=%d",
                     self._config.reserve_tokens_floor,
+                    self.context_length,
+                )
+
+        if (
+            self._compaction_policy is not None
+            and self.context_length > 0
+            and self._compaction_policy.output_reserve > 0
+        ):
+            output_reserve_cap = self.context_length - self._compaction_policy.output_reserve
+            if output_reserve_cap > 0:
+                caps.append(output_reserve_cap)
+            else:
+                logger.warning(
+                    "LCM policy output_reserve=%d disables reserve-based assembly cap because context_length=%d",
+                    self._compaction_policy.output_reserve,
                     self.context_length,
                 )
 

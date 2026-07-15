@@ -205,3 +205,77 @@ def test_engine_uses_resolved_rule_for_live_cutover_and_status(tmp_path):
         assert status["post_compaction_target_tokens"] == 15_000
     finally:
         engine.shutdown()
+
+
+@pytest.mark.parametrize(
+    "rule,match",
+    [
+        ({"match": {"min_context_window": "large"}, "overrides": {}}, "min_context_window"),
+        ({"match": {}, "overrides": {"cutover_threshold": "0.5"}}, "cutover_threshold"),
+        ({"match": {}, "overrides": {"fresh_tail_count": -1}}, "fresh_tail_count"),
+        ({"match": {}, "overrides": {"condensation_fanin": True}}, "condensation_fanin"),
+        ({"match": {}, "overrides": {"cache_economics": "cheap"}}, "cache_economics"),
+        ({"match": {}, "overrides": {"compaction_mode": "later"}}, "compaction_mode"),
+        ({"match": {}, "overrides": {"dynamic_leaf_chunk_enabled": "sometimes"}}, "dynamic_leaf_chunk_enabled"),
+    ],
+)
+def test_policy_rules_reject_wrong_types_and_ranges(rule, match):
+    with pytest.raises(ValueError, match=match):
+        _resolve([rule])
+
+
+def test_quoted_false_boolean_is_parsed_without_enabling_strategy():
+    policy = _resolve([{
+        "match": {"route": "responses"},
+        "overrides": {
+            "dynamic_leaf_chunk_enabled": "false",
+            "cache_friendly_condensation_enabled": "false",
+            "full_sweep_compaction_enabled": "false",
+        },
+    }])
+
+    assert policy.dynamic_leaf_chunk_enabled is False
+    assert policy.cache_friendly_condensation_enabled is False
+    assert policy.full_sweep_compaction_enabled is False
+
+
+def test_legacy_model_policy_layers_over_structured_rule_without_erasing_it():
+    policy = _resolve(
+        [{
+            "name": "route-base",
+            "match": {"route": "responses"},
+            "overrides": {
+                "fresh_tail_count": 7,
+                "dynamic_leaf_chunk_enabled": True,
+            },
+        }],
+        model_policies={
+            "route-model": {
+                "cutover_threshold": 0.60,
+                "cache_friendly_condensation_enabled": False,
+            },
+        },
+    )
+
+    assert policy.cutover_threshold == 0.60
+    assert policy.fresh_tail_count == 7
+    assert policy.dynamic_leaf_chunk_enabled is True
+    assert policy.cache_friendly_condensation_enabled is False
+
+
+def test_output_reserve_constrains_live_runtime_assembly_cap(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "output-reserve.db"),
+        policy_rules=[{
+            "match": {"model": "reserve-model"},
+                "overrides": {"output_reserve": 90_000},
+        }],
+    )
+    engine = LCMEngine(config=config)
+    try:
+        engine.update_model("reserve-model", 100_000, provider="test")
+        assert engine._compaction_policy.output_reserve == 90_000
+        assert engine._effective_assembly_token_cap() == 10_000
+        assert engine._assembly_token_budget() == 10_000
+    finally:
+        engine.shutdown()

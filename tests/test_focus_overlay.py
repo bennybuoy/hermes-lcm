@@ -208,6 +208,29 @@ def test_focus_output_surfaces_redact_sensitive_values(tmp_path, monkeypatch):
         assert "supersecret" not in serialized
         assert "promptsecret" not in serialized
         assert "LCM sensitive redaction" in serialized
+        persisted = engine._focus.get(created["focus_id"])
+        assert persisted is not None
+        assert "promptsecret" not in persisted.prompt
+        assert "LCM sensitive redaction" in persisted.prompt
+    finally:
+        engine.shutdown()
+
+
+def test_failed_refocus_redacts_previous_focus_metadata(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    engine._config.sensitive_patterns_enabled = True
+    _node(engine, "alpha credentials", "credential evidence")
+    monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", lambda **kwargs: "brief")
+    try:
+        created = engine.create_focus("alpha password=promptsecret")
+        monkeypatch.setattr(engine._dag, "search", lambda *args, **kwargs: [])
+        monkeypatch.setattr(engine._dag, "get_session_nodes", lambda *args, **kwargs: [])
+        result = engine.create_focus("", refocus=True)
+        serialized = json.dumps(result)
+        assert result["previous_focus_preserved"] is True
+        assert created["focus_id"] == result["focus"]["focus_id"]
+        assert "promptsecret" not in serialized
+        assert "LCM sensitive redaction" in serialized
     finally:
         engine.shutdown()
 

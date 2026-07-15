@@ -68,3 +68,13 @@ def test_fresh_tail_counts_multimodal_placeholders_for_token_boundary(tmp_path):
         assert engine.get_status()["fresh_tail_selection"]["token_start"] == 2
     finally:
         engine.shutdown()
+
+
+def test_zero_fresh_tail_remains_runtime_compatible(tmp_path):
+    engine = _engine(tmp_path, count=0, token_cap=0)
+    try:
+        engine.update_model("test-model", 100_000, provider="test")
+        assert engine._compaction_policy.fresh_tail_count == 0
+        assert engine._effective_fresh_tail_count() == 0
+    finally:
+        engine.shutdown()

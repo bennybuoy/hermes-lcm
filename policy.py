@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 from fnmatch import fnmatchcase
 from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
@@ -191,16 +192,31 @@ class ModelCompactionPolicy:
                 f"Policy invariant violated: emergency_threshold ({self.emergency_threshold}) "
                 f"must be in (0, 1.0]"
             )
-        if self.fresh_tail_count < 1:
-            raise ValueError("fresh_tail_count must be at least 1")
+        if self.fresh_tail_count < 0:
+            raise ValueError("fresh_tail_count must be non-negative")
         if self.fresh_tail_max_tokens < 0:
             raise ValueError("fresh_tail_max_tokens must be non-negative")
+        if self.leaf_chunk_tokens < 1:
+            raise ValueError("leaf_chunk_tokens must be positive")
+        if self.dynamic_leaf_chunk_max < 1:
+            raise ValueError("dynamic_leaf_chunk_max must be positive")
         if self.condensation_fanin < 2:
             raise ValueError("condensation_fanin must be at least 2")
         if not 2 <= self.condensation_min_fanin <= self.condensation_fanin:
             raise ValueError(
                 "condensation_min_fanin must be between 2 and condensation_fanin"
             )
+        if self.incremental_max_depth < -1:
+            raise ValueError("incremental_max_depth must be at least -1")
+        if self.output_reserve < 0:
+            raise ValueError("output_reserve must be non-negative")
+        for field_name in (
+            "dynamic_leaf_chunk_enabled",
+            "cache_friendly_condensation_enabled",
+            "full_sweep_compaction_enabled",
+        ):
+            if not isinstance(getattr(self, field_name), bool):
+                raise ValueError(f"{field_name} must be a boolean")
         if self.cache_economics not in {"discounted", "none", "unknown"}:
             raise ValueError(
                 "cache_economics must be discounted, none, or unknown"
@@ -236,6 +252,10 @@ class ModelCompactionPolicy:
             reserve_cap = context_length - self.assembly_reserve_floor
             if reserve_cap > 0:
                 caps.append(reserve_cap)
+        if context_length > 0 and self.output_reserve > 0:
+            output_cap = context_length - self.output_reserve
+            if output_cap > 0:
+                caps.append(output_cap)
         if caps:
             return max(1, min(derived, min(caps)))
         return derived
@@ -389,6 +409,83 @@ _RULE_OVERRIDE_FIELDS = frozenset({
     "summary_prefix_target_tokens",
 })
 
+_RATIO_OVERRIDE_FIELDS = frozenset({
+    "preparation_threshold",
+    "cutover_threshold",
+    "post_compaction_target",
+    "emergency_threshold",
+})
+_BOOLEAN_OVERRIDE_FIELDS = frozenset({
+    "dynamic_leaf_chunk_enabled",
+    "cache_friendly_condensation_enabled",
+    "cache_friendly_condensation",
+    "full_sweep_compaction_enabled",
+})
+_INTEGER_OVERRIDE_MINIMUMS = {
+    "fresh_tail_count": 0,
+    "fresh_tail_max_tokens": 0,
+    "leaf_chunk_tokens": 1,
+    "dynamic_leaf_chunk_max": 1,
+    "condensation_fanin": 2,
+    "condensation_min_fanin": 2,
+    "incremental_max_depth": -1,
+    "output_reserve": 0,
+    "cache_ttl_seconds": 0,
+    "summary_prefix_target_tokens": 0,
+}
+_ENUM_OVERRIDE_VALUES = {
+    "cache_economics": frozenset({"discounted", "none", "unknown"}),
+    "compaction_mode": frozenset({"inline", "deferred"}),
+}
+
+
+def _coerce_policy_boolean(field_name: str, value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    raise ValueError(f"{field_name} must be a boolean or 'true'/'false'")
+
+
+def _validate_policy_overrides(overrides: dict[str, Any], *, prefix: str) -> None:
+    unknown_override = set(overrides) - _RULE_OVERRIDE_FIELDS
+    if unknown_override:
+        raise ValueError(f"unknown override field: {sorted(unknown_override)[0]}")
+    for field_name, value in overrides.items():
+        if field_name in _RATIO_OVERRIDE_FIELDS:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{prefix} {field_name} must be a number")
+            if not math.isfinite(float(value)) or not 0 < float(value) <= 1.0:
+                raise ValueError(f"{prefix} {field_name} must be in (0, 1]")
+        elif field_name in _BOOLEAN_OVERRIDE_FIELDS:
+            _coerce_policy_boolean(field_name, value)
+        elif field_name in _INTEGER_OVERRIDE_MINIMUMS:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{prefix} {field_name} must be an integer")
+            minimum = _INTEGER_OVERRIDE_MINIMUMS[field_name]
+            if value < minimum:
+                raise ValueError(f"{prefix} {field_name} must be at least {minimum}")
+        elif field_name in _ENUM_OVERRIDE_VALUES:
+            if not isinstance(value, str) or value.strip().lower() not in _ENUM_OVERRIDE_VALUES[field_name]:
+                allowed = ", ".join(sorted(_ENUM_OVERRIDE_VALUES[field_name]))
+                raise ValueError(f"{prefix} {field_name} must be one of: {allowed}")
+
+
+def _normalize_policy_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(overrides)
+    for field_name in _BOOLEAN_OVERRIDE_FIELDS & set(normalized):
+        normalized[field_name] = _coerce_policy_boolean(field_name, normalized[field_name])
+    if "cache_friendly_condensation" in normalized:
+        alias_value = normalized.pop("cache_friendly_condensation")
+        normalized.setdefault("cache_friendly_condensation_enabled", alias_value)
+    for field_name in _ENUM_OVERRIDE_VALUES.keys() & normalized.keys():
+        normalized[field_name] = normalized[field_name].strip().lower()
+    return normalized
+
 
 def validate_policy_rules(rules: Optional[list[dict[str, Any]]]) -> None:
     """Validate structured rules without depending on runtime metadata."""
@@ -404,8 +501,10 @@ def validate_policy_rules(rules: Optional[list[dict[str, Any]]]) -> None:
             raise ValueError(
                 f"policy rule {index} has unknown field: {sorted(unknown_top)[0]}"
             )
-        match = rule.get("match") or {}
-        overrides = rule.get("overrides") or {}
+        if "name" in rule and not isinstance(rule["name"], str):
+            raise ValueError(f"policy rule {index} name must be a string")
+        match = rule.get("match", {})
+        overrides = rule.get("overrides", {})
         if not isinstance(match, dict) or not isinstance(overrides, dict):
             raise ValueError(f"policy rule {index} match/overrides must be objects")
         unknown_match = set(match) - _RULE_MATCH_FIELDS
@@ -413,11 +512,17 @@ def validate_policy_rules(rules: Optional[list[dict[str, Any]]]) -> None:
             raise ValueError(
                 f"unknown match field: {sorted(unknown_match)[0]}"
             )
-        unknown_override = set(overrides) - _RULE_OVERRIDE_FIELDS
-        if unknown_override:
-            raise ValueError(
-                f"unknown override field: {sorted(unknown_override)[0]}"
-            )
+        for field_name, value in match.items():
+            if field_name in {"min_context_window", "max_context_window"}:
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise ValueError(f"policy rule {index} {field_name} must be a positive integer")
+            elif not isinstance(value, str) or not value.strip():
+                raise ValueError(f"policy rule {index} {field_name} must be a non-empty string")
+        minimum = match.get("min_context_window")
+        maximum = match.get("max_context_window")
+        if minimum is not None and maximum is not None and minimum > maximum:
+            raise ValueError(f"policy rule {index} min_context_window exceeds max_context_window")
+        _validate_policy_overrides(overrides, prefix=f"policy rule {index}")
 
 
 def _pattern_match(value: str, pattern: Any) -> tuple[bool, bool]:
@@ -609,6 +714,11 @@ def resolve_policy(
         best_key = ""
         normalized_model = _normalize_model_name(model)
         for key, value in model_policies.items():
+            if not isinstance(key, str) or not key.strip():
+                raise ValueError("model_policies keys must be non-empty strings")
+            if not isinstance(value, dict):
+                raise ValueError(f"model policy {key} must be an object")
+            _validate_policy_overrides(value, prefix=f"model policy {key}")
             normalized_key = _normalize_model_name(str(key))
             if (
                 normalized_key
@@ -625,7 +735,7 @@ def resolve_policy(
     session_selector = ""
     if selected_rule is not None:
         rule, rule_name, reason = selected_rule
-        selected_overrides = dict(rule.get("overrides") or {})
+        selected_overrides = _normalize_policy_overrides(rule.get("overrides") or {})
         cutover_source = f"policy_rule:{rule_name}"
         selection_reason = reason
         match = rule.get("match") or {}
@@ -633,19 +743,10 @@ def resolve_policy(
         session_selector = str(match.get("session") or match.get("platform") or "")
     if selected_model_policy is not None:
         selector_name, model_overrides = selected_model_policy
-        unknown = set(model_overrides) - _RULE_OVERRIDE_FIELDS
-        if unknown:
-            raise ValueError(
-                f"unknown override field: {sorted(unknown)[0]}"
-            )
-        selected_overrides = dict(model_overrides)
+        selected_overrides.update(_normalize_policy_overrides(model_overrides))
         cutover_source = f"model_policies:{selector_name}"
         selection_reason = f"longest model match {selector_name}"
 
-    if "cache_friendly_condensation" in selected_overrides:
-        selected_overrides["cache_friendly_condensation_enabled"] = (
-            selected_overrides.pop("cache_friendly_condensation")
-        )
     if "cutover_threshold" in selected_overrides:
         cutover_ratio = float(selected_overrides["cutover_threshold"])
         if "preparation_threshold" not in selected_overrides:
@@ -706,17 +807,17 @@ def resolve_policy(
         "fresh_tail_count": int(selected_overrides.get("fresh_tail_count", fresh_tail_count)),
         "fresh_tail_max_tokens": int(selected_overrides.get("fresh_tail_max_tokens", fresh_tail_max_tokens)),
         "leaf_chunk_tokens": int(selected_overrides.get("leaf_chunk_tokens", leaf_chunk_tokens)),
-        "dynamic_leaf_chunk_enabled": bool(selected_overrides.get("dynamic_leaf_chunk_enabled", dynamic_leaf_chunk_enabled)),
+        "dynamic_leaf_chunk_enabled": selected_overrides.get("dynamic_leaf_chunk_enabled", dynamic_leaf_chunk_enabled),
         "dynamic_leaf_chunk_max": int(selected_overrides.get("dynamic_leaf_chunk_max", dynamic_leaf_chunk_max)),
         "condensation_fanin": int(selected_overrides.get("condensation_fanin", condensation_fanin)),
         "condensation_min_fanin": int(selected_overrides.get("condensation_min_fanin", condensation_min_fanin)),
         "incremental_max_depth": int(selected_overrides.get("incremental_max_depth", incremental_max_depth)),
-        "cache_friendly_condensation_enabled": bool(selected_overrides.get("cache_friendly_condensation_enabled", cache_friendly_condensation_enabled)),
+        "cache_friendly_condensation_enabled": selected_overrides.get("cache_friendly_condensation_enabled", cache_friendly_condensation_enabled),
         "output_reserve": int(selected_overrides.get("output_reserve", output_reserve)),
         "cache_economics": str(selected_overrides.get("cache_economics", cache_economics)).lower(),
         "compaction_mode": str(selected_overrides.get("compaction_mode", compaction_mode)).lower(),
         "cache_ttl_seconds": int(selected_overrides.get("cache_ttl_seconds", cache_ttl_seconds)),
-        "full_sweep_compaction_enabled": bool(selected_overrides.get("full_sweep_compaction_enabled", full_sweep_compaction_enabled)),
+        "full_sweep_compaction_enabled": selected_overrides.get("full_sweep_compaction_enabled", full_sweep_compaction_enabled),
         "summary_prefix_target_tokens": int(selected_overrides.get("summary_prefix_target_tokens", summary_prefix_target_tokens)),
     }
 

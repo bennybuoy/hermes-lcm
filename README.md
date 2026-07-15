@@ -240,7 +240,7 @@ outside the LCM database.
 | `lcm_load_session` | Load one ordered raw-message transcript page for an explicit `session_id`. Continues with `after_store_id` from `next_cursor`. |
 | `lcm_describe` | Inspect the current-session DAG or preview an `externalized_ref` without loading full content. |
 | `lcm_expand` | Recover source messages, child summaries, or externalized payloads with pagination. Use `store_id` to fetch a single raw message from a cross-session `lcm_grep` result. |
-| `lcm_expand_query` | Answer a question using expanded current-session LCM context while returning a bounded answer. Optional archive DAG mode requires the profile gate plus explicit scope and authorization. |
+| `lcm_expand_query` | Answer a question using expanded current-session LCM context while returning a bounded answer. Optional archive DAG mode requires the profile gate plus a trusted host-issued session capability. |
 | `lcm_focus` | Create, inspect, delta-refocus, or deactivate a persisted evidence-backed focus overlay without mutating canonical DAG history. |
 | `lcm_status` | Show runtime health, context pressure, config, source lineage, and lifecycle stats. |
 | `lcm_inspect` | Read-only operator inventory for current-session lineage, frontier/fresh-tail metadata, externalized refs/readability, compaction skip/no-op reasons, and matched ignore/stateless patterns. Returns metadata only; use retrieval tools for content. |
@@ -629,9 +629,10 @@ query. Use Hermes `session_search` for broad cross-session history outside the
 LCM database.
 
 Cross-session DAG synthesis remains disabled by default. When the profile sets
-`LCM_CROSS_SESSION_EXPANSION_ENABLED=true`, a caller must also set
-`cross_session=true`, acknowledge `authorize_cross_session=true`, and choose
-`session_scope='all'` or an explicit `session_ids` allowlist. Sessions are ranked
+`LCM_CROSS_SESSION_EXPANSION_ENABLED=true`, a caller may set
+`cross_session=true`, but the host must separately provide an opaque capability
+containing the authorized session allowlist. Model tool arguments cannot mint or
+widen that capability. Sessions are ranked
 before expansion. All selected buckets share one context budget, answer budget,
 and wall-clock deadline; completed buckets remain as provenance if a later one
 times out. Externalized refs from other sessions stay metadata-only. Concurrent

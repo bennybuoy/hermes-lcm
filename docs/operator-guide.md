@@ -395,8 +395,9 @@ What the main knobs do:
   `lcm_expand_query` may feed to the auxiliary model. It does not change what
   LCM stores.
 - Cross-session DAG synthesis is off by default. Enabling its profile gate is
-  insufficient by itself: each call must request cross-session mode, acknowledge
-  authorization, and select all local LCM sessions or a specific allowlist.
+  insufficient by itself: each call must request cross-session mode and the
+  trusted host must supply an opaque capability with a specific session
+  allowlist. Model-visible arguments cannot mint or widen that capability.
   Session ranking occurs before expansion; context, answer, and deadline limits
   are shared across buckets. External refs remain metadata-only, completed
   buckets survive later timeouts, and same-profile re-entry is rejected. Use

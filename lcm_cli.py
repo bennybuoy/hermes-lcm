@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -20,6 +21,25 @@ EXIT_NOT_FOUND = 3
 EXIT_CONFIG = 4
 EXIT_DATABASE = 5
 SCHEMA_VERSION = 8
+_CLI_MAX_PREVIEW_CHARS = 20_000
+_CLI_MAX_OUTPUT_CHARS = 100_000
+_CLI_MAX_OUTPUT_NODES = 2_000
+_CLI_MAX_CONTAINER_ITEMS = 200
+_CLI_MAX_DEPTH = 8
+_CLI_TRUNCATED = "[TRUNCATED]"
+_CLI_REDACTED = "[REDACTED by hermes-lcm CLI]"
+_CLI_SENSITIVE_KEY_RE = re.compile(
+    r"(?:api[_-]?key|authorization|bearer[_-]?token|access[_-]?token|password|passwd|pwd|passphrase|client[_-]?secret|private[_-]?key|credential|secret|\btoken\b)",
+    re.IGNORECASE,
+)
+_CLI_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+\-/]+=*")
+_CLI_ASSIGNMENT_RE = re.compile(
+    r"(?i)(\b(?:api[_-]?key|password|passwd|pwd|passphrase|client[_-]?secret|authorization|access[_-]?token|secret|token)\b\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+)
+_CLI_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 class CliError(RuntimeError):
@@ -81,11 +101,72 @@ def _bounded_limit(value: int) -> int:
     return value
 
 
+def _bounded_preview_chars(value: int) -> int:
+    if value <= 0 or value > _CLI_MAX_PREVIEW_CHARS:
+        raise CliError(
+            f"preview-chars must be between 1 and {_CLI_MAX_PREVIEW_CHARS}",
+            EXIT_INVALID,
+        )
+    return value
+
+
+def _redact_cli_text(value: str) -> str:
+    protected = _CLI_PRIVATE_KEY_RE.sub(_CLI_REDACTED, value)
+    protected = _CLI_BEARER_RE.sub(_CLI_REDACTED, protected)
+    return _CLI_ASSIGNMENT_RE.sub(lambda match: match.group(1) + _CLI_REDACTED, protected)
+
+
+def _sanitize_output(value: Any) -> Any:
+    """Recursively redact and bound every CLI output surface."""
+    state = {"chars": _CLI_MAX_OUTPUT_CHARS, "nodes": _CLI_MAX_OUTPUT_NODES}
+
+    def sanitize(item: Any, *, depth: int = 0, sensitive_key: bool = False) -> Any:
+        if state["nodes"] <= 0:
+            return _CLI_TRUNCATED
+        state["nodes"] -= 1
+        if depth > _CLI_MAX_DEPTH:
+            return _CLI_TRUNCATED
+        if sensitive_key and item not in (None, ""):
+            state["chars"] = max(0, state["chars"] - len(_CLI_REDACTED))
+            return _CLI_REDACTED
+        if isinstance(item, dict):
+            result = {}
+            entries = list(item.items())[:_CLI_MAX_CONTAINER_ITEMS]
+            for key, child in entries:
+                safe_key = _redact_cli_text(str(key))[:256]
+                result[safe_key] = sanitize(
+                    child,
+                    depth=depth + 1,
+                    sensitive_key=bool(_CLI_SENSITIVE_KEY_RE.search(str(key))),
+                )
+            if len(item) > len(entries):
+                result["output_truncated"] = True
+            return result
+        if isinstance(item, (list, tuple)):
+            entries = list(item)[:_CLI_MAX_CONTAINER_ITEMS]
+            result = [sanitize(child, depth=depth + 1) for child in entries]
+            if len(item) > len(entries):
+                result.append(_CLI_TRUNCATED)
+            return result
+        if isinstance(item, str):
+            protected = _redact_cli_text(item)
+            limit = min(_CLI_MAX_PREVIEW_CHARS, max(0, state["chars"]))
+            if len(protected) > limit:
+                suffix = _CLI_TRUNCATED if limit >= len(_CLI_TRUNCATED) else ""
+                protected = protected[:max(0, limit - len(suffix))] + suffix
+            state["chars"] = max(0, state["chars"] - len(protected))
+            return protected
+        return item
+
+    return sanitize(value)
+
+
 def _preview(value: Any, chars: int, full: bool) -> tuple[str, bool]:
     text = "" if value is None else str(value)
-    if full or len(text) <= chars:
+    limit = _CLI_MAX_PREVIEW_CHARS if full else _bounded_preview_chars(chars)
+    if len(text) <= limit:
         return text, False
-    return text[:chars], True
+    return text[:limit], True
 
 
 def _schema_version(conn: sqlite3.Connection) -> int:
@@ -164,9 +245,7 @@ def _sessions(conn: sqlite3.Connection, args: argparse.Namespace) -> dict[str, A
 def _messages(conn: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
     _require_table(conn, "messages")
     limit = _bounded_limit(args.limit)
-    preview_chars = args.preview_chars
-    if preview_chars <= 0 or preview_chars > 20_000:
-        raise CliError("preview-chars must be between 1 and 20000", EXIT_INVALID)
+    preview_chars = _bounded_preview_chars(args.preview_chars)
     where = ["store_id > ?"]
     values: list[Any] = [args.after_store_id]
     if args.session_id:
@@ -202,6 +281,7 @@ def _messages(conn: sqlite3.Connection, args: argparse.Namespace) -> dict[str, A
 
 def _summaries(conn: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
     _require_table(conn, "summary_nodes")
+    preview_chars = _bounded_preview_chars(args.preview_chars)
     if args.action == "show":
         row = conn.execute(
             "SELECT * FROM summary_nodes WHERE node_id=?",
@@ -211,7 +291,7 @@ def _summaries(conn: sqlite3.Connection, args: argparse.Namespace) -> dict[str, 
             raise CliError("not found", EXIT_NOT_FOUND)
         item = dict(row)
         item["summary"], item["summary_truncated"] = _preview(
-            item.get("summary"), args.preview_chars, args.full
+            item.get("summary"), preview_chars, args.full
         )
         return item
     limit = _bounded_limit(args.limit)
@@ -234,7 +314,7 @@ def _summaries(conn: sqlite3.Connection, args: argparse.Namespace) -> dict[str, 
     for row in rows:
         item = dict(row)
         item["summary"], item["summary_truncated"] = _preview(
-            item.get("summary"), args.preview_chars, args.full
+            item.get("summary"), preview_chars, args.full
         )
         items.append(item)
     return {
@@ -275,6 +355,7 @@ def _frontier(conn: sqlite3.Connection, args: argparse.Namespace) -> dict[str, A
 
 def _prepared(conn: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
     _require_table(conn, "lcm_prepared_batches")
+    preview_chars = _bounded_preview_chars(getattr(args, "preview_chars", 500))
     if args.action == "show":
         row = conn.execute(
             "SELECT * FROM lcm_prepared_batches WHERE batch_id=?",
@@ -285,7 +366,7 @@ def _prepared(conn: sqlite3.Connection, args: argparse.Namespace) -> dict[str, A
         item = dict(row)
         if not args.full and "summary_payload" in item:
             item["summary_payload"], item["summary_payload_truncated"] = _preview(
-                item["summary_payload"], args.preview_chars, False
+                item["summary_payload"], preview_chars, False
             )
         return item
     limit = _bounded_limit(args.limit)
@@ -670,13 +751,13 @@ def main(argv: list[str] | None = None) -> int:
                     payload = _doctor(conn, path, args)
             finally:
                 conn.close()
-        print(_render(payload, args))
+        print(_render(_sanitize_output(payload), args))
         return EXIT_OK
     except CliError as exc:
-        print(json.dumps({"error": str(exc)}))
+        print(json.dumps(_sanitize_output({"error": str(exc)})))
         return exc.exit_code
     except sqlite3.Error as exc:
-        print(json.dumps({"error": f"database failure: {exc}"}))
+        print(json.dumps(_sanitize_output({"error": f"database failure: {exc}"})))
         return EXIT_DATABASE
 
 

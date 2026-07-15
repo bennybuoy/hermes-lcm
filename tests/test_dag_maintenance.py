@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 
 import pytest
@@ -159,6 +160,36 @@ def test_backup_restore_proof_and_symlink_refusal(tmp_path):
     link.symlink_to(path)
     with pytest.raises(ValueError, match="symlink"):
         create_verified_backup(link)
+    assert os.stat(backup["backup_path"]).st_mode & 0o777 == 0o600
+
+
+def test_maintenance_backup_directory_symlink_is_rejected(tmp_path):
+    path, _, _ = _fixture(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "lcm-maintenance-backups").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        create_verified_backup(path)
+    assert list(outside.iterdir()) == []
+
+
+def test_maintenance_audit_symlink_is_rejected_before_mutation(tmp_path):
+    path, parent, _ = _fixture(tmp_path)
+    redirected = tmp_path / "redirected-audit"
+    redirected.write_text("do not append\n", encoding="utf-8")
+    (tmp_path / "lcm-maintenance-audit.jsonl").symlink_to(redirected)
+
+    with pytest.raises(ValueError, match="audit.*symlink"):
+        apply_dag_maintenance(
+            path,
+            operation="dissolve",
+            conversation_id="source-conv",
+            node_id=parent,
+            confirmation="APPLY dissolve",
+        )
+    assert redirected.read_text(encoding="utf-8") == "do not append\n"
+    assert _active(path, "source-conv")[0][0] == 1
 
 
 def test_operator_tui_once_is_functional_and_read_only(tmp_path, capsys):

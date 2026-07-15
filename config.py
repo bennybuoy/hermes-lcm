@@ -668,8 +668,8 @@ class LCMConfig:
     expansion_model: str = ""     # empty = fall back to summary_model / Hermes auxiliary model
     # Serialized summary/raw/child-source/externalized context budget fed to lcm_expand_query's auxiliary LLM before it returns a bounded answer.
     expansion_context_tokens: int = 32_000
-    # Archive DAG synthesis is disabled unless both this profile gate and the
-    # tool call's explicit cross-session authorization are present.
+    # Archive DAG synthesis is disabled unless both this profile gate and a
+    # trusted host-issued, session-allowlisted capability are present.
     cross_session_expansion_enabled: bool = False
     cross_session_max_sessions: int = 3
     cross_session_max_summaries_per_session: int = 3

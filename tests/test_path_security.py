@@ -70,3 +70,20 @@ def test_hermes_home_outside_allowed_base_rejected(monkeypatch):
         for state_db_path_for_engine in (command_state_db_path, tools_state_db_path):
             with pytest.raises(ValueError, match="not within allowed base"):
                 state_db_path_for_engine(engine)
+
+
+def test_default_externalization_root_symlink_escape_fails_closed(monkeypatch, tmp_path):
+    from hermes_lcm.externalize import get_large_output_storage_dir
+
+    allowed = tmp_path / "allowed"
+    outside = tmp_path / "outside"
+    allowed.mkdir()
+    outside.mkdir()
+    (allowed / "lcm-large-outputs").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("LCM_HERMES_BASE_DIR", str(allowed))
+
+    class Config:
+        large_output_externalization_path = ""
+
+    with pytest.raises(ValueError, match="not within allowed base"):
+        get_large_output_storage_dir(Config(), str(allowed), create=False)

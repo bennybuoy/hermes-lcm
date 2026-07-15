@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from hermes_lcm.config import LCMConfig
+from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
 
 
@@ -152,6 +153,70 @@ def test_cli_config_show_exposes_only_lcm_section(tmp_path):
     assert "secret" not in result.stdout
 
 
+def test_cli_full_output_is_recursively_redacted_and_hard_bounded(tmp_path):
+    db = _seed(tmp_path)
+    secret = "sk-proj-cli-super-secret"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "UPDATE messages SET content=? WHERE store_id=(SELECT MIN(store_id) FROM messages)",
+        (f'api_key: {secret}\n' + ("x" * 250_000),),
+    )
+    conn.commit()
+    conn.close()
+
+    result = _run(db, "messages", "list", "--full", "--limit", "200")
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    serialized = json.dumps(payload)
+    assert secret not in serialized
+    assert "[REDACTED" in serialized
+    assert payload["items"][0]["content_truncated"] is True
+    assert len(result.stdout) < 150_000
+
+
+def test_cli_config_output_redacts_nested_credentials_and_bounds_values(tmp_path):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    secret = "config-super-secret"
+    (hermes_home / "config.yaml").write_text(
+        "lcm:\n"
+        "  custom_instructions: 'password: " + secret + " " + ("z" * 250_000) + "'\n"
+        "  nested:\n"
+        "    api_key: 'nested-secret'\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "lcm_cli.py"),
+            "--hermes-home",
+            str(hermes_home),
+            "config",
+            "show",
+        ],
+        cwd=os.fspath(tmp_path),
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert secret not in result.stdout
+    assert "nested-secret" not in result.stdout
+    assert "[REDACTED" in result.stdout
+    assert len(result.stdout) < 150_000
+
+
+def test_cli_preview_bounds_apply_to_summary_and_prepared_show(tmp_path):
+    db = _seed(tmp_path)
+    summary = _run(db, "summaries", "show", "1", "--preview-chars", "20001")
+    prepared = _run(db, "prepared-batches", "show", "1", "--preview-chars", "20001")
+    assert summary.returncode == 2
+    assert prepared.returncode == 2
+
+
 def test_cli_exit_codes_distinguish_not_found_and_invalid_input(tmp_path):
     db = _seed(tmp_path)
     missing = _run(db, "summaries", "show", "999999")
@@ -164,7 +229,50 @@ def test_cli_exit_codes_distinguish_not_found_and_invalid_input(tmp_path):
 
 def test_packaged_console_script_runs_without_gateway(tmp_path):
     db = _seed(tmp_path)
-    target = tmp_path / "site"
+    engine = LCMEngine(config=LCMConfig(database_path=str(db)))
+    engine.on_session_start(
+        "maintenance-session",
+        conversation_id="maintenance-conversation",
+        platform="test",
+    )
+    store_id = engine._store.append(
+        "maintenance-session",
+        {"role": "user", "content": "maintenance source"},
+        conversation_id="maintenance-conversation",
+    )
+    leaf_id = engine._dag.add_node(SummaryNode(
+        session_id="maintenance-session",
+        depth=0,
+        summary="maintenance leaf",
+        token_count=3,
+        source_token_count=3,
+        source_ids=[store_id],
+        source_type="messages",
+        created_at=1.0,
+    ))
+    parent_id = engine._dag.add_node(SummaryNode(
+        session_id="maintenance-session",
+        depth=1,
+        summary="maintenance parent",
+        token_count=3,
+        source_token_count=3,
+        source_ids=[leaf_id],
+        source_type="nodes",
+        created_at=2.0,
+    ))
+    engine._frontier.ensure_frontier(
+        "maintenance-conversation",
+        "maintenance-session",
+        source_end_store_id=store_id,
+    )
+    engine._frontier.set_frontier_items("maintenance-conversation", 1, [{
+        "kind": "node",
+        "ref_id": parent_id,
+        "source_start": store_id,
+        "source_end": store_id,
+    }])
+    engine.shutdown()
+    target = tmp_path / "venv"
     source = tmp_path / "source"
     shutil.copytree(
         REPO_ROOT,
@@ -173,18 +281,34 @@ def test_packaged_console_script_runs_without_gateway(tmp_path):
             ".git", "build", "*.egg-info", "__pycache__", "CODEX_REPORT.md"
         ),
     )
-    install = subprocess.run(
+    wheelhouse = tmp_path / "wheelhouse"
+    build = subprocess.run(
         [
             sys.executable,
             "-m",
             "pip",
-            "install",
+            "wheel",
             "--no-deps",
             "--no-build-isolation",
-            "--target",
-            str(target),
+            "--wheel-dir",
+            str(wheelhouse),
             str(source),
         ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert build.returncode == 0, build.stderr
+    create_venv = subprocess.run(
+        [sys.executable, "-m", "venv", str(target)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert create_venv.returncode == 0, create_venv.stderr
+    wheel = next(wheelhouse.glob("hermes_lcm-*.whl"))
+    install = subprocess.run(
+        [str(target / "bin" / "python"), "-m", "pip", "install", "--no-deps", str(wheel)],
         text=True,
         capture_output=True,
         check=False,
@@ -192,14 +316,12 @@ def test_packaged_console_script_runs_without_gateway(tmp_path):
     assert install.returncode == 0, install.stderr
     result = subprocess.run(
         [
-            sys.executable,
-            "-m",
-            "hermes_lcm.lcm_cli",
+            str(target / "bin" / "hermes-lcm"),
             "--database",
             str(db),
             "status",
         ],
-        env={**os.environ, "PYTHONPATH": str(target)},
+        env={**os.environ},
         cwd=os.fspath(tmp_path),
         text=True,
         capture_output=True,
@@ -208,18 +330,46 @@ def test_packaged_console_script_runs_without_gateway(tmp_path):
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["read_only"] is True
 
+    maintenance = subprocess.run(
+        [
+            str(target / "bin" / "hermes-lcm"),
+            "--database",
+            str(db),
+            "maintenance",
+            "plan",
+            "dissolve",
+            "--conversation-id",
+            "maintenance-conversation",
+            "--node-id",
+            str(parent_id),
+        ],
+        env={**os.environ},
+        cwd=os.fspath(tmp_path),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert maintenance.returncode == 0, maintenance.stderr
+    maintenance_payload = json.loads(maintenance.stdout)
+    assert maintenance_payload["dry_run"] is True
+    assert maintenance_payload["operation"] == "dissolve"
+
     preflight = subprocess.run(
         [
-            sys.executable,
-            "-m",
-            "hermes_lcm.lcm_cli",
+            str(target / "bin" / "hermes-lcm"),
             "--pretty",
             "activation-preflight",
         ],
         env={
             **os.environ,
             "HOME": str(tmp_path / "preflight-home"),
-            "PYTHONPATH": os.pathsep.join([str(target), str(HERMES_AGENT_ROOT)]),
+            "PYTHONPATH": os.pathsep.join([
+                str(HERMES_AGENT_ROOT),
+                *[
+                    entry for entry in sys.path
+                    if entry and ("site-packages" in entry or "dist-packages" in entry)
+                ],
+            ]),
         },
         cwd=os.fspath(tmp_path),
         text=True,
@@ -241,7 +391,8 @@ def test_packaged_console_script_runs_without_gateway(tmp_path):
         "lcm_inspect",
         "lcm_doctor",
     }
-    assert (target / "hermes_lcm" / "plugin.yaml").is_file()
+    site_packages = next((target / "lib").glob("python*/site-packages"))
+    assert (site_packages / "hermes_lcm" / "plugin.yaml").is_file()
     assert (
-        target / "hermes_lcm" / "docs" / "host-activation-contract.md"
+        site_packages / "hermes_lcm" / "docs" / "host-activation-contract.md"
     ).is_file()

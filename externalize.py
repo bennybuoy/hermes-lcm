@@ -114,16 +114,15 @@ def get_large_output_storage_dir(config, hermes_home: str = "", *, create: bool)
                 _warn_externalization_path_outside_base(path, allowed_base)
     else:
         base = Path(hermes_home).expanduser().resolve() if hermes_home else Path("~/.hermes").expanduser().resolve()
-        path = base / DEFAULT_LARGE_OUTPUT_DIRNAME
-        # Check containment within allowed base for default/hermes_home-based paths
-        # Only enforced when LCM_HERMES_BASE_DIR is explicitly set
+        path = (base / DEFAULT_LARGE_OUTPUT_DIRNAME).resolve()
+        # Default storage is always contained beneath its resolved base. This
+        # rejects a pre-existing child symlink before search can trust it.
         env_base = os.environ.get("LCM_HERMES_BASE_DIR")
-        if env_base:
-            allowed_base = Path(env_base).expanduser().resolve()
-            try:
-                path.relative_to(allowed_base)
-            except ValueError:
-                raise ValueError(f"Path {path} is not within allowed base {allowed_base}")
+        allowed_base = Path(env_base).expanduser().resolve() if env_base else base
+        try:
+            path.relative_to(allowed_base)
+        except ValueError:
+            raise ValueError(f"Path {path} is not within allowed base {allowed_base}")
     if create:
         missing_dirs = _missing_directory_components(path)
         path.mkdir(parents=True, exist_ok=True)

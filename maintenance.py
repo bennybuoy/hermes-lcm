@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import tempfile
 import time
 from typing import Any
@@ -66,21 +67,41 @@ def backup_database(engine) -> dict[str, Any]:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = backup_dir / f"{db_path.stem}-{timestamp}.sqlite3"
 
+    directory_fd = -1
+    backup_fd = -1
+    dest = None
     try:
-        backup_dir.mkdir(parents=True, exist_ok=True)
+        if not backup_dir.parent.exists():
+            backup_dir.parent.mkdir(parents=True, exist_ok=True)
+        directory_fd = _open_directory_nofollow(backup_dir, create=True)
         flush_engine_connections(engine)
 
-        dest = sqlite3.connect(str(backup_path))
+        backup_fd = _open_private_exclusive_file(directory_fd, backup_path.name)
+        dest = _sqlite_connection_for_fd(backup_fd)
         try:
             engine._store.backup(dest)
         finally:
             dest.close()
-    except (OSError, sqlite3.Error) as exc:
+            dest = None
+        os.fsync(backup_fd)
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        if backup_fd >= 0:
+            try:
+                backup_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         return {
             "ok": False,
             "db_path": db_path,
             "error": str(exc),
         }
+    finally:
+        if dest is not None:
+            dest.close()
+        if backup_fd >= 0:
+            os.close(backup_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
 
     backup_size = backup_path.stat().st_size if backup_path.exists() else 0
     return {
@@ -108,34 +129,55 @@ def rotate_backup_database(engine) -> dict[str, Any]:
 
     backup_path = engine.rotate_backup_path()
     backup_dir = backup_path.parent
-    tmp_path = backup_path.with_name(backup_path.name + ".tmp")
+    tmp_path = backup_path.with_name(
+        f"{backup_path.name}.{time.time_ns():x}.tmp"
+    )
 
+    directory_fd = -1
+    tmp_fd = -1
+    dest = None
     try:
-        backup_dir.mkdir(parents=True, exist_ok=True)
+        if not backup_dir.parent.exists():
+            backup_dir.parent.mkdir(parents=True, exist_ok=True)
+        directory_fd = _open_directory_nofollow(backup_dir, create=True)
         flush_engine_connections(engine)
 
-        if tmp_path.exists():
-            tmp_path.unlink()
-        dest = sqlite3.connect(str(tmp_path))
+        tmp_fd = _open_private_exclusive_file(directory_fd, tmp_path.name)
+        dest = _sqlite_connection_for_fd(tmp_fd)
         try:
             engine._store.backup(dest)
         finally:
             dest.close()
+            dest = None
+        os.fsync(tmp_fd)
         # Atomic replace so the rolling slot is never half-written.
-        tmp_path.replace(backup_path)
-    except (OSError, sqlite3.Error) as exc:
+        os.replace(
+            tmp_path.name,
+            backup_path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    except (OSError, sqlite3.Error, ValueError) as exc:
         # Best-effort cleanup of the tmp file if something failed midway.
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except OSError:
-            pass
+        if tmp_fd >= 0:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         return {
             "ok": False,
             "db_path": db_path,
             "backup_path": backup_path,
             "error": str(exc),
         }
+    finally:
+        if dest is not None:
+            dest.close()
+        if tmp_fd >= 0:
+            os.close(tmp_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
 
     backup_size = backup_path.stat().st_size if backup_path.exists() else 0
     return {
@@ -146,20 +188,76 @@ def rotate_backup_database(engine) -> dict[str, Any]:
     }
 
 
-def _maintenance_backup_path(db_path: Path) -> Path:
+def _open_directory_nofollow(path: Path, *, create: bool) -> int:
+    if path.is_symlink():
+        raise ValueError(f"maintenance refuses symlink directory: {path}")
+    if create:
+        path.mkdir(mode=0o700, parents=False, exist_ok=True)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISDIR(file_stat.st_mode):
+            raise ValueError(f"maintenance artifact directory is not a directory: {path}")
+        os.fchmod(fd, 0o700)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _open_private_exclusive_file(directory_fd: int, name: str) -> int:
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+            raise ValueError("maintenance artifact is not a private regular file")
+        os.fchmod(fd, 0o600)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _sqlite_connection_for_fd(fd: int) -> sqlite3.Connection:
+    descriptor_path = Path(f"/proc/self/fd/{fd}")
+    if not descriptor_path.exists():  # pragma: no cover - non-Linux POSIX fallback
+        descriptor_path = Path(f"/dev/fd/{fd}")
+    return sqlite3.connect(str(descriptor_path))
+
+
+def _maintenance_backup_path(db_path: Path) -> tuple[Path, int]:
     directory = db_path.parent / "lcm-maintenance-backups"
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory_fd = _open_directory_nofollow(directory, create=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    return directory / f"{db_path.stem}-{stamp}.sqlite3"
+    return directory / f"{db_path.stem}-{stamp}.sqlite3", directory_fd
+
+
+def _validate_audit_path(path: Path) -> None:
+    if path.is_symlink():
+        raise ValueError("maintenance audit path is a symlink")
+    if path.exists() and not path.is_file():
+        raise ValueError("maintenance audit path is not a regular file")
 
 
 def create_verified_backup(db_path: str | Path) -> dict[str, Any]:
     """Create and read back a consistent SQLite backup for an offline apply."""
     source_path = _safe_database_path(db_path)
-    backup_path = _maintenance_backup_path(source_path)
-    source = sqlite3.connect(str(source_path), timeout=5.0)
-    destination = sqlite3.connect(str(backup_path))
+    backup_path, directory_fd = _maintenance_backup_path(source_path)
+    backup_fd = -1
+    destination = None
+    source = None
     try:
+        source = sqlite3.connect(str(source_path), timeout=5.0)
+        backup_fd = _open_private_exclusive_file(directory_fd, backup_path.name)
+        destination = _sqlite_connection_for_fd(backup_fd)
         source.backup(destination)
         destination.commit()
         quick = destination.execute("PRAGMA quick_check").fetchone()[0]
@@ -183,17 +281,32 @@ def create_verified_backup(db_path: str | Path) -> dict[str, Any]:
         if source_counts != backup_counts:
             raise sqlite3.DatabaseError("backup row-count proof failed")
     except Exception:
-        destination.close()
-        source.close()
-        try:
-            backup_path.unlink()
-        except OSError:
-            pass
+        created_backup = backup_fd >= 0
+        if destination is not None:
+            destination.close()
+        if source is not None:
+            source.close()
+        if backup_fd >= 0:
+            os.close(backup_fd)
+            backup_fd = -1
+        os.close(directory_fd)
+        if created_backup:
+            try:
+                backup_path.unlink()
+            except OSError:
+                pass
         raise
     destination.close()
+    os.fsync(backup_fd)
+    os.close(backup_fd)
+    os.close(directory_fd)
     source.close()
     digest_state = hashlib.sha256()
-    with backup_path.open("rb") as backup_file:
+    read_flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        read_flags |= os.O_NOFOLLOW
+    read_fd = os.open(backup_path, read_flags)
+    with os.fdopen(read_fd, "rb") as backup_file:
         for chunk in iter(lambda: backup_file.read(1024 * 1024), b""):
             digest_state.update(chunk)
     digest = digest_state.hexdigest()
@@ -209,7 +322,10 @@ def create_verified_backup(db_path: str | Path) -> dict[str, Any]:
 
 def verify_restore_proof(backup_path: str | Path) -> dict[str, Any]:
     """Restore a backup into a temporary DB and prove it opens cleanly."""
-    backup = Path(backup_path).expanduser().resolve(strict=True)
+    raw_backup = Path(backup_path).expanduser()
+    if raw_backup.is_symlink():
+        raise ValueError("maintenance refuses symlink backup paths")
+    backup = raw_backup.resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="lcm-restore-proof-") as directory:
         restored_path = Path(directory) / "restored.sqlite3"
         source = sqlite3.connect(str(backup))
@@ -591,6 +707,9 @@ def apply_dag_maintenance(
     """Backup, mutate privately, validate, then publish one new generation."""
     if confirmation != f"APPLY {operation}":
         raise ValueError(f"explicit confirmation must equal APPLY {operation}")
+    path = _safe_database_path(db_path)
+    audit_path = path.parent / "lcm-maintenance-audit.jsonl"
+    _validate_audit_path(audit_path)
     plan = plan_dag_maintenance(
         db_path,
         operation=operation,
@@ -601,7 +720,6 @@ def apply_dag_maintenance(
         target_conversation_id=target_conversation_id,
     )
     backup = create_verified_backup(db_path)
-    path = _safe_database_path(db_path)
     conn = sqlite3.connect(str(path), timeout=5.0)
     conn.row_factory = sqlite3.Row
     configure_connection(conn)
@@ -749,7 +867,6 @@ def apply_dag_maintenance(
         raise
     conn.close()
     restore = verify_restore_proof(backup["backup_path"])
-    audit_path = path.parent / "lcm-maintenance-audit.jsonl"
     audit_record = {
         "timestamp": time.time(),
         "operation": operation,
@@ -759,9 +876,19 @@ def apply_dag_maintenance(
         "created_node_ids": created_node_ids,
         "backup_sha256": backup["sha256"],
     }
-    fd = os.open(audit_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    audit_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        audit_flags |= os.O_NOFOLLOW
+    fd = os.open(audit_path, audit_flags, 0o600)
+    file_stat = os.fstat(fd)
+    if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+        os.close(fd)
+        raise ValueError("maintenance audit artifact is not a private regular file")
+    os.fchmod(fd, 0o600)
     with os.fdopen(fd, "a", encoding="utf-8") as audit:
         audit.write(json.dumps(audit_record, sort_keys=True) + "\n")
+        audit.flush()
+        os.fsync(audit.fileno())
     return {
         **plan,
         "dry_run": False,

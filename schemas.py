@@ -313,6 +313,7 @@ LCM_FOCUS = {
             },
             "prompt": {
                 "type": "string",
+                "maxLength": 20000,
                 "description": "Required for focus; optional replacement objective for refocus",
             },
         },
@@ -372,58 +373,56 @@ LCM_EXPAND_QUERY = {
         "properties": {
             "prompt": {
                 "type": "string",
+                "maxLength": 20000,
                 "description": "The question or task to answer from expanded LCM context",
             },
             "query": {
                 "type": "string",
+                "maxLength": 2000,
                 "description": "Optional search query used to find candidate summaries before expansion",
             },
             "node_ids": {
                 "type": "array",
                 "items": {"type": "integer"},
+                "maxItems": 20,
                 "description": "Optional explicit summary node IDs to expand instead of searching",
             },
             "max_results": {
                 "type": "integer",
+                "minimum": 1,
+                "maximum": 20,
                 "description": "Max candidate summaries to expand when using query (default 5)",
                 "default": 5,
             },
             "max_tokens": {
                 "type": "integer",
+                "minimum": 1,
+                "maximum": 8192,
                 "description": "Max answer tokens for bounded synthesis returned to the main agent (default 2000)",
                 "default": 2000,
             },
             "context_max_tokens": {
                 "type": "integer",
+                "minimum": 1,
+                "maximum": 65536,
                 "description": "Expanded serialized summary/raw/child-source/externalized fresh context budget for the auxiliary LLM before it returns the bounded answer (default max(answer max_tokens, 32000 or LCM_EXPANSION_CONTEXT_TOKENS))",
                 "default": 32000,
             },
             "cross_session": {
                 "type": "boolean",
-                "description": "Explicitly request profile-gated cross-session LCM DAG expansion (default false)",
+                "description": "Request profile-gated cross-session LCM DAG expansion. The trusted host must separately supply a session-scoped capability.",
                 "default": False,
-            },
-            "authorize_cross_session": {
-                "type": "boolean",
-                "description": "Required explicit authorization acknowledgment when cross_session=true",
-                "default": False,
-            },
-            "session_scope": {
-                "type": "string",
-                "enum": ["all", "sessions"],
-                "description": "Required in cross-session mode; all local LCM sessions or only session_ids",
-            },
-            "session_ids": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Explicit authorized session allowlist for session_scope=sessions",
             },
             "max_sessions": {
                 "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
                 "description": "Requested session-bucket cap, clamped to the profile maximum",
             },
             "deadline_ms": {
                 "type": "integer",
+                "minimum": 1,
+                "maximum": 120000,
                 "description": "Requested operation-wide deadline, clamped to the profile and expansion timeout",
             },
         },

@@ -9,6 +9,7 @@ import hermes_lcm.tools as lcm_tools
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
+from hermes_lcm.schemas import LCM_EXPAND_QUERY
 
 
 def _engine(tmp_path, *, enabled=True, max_sessions=2, per_session=2):
@@ -47,8 +48,6 @@ def _args(**overrides):
         "prompt": "What happened?",
         "query": "archive",
         "cross_session": True,
-        "authorize_cross_session": True,
-        "session_scope": "all",
         "max_tokens": 100,
         "context_max_tokens": 500,
     }
@@ -56,21 +55,31 @@ def _args(**overrides):
     return values
 
 
-def test_cross_session_mode_requires_profile_gate_and_explicit_authorization(tmp_path):
+def _invoke(engine, args, *, session_ids=None):
+    capability = engine.issue_cross_session_capability(
+        session_ids or ["archive", "archive-a", "archive-b", "archive-c", "one", "two"]
+    )
+    return lcm_tools.lcm_expand_query(
+        args,
+        engine=engine,
+        cross_session_capability=capability,
+    )
+
+
+def test_cross_session_mode_requires_profile_gate_and_trusted_host_capability(tmp_path):
     disabled = _engine(tmp_path / "disabled", enabled=False)
     enabled = _engine(tmp_path / "enabled")
     try:
-        assert "disabled" in json.loads(lcm_tools.lcm_expand_query(_args(), engine=disabled))["error"]
-        missing = _args()
-        missing["authorize_cross_session"] = False
-        assert "authorize_cross_session" in json.loads(
-            lcm_tools.lcm_expand_query(missing, engine=enabled)
+        assert "disabled" in json.loads(_invoke(disabled, _args()))["error"]
+        self_authorized = _args(
+            authorize_cross_session=True,
+            session_scope="all",
+            session_ids=["archive"],
+        )
+        error = json.loads(
+            lcm_tools.lcm_expand_query(self_authorized, engine=enabled)
         )["error"]
-        no_scope = _args()
-        no_scope.pop("session_scope")
-        assert "session_scope" in json.loads(
-            lcm_tools.lcm_expand_query(no_scope, engine=enabled)
-        )["error"]
+        assert "trusted host capability" in error
     finally:
         disabled.shutdown()
         enabled.shutdown()
@@ -109,7 +118,7 @@ def test_sessions_are_ranked_before_bounded_expansion(tmp_path, monkeypatch):
 
     monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", synthesize)
     try:
-        result = json.loads(lcm_tools.lcm_expand_query(_args(), engine=engine))
+        result = json.loads(_invoke(engine, _args()))
         assert result["answer"] == "bounded archive answer"
         assert result["contributing_session_ids"] == ["archive-b", "archive-a"]
         assert [match["node_id"] for match in result["matches"]] == [node_b1.node_id, node_a.node_id]
@@ -126,14 +135,13 @@ def test_session_allowlist_is_authorization_boundary(tmp_path, monkeypatch):
     monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", lambda **kwargs: "allowed only")
     try:
         result = json.loads(
-            lcm_tools.lcm_expand_query(
+            _invoke(
+                engine,
                 _args(
                     node_ids=[allowed, denied],
                     query="",
-                    session_scope="sessions",
-                    session_ids=["allowed"],
                 ),
-                engine=engine,
+                session_ids=["allowed"],
             )
         )
         assert result["node_ids"] == [allowed]
@@ -157,9 +165,9 @@ def test_context_and_answer_budgets_are_shared_not_per_bucket(tmp_path, monkeypa
     monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", synthesize)
     try:
         result = json.loads(
-            lcm_tools.lcm_expand_query(
+            _invoke(
+                engine,
                 _args(context_max_tokens=5, max_tokens=7),
-                engine=engine,
             )
         )
         assert captured["max_tokens"] == 7
@@ -187,7 +195,7 @@ def test_completed_bucket_survives_later_operation_deadline(tmp_path, monkeypatc
     monkeypatch.setattr(lcm_tools, "_collect_context_blocks_for_node", collect)
     try:
         result = json.loads(
-            lcm_tools.lcm_expand_query(_args(deadline_ms=1_000), engine=engine)
+            _invoke(engine, _args(deadline_ms=1_000))
         )
         assert result["degraded"] is True
         assert result["timed_out"] is True
@@ -217,7 +225,7 @@ def test_externalized_payloads_are_metadata_only_in_archive_mode(tmp_path, monke
 
     monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", synthesize)
     try:
-        result = json.loads(lcm_tools.lcm_expand_query(_args(), engine=engine))
+        result = json.loads(_invoke(engine, _args()))
         assert result["externalized_refs"] == "metadata-only"
         assert "payload.json" in captured["serialized"]
         assert "externalized_payload" not in captured["serialized"]
@@ -241,13 +249,13 @@ def test_concurrent_reentry_is_rejected_deterministically(tmp_path, monkeypatch)
     first_result = {}
 
     def run_first():
-        first_result.update(json.loads(lcm_tools.lcm_expand_query(_args(), engine=engine)))
+        first_result.update(json.loads(_invoke(engine, _args())))
 
     thread = threading.Thread(target=run_first)
     thread.start()
     assert entered.wait(timeout=2)
     try:
-        second = json.loads(lcm_tools.lcm_expand_query(_args(), engine=engine))
+        second = json.loads(_invoke(engine, _args()))
         assert second["reentry_blocked"] is True
         assert "already active" in second["error"]
     finally:
@@ -256,3 +264,78 @@ def test_concurrent_reentry_is_rejected_deterministically(tmp_path, monkeypatch)
         engine.shutdown()
     assert first_result["answer"] == "first answer"
 
+
+def test_tool_schema_does_not_expose_self_authorization_or_scope_controls():
+    properties = LCM_EXPAND_QUERY["parameters"]["properties"]
+    assert "authorize_cross_session" not in properties
+    assert "session_scope" not in properties
+    assert "session_ids" not in properties
+
+
+def test_allowed_node_cannot_expand_raw_source_from_denied_session(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    denied_store_id = engine._store.append(
+        "denied", {"role": "user", "content": "DENIED RAW SECRET"}
+    )
+    allowed_node_id = engine._dag.add_node(SummaryNode(
+        session_id="allowed",
+        depth=0,
+        summary="archive allowed summary",
+        token_count=4,
+        source_token_count=4,
+        source_ids=[denied_store_id],
+        source_type="messages",
+        created_at=0,
+    ))
+    captured = {}
+
+    def synthesize(**kwargs):
+        captured["context"] = json.dumps(kwargs["context_blocks"])
+        return "safe answer"
+
+    monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", synthesize)
+    try:
+        result = json.loads(_invoke(
+            engine,
+            _args(node_ids=[allowed_node_id], query=""),
+            session_ids=["allowed"],
+        ))
+        assert result["answer"] == "safe answer"
+        assert "DENIED RAW SECRET" not in captured["context"]
+        assert '"session_id": "denied"' not in captured["context"]
+    finally:
+        engine.shutdown()
+
+
+def test_cross_session_hard_bounds_override_caller_and_profile_values(tmp_path, monkeypatch):
+    engine = _engine(tmp_path, max_sessions=1_000_000, per_session=1_000_000)
+    node = engine._dag.get_node(_node(engine, "archive", "archive bounded"))
+    monkeypatch.setattr(engine._dag, "search", lambda *args, **kwargs: [node])
+    captured = {}
+
+    def synthesize(**kwargs):
+        captured.update(kwargs)
+        return "answer " * 100_000
+
+    monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", synthesize)
+    try:
+        result = json.loads(_invoke(
+            engine,
+            _args(
+                max_results=1_000_000,
+                max_tokens=1_000_000,
+                context_max_tokens=1_000_000,
+                max_sessions=1_000_000,
+                deadline_ms=1_000_000_000,
+            ),
+            session_ids=["archive"],
+        ))
+        assert captured["max_tokens"] <= 8_192
+        assert result["context_max_tokens"] <= 65_536
+        assert result["max_sessions"] <= 10
+        assert result["max_summaries_per_session"] <= 20
+        assert result["deadline_ms"] <= 120_000
+        assert result["answer_truncated"] is True
+        assert len(result["answer"]) < 100_000
+    finally:
+        engine.shutdown()
