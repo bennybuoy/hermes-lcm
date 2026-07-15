@@ -22,6 +22,35 @@ LCM_GREP = {
                     "Wrap exact phrases in quotes. Short CJK fragments and emoji-heavy queries may use substring fallback instead of plain FTS token matching."
                 ),
             },
+            "content_scope": {
+                "type": "string",
+                "enum": ["database", "externalized", "files", "all"],
+                "description": (
+                    "Content sources to search. 'database' is the safe default and preserves existing behavior; "
+                    "'externalized'/'files' searches bounded prefixes of plugin-managed payload files; "
+                    "'all' combines both sources."
+                ),
+                "default": "database",
+            },
+            "regex": {
+                "type": "boolean",
+                "description": "Use a regular expression for externalized-payload search. Database search is omitted in regex mode.",
+                "default": False,
+            },
+            "ref": {
+                "type": "string",
+                "description": "Optional basename-only externalized ref filter; requires externalized/files/all content_scope.",
+            },
+            "max_files": {
+                "type": "integer",
+                "description": "Maximum payload files scanned (default 100, hard cap 500).",
+                "default": 100,
+            },
+            "max_payload_chars": {
+                "type": "integer",
+                "description": "Maximum decoded content prefix searched per payload (default 65536, hard cap 1000000).",
+                "default": 65536,
+            },
             "limit": {
                 "type": "integer",
                 "description": (

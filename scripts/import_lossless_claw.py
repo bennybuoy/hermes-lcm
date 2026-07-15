@@ -14,7 +14,7 @@ import sqlite3
 import sys
 import time
 import types
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -1034,9 +1034,21 @@ def _insert_import_candidate(
     protection_config: LCMConfig,
     target_path: Path,
 ) -> int:
+    candidate_message = _candidate_message(candidate)
+    candidate_content = normalize_content_value(candidate_message.get("content")) or ""
+    candidate_protection_config = protection_config
+    if "data:" in candidate_content and ";base64," in candidate_content:
+        # Inline media needs substring-level externalization so surrounding
+        # legacy text remains searchable and the ref expands to the exact
+        # binary payload. Ambient generic large-output settings must not turn
+        # the entire legacy scaffold into the ref target.
+        candidate_protection_config = replace(
+            protection_config,
+            large_output_externalization_enabled=False,
+        )
     protected_msg = protect_message_for_ingest(
-        _candidate_message(candidate),
-        config=protection_config,
+        candidate_message,
+        config=candidate_protection_config,
         hermes_home=str(target_path.parent),
         session_id=candidate.target_session_id,
     )

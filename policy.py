@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from fnmatch import fnmatchcase
 from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
 
@@ -134,22 +135,34 @@ class ModelCompactionPolicy:
     summary_fallback_models: tuple[str, ...] = field(default_factory=tuple)
 
     # Leaf sizing:
+    fresh_tail_count: int = 32
+    fresh_tail_max_tokens: int = 0
     leaf_chunk_tokens: int = 20_000
     dynamic_leaf_chunk_enabled: bool = False
     dynamic_leaf_chunk_max: int = 40_000
 
     # Condensation:
     condensation_fanin: int = 4
+    condensation_min_fanin: int = 2
     incremental_max_depth: int = 3
     cache_friendly_condensation_enabled: bool = False
 
     # Output reserve (tokens to reserve for model output, 0 = disabled):
     output_reserve: int = 0
 
+    # Route economics/strategy. Cache telemetry is intentionally separate:
+    # observed cache reads never imply a billing discount.
+    cache_economics: str = "unknown"  # discounted | none | unknown
+    compaction_mode: str = "inline"  # inline | deferred
+    cache_ttl_seconds: int = 0
+
     # Source reporting:
     source: str = "default"
     model_selector: str = ""
     provider_selector: str = ""
+    route_selector: str = ""
+    session_selector: str = ""
+    selection_reason: str = "global fallback"
 
     # Stable fingerprint of the resolved policy (excluding runtime context_length):
     fingerprint: str = ""
@@ -176,6 +189,24 @@ class ModelCompactionPolicy:
                 f"Policy invariant violated: emergency_threshold ({self.emergency_threshold}) "
                 f"must be in (0, 1.0]"
             )
+        if self.fresh_tail_count < 1:
+            raise ValueError("fresh_tail_count must be at least 1")
+        if self.fresh_tail_max_tokens < 0:
+            raise ValueError("fresh_tail_max_tokens must be non-negative")
+        if self.condensation_fanin < 2:
+            raise ValueError("condensation_fanin must be at least 2")
+        if not 2 <= self.condensation_min_fanin <= self.condensation_fanin:
+            raise ValueError(
+                "condensation_min_fanin must be between 2 and condensation_fanin"
+            )
+        if self.cache_economics not in {"discounted", "none", "unknown"}:
+            raise ValueError(
+                "cache_economics must be discounted, none, or unknown"
+            )
+        if self.compaction_mode not in {"inline", "deferred"}:
+            raise ValueError("compaction_mode must be inline or deferred")
+        if self.cache_ttl_seconds < 0:
+            raise ValueError("cache_ttl_seconds must be non-negative")
 
     # -- Token boundary helpers -------------------------------------------
 
@@ -217,6 +248,9 @@ class ModelCompactionPolicy:
             "source": self.source,
             "model_selector": self.model_selector,
             "provider_selector": self.provider_selector,
+            "route_selector": self.route_selector,
+            "session_selector": self.session_selector,
+            "selection_reason": self.selection_reason,
             "preparation_threshold": round(self.preparation_threshold, 6),
             "cutover_threshold": round(self.cutover_threshold, 6),
             "post_compaction_target": round(self.post_compaction_target, 6),
@@ -229,9 +263,15 @@ class ModelCompactionPolicy:
             "emergency_tokens": self.emergency_tokens(context_length),
             "summary_model": self.summary_model,
             "summary_fallback_models": list(self.summary_fallback_models),
+            "fresh_tail_count": self.fresh_tail_count,
+            "fresh_tail_max_tokens": self.fresh_tail_max_tokens,
             "leaf_chunk_tokens": self.leaf_chunk_tokens,
             "condensation_fanin": self.condensation_fanin,
+            "condensation_min_fanin": self.condensation_min_fanin,
             "incremental_max_depth": self.incremental_max_depth,
+            "cache_economics": self.cache_economics,
+            "compaction_mode": self.compaction_mode,
+            "cache_ttl_seconds": self.cache_ttl_seconds,
         }
 
 
@@ -252,13 +292,19 @@ def _compute_fingerprint(policy_fields: dict[str, Any]) -> str:
         "assembly_reserve_floor",
         "summary_model",
         "summary_fallback_models",
+        "fresh_tail_count",
+        "fresh_tail_max_tokens",
         "leaf_chunk_tokens",
         "dynamic_leaf_chunk_enabled",
         "dynamic_leaf_chunk_max",
         "condensation_fanin",
+        "condensation_min_fanin",
         "incremental_max_depth",
         "cache_friendly_condensation_enabled",
         "output_reserve",
+        "cache_economics",
+        "compaction_mode",
+        "cache_ttl_seconds",
     ]
     semantic = {k: policy_fields.get(k) for k in semantic_keys}
     raw = json.dumps(semantic, sort_keys=True, default=str)
@@ -289,11 +335,150 @@ def _longest_match(model: str, overrides: dict[str, float]) -> tuple[str, float]
     return None
 
 
+_RULE_MATCH_FIELDS = frozenset({
+    "provider",
+    "model",
+    "route",
+    "min_context_window",
+    "max_context_window",
+    "session",
+    "platform",
+})
+_RULE_OVERRIDE_FIELDS = frozenset({
+    "preparation_threshold",
+    "cutover_threshold",
+    "post_compaction_target",
+    "emergency_threshold",
+    "fresh_tail_count",
+    "fresh_tail_max_tokens",
+    "leaf_chunk_tokens",
+    "dynamic_leaf_chunk_enabled",
+    "dynamic_leaf_chunk_max",
+    "condensation_fanin",
+    "condensation_min_fanin",
+    "incremental_max_depth",
+    "output_reserve",
+    "cache_friendly_condensation_enabled",
+    "cache_friendly_condensation",
+    "cache_economics",
+    "compaction_mode",
+    "cache_ttl_seconds",
+})
+
+
+def validate_policy_rules(rules: Optional[list[dict[str, Any]]]) -> None:
+    """Validate structured rules without depending on runtime metadata."""
+    if rules is None:
+        return
+    if not isinstance(rules, list):
+        raise ValueError("policy_rules must be a list")
+    for index, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            raise ValueError(f"policy rule {index} must be an object")
+        unknown_top = set(rule) - {"name", "match", "overrides"}
+        if unknown_top:
+            raise ValueError(
+                f"policy rule {index} has unknown field: {sorted(unknown_top)[0]}"
+            )
+        match = rule.get("match") or {}
+        overrides = rule.get("overrides") or {}
+        if not isinstance(match, dict) or not isinstance(overrides, dict):
+            raise ValueError(f"policy rule {index} match/overrides must be objects")
+        unknown_match = set(match) - _RULE_MATCH_FIELDS
+        if unknown_match:
+            raise ValueError(
+                f"unknown match field: {sorted(unknown_match)[0]}"
+            )
+        unknown_override = set(overrides) - _RULE_OVERRIDE_FIELDS
+        if unknown_override:
+            raise ValueError(
+                f"unknown override field: {sorted(unknown_override)[0]}"
+            )
+
+
+def _pattern_match(value: str, pattern: Any) -> tuple[bool, bool]:
+    normalized_value = (value or "").strip().lower()
+    normalized_pattern = str(pattern or "").strip().lower()
+    if not normalized_pattern:
+        return False, False
+    if any(char in normalized_pattern for char in "*?["):
+        return fnmatchcase(normalized_value, normalized_pattern), False
+    return normalized_value == normalized_pattern, normalized_value == normalized_pattern
+
+
+def _matching_policy_rule(
+    rules: Optional[list[dict[str, Any]]],
+    *,
+    provider: str,
+    model: str,
+    route: str,
+    context_length: int,
+    session_id: str,
+    platform: str,
+) -> tuple[dict[str, Any], str, str] | None:
+    validate_policy_rules(rules)
+    candidates: list[tuple[int, int, dict[str, Any], str, str]] = []
+    for index, rule in enumerate(rules or []):
+        match = rule.get("match") or {}
+        score = 0
+        selectors: list[str] = []
+        matched = True
+        for field_name, runtime_value in (
+            ("provider", provider),
+            ("model", model),
+            ("route", route),
+        ):
+            if field_name not in match:
+                continue
+            field_matched, exact = _pattern_match(runtime_value, match[field_name])
+            if not field_matched:
+                matched = False
+                break
+            score += 1_000 if exact else 700
+            selectors.append(f"{field_name}={match[field_name]}")
+        if not matched:
+            continue
+        for field_name, runtime_value in (
+            ("session", session_id),
+            ("platform", platform),
+        ):
+            if field_name not in match:
+                continue
+            field_matched, exact = _pattern_match(runtime_value, match[field_name])
+            if not field_matched:
+                matched = False
+                break
+            score += 400 if exact else 300
+            selectors.append(f"{field_name}={match[field_name]}")
+        if not matched:
+            continue
+        minimum = match.get("min_context_window")
+        maximum = match.get("max_context_window")
+        if minimum is not None and context_length < int(minimum):
+            continue
+        if maximum is not None and context_length > int(maximum):
+            continue
+        if minimum is not None or maximum is not None:
+            score += 100
+            selectors.append(f"context={minimum or '*'}..{maximum or '*'}")
+        name = str(rule.get("name") or f"rule-{index + 1}")
+        candidates.append((score, -index, rule, name, ", ".join(selectors) or "match-all"))
+    if not candidates:
+        return None
+    _score, _order, selected, name, reason = max(candidates, key=lambda item: (item[0], item[1]))
+    return selected, name, reason
+
+
 def resolve_policy(
     *,
     model: str,
     provider: str = "",
+    route: str = "",
     context_length: int = 0,
+    session_id: str = "",
+    platform: str = "",
+    policy_rules: Optional[list[dict[str, Any]]] = None,
+    model_policies: Optional[dict[str, dict[str, Any]]] = None,
     # Legacy backward-compatible inputs:
     context_threshold: float = 0.35,
     model_thresholds: Optional[dict[str, float]] = None,
@@ -302,13 +487,19 @@ def resolve_policy(
     reserve_tokens_floor: int = 0,
     summary_model: str = "",
     summary_fallback_models: Optional[tuple[str, ...]] = None,
+    fresh_tail_count: int = 32,
+    fresh_tail_max_tokens: int = 0,
     leaf_chunk_tokens: int = 20_000,
     dynamic_leaf_chunk_enabled: bool = False,
     dynamic_leaf_chunk_max: int = 40_000,
     condensation_fanin: int = 4,
+    condensation_min_fanin: int = 2,
     incremental_max_depth: int = 3,
     cache_friendly_condensation_enabled: bool = False,
     output_reserve: int = 0,
+    cache_economics: str = "unknown",
+    compaction_mode: str = "inline",
+    cache_ttl_seconds: int = 0,
     # Config source tracking:
     context_threshold_source: str = "manual_or_default",
     config_sources: Optional[dict[str, str]] = None,
@@ -376,6 +567,79 @@ def resolve_policy(
     target_ratio = cutover_ratio * DEFAULT_TARGET_RATIO
     emergency_ratio = float(emergency_pressure_ratio)
 
+    # Structured rules outrank legacy model thresholds and built-ins. Explicit
+    # model_policies are compatibility sugar for highest-priority model rules.
+    selected_rule = _matching_policy_rule(
+        policy_rules,
+        provider=provider,
+        model=model,
+        route=route,
+        context_length=context_length,
+        session_id=session_id,
+        platform=platform,
+    )
+    selected_model_policy: tuple[str, dict[str, Any]] | None = None
+    if model_policies:
+        best_key = ""
+        normalized_model = _normalize_model_name(model)
+        for key, value in model_policies.items():
+            normalized_key = _normalize_model_name(str(key))
+            if (
+                normalized_key
+                and normalized_key in normalized_model
+                and len(normalized_key) > len(best_key)
+                and isinstance(value, dict)
+            ):
+                best_key = normalized_key
+                selected_model_policy = (str(key), value)
+
+    selected_overrides: dict[str, Any] = {}
+    selection_reason = "global fallback"
+    route_selector = ""
+    session_selector = ""
+    if selected_rule is not None:
+        rule, rule_name, reason = selected_rule
+        selected_overrides = dict(rule.get("overrides") or {})
+        cutover_source = f"policy_rule:{rule_name}"
+        selection_reason = reason
+        match = rule.get("match") or {}
+        route_selector = str(match.get("route") or "")
+        session_selector = str(match.get("session") or match.get("platform") or "")
+    if selected_model_policy is not None:
+        selector_name, model_overrides = selected_model_policy
+        unknown = set(model_overrides) - _RULE_OVERRIDE_FIELDS
+        if unknown:
+            raise ValueError(
+                f"unknown override field: {sorted(unknown)[0]}"
+            )
+        selected_overrides = dict(model_overrides)
+        cutover_source = f"model_policies:{selector_name}"
+        selection_reason = f"longest model match {selector_name}"
+
+    if "cache_friendly_condensation" in selected_overrides:
+        selected_overrides["cache_friendly_condensation_enabled"] = (
+            selected_overrides.pop("cache_friendly_condensation")
+        )
+    if "cutover_threshold" in selected_overrides:
+        cutover_ratio = float(selected_overrides["cutover_threshold"])
+        if "preparation_threshold" not in selected_overrides:
+            preparation_ratio = cutover_ratio * DEFAULT_PREPARATION_RATIO
+        if "post_compaction_target" not in selected_overrides:
+            target_ratio = cutover_ratio * DEFAULT_TARGET_RATIO
+    if "preparation_threshold" in selected_overrides:
+        preparation_ratio = float(selected_overrides["preparation_threshold"])
+    if "post_compaction_target" in selected_overrides:
+        target_ratio = float(selected_overrides["post_compaction_target"])
+    if "emergency_threshold" in selected_overrides:
+        emergency_ratio = float(selected_overrides["emergency_threshold"])
+    if selected_overrides and not (
+        0 < target_ratio < preparation_ratio <= cutover_ratio < emergency_ratio <= 1.0
+    ):
+        raise ValueError(
+            "Policy invariant violated: expected post_compaction_target < "
+            "preparation_threshold <= cutover_threshold < emergency_threshold <= 1.0"
+        )
+
     # Adjust target if assembly caps are configured — but never let the
     # target reach or exceed cutover (the invariant).
     if max_assembly_tokens > 0 and context_length > 0:
@@ -413,13 +677,19 @@ def resolve_policy(
         "assembly_reserve_floor": reserve_tokens_floor,
         "summary_model": summary_model,
         "summary_fallback_models": fallbacks,
-        "leaf_chunk_tokens": leaf_chunk_tokens,
-        "dynamic_leaf_chunk_enabled": dynamic_leaf_chunk_enabled,
-        "dynamic_leaf_chunk_max": dynamic_leaf_chunk_max,
-        "condensation_fanin": condensation_fanin,
-        "incremental_max_depth": incremental_max_depth,
-        "cache_friendly_condensation_enabled": cache_friendly_condensation_enabled,
-        "output_reserve": output_reserve,
+        "fresh_tail_count": int(selected_overrides.get("fresh_tail_count", fresh_tail_count)),
+        "fresh_tail_max_tokens": int(selected_overrides.get("fresh_tail_max_tokens", fresh_tail_max_tokens)),
+        "leaf_chunk_tokens": int(selected_overrides.get("leaf_chunk_tokens", leaf_chunk_tokens)),
+        "dynamic_leaf_chunk_enabled": bool(selected_overrides.get("dynamic_leaf_chunk_enabled", dynamic_leaf_chunk_enabled)),
+        "dynamic_leaf_chunk_max": int(selected_overrides.get("dynamic_leaf_chunk_max", dynamic_leaf_chunk_max)),
+        "condensation_fanin": int(selected_overrides.get("condensation_fanin", condensation_fanin)),
+        "condensation_min_fanin": int(selected_overrides.get("condensation_min_fanin", condensation_min_fanin)),
+        "incremental_max_depth": int(selected_overrides.get("incremental_max_depth", incremental_max_depth)),
+        "cache_friendly_condensation_enabled": bool(selected_overrides.get("cache_friendly_condensation_enabled", cache_friendly_condensation_enabled)),
+        "output_reserve": int(selected_overrides.get("output_reserve", output_reserve)),
+        "cache_economics": str(selected_overrides.get("cache_economics", cache_economics)).lower(),
+        "compaction_mode": str(selected_overrides.get("compaction_mode", compaction_mode)).lower(),
+        "cache_ttl_seconds": int(selected_overrides.get("cache_ttl_seconds", cache_ttl_seconds)),
     }
 
     fingerprint = _compute_fingerprint(fields)
@@ -429,6 +699,9 @@ def resolve_policy(
         source=cutover_source,
         model_selector=selector,
         provider_selector=n_provider,
+        route_selector=route_selector,
+        session_selector=session_selector,
+        selection_reason=selection_reason,
         fingerprint=fingerprint,
     )
     return policy

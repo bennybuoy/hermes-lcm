@@ -21,6 +21,7 @@ from hermes_lcm.db_bootstrap import (
     SCHEMA_VERSION,
     run_versioned_migrations,
 )
+from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.frontier import PREPARED_PAYLOAD_VERSION, FrontierStore
 from hermes_lcm.tokens import count_messages_tokens, count_tokens
@@ -1312,5 +1313,165 @@ class TestIssue4FrontierItems:
             )
             assert engine._dag.get_session_node_count(engine.current_session_id) == 0
             assert engine._frontier.get_batch(batch.batch_id).state == "ready"
+        finally:
+            engine.shutdown()
+
+
+# ===========================================================================
+# Issue #6 — active frontier is authoritative for assembly
+# ===========================================================================
+
+class TestIssue6AuthoritativeFrontierAssembly:
+    def test_foreground_compaction_publishes_authoritative_generation_without_async(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path, fresh_tail_count=2, async_enabled=False)
+        _stub_summarize(monkeypatch, engine, text="foreground frontier leaf")
+        try:
+            messages = _messages(16, tokens_each=40)
+            engine.ingest(messages)
+            compressed = engine.compress(
+                messages,
+                current_tokens=count_messages_tokens(messages),
+                force=True,
+            )
+
+            assert compressed != messages
+            frontier = engine._frontier.get_active_frontier(
+                engine.current_conversation_id
+            )
+            assert frontier is not None
+            assert int(frontier["source_end_store_id"]) > 0
+            items = engine._frontier.get_frontier_items(
+                engine.current_conversation_id,
+                int(frontier["generation"]),
+            )
+            assert items
+            node_items = [item for item in items if item["kind"] == "node"]
+            assert node_items
+            for item in node_items:
+                assert engine._dag.get_node(int(item["ref_id"])) is not None
+        finally:
+            engine.shutdown()
+
+    def test_assembly_projects_exact_active_generation_not_stale_host_or_dag(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path, fresh_tail_count=2)
+        _stub_summarize(monkeypatch, engine, text="authoritative frontier leaf")
+        try:
+            messages = _messages(16, tokens_each=40)
+            engine.ingest(messages)
+            prepared = engine.prepare_background_compaction_once(messages)
+            assert prepared is not None and prepared.state == "ready"
+            covered = set(int(s) for s in prepared.source_ids)
+            id_map = engine._get_store_id_map_for_messages(messages)
+            covered_contents = {
+                str(message.get("content") or "")
+                for message in messages
+                if id_map.get(id(message)) in covered
+                and message.get("role") != "system"
+            }
+            assert covered_contents
+            promoted = engine.promote_prepared_compaction(
+                prepared.batch_id,
+                messages,
+            )
+            assert promoted.promoted is True
+
+            # Canonical storage may contain nodes that are not members of the
+            # selected generation. Assembly must not infer visibility merely
+            # from "uncondensed" DAG state.
+            engine._dag.add_node(
+                SummaryNode(
+                    session_id=engine.current_session_id,
+                    depth=0,
+                    summary="unpublished rogue canonical node",
+                    token_count=5,
+                    source_token_count=5,
+                    source_ids=[],
+                    source_type="messages",
+                    created_at=time.time(),
+                )
+            )
+
+            assembled = engine._assemble_context(messages[0], messages[1:])
+            blob = "\n".join(str(message.get("content") or "") for message in assembled)
+
+            assert "authoritative frontier leaf" in blob
+            assert "unpublished rogue canonical node" not in blob
+            for content in covered_contents:
+                assert content not in blob
+            for tail_message in messages[-2:]:
+                assert str(tail_message["content"]) in blob
+        finally:
+            engine.shutdown()
+
+    def test_restart_assembles_same_authoritative_generation(
+        self, tmp_path, monkeypatch
+    ):
+        config = LCMConfig(
+            database_path=str(tmp_path / "frontier-restart.db"),
+            fresh_tail_count=2,
+            leaf_chunk_tokens=20,
+            context_threshold=0.10,
+            async_background_compaction_enabled=True,
+            async_background_compaction_worker_enabled=False,
+        )
+        messages = _messages(16, tokens_each=40)
+        first = LCMEngine(config=config)
+        first.on_session_start(
+            "frontier-restart-session",
+            conversation_id="frontier-restart-conversation",
+            platform="test",
+            context_length=50_000,
+        )
+        _stub_summarize(monkeypatch, first, text="restart stable frontier")
+        try:
+            first.ingest(messages)
+            prepared = first.prepare_background_compaction_once(messages)
+            assert prepared is not None
+            assert first.promote_prepared_compaction(
+                prepared.batch_id,
+                messages,
+            ).promoted
+            before = first._assemble_context(messages[0], messages[1:])
+        finally:
+            first.shutdown()
+
+        restarted = LCMEngine(config=config)
+        restarted.on_session_start(
+            "frontier-restart-session",
+            conversation_id="frontier-restart-conversation",
+            platform="test",
+            context_length=50_000,
+        )
+        try:
+            after = restarted._assemble_context(messages[0], messages[1:])
+            assert after == before
+            blob = "\n".join(str(message.get("content") or "") for message in after)
+            assert "restart stable frontier" in blob
+        finally:
+            restarted.shutdown()
+
+    def test_missing_active_node_ref_fails_closed_instead_of_host_replay(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path, fresh_tail_count=2)
+        _stub_summarize(monkeypatch, engine, text="missing frontier node")
+        try:
+            messages = _messages(16, tokens_each=40)
+            engine.ingest(messages)
+            prepared = engine.prepare_background_compaction_once(messages)
+            assert prepared is not None
+            promoted = engine.promote_prepared_compaction(
+                prepared.batch_id,
+                messages,
+            )
+            assert promoted.promoted
+            assert engine._dag.delete_node(promoted.node_id)
+
+            with pytest.raises(RuntimeError, match="missing canonical node"):
+                engine._assemble_context(messages[0], messages[1:])
         finally:
             engine.shutdown()

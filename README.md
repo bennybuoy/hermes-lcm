@@ -329,6 +329,8 @@ Environment variables still take precedence over YAML, and
 | `LCM_CONTEXT_THRESHOLD` | `0.35` | Fraction of the context window that triggers LCM compaction |
 | `LCM_MODEL_THRESHOLDS` | empty | Per-model threshold overrides. Format: `"glm-5.2:0.70,glm-5.2-1M:0.25"`. Keys matched as substrings (longest wins). Also settable as `lcm.model_thresholds` in config.yaml. |
 | `LCM_FRESH_TAIL_COUNT` | `32` | Recent messages protected from compaction |
+| `LCM_FRESH_TAIL_MAX_TOKENS` | `0` | Optional token cap for the protected suffix; `0` disables it, while the newest user-visible message remains protected on overflow |
+| `LCM_PROMPT_AWARE_EVICTION_ENABLED` | `false` | Opt into deterministic local relevance selection when summaries cannot all fit the assembly budget |
 | `LCM_INCREMENTAL_MAX_DEPTH` | `3` | Max DAG condensation depth (`-1` = unlimited, `0` = leaf only); enables hierarchical summarization |
 | `LCM_LEAF_CHUNK_TOKENS` | `20000` | Raw-backlog floor before leaf compaction; with dynamic chunking enabled, the base chunk target |
 | `LCM_DYNAMIC_LEAF_CHUNK_ENABLED` | `false` | Enable chunk-sized leaf compaction passes instead of compacting the whole non-tail raw backlog per pass |
@@ -380,6 +382,11 @@ LCM_SUMMARY_FALLBACK_MODELS=custom:llamaherd-compression/glm-5.2,provider:openai
 ```
 
 Advanced compaction, assembly, and extraction knobs are defined in `config.py`.
+
+Prompt-aware eviction never changes system/objective anchors or the fresh tail,
+and it makes no model call. It ranks only budget-constrained summary items, then
+restores their chronological order. Because the selected prefix depends on the
+latest user prompt, enabling it can reduce provider prefix-cache hit rates.
 
 ### Sensitive-pattern redaction
 

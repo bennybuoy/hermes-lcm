@@ -112,7 +112,7 @@ def _load_hermes_config_yaml() -> dict[str, Any]:
 
 def _supported_lcm_config_yaml_keys() -> frozenset[str]:
     return frozenset(
-        {"context_threshold", "model_thresholds"}
+        {"context_threshold", "model_thresholds", "model_policies", "policy_rules"}
         | {spec.name for spec in ENV_FIELD_SPECS}
     )
 
@@ -153,6 +153,59 @@ def _parse_model_thresholds_env(raw: str) -> dict[str, float]:
             result[key] = float(value.strip())
         except ValueError:
             continue
+    return result
+
+
+def _load_model_policies_from_yaml(
+    cfg: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    cfg = cfg if cfg is not None else _load_hermes_config_yaml()
+    lcm_section = cfg.get("lcm") if isinstance(cfg, dict) else None
+    raw = lcm_section.get("model_policies") if isinstance(lcm_section, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(key): dict(value)
+        for key, value in raw.items()
+        if str(key).strip() and isinstance(value, dict)
+    }
+
+
+def _load_policy_rules_from_yaml(
+    cfg: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    cfg = cfg if cfg is not None else _load_hermes_config_yaml()
+    lcm_section = cfg.get("lcm") if isinstance(cfg, dict) else None
+    raw = lcm_section.get("policy_rules") if isinstance(lcm_section, dict) else None
+    if not isinstance(raw, list):
+        return []
+    return [dict(rule) for rule in raw if isinstance(rule, dict)]
+
+
+def _parse_model_policies_env(raw: str) -> dict[str, dict[str, Any]]:
+    """Parse ``model:mode:cutover:cache_friendly[:cache_ttl]`` entries."""
+    result: dict[str, dict[str, Any]] = {}
+    for entry in raw.split(","):
+        parts = [part.strip() for part in entry.split(":")]
+        if len(parts) not in {4, 5}:
+            continue
+        model, mode, cutover, cache_friendly = parts[:4]
+        if not model or mode not in {"inline", "deferred"}:
+            continue
+        try:
+            cutover_value = float(cutover)
+            ttl = int(parts[4]) if len(parts) == 5 else 0
+        except ValueError:
+            continue
+        lowered = cache_friendly.lower()
+        if lowered not in {"true", "false"} or ttl < 0:
+            continue
+        result[model] = {
+            "compaction_mode": mode,
+            "cutover_threshold": cutover_value,
+            "cache_friendly_condensation_enabled": lowered == "true",
+            "cache_ttl_seconds": ttl,
+        }
     return result
 
 
@@ -274,13 +327,19 @@ class _EnvFieldSpec:
 # duplicated. Order mirrors the historical ``from_env`` order for readability.
 ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("fresh_tail_count", "LCM_FRESH_TAIL_COUNT", int),
+    _EnvFieldSpec("fresh_tail_max_tokens", "LCM_FRESH_TAIL_MAX_TOKENS", int),
     _EnvFieldSpec("leaf_chunk_tokens", "LCM_LEAF_CHUNK_TOKENS", int),
     _EnvFieldSpec("context_threshold", "LCM_CONTEXT_THRESHOLD", float),
     _EnvFieldSpec("incremental_max_depth", "LCM_INCREMENTAL_MAX_DEPTH", int),
     _EnvFieldSpec("condensation_fanin", "LCM_CONDENSATION_FANIN", int),
+    _EnvFieldSpec("condensation_min_fanin", "LCM_CONDENSATION_MIN_FANIN", int),
     _EnvFieldSpec("dynamic_leaf_chunk_enabled", "LCM_DYNAMIC_LEAF_CHUNK_ENABLED", bool),
     _EnvFieldSpec("dynamic_leaf_chunk_max", "LCM_DYNAMIC_LEAF_CHUNK_MAX", int),
     _EnvFieldSpec("cache_friendly_condensation_enabled", "LCM_CACHE_FRIENDLY_CONDENSATION_ENABLED", bool),
+    _EnvFieldSpec("cache_economics", "LCM_CACHE_ECONOMICS", str),
+    _EnvFieldSpec("compaction_mode", "LCM_COMPACTION_MODE", str),
+    _EnvFieldSpec("cache_ttl_seconds", "LCM_CACHE_TTL_SECONDS", int),
+    _EnvFieldSpec("prompt_aware_eviction_enabled", "LCM_PROMPT_AWARE_EVICTION_ENABLED", bool),
     _EnvFieldSpec("cache_friendly_min_debt_groups", "LCM_CACHE_FRIENDLY_MIN_DEBT_GROUPS", int),
     _EnvFieldSpec("deferred_maintenance_enabled", "LCM_DEFERRED_MAINTENANCE_ENABLED", bool),
     _EnvFieldSpec("deferred_maintenance_max_passes", "LCM_DEFERRED_MAINTENANCE_MAX_PASSES", int),
@@ -436,6 +495,19 @@ class LCMConfig:
     context_threshold: float = 0.35
     # Model-substring overrides. Longest case-sensitive substring wins.
     model_thresholds: dict[str, float] = field(default_factory=dict)
+    # Structured ordered rules and issue-21 model-policy compatibility map.
+    policy_rules: list[dict[str, Any]] = field(default_factory=list)
+    model_policies: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Optional protected-tail token rail; policy rules may override it.
+    fresh_tail_max_tokens: int = 0
+    # Hard minimum fan-in used only by bounded pressure compaction.
+    condensation_min_fanin: int = 2
+    # Global route-economics defaults when no structured rule matches.
+    cache_economics: str = "unknown"
+    compaction_mode: str = "inline"
+    cache_ttl_seconds: int = 0
+    # Opt-in deterministic local relevance selection for constrained summaries.
+    prompt_aware_eviction_enabled: bool = False
     # Mirror Hermes Agent's Codex gpt-5.5 route-specific threshold auto-raise
     # when LCM is inheriting the host compression threshold. Explicit LCM
     # threshold overrides remain authoritative.
@@ -599,6 +671,19 @@ class LCMConfig:
     def __post_init__(self) -> None:
         if not 0.0 < float(self.emergency_pressure_ratio) <= 1.0:
             raise ValueError("emergency_pressure_ratio must be greater than 0 and at most 1")
+        from .policy import validate_policy_rules
+
+        validate_policy_rules(self.policy_rules)
+        if self.fresh_tail_max_tokens < 0:
+            raise ValueError("fresh_tail_max_tokens must be non-negative")
+        if self.condensation_min_fanin < 2:
+            raise ValueError("condensation_min_fanin must be at least 2")
+        if self.cache_economics not in {"discounted", "none", "unknown"}:
+            raise ValueError("cache_economics must be discounted, none, or unknown")
+        if self.compaction_mode not in {"inline", "deferred"}:
+            raise ValueError("compaction_mode must be inline or deferred")
+        if self.cache_ttl_seconds < 0:
+            raise ValueError("cache_ttl_seconds must be non-negative")
 
     @classmethod
     def from_env(cls) -> "LCMConfig":
@@ -629,6 +714,11 @@ class LCMConfig:
         raw_model_thresholds = os.environ.get("LCM_MODEL_THRESHOLDS")
         if raw_model_thresholds is not None:
             c.model_thresholds = _parse_model_thresholds_env(raw_model_thresholds)
+        c.policy_rules = _load_policy_rules_from_yaml(hermes_config)
+        c.model_policies = _load_model_policies_from_yaml(hermes_config)
+        raw_model_policies = os.environ.get("LCM_MODEL_POLICIES")
+        if raw_model_policies is not None:
+            c.model_policies = _parse_model_policies_env(raw_model_policies)
         c.codex_gpt55_autoraise_enabled, source = _hermes_codex_gpt55_autoraise_with_source(
             c.codex_gpt55_autoraise_enabled, hermes_config
         )

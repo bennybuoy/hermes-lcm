@@ -30,6 +30,7 @@ from .ingest_protection import (
     externalized_payload_stats,
     extract_ingest_externalized_refs,
     restore_ingest_payload_placeholders,
+    redact_sensitive_text,
     scan_externalized_payload_integrity,
     scan_sqlite_payload_risks,
     sensitive_pattern_status,
@@ -45,6 +46,12 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+_LCM_GREP_EXTERNALIZED_DEFAULT_FILES = 100
+_LCM_GREP_EXTERNALIZED_MAX_FILES = 500
+_LCM_GREP_EXTERNALIZED_DEFAULT_CHARS = 65_536
+_LCM_GREP_EXTERNALIZED_MAX_CHARS = 1_000_000
+_LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES = 4_000_000
 
 
 def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
@@ -104,6 +111,210 @@ def _get_externalized_payload(
     if payload_session_id and payload_session_id not in allowed:
         return None
     return payload
+
+
+def _decode_json_string_prefix(text: str, start: int, max_chars: int) -> tuple[str, bool]:
+    """Decode at most ``max_chars`` from one JSON string starting at quote."""
+    if start >= len(text) or text[start] != '"':
+        raise ValueError("invalid content string")
+    output: list[str] = []
+    index = start + 1
+    closed = False
+    while index < len(text) and len(output) < max_chars:
+        char = text[index]
+        if char == '"':
+            closed = True
+            break
+        if char != "\\":
+            output.append(char)
+            index += 1
+            continue
+        if index + 1 >= len(text):
+            break
+        escape = text[index + 1]
+        if escape == "u":
+            if index + 6 > len(text):
+                break
+            raw_escape = text[index:index + 6]
+            index += 6
+        else:
+            raw_escape = text[index:index + 2]
+            index += 2
+        try:
+            output.append(json.loads(f'"{raw_escape}"'))
+        except (ValueError, json.JSONDecodeError):
+            output.append("?")
+    return "".join(output), closed
+
+
+def _json_prefix_field(text: str, field: str) -> str:
+    match = re.search(rf'"{re.escape(field)}"\s*:\s*("(?:\\.|[^"\\])*")', text)
+    if not match:
+        return ""
+    try:
+        value = json.loads(match.group(1))
+    except (ValueError, json.JSONDecodeError):
+        return ""
+    return value if isinstance(value, str) else ""
+
+
+def _externalized_literal_match(content: str, query: str) -> re.Match[str] | None:
+    terms = [
+        phrase or word
+        for phrase, word in re.findall(r'"([^"]+)"|(\S+)', query)
+        if phrase or word
+    ]
+    if not terms:
+        return None
+    lowered = content.lower()
+    if not all(term.lower() in lowered for term in terms):
+        return None
+    return re.search(re.escape(terms[0]), content, flags=re.IGNORECASE)
+
+
+def _search_externalized_payloads(
+    engine: "LCMEngine",
+    *,
+    query: str,
+    regex_mode: bool,
+    session_id: str | None,
+    ref: str,
+    limit: int,
+    max_files: int,
+    max_payload_chars: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, Any]]:
+    diagnostics: list[dict[str, str]] = []
+    hits: list[dict[str, Any]] = []
+    files_scanned = 0
+    bytes_scanned = 0
+    scan_truncated = False
+    try:
+        root = get_large_output_storage_dir(
+            engine._config,
+            hermes_home=engine._hermes_home,
+            create=False,
+        ).resolve()
+    except (OSError, ValueError) as exc:
+        return [], [{"ref": ref or "", "error": str(exc)}], {
+            "files_scanned": 0,
+            "bytes_scanned": 0,
+            "matches": 0,
+            "scan_truncated": False,
+            "max_files": max_files,
+            "max_payload_chars": max_payload_chars,
+        }
+    if not root.exists() or not root.is_dir():
+        if ref:
+            diagnostics.append({"ref": ref, "error": "missing"})
+        return [], diagnostics, {
+            "files_scanned": 0,
+            "bytes_scanned": 0,
+            "matches": 0,
+            "scan_truncated": False,
+            "max_files": max_files,
+            "max_payload_chars": max_payload_chars,
+        }
+    paths = [root / ref] if ref else sorted(root.glob("*.json"))
+    if len(paths) > max_files:
+        paths = paths[:max_files]
+        scan_truncated = True
+    compiled = re.compile(query, flags=re.IGNORECASE) if regex_mode else None
+    for path in paths:
+        if bytes_scanned >= _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES:
+            scan_truncated = True
+            break
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(root)
+        except FileNotFoundError:
+            diagnostics.append({"ref": path.name, "error": "missing"})
+            continue
+        except (OSError, ValueError):
+            diagnostics.append({"ref": path.name, "error": "path_escape"})
+            continue
+        if not resolved.is_file():
+            diagnostics.append({"ref": path.name, "error": "not_a_file"})
+            continue
+        remaining = _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES - bytes_scanned
+        read_limit = min(remaining, max(4_096, max_payload_chars * 6 + 4_096))
+        try:
+            with resolved.open("rb") as handle:
+                raw = handle.read(read_limit + 1)
+        except OSError as exc:
+            diagnostics.append({"ref": path.name, "error": str(exc)})
+            continue
+        files_scanned += 1
+        bytes_scanned += min(len(raw), read_limit)
+        raw_truncated = len(raw) > read_limit
+        prefix = raw[:read_limit].decode("utf-8", errors="replace")
+        payload_session_id = _json_prefix_field(prefix, "session_id")
+        if session_id is not None and payload_session_id != session_id:
+            diagnostics.append({"ref": path.name, "error": "session_mismatch"})
+            continue
+        content_key = re.search(r'"content"\s*:\s*', prefix)
+        if content_key is None:
+            diagnostics.append({"ref": path.name, "error": "content_not_in_prefix"})
+            continue
+        try:
+            content, content_closed = _decode_json_string_prefix(
+                prefix,
+                content_key.end(),
+                max_payload_chars,
+            )
+        except ValueError:
+            diagnostics.append({"ref": path.name, "error": "invalid_payload"})
+            continue
+        match = compiled.search(content) if compiled is not None else _externalized_literal_match(content, query)
+        if match is None:
+            continue
+        start, end = match.span()
+        line = content.count("\n", 0, start) + 1
+        line_start = content.rfind("\n", 0, start) + 1
+        line_end = content.find("\n", end)
+        if line_end < 0:
+            line_end = len(content)
+        context_start = max(line_start, start - 120)
+        context_end = min(line_end, end + 120)
+        try:
+            created_match = re.search(r'"created_at"\s*:\s*([0-9.]+)', prefix)
+            created_at = float(created_match.group(1)) if created_match else resolved.stat().st_mtime
+        except (OSError, ValueError):
+            created_at = 0.0
+        matched_text = content[start:end]
+        snippet = content[context_start:context_end]
+        safe_snippet = redact_sensitive_text(snippet, engine._config)
+        safe_matched_text = (
+            matched_text
+            if matched_text in safe_snippet
+            else "[redacted by sensitive-pattern policy]"
+        )
+        hits.append({
+            "type": "externalized",
+            "ref": path.name,
+            "session_id": payload_session_id,
+            "line": line,
+            "char_offset": start,
+            "byte_offset": len(content[:start].encode("utf-8")),
+            "matched_text": safe_matched_text,
+            "snippet": safe_snippet,
+            "payload_truncated": bool(raw_truncated or not content_closed),
+            "content_chars_scanned": len(content),
+            "_sort_ts": created_at,
+            "_sort_rank": 0.0,
+            "_sort_directness": 0.0,
+        })
+        if len(hits) >= limit:
+            scan_truncated = scan_truncated or len(paths) > files_scanned
+            break
+    return hits, diagnostics, {
+        "files_scanned": files_scanned,
+        "bytes_scanned": bytes_scanned,
+        "matches": len(hits),
+        "scan_truncated": scan_truncated,
+        "max_files": max_files,
+        "max_payload_chars": max_payload_chars,
+        "max_total_bytes": _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES,
+    }
 
 
 def _truncate_text_to_token_budget(text: str, max_tokens: int) -> tuple[str, bool]:
@@ -1060,6 +1271,41 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     if not query:
         return json.dumps({"error": "No query provided"})
 
+    content_scope = str(args.get("content_scope") or "database").strip().lower()
+    if content_scope == "files":
+        content_scope = "externalized"
+    if content_scope not in {"database", "externalized", "all"}:
+        return json.dumps({
+            "error": "content_scope must be database, externalized, or all",
+        })
+    regex_mode = bool(args.get("regex", False))
+    if regex_mode:
+        try:
+            re.compile(query)
+        except re.error as exc:
+            return json.dumps({"error": f"invalid regex: {exc}"})
+    ref = str(args.get("ref") or "").strip()
+    if ref and (Path(ref).name != ref or "/" in ref or "\\" in ref):
+        return json.dumps({"error": "invalid externalized ref"})
+    if ref and content_scope == "database":
+        return json.dumps({"error": "ref requires externalized content_scope"})
+
+    requested_max_files = _parse_int_value(
+        args.get("max_files"),
+        _LCM_GREP_EXTERNALIZED_DEFAULT_FILES,
+    )
+    requested_max_payload_chars = _parse_int_value(
+        args.get("max_payload_chars"),
+        _LCM_GREP_EXTERNALIZED_DEFAULT_CHARS,
+    )
+    if requested_max_files <= 0 or requested_max_payload_chars <= 0:
+        return json.dumps({"error": "externalized scan bounds must be positive"})
+    max_files = min(requested_max_files, _LCM_GREP_EXTERNALIZED_MAX_FILES)
+    max_payload_chars = min(
+        requested_max_payload_chars,
+        _LCM_GREP_EXTERNALIZED_MAX_CHARS,
+    )
+
     raw_limit_arg = args.get("limit", 10)
     parsed_limit = _parse_int_value(raw_limit_arg, 10)
     if parsed_limit <= 0:
@@ -1136,8 +1382,11 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     current_session_id = engine.current_session_id
     has_current_session = bool(current_session_id)
     results: list[Dict[str, Any]] = []
+    externalized_diagnostics: list[dict[str, str]] = []
+    externalized_scan: dict[str, Any] | None = None
 
-    try:
+    if content_scope in {"database", "all"} and not regex_mode:
+      try:
         msg_hits = engine._store.search(
             query,
             session_id=search_session_id,
@@ -1168,7 +1417,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                     "_sort_directness": hit.get("_directness_score") or 0.0,
                 }
             )
-    except Exception as exc:
+      except Exception as exc:
         logger.warning("Message search failed: %s", exc)
 
     # Summary-node search is intentionally current-session only. Cross-session
@@ -1176,7 +1425,12 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     # contract would push this tool toward a memory-system shape rather than
     # a plugin-local archive search. Raw-message hits remain expandable across
     # sessions via lcm_expand(store_id=...).
-    if session_scope == "current" and not raw_message_filter_active:
+    if (
+        content_scope in {"database", "all"}
+        and not regex_mode
+        and session_scope == "current"
+        and not raw_message_filter_active
+    ):
         try:
             node_hits = engine._dag.search(
                 query,
@@ -1206,6 +1460,26 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         except Exception as exc:
             logger.warning("Node search failed: %s", exc)
 
+    if content_scope in {"externalized", "all"}:
+        external_hits, externalized_diagnostics, externalized_scan = (
+            _search_externalized_payloads(
+                engine,
+                query=query,
+                regex_mode=regex_mode,
+                session_id=search_session_id,
+                ref=ref,
+                limit=limit,
+                max_files=max_files,
+                max_payload_chars=max_payload_chars,
+            )
+        )
+        for hit in external_hits:
+            hit["from_current_session"] = bool(
+                current_session_id
+                and hit.get("session_id") == current_session_id
+            )
+            results.append(hit)
+
     if sort == "hybrid":
         max_message_directness = max(
             (float(result.get("_sort_directness") or 0.0) for result in results if result.get("type") == "message"),
@@ -1225,6 +1499,8 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     response: Dict[str, Any] = {
         "query": query,
         "sort": sort,
+        "content_scope": content_scope,
+        "regex": regex_mode,
         "session_scope": session_scope,
         "source": source,
         "conversation_id": conversation_id,
@@ -1232,6 +1508,13 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         "total_results": len(results),
         "results": results[:limit],
     }
+    if externalized_scan is not None:
+        response["scan"] = externalized_scan
+        response["diagnostics"] = externalized_diagnostics
+        if requested_max_files > max_files:
+            response["max_files_clamped_from"] = requested_max_files
+        if requested_max_payload_chars > max_payload_chars:
+            response["max_payload_chars_clamped_from"] = requested_max_payload_chars
     if role is not None:
         response["role"] = role
     if time_from is not None:
@@ -2339,11 +2622,16 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
     min_store_id = store_totals_row[1] if store_totals_row else None
     max_store_id = store_totals_row[2] if store_totals_row else None
     estimated_tokens = int(store_totals_row[3] or 0) if store_totals_row else 0
-    fresh_tail_count = max(0, int(engine._config.fresh_tail_count or 0))
+    stored_messages = engine._store.get_session_messages(session_id)
+    fresh_tail_start = engine._fresh_tail_start(stored_messages)
+    selected_tail = stored_messages[fresh_tail_start:]
+    fresh_tail_count = len(selected_tail)
     fresh_tail_limit = min(limit, fresh_tail_count) if fresh_tail_count > 0 else 0
     fresh_tail_items = [
         _inspect_message_metadata(row)
-        for row in engine._store.get_session_tail(session_id, fresh_tail_limit)
+        for row in (
+            selected_tail[-fresh_tail_limit:] if fresh_tail_limit > 0 else []
+        )
     ]
 
     depth_stats = engine._dag.get_session_depth_stats(session_id)
@@ -2410,7 +2698,10 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
             "min_store_id": min_store_id,
             "max_store_id": max_store_id,
             "fresh_tail_count": fresh_tail_count,
-            "pre_tail_message_count": max(0, message_total - fresh_tail_count),
+            "fresh_tail_count_limit": engine._effective_fresh_tail_count(),
+            "fresh_tail_max_tokens": engine._effective_fresh_tail_max_tokens(),
+            "fresh_tail_selection": full_status.get("fresh_tail_selection"),
+            "pre_tail_message_count": fresh_tail_start,
             "fresh_tail": {
                 "returned": len(fresh_tail_items),
                 "items": fresh_tail_items,
@@ -2547,6 +2838,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "leaf_health": leaf_health,
         "config": {
             "fresh_tail_count": engine._config.fresh_tail_count,
+            "fresh_tail_max_tokens": engine._config.fresh_tail_max_tokens,
             "leaf_chunk_tokens": engine._config.leaf_chunk_tokens,
             "dynamic_leaf_chunk_enabled": engine._config.dynamic_leaf_chunk_enabled,
             "dynamic_leaf_chunk_max": engine._config.dynamic_leaf_chunk_max,

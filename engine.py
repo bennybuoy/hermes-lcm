@@ -1611,9 +1611,102 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         self._clear_pending_reset_boundary()
 
-    def _raw_backlog_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _effective_fresh_tail_count(self) -> int:
+        policy = getattr(self, "_compaction_policy", None)
+        if policy is not None:
+            return max(0, int(policy.fresh_tail_count))
+        return max(0, int(self._config.fresh_tail_count or 0))
+
+    def _effective_fresh_tail_max_tokens(self) -> int:
+        policy = getattr(self, "_compaction_policy", None)
+        if policy is not None:
+            return max(0, int(policy.fresh_tail_max_tokens))
+        return max(0, int(self._config.fresh_tail_max_tokens or 0))
+
+    def _fresh_tail_start(self, messages: List[Dict[str, Any]]) -> int:
+        """Resolve the shared suffix protected by count and token rails."""
         n = len(messages)
-        fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+        leading = self._leading_anchor_count(messages)
+        count_limit = self._effective_fresh_tail_count()
+        token_limit = self._effective_fresh_tail_max_tokens()
+        count_start = max(leading, n - count_limit) if count_limit > 0 else n
+
+        token_start = leading
+        if token_limit > 0:
+            token_start = n
+            token_total = 0
+            for index in range(n - 1, leading - 1, -1):
+                message_tokens = count_message_tokens(messages[index])
+                if token_total + message_tokens > token_limit:
+                    break
+                token_total += message_tokens
+                token_start = index
+
+        start = max(count_start, token_start)
+        overflow_reason = ""
+        newest_user_index = next(
+            (
+                index
+                for index in range(n - 1, leading - 1, -1)
+                if messages[index].get("role") == "user"
+            ),
+            None,
+        )
+        tail_enabled = count_limit > 0 or token_limit > 0
+        if (
+            tail_enabled
+            and newest_user_index == n - 1
+            and newest_user_index < start
+        ):
+            start = newest_user_index
+            overflow_reason = "newest-user-exceeds-token-cap"
+
+        newest_anchor_index = next(
+            (
+                index
+                for index in range(n - 1, leading - 1, -1)
+                if self._is_preserved_todo_context_message(messages[index])
+                or bool(self._preserved_objective_context_content(messages[index]))
+            ),
+            None,
+        )
+        if (
+            tail_enabled
+            and newest_anchor_index == n - 1
+            and newest_anchor_index < start
+        ):
+            start = newest_anchor_index
+            overflow_reason = "protected-anchor-exceeds-tail-boundary"
+
+        selected = messages[start:]
+        selected_tokens = count_messages_tokens(selected)
+        overflow = bool(token_limit > 0 and selected_tokens > token_limit)
+        if overflow and not overflow_reason:
+            overflow_reason = "protected-suffix-exceeds-token-cap"
+        boundary_reason = (
+            "token-cap"
+            if token_limit > 0 and token_start > count_start
+            else "count-cap" if count_limit > 0 else "no-count-tail"
+        )
+        self._last_fresh_tail_selection = {
+            "count_limit": count_limit,
+            "token_limit": token_limit,
+            "count_start": count_start,
+            "token_start": token_start,
+            "selected_start": start,
+            "selected_count": len(selected),
+            "selected_tokens": selected_tokens,
+            "boundary_reason": boundary_reason,
+            "overflow": overflow,
+            "overflow_reason": overflow_reason,
+            "tool_repair_stub_required": bool(
+                selected and selected[0].get("role") == "tool"
+            ),
+        }
+        return start
+
+    def _raw_backlog_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        fresh_tail_start = self._fresh_tail_start(messages)
         leading_anchor_count = self._leading_anchor_count(messages)
         if fresh_tail_start <= leading_anchor_count:
             return []
@@ -1733,6 +1826,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._session_id = session_id
         self._session_platform = str(kwargs.get("platform") or "")
         self._refresh_session_filters()
+        if self.context_length > 0 and self.model:
+            self._resolve_live_compaction_policy()
         # Hold the foreground view stable when the new binding is a side
         # channel (cron tick inside the gateway process, debug probe, etc.).
         # Tools that report "current session" to operators must keep pointing
@@ -1851,6 +1946,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 model=self.model,
                 provider=self.provider,
             )
+        if self.context_length > 0 and self.model:
+            self._resolve_live_compaction_policy()
         self._update_model_pending_session_start = False
 
     def _continue_compression_boundary(
@@ -3428,6 +3525,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 if self._compaction_policy is not None
                 else None
             ),
+            "assembly_selection": dict(getattr(
+                self,
+                "_last_assembly_selection",
+                {
+                    "mode": "full-fit",
+                    "items_considered": 0,
+                    "items_evicted": 0,
+                    "tokens_evicted": 0,
+                },
+            )),
+            "fresh_tail_selection": dict(getattr(
+                self,
+                "_last_fresh_tail_selection",
+                {
+                    "count_limit": self._effective_fresh_tail_count(),
+                    "token_limit": self._effective_fresh_tail_max_tokens(),
+                    "selected_count": 0,
+                    "selected_tokens": 0,
+                    "boundary_reason": "not-evaluated",
+                    "overflow": False,
+                    "overflow_reason": "",
+                },
+            )),
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),
@@ -3535,6 +3655,52 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 }
         return status
 
+    def _resolve_live_compaction_policy(self) -> None:
+        """Resolve policy from current route/session metadata and apply cutover."""
+        self._compaction_policy = resolve_policy(
+            model=self.model,
+            provider=self.provider,
+            route=self.api_mode,
+            context_length=self.context_length,
+            session_id=self.current_session_id,
+            platform=self.current_session_platform,
+            policy_rules=self._config.policy_rules,
+            model_policies=self._config.model_policies,
+            context_threshold=self._config.context_threshold,
+            model_thresholds=self._config.model_thresholds,
+            emergency_pressure_ratio=self._config.emergency_pressure_ratio,
+            max_assembly_tokens=self._config.max_assembly_tokens,
+            reserve_tokens_floor=self._config.reserve_tokens_floor,
+            summary_model=self._config.summary_model,
+            summary_fallback_models=tuple(self._config.summary_fallback_models) if self._config.summary_fallback_models else (),
+            fresh_tail_count=self._config.fresh_tail_count,
+            fresh_tail_max_tokens=self._config.fresh_tail_max_tokens,
+            leaf_chunk_tokens=self._config.leaf_chunk_tokens,
+            dynamic_leaf_chunk_enabled=self._config.dynamic_leaf_chunk_enabled,
+            dynamic_leaf_chunk_max=self._config.dynamic_leaf_chunk_max,
+            condensation_fanin=self._config.condensation_fanin,
+            condensation_min_fanin=self._config.condensation_min_fanin,
+            incremental_max_depth=self._config.incremental_max_depth,
+            cache_friendly_condensation_enabled=self._config.cache_friendly_condensation_enabled,
+            cache_economics=self._config.cache_economics,
+            compaction_mode=self._config.compaction_mode,
+            cache_ttl_seconds=self._config.cache_ttl_seconds,
+            context_threshold_source=self._context_threshold_source,
+            config_sources=getattr(self._config, "config_sources", None),
+        )
+        # Structured rules are first-class live cutover inputs. Legacy/builtin
+        # policy derivation keeps the existing runtime-threshold resolver as the
+        # compatibility authority (including Codex auto-raise behavior).
+        if self._compaction_policy.source.startswith(
+            ("policy_rule:", "model_policies:")
+        ):
+            self.context_threshold = self._compaction_policy.cutover_threshold
+            self.threshold_percent = self.context_threshold
+            if self.context_length > 0:
+                self.threshold_tokens = self._effective_threshold_tokens(
+                    self._compaction_policy.cutover_tokens(self.context_length)
+                )
+
     def update_model(self, model: str, context_length: int,
                      base_url: str = "", api_key: str = "",
                      provider: str = "",
@@ -3552,27 +3718,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self.provider = str(provider or "")
         self.api_mode = str(api_mode or "")
         self._set_context_length(context_length, source="update_model")
-        # Resolve typed compaction policy for this model/provider/context.
-        self._compaction_policy = resolve_policy(
-            model=self.model,
-            provider=self.provider,
-            context_length=self.context_length,
-            context_threshold=self._config.context_threshold,
-            model_thresholds=self._config.model_thresholds,
-            emergency_pressure_ratio=self._config.emergency_pressure_ratio,
-            max_assembly_tokens=self._config.max_assembly_tokens,
-            reserve_tokens_floor=self._config.reserve_tokens_floor,
-            summary_model=self._config.summary_model,
-            summary_fallback_models=tuple(self._config.summary_fallback_models) if self._config.summary_fallback_models else (),
-            leaf_chunk_tokens=self._config.leaf_chunk_tokens,
-            dynamic_leaf_chunk_enabled=self._config.dynamic_leaf_chunk_enabled,
-            dynamic_leaf_chunk_max=self._config.dynamic_leaf_chunk_max,
-            condensation_fanin=self._config.condensation_fanin,
-            incremental_max_depth=self._config.incremental_max_depth,
-            cache_friendly_condensation_enabled=self._config.cache_friendly_condensation_enabled,
-            context_threshold_source=self._context_threshold_source,
-            config_sources=getattr(self._config, "config_sources", None),
-        )
+        # Resolve typed compaction policy for this model/provider/route/session.
+        self._resolve_live_compaction_policy()
         logger.debug(
             "LCM resolved compaction policy: model=%s cutover=%.4f fingerprint=%s",
             self.model,
@@ -4931,6 +5078,31 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
           [fresh tail messages]
         """
         result = []
+        self._last_assembly_selection = {
+            "mode": "full-fit",
+            "items_considered": 0,
+            "items_evicted": 0,
+            "tokens_evicted": 0,
+        }
+
+        # Once a positive active generation has ordered items, that generation
+        # is the provider-visible layout. Host messages are only an input seam;
+        # they cannot make covered raw rows or unrelated canonical nodes active.
+        host_tail_messages = list(tail_messages)
+        authoritative_layout = self._resolve_active_frontier_for_assembly()
+        authoritative_nodes: Optional[List[SummaryNode]] = None
+        if authoritative_layout is not None:
+            authoritative_nodes, frontier_messages = authoritative_layout
+            frontier_messages = (
+                self._drop_preexisting_generated_ignored_dependent_eof_replies(
+                    frontier_messages,
+                    self._load_generated_ignored_dependent_reply_records(),
+                )
+            )
+            tail_messages = self._merge_unpublished_host_tail(
+                frontier_messages,
+                host_tail_messages,
+            )
 
         # Leading anchor with optional LCM annotation. Only a true system prompt
         # is a safe permanent anchor; gateway sessions can start directly with
@@ -4966,7 +5138,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         tail_selected = tail_messages
         anchor_source = getattr(self, "_pending_context_anchor_messages", None)
         if anchor_source is None:
-            anchor_source = tail_messages
+            anchor_source = host_tail_messages
         anchor_part: Optional[str] = None
         summary_budget = None
         used = count_message_tokens(leading_msg) if leading_msg is not None else 0
@@ -5015,15 +5187,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if summary_budget is None or count_message_tokens(anchor_msg) <= summary_budget:
                 summary_parts.append(anchor_part)
 
-        all_nodes = self._dag.get_session_nodes(self._session_id)
+        all_nodes = (
+            authoritative_nodes
+            if authoritative_nodes is not None
+            else self._dag.get_session_nodes(self._session_id)
+        )
         if all_nodes:
-            # Group by depth, take the most recent uncondensed at each level
-            # For active context, we want the highest-level summaries
-            # that haven't been condensed into even higher levels
-            depths = sorted(set(n.depth for n in all_nodes), reverse=True)
-            for d in depths:
-                uncondensed = self._dag.get_uncondensed_at_depth(self._session_id, d)
-                for node in uncondensed:
+            if authoritative_nodes is not None:
+                node_groups = [(node.depth, [node]) for node in all_nodes]
+            else:
+                # Legacy/no-frontier fallback: infer the visible DAG prefix.
+                depths = sorted(set(n.depth for n in all_nodes), reverse=True)
+                node_groups = [
+                    (depth, self._dag.get_uncondensed_at_depth(self._session_id, depth))
+                    for depth in depths
+                ]
+            for d, visible_nodes in node_groups:
+                for node in visible_nodes:
                     depth_label = {
                         0: "Recent",
                         1: "Session Arc",
@@ -5038,15 +5218,66 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if summary_parts:
             selected_parts = summary_parts
             if summary_budget is not None:
-                selected_parts = []
-                for part in summary_parts:
-                    candidate = "\n\n---\n\n".join(selected_parts + [part])
+                anchor_indices = (
+                    [summary_parts.index(anchor_part)]
+                    if anchor_part is not None and anchor_part in summary_parts
+                    else []
+                )
+                candidate_order = [
+                    index
+                    for index in range(len(summary_parts))
+                    if index not in anchor_indices
+                ]
+                selection_mode = "chronological"
+                prompt_terms = self._prompt_aware_search_terms(tail_messages)
+                if (
+                    self._config.prompt_aware_eviction_enabled
+                    and prompt_terms
+                ):
+                    candidate_order.sort(
+                        key=lambda index: (
+                            -self._prompt_aware_relevance_score(
+                                summary_parts[index],
+                                prompt_terms,
+                            ),
+                            index,
+                        )
+                    )
+                    selection_mode = "prompt-aware"
+                selected_indices: list[int] = list(anchor_indices)
+                for index in candidate_order:
+                    part = summary_parts[index]
+                    ordered_indices = sorted(selected_indices + [index])
+                    candidate = "\n\n---\n\n".join(
+                        summary_parts[selected_index]
+                        for selected_index in ordered_indices
+                    )
                     candidate_msg = {"role": summary_role, "content": candidate}
                     if count_message_tokens(candidate_msg) > summary_budget:
-                        if part == anchor_part:
-                            continue
                         continue
-                    selected_parts.append(part)
+                    selected_indices.append(index)
+                selected_parts = [
+                    summary_parts[index] for index in sorted(selected_indices)
+                ]
+                if len(selected_parts) == len(summary_parts):
+                    selection_mode = "full-fit"
+                self._last_assembly_selection = {
+                    "mode": selection_mode,
+                    "items_considered": len(summary_parts),
+                    "items_evicted": len(summary_parts) - len(selected_parts),
+                    "tokens_evicted": max(
+                        0,
+                        count_tokens("\n\n---\n\n".join(summary_parts))
+                        - count_tokens("\n\n---\n\n".join(selected_parts)),
+                    ),
+                }
+            else:
+                self._last_assembly_selection = {
+                    "mode": "full-fit",
+                    "items_considered": len(summary_parts),
+                    "items_evicted": 0,
+                    "tokens_evicted": 0,
+                }
             if selected_parts:
                 combined = "\n\n---\n\n".join(selected_parts)
                 result.append({"role": summary_role, "content": combined})
@@ -5083,6 +5314,160 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             result = self._sanitize_active_context_messages(trimmed_result)
 
         return result
+
+    @staticmethod
+    def _prompt_aware_relevance_score(text: str, terms: list[str]) -> float:
+        words = re.findall(r"[\w-]+", (text or "").lower())
+        if not words:
+            return 0.0
+        frequencies: dict[str, int] = {}
+        for word in words:
+            frequencies[word] = frequencies.get(word, 0) + 1
+        length_normalizer = 1.0 + (len(words) / 200.0)
+        return sum(
+            (1.0 + math.log(float(frequencies.get(term, 0)))) / length_normalizer
+            for term in terms
+            if frequencies.get(term, 0) > 0
+        )
+
+    @staticmethod
+    def _prompt_aware_search_terms(
+        tail_messages: List[Dict[str, Any]],
+    ) -> list[str]:
+        prompt = ""
+        for message in reversed(tail_messages):
+            if message.get("role") == "user":
+                prompt = normalize_content_value(message.get("content")) or ""
+                break
+        stop = {"about", "after", "again", "could", "from", "have", "into", "that", "the", "this", "what", "when", "where", "which", "with", "would", "your"}
+        return list(dict.fromkeys(
+            term
+            for term in re.findall(r"[\w-]{2,}", prompt.lower())
+            if term not in stop
+        ))
+
+    def _resolve_active_frontier_for_assembly(
+        self,
+    ) -> Optional[tuple[List[SummaryNode], List[Dict[str, Any]]]]:
+        """Resolve one positive active generation into canonical prompt items.
+
+        ``None`` means no authoritative positive generation exists and permits
+        the legacy DAG/host fallback. Once a positive generation exists, missing,
+        overlapping, cross-session, or unknown refs are invariant violations and
+        raise instead of silently replaying the caller's stale host context.
+        """
+        conversation_id = self.current_conversation_id
+        if not conversation_id:
+            return None
+        frontier = self._frontier.get_active_frontier(conversation_id)
+        if frontier is None or int(frontier.get("source_end_store_id") or 0) <= 0:
+            return None
+        generation = int(frontier["generation"])
+        items = self._frontier.get_frontier_items(conversation_id, generation)
+        if not items:
+            self.reconcile_itemless_frontier_generations(conversation_id)
+            items = self._frontier.get_frontier_items(conversation_id, generation)
+        if not items:
+            raise RuntimeError(
+                f"active frontier generation {generation} has no ordered items"
+            )
+
+        session_id = str(frontier.get("session_id") or "")
+        nodes: list[SummaryNode] = []
+        messages: list[Dict[str, Any]] = []
+        previous_end = 0
+        for item in items:
+            start = int(item.get("source_start") or 0)
+            end = int(item.get("source_end") or 0)
+            ref_id = int(item.get("ref_id") or 0)
+            kind = str(item.get("kind") or "")
+            if start <= 0 or end < start or start <= previous_end:
+                raise RuntimeError(
+                    f"invalid frontier item range in generation {generation}"
+                )
+            previous_end = end
+            if kind == "node":
+                node = self._dag.get_node(ref_id)
+                if node is None or node.session_id != session_id:
+                    raise RuntimeError(
+                        f"frontier generation {generation} references missing canonical node {ref_id}"
+                    )
+                nodes.append(node)
+                continue
+            if kind == "message":
+                if ref_id < start or ref_id > end:
+                    raise RuntimeError(
+                        f"frontier generation {generation} has out-of-range message ref {ref_id}"
+                    )
+                stored = self._store.get(ref_id)
+                if stored is None or str(stored.get("session_id") or "") != session_id:
+                    raise RuntimeError(
+                        f"frontier generation {generation} references missing raw message {ref_id}"
+                    )
+                messages.append(self._store.to_openai_msg(stored))
+                continue
+            raise RuntimeError(
+                f"frontier generation {generation} has unknown item kind {kind!r}"
+            )
+        return nodes, messages
+
+    def _merge_unpublished_host_tail(
+        self,
+        frontier_messages: List[Dict[str, Any]],
+        host_tail_messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Append genuinely new host rows without replaying covered history.
+
+        A promotion can win immediately before foreground ingest hits a bounded
+        SQLite failure. Those not-yet-stored host rows are newer than the
+        generation and must survive the canonical fallback. Durable rows at or
+        below the generation boundary, however, are covered and never reappear.
+        """
+        frontier = self._frontier.get_active_frontier(self.current_conversation_id)
+        if frontier is None:
+            return list(frontier_messages)
+        session_id = str(frontier.get("session_id") or "")
+        source_end = int(frontier.get("source_end_store_id") or 0)
+        covered_rows: list[Dict[str, Any]] = []
+        next_store_id = 0
+        while next_store_id <= source_end:
+            page = self._store.get_range(
+                session_id,
+                start_id=next_store_id,
+                end_id=source_end,
+                limit=1_000,
+            )
+            if not page:
+                break
+            covered_rows.extend(page)
+            last_store_id = int(page[-1].get("store_id") or 0)
+            if last_store_id < next_store_id:
+                break
+            next_store_id = last_store_id + 1
+
+        def counts(messages, *, stored_row: bool) -> dict[tuple[Any, ...], int]:
+            result: dict[tuple[Any, ...], int] = {}
+            for message in messages:
+                identity = self._message_replay_identity(
+                    message,
+                    stored_row=stored_row,
+                )
+                result[identity] = result.get(identity, 0) + 1
+            return result
+
+        covered_counts = counts(covered_rows, stored_row=True)
+        frontier_counts = counts(frontier_messages, stored_row=False)
+        unpublished: list[Dict[str, Any]] = []
+        for message in host_tail_messages:
+            identity = self._message_replay_identity(message)
+            if covered_counts.get(identity, 0) > 0:
+                covered_counts[identity] -= 1
+                continue
+            if frontier_counts.get(identity, 0) > 0:
+                frontier_counts[identity] -= 1
+                continue
+            unpublished.append(message)
+        return list(frontier_messages) + unpublished
 
     def _is_budget_droppable_tail_message(self, message: Dict[str, Any]) -> bool:
         """Return whether an over-budget tail message may be evicted.
@@ -5304,6 +5689,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         fields = {
             "protocol": "async_compaction_protocol_v1",
             "fresh_tail_count": int(self._config.fresh_tail_count),
+            "fresh_tail_max_tokens": int(self._config.fresh_tail_max_tokens or 0),
             "leaf_chunk_tokens": int(self._config.leaf_chunk_tokens),
             "configured_context_threshold": float(self._config.context_threshold),
             "runtime_context_threshold": runtime_threshold,
@@ -5338,22 +5724,24 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         node_id: int = 0,
         covered_source_ids: Optional[List[int]] = None,
     ) -> int:
-        """Atomically advance async frontier after foreground compaction.
+        """Atomically advance the persistent frontier after foreground compaction.
 
-        Returns the committed generation, ``-1`` when async compaction is
-        disabled (a successful no-op), or ``0`` on failure. Pending prepared
-        batches stay ``ready`` but become stale against the new generation, so
-        later promotion returns ``frontier_mismatch`` rather than
-        double-publishing. Generation and ordered items are committed in one
-        FrontierStore transaction; callers can roll back the exact generation
-        if a later lifecycle write fails.
+        Returns the committed generation, ``-1`` for a legacy engine instance
+        without a conversation binding, or ``0`` on failure. Publication is
+        independent of speculative async preparation: ordinary foreground and
+        async promotion must expose the same generation-scoped layout. Pending
+        prepared batches stay ``ready`` but become stale against the new
+        generation, so later promotion returns ``frontier_mismatch`` rather
+        than double-publishing. Generation and ordered items are committed in
+        one FrontierStore transaction; callers can roll back the exact
+        generation if a later lifecycle write fails.
         """
-        if not getattr(self._config, "async_background_compaction_enabled", False):
-            return -1
         conv_id = self.current_conversation_id
         session_id = self.current_session_id
-        if not conv_id or not session_id:
-            return False
+        if not conv_id:
+            return -1
+        if not session_id:
+            return 0
         try:
             policy_fp = self._async_policy_fingerprint()
             route_fp = self._async_route_fingerprint()
@@ -5370,6 +5758,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 return False
             source_end = int(source_end_store_id or 0)
             items = self._build_promoted_frontier_items(
+                conversation_id=conv_id,
                 session_id=session_id,
                 node_id=int(node_id or 0),
                 covered_source_ids=[int(s) for s in (covered_source_ids or [])],
@@ -5502,13 +5891,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         source_end = frontier["source_end_store_id"] if frontier else 0
 
         # Get the raw messages that are candidates for compaction.
-        fresh_tail = self._config.fresh_tail_count
         all_stored = self._store.get_session_messages(session_id)
         if not all_stored:
             return None
 
         # Determine which messages are candidates (exclude fresh tail)
-        candidate_count = max(0, len(all_stored) - fresh_tail)
+        candidate_count = self._fresh_tail_start(all_stored)
         if candidate_count <= 0:
             return None
 
@@ -5802,6 +6190,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             # Write ordered frontier items BEFORE marking the batch promoted.
             # A generation tip with source_end > 0 must never be itemless.
             frontier_items = self._build_promoted_frontier_items(
+                conversation_id=batch.conversation_id,
                 session_id=batch.session_id,
                 node_id=int(inserted_node_id),
                 covered_source_ids=covered_source_ids,
@@ -5921,6 +6310,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _build_promoted_frontier_items(
         self,
         *,
+        conversation_id: str,
         session_id: str,
         node_id: int,
         covered_source_ids: list[int],
@@ -5936,6 +6326,31 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
            non-overlapping ranges.
         """
         items: list[dict[str, Any]] = []
+        # Carry forward already-published canonical nodes. A new leaf replaces
+        # only its covered raw range; it must not erase older summary members.
+        active = self._frontier.get_active_frontier(conversation_id)
+        if active is not None and str(active.get("session_id") or "") == session_id:
+            for item in self._frontier.get_frontier_items(
+                conversation_id, int(active["generation"])
+            ):
+                if item.get("kind") != "node":
+                    continue
+                start = int(item.get("source_start") or 0)
+                end = int(item.get("source_end") or 0)
+                if start <= 0 or end < start:
+                    continue
+                if any(start <= source_id <= end for source_id in covered_source_ids):
+                    continue
+                if self._dag.get_node(int(item.get("ref_id") or 0)) is None:
+                    continue
+                items.append(
+                    {
+                        "kind": "node",
+                        "ref_id": int(item["ref_id"]),
+                        "source_start": start,
+                        "source_end": end,
+                    }
+                )
         if covered_source_ids and node_id > 0:
             items.append(
                 {
@@ -5971,9 +6386,27 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     "source_end": sid,
                 }
             )
+        # Generation rows require strict source ordering and non-overlap.
+        ordered = sorted(
+            items,
+            key=lambda item: (
+                int(item.get("source_start") or 0),
+                0 if item.get("kind") == "node" else 1,
+                int(item.get("ref_id") or 0),
+            ),
+        )
+        validated: list[dict[str, Any]] = []
+        previous_end = 0
+        for item in ordered:
+            start = int(item.get("source_start") or 0)
+            end = int(item.get("source_end") or 0)
+            if start <= previous_end or end < start:
+                continue
+            validated.append(item)
+            previous_end = end
         # If there is no uncovered tail (empty session after full cover), the
         # node item alone still satisfies non-empty for source_end > 0.
-        return items
+        return validated
 
     def reconcile_itemless_frontier_generations(
         self,
@@ -6156,10 +6589,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Fallback when identity mapping fails (e.g. host payload drift): keep
         # leading anchors + the configured fresh tail only.
         leading = self._leading_anchor_count(messages)
-        fresh_tail = int(getattr(self._config, "fresh_tail_count", 0) or 0)
-        if fresh_tail <= 0:
+        tail_start = self._fresh_tail_start(messages)
+        if tail_start >= len(messages):
             return list(messages[:leading]) if leading else []
-        tail_start = max(leading, len(messages) - fresh_tail)
         return list(messages[:leading]) + list(messages[tail_start:])
 
     # -- Async background worker -------------------------------------------
@@ -6336,7 +6768,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         counts = self._frontier.get_batch_counts_by_state(conv_id)
         if counts.get("ready", 0) > 0 or counts.get("preparing", 0) > 0:
             return None
-        fresh_tail = int(getattr(self._config, "fresh_tail_count", 0) or 0)
         try:
             stored = self._store.get_session_messages(session_id)
         except Exception:
@@ -6345,7 +6776,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 exc_info=True,
             )
             return False
-        if not stored or len(stored) <= fresh_tail:
+        if not stored or self._fresh_tail_start(stored) <= self._leading_anchor_count(stored):
             return None
         # prepare_background_compaction_once snapshots from the store; the
         # messages argument is only needed for API compatibility.
@@ -6587,8 +7018,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if self._session_stateless:
             return {"ok": False, "reason": "session_stateless", "session_id": session_id}
 
-        fresh_tail_count = max(1, int(self._config.fresh_tail_count))
-        total_count = int(self._store.get_session_count(session_id))
+        stored = self._store.get_session_messages(session_id)
+        total_count = len(stored)
+        fresh_tail_start = self._fresh_tail_start(stored)
+        fresh_tail_count = total_count - fresh_tail_start
 
         state = self._lifecycle.get_by_conversation(conversation_id)
         current_frontier = int(state.current_frontier_store_id) if state else 0
@@ -6599,11 +7032,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "conversation_id": conversation_id,
             "total_message_count": total_count,
             "fresh_tail_count": fresh_tail_count,
+            "fresh_tail_max_tokens": self._effective_fresh_tail_max_tokens(),
             "current_frontier_store_id": current_frontier,
             "mode": "apply" if apply else "preview",
         }
 
-        if total_count <= fresh_tail_count:
+        if fresh_tail_start <= self._leading_anchor_count(stored):
             return {
                 **base,
                 "noop": True,

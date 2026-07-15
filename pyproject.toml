@@ -1,8 +1,24 @@
-# Tooling configuration for the hermes-lcm plugin.
-#
-# This file exists only to pin lint settings so `ruff` behaves identically
-# locally and in CI. It intentionally declares no [build-system] or project
-# metadata: the plugin is installed via scripts/install.sh, not pip.
+# Tooling and standalone diagnostics packaging for hermes-lcm.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-lcm"
+version = "0.19.0"
+description = "Lossless Context Management plugin and read-only diagnostics CLI"
+requires-python = ">=3.11"
+
+[project.scripts]
+hermes-lcm = "hermes_lcm.lcm_cli:main"
+
+[tool.setuptools]
+packages = ["hermes_lcm", "hermes_lcm.benchmarking"]
+
+[tool.setuptools.package-dir]
+hermes_lcm = "."
+"hermes_lcm.benchmarking" = "benchmarking"
 
 [tool.ruff]
 # Match the oldest runtime CI exercises; keeps lint aligned with the 3.11 leg.
