@@ -550,12 +550,13 @@ class TestIssue2HostReplacementDropsCovered:
                 prepared.conversation_id,
                 frontier_after["generation"],
             )
+            assert engine._frontier.get_batch(prepared.batch_id).state == "superseded"
             stale_result = engine.promote_prepared_compaction(
                 prepared.batch_id,
                 messages,
             )
             assert stale_result.promoted is False
-            assert stale_result.reason == "frontier_mismatch"
+            assert stale_result.reason == "batch_state_superseded"
         finally:
             engine.shutdown()
 

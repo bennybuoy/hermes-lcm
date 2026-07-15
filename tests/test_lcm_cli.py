@@ -327,6 +327,31 @@ def test_cli_redaction_bounds_pathological_private_key_scan_and_keeps_detection(
     assert len(protected["pathological"]) <= lcm_cli._CLI_MAX_PREVIEW_CHARS
 
 
+def test_cli_200_adversarial_private_key_keys_are_linear_and_still_redact():
+    header = "-----BEGIN PRIVATE KEY-----\n"
+    adversarial_key = (header * 800)[:20_000]
+    payload = {
+        "legitimate": (
+            "-----BEGIN PRIVATE KEY-----\n"
+            "REAL_PRIVATE_KEY_MATERIAL\n"
+            "-----END PRIVATE KEY-----"
+        )
+    }
+    payload.update({
+        f"{index:03d}-{adversarial_key}": "ordinary"
+        for index in range(199)
+    })
+
+    started = time.monotonic()
+    protected = lcm_cli._sanitize_output(payload)
+    elapsed = time.monotonic() - started
+    serialized = json.dumps(protected)
+
+    assert elapsed < 2.0
+    assert "REAL_PRIVATE_KEY_MATERIAL" not in serialized
+    assert "[REDACTED by hermes-lcm CLI]" in serialized
+
+
 def test_cli_preview_bounds_apply_to_summary_and_prepared_show(tmp_path):
     db = _seed(tmp_path)
     summary = _run(db, "summaries", "show", "1", "--preview-chars", "20001")

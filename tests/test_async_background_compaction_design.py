@@ -198,11 +198,13 @@ def test_foreground_compaction_race_supersedes_pending_batch(tmp_path, monkeypat
         batch = engine.prepare_background_compaction_once(messages)
 
         compacted = engine.compress(messages, current_tokens=engine.threshold_tokens + 1)
+        assert engine._frontier.get_batch(batch.batch_id).state == "superseded"
+        assert engine.get_async_compaction_status()["prepared_batches"] == 0
         result = engine.promote_prepared_compaction(batch.batch_id, compacted)
 
         assert engine._dag.get_session_node_count(engine.current_session_id) >= 1
         assert result.promoted is False
-        assert result.reason in {"frontier_mismatch", "canonical_source_overlap"}
+        assert result.reason == "batch_state_superseded"
         async_status = engine.get_async_compaction_status()
         assert async_status["superseded_batches"] + async_status["rejected_batches"] >= 1
     finally:

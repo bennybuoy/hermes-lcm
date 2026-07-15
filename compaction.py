@@ -1186,10 +1186,17 @@ class CompactionMixin:
                     raise RuntimeError(
                         "atomic foreground publication primitive unavailable"
                     )
+                expected_identity = self._foreground_source_identity_for_messages(
+                    source_lookup_chunk, consumed_store_ids
+                )
+                if not expected_identity:
+                    noop_reason = "selected leaf source identity changed"
+                    break
                 publication_result = publish(
                     node=None,
                     source_end_store_id=max(consumed_store_ids),
                     covered_source_ids=list(consumed_store_ids),
+                    expected_source_identity_hash=expected_identity,
                 )
                 if not bool(publication_result.get("published")):
                     noop_reason = str(
@@ -1215,6 +1222,12 @@ class CompactionMixin:
                 break
             earliest_at, latest_at = self._store.get_time_bounds(source_store_ids)
             summary_tokens = count_tokens(summary_text)
+            expected_identity = self._foreground_source_identity_for_messages(
+                source_lineage_chunk, source_store_ids
+            )
+            if not expected_identity:
+                noop_reason = "selected leaf source identity changed"
+                break
 
             node = SummaryNode(
                 session_id=self._session_id,
@@ -1250,6 +1263,7 @@ class CompactionMixin:
                         node=node,
                         source_end_store_id=max(consumed_store_ids),
                         covered_source_ids=list(source_store_ids),
+                        expected_source_identity_hash=expected_identity,
                     )
                     if not bool(publication_result.get("published")):
                         if publication_result.get("reason") != "canonical_source_overlap":

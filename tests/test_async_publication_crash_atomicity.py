@@ -27,6 +27,14 @@ PRECOMMIT_PHASES = (
     "after_lifecycle_advanced",
 )
 ALL_PHASES = (*PRECOMMIT_PHASES, "after_commit")
+FOREGROUND_PRECOMMIT_PHASES = (
+    "after_begin",
+    "after_canonical_insert",
+    "after_frontier",
+    "after_batches_superseded",
+    "after_lifecycle",
+)
+FOREGROUND_ALL_PHASES = (*FOREGROUND_PRECOMMIT_PHASES, "after_commit")
 
 
 def _messages(count: int = 12) -> list[dict[str, Any]]:
@@ -157,6 +165,70 @@ raise SystemExit("crash hook did not fire")
     )
 
 
+def _crash_foreground_publisher(
+    tmp_path: Path,
+    db_path: Path,
+    batch_id: int,
+    phase: str,
+) -> subprocess.CompletedProcess[str]:
+    package_root = tmp_path / f"foreground-package-{phase}"
+    package_root.mkdir(exist_ok=True)
+    package_link = package_root / "hermes_lcm"
+    if not package_link.exists():
+        package_link.symlink_to(Path(__file__).resolve().parents[1], target_is_directory=True)
+    script = """
+import sys
+from hermes_lcm.config import LCMConfig
+from hermes_lcm.dag import SummaryNode
+from hermes_lcm.engine import LCMEngine
+
+engine = LCMEngine(config=LCMConfig(
+    database_path=sys.argv[1],
+    fresh_tail_count=2,
+    leaf_chunk_tokens=20,
+    context_threshold=0.10,
+    async_background_compaction_enabled=True,
+    async_background_compaction_worker_enabled=False,
+))
+engine.on_session_start(
+    "crash-publication-session",
+    conversation_id="crash-publication-conversation",
+    platform="test",
+    context_length=50000,
+)
+batch = engine._frontier.get_batch(int(sys.argv[2]))
+node = SummaryNode(
+    session_id=batch.session_id,
+    depth=0,
+    summary="foreground crash winner",
+    token_count=5,
+    source_token_count=100,
+    source_ids=list(batch.source_ids),
+    source_type="messages",
+    created_at=1.0,
+)
+engine._foreground_publish_crash_hook = sys.argv[3]
+engine._publish_foreground_leaf(
+    node=node,
+    source_end_store_id=batch.frontier_end_store_id,
+    covered_source_ids=batch.source_ids,
+)
+raise SystemExit("foreground crash hook did not fire")
+"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        value for value in (str(package_root), env.get("PYTHONPATH", "")) if value
+    )
+    return subprocess.run(
+        [sys.executable, "-c", script, str(db_path), str(batch_id), phase],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+
+
 @pytest.mark.parametrize("phase", ALL_PHASES)
 def test_process_crash_exposes_only_wholly_old_or_wholly_new_publication(
     tmp_path,
@@ -276,6 +348,41 @@ def test_process_crash_exposes_only_wholly_old_or_wholly_new_publication(
         reopened.shutdown()
 
 
+@pytest.mark.parametrize("phase", FOREGROUND_ALL_PHASES)
+def test_foreground_crash_atomically_settles_competing_batch(
+    tmp_path, monkeypatch, phase
+):
+    db_path = tmp_path / f"foreground-publication-{phase}.db"
+    batch_id, old_generation, old_lifecycle_frontier, _messages_value = _prepare(
+        db_path, monkeypatch
+    )
+
+    crashed = _crash_foreground_publisher(tmp_path, db_path, batch_id, phase)
+    assert crashed.returncode == 89, (crashed.stdout, crashed.stderr)
+
+    reopened = _open_engine(db_path)
+    try:
+        batch = reopened._frontier.get_batch(batch_id)
+        active = reopened._frontier.get_active_frontier(CONVERSATION_ID)
+        lifecycle = reopened._lifecycle.get_by_conversation(CONVERSATION_ID)
+        nodes = reopened._dag.get_session_nodes(SESSION_ID)
+        assert batch is not None and active is not None and lifecycle is not None
+        if phase in FOREGROUND_PRECOMMIT_PHASES:
+            assert batch.state == "ready"
+            assert int(active["generation"]) == old_generation
+            assert lifecycle.current_frontier_store_id == old_lifecycle_frontier
+            assert nodes == []
+            assert reopened.get_async_compaction_status()["prepared_batches"] == 1
+        else:
+            assert batch.state == "superseded"
+            assert int(active["generation"]) == old_generation + 1
+            assert lifecycle.current_frontier_store_id == batch.frontier_end_store_id
+            assert [node.summary for node in nodes] == ["foreground crash winner"]
+            assert reopened.get_async_compaction_status()["prepared_batches"] == 0
+    finally:
+        reopened.shutdown()
+
+
 def test_after_commit_crash_then_normal_compress_uses_authoritative_frontier(
     tmp_path, monkeypatch
 ):
@@ -338,6 +445,52 @@ def test_after_commit_crash_then_normal_compress_uses_authoritative_frontier(
         )
         assert SUMMARY_SENTINEL in recovered_blob
         assert "invalid duplicate post-crash foreground summary" not in recovered_blob
+    finally:
+        reopened.shutdown()
+
+
+def test_async_winner_crash_commit_supersedes_competing_ready_batch(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "publication-after-commit-settles-competitor.db"
+    batch_id, _old_generation, _old_frontier, messages = _prepare(db_path, monkeypatch)
+
+    setup = _open_engine(db_path)
+    try:
+        batch = setup._frontier.get_batch(batch_id)
+        assert batch is not None
+        competitor_id = setup._frontier.create_batch(
+            conversation_id=batch.conversation_id,
+            session_id=batch.session_id,
+            base_generation=batch.base_generation,
+            source_end_store_id=batch.source_end_store_id,
+            source_identity_hash=batch.source_identity_hash,
+            source_ids=batch.source_ids,
+            policy_fingerprint=batch.policy_fingerprint,
+            route_fingerprint=batch.route_fingerprint,
+            state="ready",
+        )
+        setup._frontier.update_batch_state(
+            competitor_id,
+            "ready",
+            expected_leaf_count=batch.expected_leaf_count,
+            frontier_end_store_id=batch.frontier_end_store_id,
+            summary_payload=batch.summary_payload,
+            payload_version=batch.payload_version,
+        )
+    finally:
+        setup.shutdown()
+
+    crashed = _crash_promoter(tmp_path, db_path, batch_id, messages, "after_commit")
+    assert crashed.returncode == 86, (crashed.stdout, crashed.stderr)
+
+    reopened = _open_engine(db_path)
+    try:
+        assert reopened._frontier.get_batch(batch_id).state == "promoted"
+        competitor = reopened._frontier.get_batch(competitor_id)
+        assert competitor is not None
+        assert competitor.state == "superseded"
+        assert reopened.get_async_compaction_status()["prepared_batches"] == 0
     finally:
         reopened.shutdown()
 

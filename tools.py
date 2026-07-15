@@ -1211,14 +1211,53 @@ def _bounded_cross_session_text(
     """Redact and bound one archive string before it reaches synthesis/output."""
     text = str(value or "")
     truncated = False
+    # Redact the complete value first. Truncating first can split a PEM block or
+    # credential at the exact output boundary and turn it into an unmatched leak.
+    text = redact_sensitive_output_text(text)
     if max_chars is not None and len(text) > max_chars:
         text = text[:max_chars]
         truncated = True
-    # Archive output crosses a session boundary. Output safety is mandatory and
-    # intentionally independent of the opt-in lossless ingest-redaction policy.
-    text = redact_sensitive_output_text(text)
     text, token_truncated = _truncate_text_to_token_budget(text, max_tokens)
     return text, truncated or token_truncated
+
+
+def _node_provenance_is_authorized(
+    engine: "LCMEngine",
+    node,
+    allowed_session_ids: frozenset[str],
+) -> bool:
+    """Require complete node/raw provenance to remain inside the capability."""
+    stack = [node]
+    visited: set[int] = set()
+    remaining = _CROSS_SESSION_CONTEXT_MAX_ITEMS * _CROSS_SESSION_CONTEXT_MAX_DEPTH
+    while stack:
+        current = stack.pop()
+        node_id = int(current.node_id)
+        if node_id in visited:
+            continue
+        visited.add(node_id)
+        remaining -= 1
+        if remaining < 0 or current.session_id not in allowed_session_ids:
+            return False
+        if not current.source_ids:
+            return False
+        if current.source_type == "messages":
+            for source_id in current.source_ids:
+                row = engine._store._conn.execute(
+                    "SELECT session_id FROM messages WHERE store_id = ?",
+                    (int(source_id),),
+                ).fetchone()
+                if row is None or str(row[0] or "") not in allowed_session_ids:
+                    return False
+        elif current.source_type == "nodes":
+            for child_id in current.source_ids:
+                child = engine._dag.get_node(int(child_id))
+                if child is None:
+                    return False
+                stack.append(child)
+        else:
+            return False
+    return True
 
 
 def _bound_cross_session_context(
@@ -1287,6 +1326,77 @@ def _bound_cross_session_context(
             bounded.pop()
             state["truncated"] = True
     return bounded, bool(state["truncated"])
+
+
+def _bound_current_session_value(
+    value: Any,
+    *,
+    config,
+    content_max_chars: int | None = None,
+) -> tuple[Any, bool]:
+    """Redact/bound current-session fields without changing pagination shape.
+
+    Current-session collectors already allocate the caller's evidence budget and
+    deliberately preserve zero/one-token pagination sentinels. This pass bounds
+    hostile metadata and every emitted string, but does not spend structural
+    labels ahead of evidence or discard blocks as the cross-session shared-budget
+    allocator must.
+    """
+    state = {"truncated": False}
+
+    def bound(item: Any, *, field_name: str = "", depth: int = 0) -> Any:
+        if depth > _CROSS_SESSION_CONTEXT_MAX_DEPTH:
+            state["truncated"] = True
+            return None
+        if isinstance(item, dict):
+            result: dict[str, Any] = {}
+            entries = list(item.items())[:_CROSS_SESSION_CONTEXT_MAX_ITEMS]
+            state["truncated"] = state["truncated"] or len(entries) < len(item)
+            for raw_key, child in entries:
+                safe_key, key_truncated = _bounded_cross_session_text(
+                    raw_key,
+                    config,
+                    max_tokens=_CROSS_SESSION_METADATA_MAX_TOKENS,
+                    max_chars=256,
+                )
+                state["truncated"] = state["truncated"] or key_truncated
+                result[safe_key] = bound(
+                    child, field_name=safe_key, depth=depth + 1
+                )
+            return result
+        if isinstance(item, (list, tuple)):
+            entries = list(item)[:_CROSS_SESSION_CONTEXT_MAX_ITEMS]
+            state["truncated"] = state["truncated"] or len(entries) < len(item)
+            return [
+                bound(child, field_name=field_name, depth=depth + 1)
+                for child in entries
+            ]
+        if isinstance(item, str):
+            is_content = field_name in _CROSS_SESSION_CONTENT_FIELDS
+            if is_content:
+                # The current-session collectors have already applied their
+                # shared token budget and chosen cursor-safe one-character
+                # sentinels where necessary. Redact the complete collected
+                # value, then apply only the optional hard character ceiling;
+                # a second token pass here can erase those sentinels and break
+                # deterministic pagination under custom tokenizers.
+                protected = redact_sensitive_output_text(item)
+                truncated = False
+                if content_max_chars is not None and len(protected) > content_max_chars:
+                    protected = protected[:content_max_chars]
+                    truncated = True
+            else:
+                protected, truncated = _bounded_cross_session_text(
+                    item,
+                    config,
+                    max_tokens=_CROSS_SESSION_METADATA_MAX_TOKENS,
+                    max_chars=_CROSS_SESSION_METADATA_MAX_CHARS,
+                )
+            state["truncated"] = state["truncated"] or truncated
+            return protected
+        return item
+
+    return bound(value), bool(state["truncated"])
 
 
 def _synthesize_expansion_answer(
@@ -1406,7 +1516,12 @@ def _cross_session_expand_query(
         else:
             return json.dumps({"error": "Provide either query or node_ids"})
 
-        candidates = [node for node in candidates if node.session_id in allowed_session_ids]
+        candidates = [
+            node
+            for node in candidates
+            if node.session_id in allowed_session_ids
+            and _node_provenance_is_authorized(engine, node, allowed_session_ids)
+        ]
 
         # Search order is relevance order. First bucket occurrence therefore
         # ranks sessions before any source expansion occurs.
@@ -1630,7 +1745,12 @@ def _cross_session_expand_query(
                 "model_truncated": model_truncated,
             })
             return json.dumps(base_payload)
-        bounded_answer, answer_truncated = _truncate_text_to_token_budget(answer, max_tokens)
+        bounded_answer, answer_truncated = _bounded_cross_session_text(
+            answer,
+            engine._config,
+            max_tokens=max_tokens,
+            max_chars=None,
+        )
         base_payload.update({
             "answer": bounded_answer,
             "answer_truncated": answer_truncated,
@@ -2399,6 +2519,19 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             allowed_session_ids=allowed_session_ids,
         )
 
+    safe_prompt, prompt_truncated = _bounded_cross_session_text(
+        prompt,
+        engine._config,
+        max_tokens=2_000,
+        max_chars=20_000,
+    )
+    safe_query, query_truncated = _bounded_cross_session_text(
+        query,
+        engine._config,
+        max_tokens=_CROSS_SESSION_METADATA_MAX_TOKENS,
+        max_chars=2_000,
+    )
+
     nodes = []
     raw_results: list[dict[str, Any]] = []
     if raw_node_ids:
@@ -2419,8 +2552,10 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     if not nodes and not raw_results:
         return json.dumps(
             {
-                "prompt": prompt,
-                "query": query,
+                "prompt": safe_prompt,
+                "prompt_truncated": prompt_truncated,
+                "query": safe_query,
+                "query_truncated": query_truncated,
                 "answer": "No matching summaries or raw messages found in the current session.",
                 "node_ids": [],
                 "matches": [],
@@ -2455,6 +2590,12 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
         if raw_block is not None:
             context_blocks.append(raw_block)
             context_budget_used += _context_content_token_count([raw_block])
+
+    context_blocks, output_context_truncated = _bound_current_session_value(
+        context_blocks,
+        config=engine._config,
+    )
+    context_budget_used = _context_content_token_count(context_blocks)
 
     context_pagination = []
     for block in context_blocks:
@@ -2548,30 +2689,60 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             }
         context_pagination.append(item)
 
-    context_truncated = any(
+    context_truncated = output_context_truncated or any(
         bool(item.get("summary_truncated")) or bool(item.get("pagination", {}).get("has_more"))
         for item in context_pagination
     )
 
     selected_nodes = nodes[:max_results]
-    matches = [
-        {
+    matches = []
+    for node in selected_nodes:
+        safe_summary, summary_truncated = _bounded_cross_session_text(
+            node.summary,
+            engine._config,
+            max_tokens=_CROSS_SESSION_METADATA_MAX_TOKENS,
+            max_chars=300,
+        )
+        safe_hint, hint_truncated = _bounded_cross_session_text(
+            node.expand_hint,
+            engine._config,
+            max_tokens=_CROSS_SESSION_METADATA_MAX_TOKENS,
+            max_chars=_CROSS_SESSION_METADATA_MAX_CHARS,
+        )
+        matches.append({
             "node_id": node.node_id,
             "depth": node.depth,
-            "summary": node.summary[:300],
-            "expand_hint": node.expand_hint,
-        }
-        for node in selected_nodes
-    ]
+            "summary": safe_summary,
+            "summary_truncated": summary_truncated,
+            "expand_hint": safe_hint,
+            "expand_hint_truncated": hint_truncated,
+        })
+    raw_matches, raw_matches_truncated = _bound_current_session_value(
+        raw_matches,
+        config=engine._config,
+        content_max_chars=_CROSS_SESSION_METADATA_MAX_CHARS,
+    )
+    context_truncated = context_truncated or raw_matches_truncated
     node_ids = [node.node_id for node in selected_nodes]
+
+    model = engine._config.expansion_model or engine._config.summary_model or ""
+    safe_model, model_truncated = _bounded_cross_session_text(
+        model,
+        engine._config,
+        max_tokens=_CROSS_SESSION_METADATA_MAX_TOKENS,
+        max_chars=_CROSS_SESSION_METADATA_MAX_CHARS,
+    )
 
     def _degraded_payload(reason: str, *, include_timeout: bool = False) -> str:
         payload: Dict[str, Any] = {
-            "prompt": prompt,
-            "query": query,
+            "prompt": safe_prompt,
+            "prompt_truncated": prompt_truncated,
+            "query": safe_query,
+            "query_truncated": query_truncated,
             "error": reason,
             "degraded": True,
-            "model": model,
+            "model": safe_model,
+            "model_truncated": model_truncated,
             "max_tokens": max_tokens,
             "context_max_tokens": context_max_tokens,
             "context_truncated": context_truncated,
@@ -2584,7 +2755,6 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             payload["timeout_seconds"] = timeout
         return json.dumps(payload)
 
-    model = engine._config.expansion_model or engine._config.summary_model or ""
     timeout = engine._config.expansion_timeout_ms / 1000
     try:
         answer = _synthesize_expansion_answer(
@@ -2606,12 +2776,22 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
         logger.warning("LCM expand_query synthesis returned an empty answer")
         return _degraded_payload("lcm_expand_query synthesis returned an empty answer")
 
+    bounded_answer, answer_truncated = _bounded_cross_session_text(
+        answer,
+        engine._config,
+        max_tokens=max_tokens,
+        max_chars=None,
+    )
     return json.dumps(
         {
-            "prompt": prompt,
-            "query": query,
-            "answer": answer,
-            "model": model,
+            "prompt": safe_prompt,
+            "prompt_truncated": prompt_truncated,
+            "query": safe_query,
+            "query_truncated": query_truncated,
+            "answer": bounded_answer,
+            "answer_truncated": answer_truncated,
+            "model": safe_model,
+            "model_truncated": model_truncated,
             "max_tokens": max_tokens,
             "context_max_tokens": context_max_tokens,
             "context_truncated": context_truncated,

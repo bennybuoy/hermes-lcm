@@ -41,9 +41,11 @@ _CLI_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+\-/]+=*")
 _CLI_ASSIGNMENT_RE = re.compile(
     r"(?i)(\b(?:api[_-]?key|password|passwd|pwd|passphrase|client[_-]?secret|authorization|access[_-]?token|secret|token)\b\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
-_CLI_PRIVATE_KEY_RE = re.compile(
-    r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----",
-    re.IGNORECASE | re.DOTALL,
+_CLI_PRIVATE_KEY_BEGIN_RE = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE
+)
+_CLI_PRIVATE_KEY_END_RE = re.compile(
+    r"-----END [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE
 )
 _CLI_STANDALONE_CREDENTIAL_RE = re.compile(
     r"""
@@ -153,7 +155,7 @@ def _redact_cli_text(value: str, *, max_chars: int = _CLI_MAX_PREVIEW_CHARS) -> 
     )
     input_truncated = len(value) > scan_limit
     bounded = value[:scan_limit]
-    protected = _CLI_PRIVATE_KEY_RE.sub(_CLI_REDACTED, bounded)
+    protected = _redact_cli_private_keys(bounded)
     protected = _CLI_BEARER_RE.sub(_CLI_REDACTED, protected)
     protected = _CLI_STANDALONE_CREDENTIAL_RE.sub(_CLI_REDACTED, protected)
     protected = _CLI_ASSIGNMENT_RE.sub(
@@ -161,6 +163,29 @@ def _redact_cli_text(value: str, *, max_chars: int = _CLI_MAX_PREVIEW_CHARS) -> 
         protected,
     )
     return _truncate_cli_text(protected, output_limit, force=input_truncated)
+
+
+def _redact_cli_private_keys(value: str) -> str:
+    """Replace complete PEM private-key blocks with one linear scan."""
+    if "private key-----" not in value.lower():
+        return value
+    chunks: list[str] = []
+    cursor = 0
+    changed = False
+    while True:
+        begin = _CLI_PRIVATE_KEY_BEGIN_RE.search(value, cursor)
+        if begin is None:
+            chunks.append(value[cursor:])
+            break
+        end = _CLI_PRIVATE_KEY_END_RE.search(value, begin.end())
+        if end is None:
+            chunks.append(value[cursor:])
+            break
+        chunks.append(value[cursor:begin.start()])
+        chunks.append(_CLI_REDACTED)
+        cursor = end.end()
+        changed = True
+    return "".join(chunks) if changed else value
 
 
 def _sanitize_output(value: Any) -> Any:

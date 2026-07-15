@@ -12393,6 +12393,58 @@ class TestSessionRollover:
         ))
         assert result["total_results"] == 0
 
+    def test_disabled_carry_publishes_zero_authoritative_frontier_from_positive_state(self, engine):
+        engine._config.new_session_retain_depth = -1
+        engine.on_session_start(
+            "positive-no-carry-old",
+            conversation_id="positive-no-carry-conversation",
+            platform="test",
+            context_length=200000,
+        )
+        store_id = engine._store.append(
+            "positive-no-carry-old",
+            {"role": "user", "content": "positive frontier must reset"},
+            source="test",
+            conversation_id="positive-no-carry-conversation",
+        )
+        node = SummaryNode(
+            session_id="positive-no-carry-old",
+            depth=2,
+            summary="positive retained summary must not become authoritative",
+            token_count=5,
+            source_token_count=7,
+            source_ids=[store_id],
+            source_type="messages",
+            created_at=time.time(),
+        )
+        published = engine._publish_foreground_leaf(
+            node=node,
+            source_end_store_id=store_id,
+            covered_source_ids=[store_id],
+        )
+        assert published["published"] is True
+
+        moved = engine.rollover_session(
+            "positive-no-carry-old",
+            "positive-no-carry-new",
+            previous_messages=[],
+            carry_over_context=False,
+            platform="test",
+            context_length=200000,
+        )
+
+        active = engine._frontier.get_active_frontier("positive-no-carry-conversation")
+        lifecycle = engine._lifecycle.get_by_conversation("positive-no-carry-conversation")
+        assert moved == 0
+        assert active["session_id"] == "positive-no-carry-new"
+        assert active["source_end_store_id"] == 0
+        assert engine._frontier.get_frontier_items(
+            "positive-no-carry-conversation", active["generation"]
+        ) == []
+        assert lifecycle.current_session_id == "positive-no-carry-new"
+        assert lifecycle.current_frontier_store_id == 0
+        assert engine._last_compacted_store_id == 0
+
     def test_rollover_session_skips_carry_over_when_old_session_is_not_bound(self, engine):
         engine._config.new_session_retain_depth = 2
 

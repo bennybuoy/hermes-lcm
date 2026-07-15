@@ -84,6 +84,7 @@ from .ingest_protection import (
     quarantine_suspicious_assistant_messages,
     recover_hermes_persisted_output_with_file_stat,
     redact_sensitive_text,
+    redact_sensitive_output_text,
     redact_sensitive_value,
     restore_ingest_payload_placeholders,
     sensitive_pattern_status,
@@ -3400,7 +3401,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         with self._storage_lifetime_lock:
             self._on_session_reset_locked()
 
-    def _on_session_reset_locked(self) -> None:
+    def _on_session_reset_locked(self, *, persist_storage: bool = True) -> None:
         if self._host_fallback_compressor is not None:
             compressor = self._host_fallback_compressor
             on_session_reset = getattr(compressor, "on_session_reset", None)
@@ -3421,6 +3422,9 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 "LCM refusing on_session_reset storage work while storage is %s",
                 self._storage_lifetime_state,
             )
+            self._reset_session_scoped_runtime_state()
+            return
+        if not persist_storage:
             self._reset_session_scoped_runtime_state()
             return
         self._lifecycle.record_reset(self._conversation_id)
@@ -3551,6 +3555,121 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             reset_if_no_items=True,
         )
 
+    def _rollover_publication_boundary(self, phase: str) -> None:
+        crash_hook = getattr(self, "_rollover_publish_crash_hook", None)
+        if callable(crash_hook):
+            crash_hook(phase)
+        elif crash_hook == phase:
+            os._exit(88)  # noqa: PLW1510 - deliberate subprocess crash injection
+        failure_hook = getattr(self, "_rollover_publish_failure_hook", None)
+        if callable(failure_hook):
+            failure_hook(phase)
+        elif failure_hook == phase:
+            raise RuntimeError("injected rollover publication failure")
+
+    def _publish_rollover_state(
+        self,
+        conversation_id: str,
+        old_session_id: str,
+        new_session_id: str,
+        *,
+        carry_over_context: bool,
+    ) -> int:
+        """Prune/own DAG and publish frontier+lifecycle in one transaction."""
+        moved = 0
+        with self._frontier.publication_transaction() as conn:
+            self._rollover_publication_boundary("after_begin")
+            active = conn.execute(
+                """
+                SELECT generation, session_id, source_end_store_id,
+                       policy_fingerprint, route_fingerprint
+                FROM lcm_active_frontiers
+                WHERE conversation_id = ? ORDER BY generation DESC LIMIT 1
+                """,
+                (conversation_id,),
+            ).fetchone()
+            base_generation = int(active[0]) if active else 0
+            old_frontier = int(active[2] or 0) if active else 0
+
+            retain = int(self._config.new_session_retain_depth)
+            if retain == 0:
+                conn.execute(
+                    "DELETE FROM summary_nodes WHERE session_id = ?",
+                    (old_session_id,),
+                )
+            elif retain > 0:
+                conn.execute(
+                    "DELETE FROM summary_nodes WHERE session_id = ? AND depth < ?",
+                    (old_session_id, retain),
+                )
+            self._rollover_publication_boundary("after_prune")
+
+            if carry_over_context:
+                cur = conn.execute(
+                    "UPDATE summary_nodes SET session_id = ? WHERE session_id = ?",
+                    (new_session_id, old_session_id),
+                )
+                moved = max(0, int(cur.rowcount or 0))
+            self._rollover_publication_boundary("after_reassign")
+
+            items: list[dict[str, Any]] = []
+            if carry_over_context and active is not None and old_frontier > 0:
+                rows = conn.execute(
+                    """
+                    SELECT i.ref_id, i.source_start, i.source_end
+                    FROM lcm_frontier_items AS i
+                    JOIN summary_nodes AS n ON n.node_id = i.ref_id
+                    WHERE i.conversation_id = ? AND i.generation = ?
+                      AND i.kind = 'node' AND n.session_id = ?
+                    ORDER BY i.ordinal
+                    """,
+                    (conversation_id, base_generation, new_session_id),
+                ).fetchall()
+                items = [
+                    {
+                        "kind": "node",
+                        "ref_id": int(row[0]),
+                        "source_start": int(row[1]),
+                        "source_end": int(row[2]),
+                    }
+                    for row in rows
+                    if int(row[1] or 0) > 0
+                    and int(row[2] or 0) >= int(row[1] or 0)
+                ]
+            new_frontier = old_frontier if items else 0
+            new_generation = self._frontier.advance_frontier_generation_with_items_no_commit(
+                conn,
+                conversation_id,
+                new_session_id,
+                new_frontier,
+                str(active[3] or "") if active else "",
+                str(active[4] or "") if active else "",
+                base_generation,
+                items,
+            )
+            if not new_generation:
+                raise RuntimeError("canonical frontier changed during rollover")
+            self._frontier.supersede_competing_batches_no_commit(
+                conn,
+                conversation_id,
+                base_generation,
+                reason="session_rollover_published",
+            )
+            self._rollover_publication_boundary("after_frontier")
+
+            self._lifecycle.record_rollover_no_commit(
+                conn,
+                conversation_id,
+                old_session_id=old_session_id,
+                new_session_id=new_session_id,
+                current_frontier_store_id=new_frontier,
+                finalized_frontier_store_id=old_frontier,
+            )
+            self._rollover_publication_boundary("after_lifecycle")
+
+        self._rollover_publication_boundary("after_commit")
+        return moved
+
     def rollover_session(
         self,
         old_session_id: str,
@@ -3623,9 +3742,19 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             after_node_ids = {node.node_id for node in self._dag.get_session_nodes(new_session_id)}
             return len(after_node_ids - before_node_ids)
 
+        published_rollover = False
+        moved = 0
         if old_session_id and can_carry_over:
             self.on_session_end(old_session_id, previous_messages)
-            self.on_session_reset()
+            self._on_session_reset_locked(persist_storage=False)
+            moved = self._publish_rollover_state(
+                conversation_id,
+                old_session_id,
+                new_session_id,
+                carry_over_context=carry_over_context,
+            )
+            published_rollover = True
+            self._clear_pending_reset_boundary()
         elif old_session_id and not carry_over_context:
             logger.warning(
                 "LCM rollover skipped old-session finalization: old_session_id=%s does not match bound session=%s",
@@ -3641,6 +3770,8 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
 
         self.on_session_start(new_session_id, conversation_id=conversation_id, **kwargs)
 
+        if published_rollover:
+            return moved
         if not carry_over_context:
             return 0
         if old_session_id and not can_carry_over:
@@ -5433,7 +5564,9 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 prompt = previous.prompt
         elif not prompt:
             return {"error": "focus prompt is required"}
-        prompt = redact_sensitive_text(prompt, self._config)
+        # Focus is a persisted/output overlay, not lossless ingest. Mandatory
+        # high-confidence redaction applies regardless of ingest policy.
+        prompt = redact_sensitive_output_text(prompt)
 
         max_nodes = max(1, int(self._config.focus_max_source_nodes))
         if refocus:
@@ -5545,7 +5678,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 "error": "focus synthesis returned an empty brief",
                 "previous_focus_preserved": bool(previous),
             }
-        content = redact_sensitive_text(content, self._config)
+        content = redact_sensitive_output_text(content)
         frontier = self._frontier.get_active_frontier(conversation_id) or {}
         covered_store_id = max(
             [self._focus_node_max_store_id(node) for node in selected_nodes]
@@ -5572,7 +5705,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             "refocus": refocus,
             "context_tokens_used": budget_used,
             "context_truncated": truncated,
-            "model": model,
+            "model": redact_sensitive_output_text(model),
         })
         return result
 
@@ -6332,12 +6465,98 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         ).fetchall()
         return {int(row[0]) for row in rows} == set(normalized)
 
+    @staticmethod
+    def _source_content_identity_hash_no_commit(
+        conn: sqlite3.Connection,
+        session_id: str,
+        source_ids: Sequence[int],
+    ) -> str:
+        """Hash exact source id/session/role/content identity in stable order."""
+        h = hashlib.sha256()
+        for source_id in [int(value) for value in source_ids]:
+            row = conn.execute(
+                """
+                SELECT store_id, session_id, role, content
+                FROM messages WHERE store_id = ? AND session_id = ?
+                """,
+                (source_id, session_id),
+            ).fetchone()
+            if row is None:
+                h.update(f"{source_id}|missing".encode("utf-8"))
+                continue
+            h.update(
+                json.dumps(
+                    [int(row[0]), str(row[1]), str(row[2] or ""), str(row[3] or "")],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+        return h.hexdigest()
+
+    def _foreground_source_identity_for_messages(
+        self,
+        messages: Sequence[Dict[str, Any]],
+        source_ids: Sequence[int],
+    ) -> str:
+        """Capture DB identity only while it still matches summarized messages."""
+        wanted = [int(value) for value in source_ids]
+        id_map = self._get_store_id_map_for_messages(list(messages))
+        message_by_store_id = {
+            int(id_map[id(message)]): message
+            for message in messages
+            if id(message) in id_map
+        }
+        if set(message_by_store_id) != set(wanted):
+            return ""
+        stored_by_id = self._store.get_batch(wanted)
+        for source_id in wanted:
+            active = message_by_store_id[source_id]
+            stored = stored_by_id.get(source_id)
+            if stored is None or str(stored.get("session_id") or "") != self._session_id:
+                return ""
+            active_role = str(active.get("role") or "unknown")
+            active_content = normalize_content_value(active.get("content")) or ""
+            stored_role = str(stored.get("role") or "unknown")
+            stored_content = normalize_content_value(stored.get("content")) or ""
+            if (active_role, active_content) == (stored_role, stored_content):
+                continue
+            # Externalization/cleanup can intentionally make the durable form
+            # differ while retaining an equivalent replay identity.
+            active_identity = self._message_replay_identity(active)
+            stored_identity = self._message_replay_identity(stored, stored_row=True)
+            cleanup_identity = self._active_cleanup_replay_identity(active_identity)
+            if stored_identity != active_identity and (
+                cleanup_identity is None
+                or self._active_cleanup_replay_identity(stored_identity) != cleanup_identity
+            ):
+                return ""
+        # Hash the exact rows just validated against the summarized in-memory
+        # messages. A second SELECT here would reopen a race where a rewrite
+        # could become the newly "expected" identity before publication.
+        h = hashlib.sha256()
+        for source_id in wanted:
+            stored = stored_by_id[source_id]
+            h.update(
+                json.dumps(
+                    [
+                        source_id,
+                        str(stored.get("session_id") or ""),
+                        str(stored.get("role") or ""),
+                        str(stored.get("content") or ""),
+                    ],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+        return h.hexdigest()
+
     def _publish_foreground_leaf(
         self,
         *,
         node: Optional[SummaryNode],
         source_end_store_id: int,
         covered_source_ids: Sequence[int],
+        expected_source_identity_hash: str | None = None,
     ) -> dict[str, Any]:
         """Publish a foreground leaf, frontier, and lifecycle in one transaction.
 
@@ -6354,6 +6573,18 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         if not source_ids or source_end <= 0:
             raise RuntimeError("foreground publication requires non-empty raw lineage")
 
+        def _foreground_boundary(phase: str) -> None:
+            crash_hook = getattr(self, "_foreground_publish_crash_hook", None)
+            if callable(crash_hook):
+                crash_hook(phase)
+            elif crash_hook == phase:
+                os._exit(89)  # noqa: PLW1510 - deliberate subprocess crash injection
+            failure_hook = getattr(self, "_foreground_publish_failure_hook", None)
+            if callable(failure_hook):
+                failure_hook(phase)
+            elif failure_hook == phase:
+                raise RuntimeError("injected foreground publication failure")
+
         # Legacy embedders can set only ``_session_id`` and never bind lifecycle
         # conversation state. Async preparation is impossible in that mode, but
         # retain foreground DAG behavior with one writer transaction and the same
@@ -6365,6 +6596,16 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     conn.execute("BEGIN IMMEDIATE")
                     if not self._exact_source_rows_exist_no_commit(
                         conn, session_id, source_ids
+                    ):
+                        raise RuntimeError(
+                            "foreground source identity changed before publication"
+                        )
+                    locked_identity = self._source_content_identity_hash_no_commit(
+                        conn, session_id, source_ids
+                    )
+                    if (
+                        expected_source_identity_hash is not None
+                        and locked_identity != expected_source_identity_hash
                     ):
                         raise RuntimeError(
                             "foreground source identity changed before publication"
@@ -6398,6 +6639,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         policy_fp = self._async_policy_fingerprint()
         route_fp = self._async_route_fingerprint()
         with self._frontier.publication_transaction() as publication_conn:
+            _foreground_boundary("after_begin")
             frontier_row = publication_conn.execute(
                 """
                 SELECT generation, session_id, source_end_store_id
@@ -6428,6 +6670,21 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             ):
                 raise RuntimeError("foreground source identity changed before publication")
 
+            locked_identity = self._source_content_identity_hash_no_commit(
+                publication_conn, session_id, source_ids
+            )
+            if (
+                expected_source_identity_hash is not None
+                and locked_identity != expected_source_identity_hash
+            ):
+                return {
+                    "published": False,
+                    "reason": "source_identity_mismatch",
+                    "node_id": 0,
+                    "generation": base_generation,
+                    "source_end_store_id": active_end,
+                }
+
             node_id = 0
             if node is not None:
                 bounds = publication_conn.execute(
@@ -6440,6 +6697,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 node.earliest_at = bounds[0] if bounds else None
                 node.latest_at = bounds[1] if bounds else None
                 node_id = self._dag.add_node_no_commit(publication_conn, node)
+            _foreground_boundary("after_canonical_insert")
             items = self._build_promoted_frontier_items_no_commit(
                 publication_conn,
                 conversation_id=conv_id,
@@ -6462,6 +6720,14 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             )
             if not new_gen:
                 raise RuntimeError("foreground frontier changed inside publication")
+            _foreground_boundary("after_frontier")
+            self._frontier.supersede_competing_batches_no_commit(
+                publication_conn,
+                conv_id,
+                base_generation,
+                reason="foreground_generation_published",
+            )
+            _foreground_boundary("after_batches_superseded")
             with self._lifecycle.publication_connection(publication_conn):
                 try:
                     lifecycle_state = self._lifecycle.advance_frontier(
@@ -6498,13 +6764,15 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 )
             ):
                 raise RuntimeError("foreground lifecycle frontier not advanced")
-            return {
-                "published": True,
-                "reason": "",
-                "node_id": int(node_id),
-                "generation": int(new_gen),
-                "source_end_store_id": source_end,
-            }
+            _foreground_boundary("after_lifecycle")
+        _foreground_boundary("after_commit")
+        return {
+            "published": True,
+            "reason": "",
+            "node_id": int(node_id),
+            "generation": int(new_gen),
+            "source_end_store_id": source_end,
+        }
 
     def get_async_compaction_status(self) -> dict[str, Any]:
         """Return counts of prepared batches by state for the active conversation."""
@@ -7251,6 +7519,13 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     raise RuntimeError("frontier_changed_inside_publication_transaction")
 
                 self._frontier.update_batch_state(batch_id, "promoted")
+                self._frontier.supersede_competing_batches_no_commit(
+                    publication_conn,
+                    batch.conversation_id,
+                    batch.base_generation,
+                    winner_batch_id=batch_id,
+                    reason="async_generation_published",
+                )
                 _publication_boundary("after_batch_promoted")
 
                 with self._lifecycle.publication_connection(publication_conn):

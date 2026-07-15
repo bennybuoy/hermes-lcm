@@ -194,7 +194,7 @@ def test_unfocus_deactivates_overlay_without_deleting_history(tmp_path, monkeypa
 
 def test_focus_output_surfaces_redact_sensitive_values(tmp_path, monkeypatch):
     engine = _engine(tmp_path)
-    engine._config.sensitive_patterns_enabled = True
+    assert engine._config.sensitive_patterns_enabled is False
     _node(engine, "alpha credentials", "credential evidence")
     monkeypatch.setattr(
         lcm_tools,

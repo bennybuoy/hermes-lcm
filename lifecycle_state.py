@@ -382,6 +382,53 @@ class LifecycleStateStore:
         assert updated is not None
         return updated
 
+    @staticmethod
+    def record_rollover_no_commit(
+        conn: sqlite3.Connection,
+        conversation_id: str,
+        *,
+        old_session_id: str,
+        new_session_id: str,
+        current_frontier_store_id: int,
+        finalized_frontier_store_id: int,
+    ) -> None:
+        """Publish the rollover lifecycle row on a caller-owned transaction."""
+        now = time.time()
+        conn.execute(
+            """
+            INSERT INTO lcm_lifecycle_state(
+                conversation_id, current_session_id, last_finalized_session_id,
+                current_frontier_store_id, last_finalized_frontier_store_id,
+                current_bound_at, last_finalized_at, last_rollover_at,
+                last_reset_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(conversation_id) DO UPDATE SET
+                current_session_id = excluded.current_session_id,
+                last_finalized_session_id = excluded.last_finalized_session_id,
+                current_frontier_store_id = excluded.current_frontier_store_id,
+                last_finalized_frontier_store_id = MAX(
+                    lcm_lifecycle_state.last_finalized_frontier_store_id,
+                    excluded.last_finalized_frontier_store_id
+                ),
+                current_bound_at = excluded.current_bound_at,
+                last_finalized_at = excluded.last_finalized_at,
+                last_rollover_at = excluded.last_rollover_at,
+                last_reset_at = excluded.last_reset_at,
+                debt_kind = NULL,
+                debt_size_estimate = 0,
+                debt_updated_at = excluded.updated_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                conversation_id,
+                new_session_id,
+                old_session_id,
+                max(0, int(current_frontier_store_id or 0)),
+                max(0, int(finalized_frontier_store_id or 0)),
+                now, now, now, now, now,
+            ),
+        )
+
     def get_fragmentation_stats(self, state_db_path: str | Path | None = None) -> dict[str, Any]:
         """Return read-only lifecycle/session fragmentation diagnostics.
 

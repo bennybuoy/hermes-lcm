@@ -867,6 +867,32 @@ class FrontierStore:
             self._conn.commit()
             return cur.rowcount
 
+    @staticmethod
+    def supersede_competing_batches_no_commit(
+        conn: sqlite3.Connection,
+        conversation_id: str,
+        base_generation: int,
+        *,
+        winner_batch_id: int | None = None,
+        reason: str = "canonical_generation_published",
+    ) -> int:
+        """Settle every losing candidate tied to a published base generation."""
+        params: list[Any] = [reason, time.time(), conversation_id, int(base_generation)]
+        winner_clause = ""
+        if winner_batch_id is not None:
+            winner_clause = " AND batch_id != ?"
+            params.append(int(winner_batch_id))
+        cur = conn.execute(
+            f"""
+            UPDATE lcm_prepared_batches
+            SET state = 'superseded', failure_reason = ?, updated_at = ?
+            WHERE conversation_id = ? AND base_generation = ?
+              AND state IN ('preparing', 'ready'){winner_clause}
+            """,
+            params,
+        )
+        return max(0, int(cur.rowcount or 0))
+
     def list_itemless_active_generations(
         self,
         conversation_id: str | None = None,

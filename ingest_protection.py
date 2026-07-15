@@ -169,8 +169,13 @@ _SENSITIVE_PATTERN_CATALOG: dict[str, re.Pattern[str]] = {
 _STANDALONE_OUTPUT_CREDENTIAL_RE = re.compile(
     r"(?<![A-Za-z0-9_-])(?P<secret>"
     r"(?:sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{16,})|"
+    r"(?:(?:AKIA|ASIA)[A-Z0-9]{16})|"
     r"(?:gh[pousr]_[A-Za-z0-9]{20,})|"
-    r"(?:AKIA[A-Z0-9]{16})"
+    r"(?:github_pat_[A-Za-z0-9_]{20,})|"
+    r"(?:glpat-[A-Za-z0-9_-]{20,})|"
+    r"(?:AIza[A-Za-z0-9_-]{35})|"
+    r"(?:sk_live_[A-Za-z0-9]{16,})|"
+    r"(?:xox[baprs]-[A-Za-z0-9-]{20,})"
     r")(?![A-Za-z0-9_-])"
 )
 
@@ -793,7 +798,8 @@ def redact_sensitive_output_text(text: str) -> str:
 
     Unlike ingest redaction, this is deliberately independent of configuration:
     opt-in lossless storage policy must never decide whether returned metadata
-    exposes a credential. Inputs are expected to be bounded by the caller.
+    exposes a credential. The private-key path is linear, so callers can and
+    must apply this before truncation to protect boundary-spanning blocks.
     """
     if not isinstance(text, str) or not text:
         return text

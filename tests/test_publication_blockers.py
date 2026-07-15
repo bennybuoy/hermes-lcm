@@ -341,3 +341,104 @@ def test_source_identity_is_revalidated_under_publication_writer_lock(
         mutation_complete.set()
         mutator.join(timeout=2)
         engine.shutdown()
+
+
+def test_foreground_summary_revalidates_exact_summarized_source_identity(
+    tmp_path, monkeypatch
+):
+    """A rewrite after source mapping cannot publish a stale foreground leaf."""
+    engine = _engine(tmp_path)
+    messages = _messages()
+    engine.ingest(messages)
+    original_publish = engine._publish_foreground_leaf
+    rewrite_done = threading.Event()
+
+    monkeypatch.setattr(
+        engine_module,
+        "summarize_with_escalation",
+        lambda **kwargs: ("foreground identity sentinel", 0),
+    )
+
+    def publish_after_concurrent_rewrite(**kwargs):
+        source_id = int(kwargs["covered_source_ids"][0])
+
+        def rewrite():
+            conn = sqlite3.connect(str(engine._store.db_path), timeout=2)
+            try:
+                conn.execute(
+                    "UPDATE messages SET content = content || ' concurrent rewrite' WHERE store_id = ?",
+                    (source_id,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+                rewrite_done.set()
+
+        mutator = threading.Thread(target=rewrite, name="foreground-source-rewrite")
+        mutator.start()
+        assert rewrite_done.wait(timeout=2)
+        mutator.join(timeout=2)
+        return original_publish(**kwargs)
+
+    monkeypatch.setattr(engine, "_publish_foreground_leaf", publish_after_concurrent_rewrite)
+    try:
+        before = engine._frontier.get_active_frontier(CONVERSATION_ID)
+        compacted = engine.compress(
+            messages,
+            current_tokens=engine.threshold_tokens + 1,
+            force=True,
+        )
+        after = engine._frontier.get_active_frontier(CONVERSATION_ID)
+
+        assert rewrite_done.is_set()
+        assert engine._dag.get_session_nodes(SESSION_ID) == []
+        assert after == before
+        assert all(
+            "foreground identity sentinel" not in str(message.get("content") or "")
+            for message in compacted
+        )
+    finally:
+        engine.shutdown()
+
+
+def test_foreground_winner_atomically_supersedes_all_losing_base_batches(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    messages = _messages()
+    batch = _prepare(engine, messages, monkeypatch)
+    competitor_id = engine._frontier.create_batch(
+        conversation_id=batch.conversation_id,
+        session_id=batch.session_id,
+        base_generation=batch.base_generation,
+        source_end_store_id=batch.source_end_store_id,
+        source_identity_hash=batch.source_identity_hash,
+        source_ids=batch.source_ids,
+        policy_fingerprint=batch.policy_fingerprint,
+        route_fingerprint=batch.route_fingerprint,
+        state="ready",
+    )
+    node = SummaryNode(
+        session_id=SESSION_ID,
+        depth=0,
+        summary="foreground winner",
+        token_count=5,
+        source_token_count=100,
+        source_ids=list(batch.source_ids),
+        source_type="messages",
+        created_at=1.0,
+    )
+    try:
+        result = engine._publish_foreground_leaf(
+            node=node,
+            source_end_store_id=int(batch.frontier_end_store_id),
+            covered_source_ids=list(batch.source_ids),
+        )
+        assert result["published"] is True
+        assert engine._frontier.get_batch(batch.batch_id).state == "superseded"
+        assert engine._frontier.get_batch(competitor_id).state == "superseded"
+        status = engine.get_async_compaction_status()
+        assert status["prepared_batches"] == 0
+        assert status["superseded_batches"] >= 2
+    finally:
+        engine.shutdown()

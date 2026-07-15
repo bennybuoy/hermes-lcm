@@ -402,9 +402,161 @@ def test_allowed_node_cannot_expand_raw_source_from_denied_session(tmp_path, mon
             _args(node_ids=[allowed_node_id], query=""),
             session_ids=["allowed"],
         ))
-        assert result["answer"] == "safe answer"
-        assert "DENIED RAW SECRET" not in captured["context"]
-        assert '"session_id": "denied"' not in captured["context"]
+        assert captured == {}
+        assert result["node_ids"] == []
+        assert result["matches"] == []
+        assert "DENIED RAW SECRET" not in json.dumps(result)
+    finally:
+        engine.shutdown()
+
+
+def test_authorization_denies_summary_derived_from_disallowed_raw_lineage(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    denied_store_id = engine._store.append(
+        "denied", {"role": "user", "content": "DENIED DESCENDANT SECRET"}
+    )
+    allowed_node_id = engine._dag.add_node(SummaryNode(
+        session_id="allowed",
+        depth=0,
+        summary="SUMMARY DISCLOSES DENIED DESCENDANT SECRET",
+        token_count=6,
+        source_token_count=6,
+        source_ids=[denied_store_id],
+        source_type="messages",
+        created_at=0,
+    ))
+    synthesized = []
+    monkeypatch.setattr(
+        lcm_tools,
+        "_synthesize_expansion_answer",
+        lambda **kwargs: synthesized.append(kwargs) or "unsafe",
+    )
+    try:
+        result = json.loads(_invoke(
+            engine,
+            _args(node_ids=[allowed_node_id], query=""),
+            session_ids=["allowed"],
+        ))
+        assert synthesized == []
+        assert result["node_ids"] == []
+        assert result["matches"] == []
+        assert "DENIED DESCENDANT SECRET" not in json.dumps(result)
+    finally:
+        engine.shutdown()
+
+
+def test_rollover_provenance_still_requires_original_raw_session_capability(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    engine._config.new_session_retain_depth = -1
+    raw_id = engine._store.append(
+        "current", {"role": "user", "content": "ROLLOVER DENIED RAW"}
+    )
+    node_id = engine._dag.add_node(SummaryNode(
+        session_id="current",
+        depth=0,
+        summary="ROLLOVER SUMMARY REVEALS DENIED RAW",
+        token_count=6,
+        source_token_count=6,
+        source_ids=[raw_id],
+        source_type="messages",
+        created_at=0,
+    ))
+    engine.rollover_session(
+        "current",
+        "carried",
+        previous_messages=[],
+        platform="test",
+    )
+    monkeypatch.setattr(
+        lcm_tools,
+        "_synthesize_expansion_answer",
+        lambda **kwargs: "unsafe",
+    )
+    try:
+        result = json.loads(_invoke(
+            engine,
+            _args(node_ids=[node_id], query=""),
+            session_ids=["carried"],
+        ))
+        assert result["node_ids"] == []
+        assert "ROLLOVER SUMMARY REVEALS" not in json.dumps(result)
+    finally:
+        engine.shutdown()
+
+
+def test_mandatory_redaction_precedes_truncation_and_covers_shared_credentials(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    asia = "ASIAABCDEFGHIJKLMNOP"
+    github_pat = "github_pat_11AA22BB33CC44DD55EE66FF77GG88HH"
+    pem = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        "BOUNDARY_PRIVATE_KEY_MATERIAL\n"
+        "-----END PRIVATE KEY-----"
+    )
+    node = engine._dag.get_node(_node(
+        engine,
+        "archive",
+        "archive boundary",
+        expand_hint=("x" * 2030) + pem + " " + asia + " " + github_pat,
+    ))
+    monkeypatch.setattr(engine._dag, "search", lambda *args, **kwargs: [node])
+    monkeypatch.setattr(
+        lcm_tools,
+        "_synthesize_expansion_answer",
+        lambda **kwargs: f"answer {pem} {asia} {github_pat}",
+    )
+    try:
+        result = json.loads(_invoke(engine, _args(max_tokens=500)))
+        serialized = json.dumps(result)
+        for secret in ("BOUNDARY_PRIVATE_KEY_MATERIAL", asia, github_pat):
+            assert secret not in serialized
+        assert "BEGIN PRIVATE" not in result["matches"][0]["expand_hint"]
+        assert "LCM sensitive redaction" in serialized
+    finally:
+        engine.shutdown()
+
+
+def test_current_session_expansion_uses_same_bounded_redacted_output_boundary(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    secret = "github_pat_11AA22BB33CC44DD55EE66FF77GG88HH"
+    node_id = _node(
+        engine,
+        "current",
+        "current million metadata",
+        expand_hint=("h" * 1_000_000) + secret,
+    )
+    engine._config.expansion_model = ("model " * 200_000) + secret
+    captured = {}
+
+    def synthesize(**kwargs):
+        captured.update(kwargs)
+        return ("answer " * 200_000) + secret
+
+    monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", synthesize)
+    try:
+        result = json.loads(lcm_tools.lcm_expand_query(
+            {
+                "prompt": "What happened?",
+                "node_ids": [node_id],
+                "max_tokens": 100,
+                "context_max_tokens": 200,
+            },
+            engine=engine,
+        ))
+        serialized = json.dumps(result)
+        assert secret not in serialized
+        assert len(serialized) < 50_000
+        assert len(json.dumps(captured["context_blocks"])) < 20_000
+        assert len(result["model"]) <= lcm_tools._CROSS_SESSION_METADATA_MAX_CHARS
+        assert result["answer_truncated"] is True
     finally:
         engine.shutdown()
 
