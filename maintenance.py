@@ -41,17 +41,27 @@ def flush_engine_connections(engine) -> None:
     ``rotate_backup_database`` (rolling backup) so the connection-flush
     contract stays in one place.
     """
-    engine._store.commit()
-    engine._dag._conn.commit()
-    lifecycle_conn = getattr(getattr(engine, "_lifecycle", None), "_conn", None)
-    if lifecycle_conn is not None:
-        lifecycle_conn.commit()
-    frontier_conn = getattr(getattr(engine, "_frontier", None), "_conn", None)
-    if frontier_conn is not None:
-        frontier_conn.commit()
-    focus_conn = getattr(getattr(engine, "_focus", None), "_conn", None)
-    if focus_conn is not None:
-        focus_conn.commit()
+    # Each connection is shared across threads. Commit only while holding the
+    # lock that owns that connection; in particular, never commit the frontier
+    # coordinator while another thread is midway through canonical publication.
+    stores = (
+        (getattr(engine, "_store", None), "_write_lock"),
+        (getattr(engine, "_dag", None), "_db_lock"),
+        (getattr(engine, "_lifecycle", None), "_lock"),
+        (getattr(engine, "_frontier", None), "_lock"),
+        (getattr(engine, "_focus", None), "_lock"),
+    )
+    for store, lock_name in stores:
+        if store is None:
+            continue
+        conn = getattr(store, "_conn", None)
+        lock = getattr(store, lock_name, None)
+        if conn is None or lock is None:
+            continue
+        # Locks are acquired one at a time, so maintenance introduces no
+        # cross-store lock order and cannot participate in an inversion.
+        with lock:
+            conn.commit()
 
 
 def backup_database(engine) -> dict[str, Any]:

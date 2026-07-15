@@ -1337,7 +1337,8 @@ class MessageStore:
         the private connection. Requires a live connection: a closed store
         raises, matching direct ``_conn.commit()`` use.
         """
-        self._conn.commit()
+        with self._write_lock:
+            self._conn.commit()
 
     def backup(self, dest: sqlite3.Connection) -> None:
         """Copy the store's database into the already-open ``dest`` connection.
@@ -1346,7 +1347,8 @@ class MessageStore:
         store without reaching its private connection. Requires a live
         connection, matching direct ``_conn.backup(dest)`` use.
         """
-        self._conn.backup(dest)
+        with self._write_lock:
+            self._conn.backup(dest)
 
     # -- Lifecycle ----------------------------------------------------------
 

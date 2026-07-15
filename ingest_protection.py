@@ -166,6 +166,13 @@ _SENSITIVE_PATTERN_CATALOG: dict[str, re.Pattern[str]] = {
         re.IGNORECASE | re.DOTALL,
     ),
 }
+_STANDALONE_OUTPUT_CREDENTIAL_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?P<secret>"
+    r"(?:sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{16,})|"
+    r"(?:gh[pousr]_[A-Za-z0-9]{20,})|"
+    r"(?:AKIA[A-Z0-9]{16})"
+    r")(?![A-Za-z0-9_-])"
+)
 
 # Sensitive redaction runs synchronously in the ingest path. The private_key
 # pattern (lazy `.*?` under DOTALL) rescans to end-of-string for every unmatched
@@ -779,6 +786,30 @@ def redact_sensitive_text(text: str, config) -> str:
             protected,
         )
     return protected
+
+
+def redact_sensitive_output_text(text: str) -> str:
+    """Redact high-confidence credentials at an output trust boundary.
+
+    Unlike ingest redaction, this is deliberately independent of configuration:
+    opt-in lossless storage policy must never decide whether returned metadata
+    exposes a credential. Inputs are expected to be bounded by the caller.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    protected = text
+    for name in _SENSITIVE_PATTERN_CATALOG:
+        protected = _apply_sensitive_pattern(
+            name,
+            lambda match, pattern_name=name: _redact_match(pattern_name, match),
+            protected,
+        )
+    return _STANDALONE_OUTPUT_CREDENTIAL_RE.sub(
+        lambda match: _sensitive_placeholder(
+            "standalone_credential", match.group("secret")
+        ),
+        protected,
+    )
 
 
 def _redact_entire_sensitive_string(text: str, pattern_name: str) -> str:

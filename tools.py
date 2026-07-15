@@ -33,6 +33,7 @@ from .ingest_protection import (
     extract_ingest_externalized_refs,
     restore_ingest_payload_placeholders,
     redact_sensitive_text,
+    redact_sensitive_output_text,
     scan_externalized_payload_integrity,
     scan_sqlite_payload_risks,
     sensitive_pattern_status,
@@ -1213,7 +1214,9 @@ def _bounded_cross_session_text(
     if max_chars is not None and len(text) > max_chars:
         text = text[:max_chars]
         truncated = True
-    text = redact_sensitive_text(text, config)
+    # Archive output crosses a session boundary. Output safety is mandatory and
+    # intentionally independent of the opt-in lossless ingest-redaction policy.
+    text = redact_sensitive_output_text(text)
     text, token_truncated = _truncate_text_to_token_budget(text, max_tokens)
     return text, truncated or token_truncated
 

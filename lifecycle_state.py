@@ -865,14 +865,56 @@ class LifecycleStateStore:
     ) -> LifecycleState | None:
         if not conversation_id:
             return None
+        publication_conn = getattr(self._transaction_local, "connection", None)
+        if publication_conn is not None:
+            # Global lock order: a caller that already owns SQLite's writer lock
+            # must never acquire a sibling store lock. Lifecycle operations take
+            # ``_lock`` before beginning their own SQL transaction; publication
+            # therefore performs its lifecycle SQL directly on the coordinator
+            # connection and lets SQLite serialize concurrent lifecycle writers.
+            advanced = self.advance_frontier_no_commit(
+                publication_conn,
+                conversation_id,
+                session_id,
+                frontier_store_id,
+            )
+            if not advanced:
+                return None
+            row = publication_conn.execute(
+                """
+                SELECT conversation_id, current_session_id,
+                       last_finalized_session_id, current_frontier_store_id,
+                       last_finalized_frontier_store_id, debt_kind,
+                       debt_size_estimate, current_bound_at, last_finalized_at,
+                       debt_updated_at, last_maintenance_attempt_at,
+                       last_rollover_at, last_reset_at, updated_at
+                FROM lcm_lifecycle_state WHERE conversation_id = ?
+                """,
+                (conversation_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return LifecycleState(
+                conversation_id=str(row[0]),
+                current_session_id=row[1],
+                last_finalized_session_id=row[2],
+                current_frontier_store_id=int(row[3] or 0),
+                last_finalized_frontier_store_id=int(row[4] or 0),
+                debt_kind=row[5],
+                debt_size_estimate=int(row[6] or 0),
+                current_bound_at=row[7],
+                last_finalized_at=row[8],
+                debt_updated_at=row[9],
+                last_maintenance_attempt_at=row[10],
+                last_rollover_at=row[11],
+                last_reset_at=row[12],
+                updated_at=float(row[13] or 0.0),
+            )
         with self._lock:
             state = self.get_by_conversation(conversation_id)
             if state is None or state.current_session_id != session_id:
                 return state
-            conn = (
-                getattr(self._transaction_local, "connection", None)
-                or self._conn
-            )
+            conn = self._conn
             assert conn is not None
             advanced = self.advance_frontier_no_commit(
                 conn,
@@ -880,37 +922,9 @@ class LifecycleStateStore:
                 session_id,
                 frontier_store_id,
             )
-            if conn is self._conn:
-                if advanced:
-                    conn.commit()
-                return self.get_by_conversation(conversation_id)
-            if not advanced:
-                return self.get_by_conversation(conversation_id)
-            # The canonical row is uncommitted and therefore invisible to the
-            # lifecycle store's sibling connection. Return an acknowledgement
-            # with the fields publication validates; commit remains caller-owned.
-            state = self.get_by_conversation(conversation_id)
-            if state is None:
-                return None
-            return LifecycleState(
-                conversation_id=state.conversation_id,
-                current_session_id=session_id,
-                last_finalized_session_id=state.last_finalized_session_id,
-                current_frontier_store_id=max(
-                    state.current_frontier_store_id,
-                    int(frontier_store_id or 0),
-                ),
-                last_finalized_frontier_store_id=state.last_finalized_frontier_store_id,
-                debt_kind=state.debt_kind,
-                debt_size_estimate=state.debt_size_estimate,
-                current_bound_at=state.current_bound_at,
-                last_finalized_at=state.last_finalized_at,
-                debt_updated_at=state.debt_updated_at,
-                last_maintenance_attempt_at=state.last_maintenance_attempt_at,
-                last_rollover_at=state.last_rollover_at,
-                last_reset_at=state.last_reset_at,
-                updated_at=time.time(),
-            )
+            if advanced:
+                conn.commit()
+            return self.get_by_conversation(conversation_id)
 
     @staticmethod
     def advance_frontier_no_commit(

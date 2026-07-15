@@ -2372,7 +2372,11 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             # raw rows here makes session-scoped transcript recovery report the
             # old/child session as missing even though its payload was only
             # reassigned to the next compression segment.
-            moved_nodes = self._dag.reassign_session_nodes(source_session_id, session_id)
+            moved_nodes = self._reassign_canonical_session_state(
+                conversation_id,
+                source_session_id,
+                session_id,
+            )
             logger.debug(
                 "LCM compression boundary continued %s -> %s: carried %d DAG nodes; preserved raw message ownership",
                 source_session_id,
@@ -3447,6 +3451,82 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 old_session_id, new_session_id
             )
 
+    def _reassign_canonical_session_state(
+        self,
+        conversation_id: str,
+        old_session_id: str,
+        new_session_id: str,
+        *,
+        reset_if_no_items: bool = False,
+    ) -> int:
+        """Carry DAG ownership and its active frontier in one writer transaction."""
+        if not conversation_id:
+            return self._dag.reassign_session_nodes(old_session_id, new_session_id)
+
+        with self._frontier.publication_transaction() as conn:
+            active = conn.execute(
+                """
+                SELECT generation, session_id, source_end_store_id,
+                       policy_fingerprint, route_fingerprint
+                FROM lcm_active_frontiers
+                WHERE conversation_id = ?
+                ORDER BY generation DESC LIMIT 1
+                """,
+                (conversation_id,),
+            ).fetchone()
+            cur = conn.execute(
+                "UPDATE summary_nodes SET session_id = ? WHERE session_id = ?",
+                (new_session_id, old_session_id),
+            )
+            moved = int(cur.rowcount or 0)
+
+            if (
+                active is None
+                or str(active[1] or "") != old_session_id
+                or int(active[2] or 0) <= 0
+            ):
+                return moved
+
+            rows = conn.execute(
+                """
+                SELECT i.ref_id, i.source_start, i.source_end
+                FROM lcm_frontier_items AS i
+                JOIN summary_nodes AS n ON n.node_id = i.ref_id
+                WHERE i.conversation_id = ? AND i.generation = ?
+                  AND i.kind = 'node' AND n.session_id = ?
+                ORDER BY i.ordinal
+                """,
+                (conversation_id, int(active[0]), new_session_id),
+            ).fetchall()
+            items = [
+                {
+                    "kind": "node",
+                    "ref_id": int(row[0]),
+                    "source_start": int(row[1]),
+                    "source_end": int(row[2]),
+                }
+                for row in rows
+                if int(row[1] or 0) > 0 and int(row[2] or 0) >= int(row[1] or 0)
+            ]
+            if not items and not reset_if_no_items:
+                raise RuntimeError(
+                    "positive canonical frontier has no carried node items"
+                )
+            next_source_end = int(active[2]) if items else 0
+            new_generation = self._frontier.advance_frontier_generation_with_items_no_commit(
+                conn,
+                conversation_id,
+                new_session_id,
+                next_source_end,
+                str(active[3] or ""),
+                str(active[4] or ""),
+                int(active[0]),
+                items,
+            )
+            if not new_generation:
+                raise RuntimeError("canonical frontier changed during session carry-over")
+            return moved
+
     def _carry_over_new_session_context_locked(
         self, old_session_id: str, new_session_id: str
     ) -> int:
@@ -3464,7 +3544,12 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 self._storage_lifetime_state,
             )
             return 0
-        return self._dag.reassign_session_nodes(old_session_id, new_session_id)
+        return self._reassign_canonical_session_state(
+            self._conversation_id,
+            old_session_id,
+            new_session_id,
+            reset_if_no_items=True,
+        )
 
     def rollover_session(
         self,
@@ -6201,72 +6286,225 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             f"{self._main_route_fingerprint()}:{summary_fingerprint}".encode("utf-8")
         ).hexdigest()[:32]
 
-    def _note_foreground_async_frontier_advance(
+    @staticmethod
+    def _canonical_message_source_ids_no_commit(
+        conn: sqlite3.Connection,
+        session_id: str,
+    ) -> set[int]:
+        """Return canonical raw lineage visible on ``conn``'s transaction."""
+        covered: set[int] = set()
+        rows = conn.execute(
+            """
+            SELECT source_ids FROM summary_nodes
+            WHERE session_id = ? AND source_type = 'messages'
+            """,
+            (session_id,),
+        ).fetchall()
+        for row in rows:
+            try:
+                source_values = json.loads(row[0] or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            for source_id in source_values:
+                try:
+                    covered.add(int(source_id))
+                except (TypeError, ValueError):
+                    continue
+        return covered
+
+    @staticmethod
+    def _exact_source_rows_exist_no_commit(
+        conn: sqlite3.Connection,
+        session_id: str,
+        source_ids: Sequence[int],
+    ) -> bool:
+        """Check exact, unique source membership on the locked transaction."""
+        normalized = [int(source_id) for source_id in source_ids]
+        if not normalized or len(set(normalized)) != len(normalized):
+            return False
+        placeholders = ",".join("?" for _ in normalized)
+        rows = conn.execute(
+            f"""
+            SELECT store_id FROM messages
+            WHERE session_id = ? AND store_id IN ({placeholders})
+            """,
+            (session_id, *normalized),
+        ).fetchall()
+        return {int(row[0]) for row in rows} == set(normalized)
+
+    def _publish_foreground_leaf(
         self,
         *,
+        node: Optional[SummaryNode],
         source_end_store_id: int,
-        node_id: int = 0,
-        covered_source_ids: Optional[List[int]] = None,
-    ) -> int:
-        """Atomically advance the persistent frontier after foreground compaction.
+        covered_source_ids: Sequence[int],
+    ) -> dict[str, Any]:
+        """Publish a foreground leaf, frontier, and lifecycle in one transaction.
 
-        Returns the committed generation, ``-1`` for a legacy engine instance
-        without a conversation binding, or ``0`` on failure. Publication is
-        independent of speculative async preparation: ordinary foreground and
-        async promotion must expose the same generation-scoped layout. Pending
-        prepared batches stay ``ready`` but become stale against the new
-        generation, so later promotion returns ``frontier_mismatch`` rather
-        than double-publishing. Generation and ordered items are committed in
-        one FrontierStore transaction; callers can roll back the exact
-        generation if a later lifecycle write fails.
+        Async and foreground publishers contend on the same ``BEGIN IMMEDIATE``
+        writer lock. The first canonical coverage wins; the loser returns the
+        authoritative generation without inserting a DAG/FTS row.
         """
-        conv_id = self.current_conversation_id
-        session_id = self.current_session_id
-        if not conv_id:
-            return -1
+        conv_id = self._conversation_id
+        session_id = self._session_id
+        source_ids = [int(value) for value in covered_source_ids]
+        source_end = int(source_end_store_id or 0)
         if not session_id:
-            return 0
-        try:
-            policy_fp = self._async_policy_fingerprint()
-            route_fp = self._async_route_fingerprint()
-            frontier = self._frontier.get_active_frontier(conv_id)
-            if frontier is None:
-                self._frontier.ensure_frontier(
-                    conv_id,
-                    session_id,
-                    policy_fingerprint=policy_fp,
-                    route_fingerprint=route_fp,
-                )
-                frontier = self._frontier.get_active_frontier(conv_id)
-            if frontier is None:
-                return False
-            source_end = int(source_end_store_id or 0)
-            items = self._build_promoted_frontier_items(
+            raise RuntimeError("foreground publication requires a bound session")
+        if not source_ids or source_end <= 0:
+            raise RuntimeError("foreground publication requires non-empty raw lineage")
+
+        # Legacy embedders can set only ``_session_id`` and never bind lifecycle
+        # conversation state. Async preparation is impossible in that mode, but
+        # retain foreground DAG behavior with one writer transaction and the same
+        # non-empty/exact-source guards.
+        if not conv_id:
+            with self._dag._db_lock:
+                conn = self._dag._conn
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    if not self._exact_source_rows_exist_no_commit(
+                        conn, session_id, source_ids
+                    ):
+                        raise RuntimeError(
+                            "foreground source identity changed before publication"
+                        )
+                    node_id = 0
+                    if node is not None:
+                        bounds = conn.execute(
+                            f"""
+                            SELECT MIN(timestamp), MAX(timestamp) FROM messages
+                            WHERE session_id = ? AND store_id IN (
+                                {','.join('?' for _ in source_ids)}
+                            )
+                            """,
+                            (session_id, *source_ids),
+                        ).fetchone()
+                        node.earliest_at = bounds[0] if bounds else None
+                        node.latest_at = bounds[1] if bounds else None
+                        node_id = self._dag.add_node_no_commit(conn, node)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+            return {
+                "published": True,
+                "reason": "",
+                "node_id": int(node_id),
+                "generation": -1,
+                "source_end_store_id": source_end,
+            }
+
+        policy_fp = self._async_policy_fingerprint()
+        route_fp = self._async_route_fingerprint()
+        with self._frontier.publication_transaction() as publication_conn:
+            frontier_row = publication_conn.execute(
+                """
+                SELECT generation, session_id, source_end_store_id
+                FROM lcm_active_frontiers
+                WHERE conversation_id = ?
+                ORDER BY generation DESC LIMIT 1
+                """,
+                (conv_id,),
+            ).fetchone()
+            base_generation = int(frontier_row[0]) if frontier_row else 0
+            active_end = int(frontier_row[2] or 0) if frontier_row else 0
+            if frontier_row is not None and str(frontier_row[1] or "") != session_id:
+                raise RuntimeError("foreground frontier session changed")
+
+            canonical_coverage = self._canonical_message_source_ids_no_commit(
+                publication_conn, session_id
+            )
+            if canonical_coverage.intersection(source_ids):
+                return {
+                    "published": False,
+                    "reason": "canonical_source_overlap",
+                    "node_id": 0,
+                    "generation": base_generation,
+                    "source_end_store_id": active_end,
+                }
+            if not self._exact_source_rows_exist_no_commit(
+                publication_conn, session_id, source_ids
+            ):
+                raise RuntimeError("foreground source identity changed before publication")
+
+            node_id = 0
+            if node is not None:
+                bounds = publication_conn.execute(
+                    f"""
+                    SELECT MIN(timestamp), MAX(timestamp) FROM messages
+                    WHERE session_id = ? AND store_id IN ({','.join('?' for _ in source_ids)})
+                    """,
+                    (session_id, *source_ids),
+                ).fetchone()
+                node.earliest_at = bounds[0] if bounds else None
+                node.latest_at = bounds[1] if bounds else None
+                node_id = self._dag.add_node_no_commit(publication_conn, node)
+            items = self._build_promoted_frontier_items_no_commit(
+                publication_conn,
                 conversation_id=conv_id,
                 session_id=session_id,
-                node_id=int(node_id or 0),
-                covered_source_ids=[int(s) for s in (covered_source_ids or [])],
+                node_id=int(node_id),
+                covered_source_ids=source_ids,
                 frontier_end_store_id=source_end,
-                base_generation=int(frontier["generation"]),
+                base_generation=base_generation,
             )
-            if source_end > 0 and not items:
-                return False
+            if not items:
+                raise RuntimeError("foreground frontier items are empty")
             new_gen = self._frontier.advance_frontier_generation_with_items(
                 conv_id,
                 session_id,
                 source_end,
                 policy_fp,
                 route_fp,
-                frontier["generation"],
+                base_generation,
                 items,
             )
-            return int(new_gen or 0)
-        except Exception:
-            logger.debug(
-                "LCM async frontier advance after foreground compact failed",
-                exc_info=True,
-            )
-            return False
+            if not new_gen:
+                raise RuntimeError("foreground frontier changed inside publication")
+            with self._lifecycle.publication_connection(publication_conn):
+                try:
+                    lifecycle_state = self._lifecycle.advance_frontier(
+                        conv_id, session_id, source_end
+                    )
+                except Exception:
+                    # A wrapper may raise after applying the no-commit SQL. Verify
+                    # on the same transaction: if the marker is present, the
+                    # exception is observational and the whole publication can
+                    # still commit atomically; otherwise roll everything back.
+                    acknowledged = publication_conn.execute(
+                        """
+                        SELECT current_session_id, current_frontier_store_id
+                        FROM lcm_lifecycle_state WHERE conversation_id = ?
+                        """,
+                        (conv_id,),
+                    ).fetchone()
+                    if (
+                        acknowledged is None
+                        or str(acknowledged[0] or "") != session_id
+                        or int(acknowledged[1] or 0) < source_end
+                    ):
+                        raise
+                    lifecycle_state = True
+            if (
+                lifecycle_state is None
+                or (
+                    lifecycle_state is not True
+                    and (
+                        lifecycle_state.current_session_id != session_id
+                        or int(lifecycle_state.current_frontier_store_id or 0)
+                        < source_end
+                    )
+                )
+            ):
+                raise RuntimeError("foreground lifecycle frontier not advanced")
+            return {
+                "published": True,
+                "reason": "",
+                "node_id": int(node_id),
+                "generation": int(new_gen),
+                "source_end_store_id": source_end,
+            }
 
     def get_async_compaction_status(self) -> dict[str, Any]:
         """Return counts of prepared batches by state for the active conversation."""
@@ -6885,36 +7123,6 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
 
         try:
             publication_started = time.perf_counter()
-            earliest_at, latest_at = self._store.get_time_bounds(covered_source_ids)
-            now = time.time()
-            node = SummaryNode(
-                session_id=batch.session_id,
-                depth=0,
-                summary=summary_text,
-                token_count=leaf_tokens,
-                source_token_count=source_tokens,
-                source_ids=list(batch.source_ids),
-                source_type="messages",
-                created_at=now,
-                earliest_at=earliest_at,
-                latest_at=latest_at,
-                expand_hint=expand_hint,
-            )
-
-            # Build the immutable layout before acquiring the write lock.  The
-            # placeholder is replaced with the transaction-assigned node id.
-            # In-transaction CAS guarantees that the base layout did not change.
-            frontier_items_template = self._build_promoted_frontier_items(
-                conversation_id=batch.conversation_id,
-                session_id=batch.session_id,
-                node_id=-1,
-                covered_source_ids=covered_source_ids,
-                frontier_end_store_id=int(batch.frontier_end_store_id or 0),
-                base_generation=int(batch.base_generation),
-            )
-            if not frontier_items_template:
-                raise RuntimeError("frontier_items_empty_after_promotion")
-
             with self._frontier.publication_transaction() as publication_conn:
                 _publication_boundary("after_begin")
 
@@ -6948,26 +7156,34 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     )
                     return _result(promoted=False, reason="frontier_mismatch")
 
-                # A foreground publisher can commit a canonical leaf before its
-                # frontier CAS. Recheck source coverage while holding SQLite's
-                # writer lock so async retry never creates duplicate lineage.
-                covered = set()
-                for source_row in publication_conn.execute(
-                    """
-                    SELECT source_ids FROM summary_nodes
-                    WHERE session_id = ? AND source_type = 'messages'
-                    """,
-                    (batch.session_id,),
-                ).fetchall():
-                    try:
-                        source_values = json.loads(source_row[0] or "[]")
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        continue
-                    for source_id in source_values:
-                        try:
-                            covered.add(int(source_id))
-                        except (TypeError, ValueError):
-                            continue
+                # Optimistic validation can race cleanup, reassignment, or a
+                # narrow permitted source rewrite. Recheck exact membership and
+                # content identity after BEGIN IMMEDIATE, immediately before the
+                # first canonical insert; the writer lock closes the TOCTOU gap.
+                locked_source_hash = compute_source_identity_hash(
+                    publication_conn, batch.session_id, covered_source_ids
+                )
+                if (
+                    not self._exact_source_rows_exist_no_commit(
+                        publication_conn, batch.session_id, covered_source_ids
+                    )
+                    or locked_source_hash != batch.source_identity_hash
+                ):
+                    self._frontier.update_batch_state_no_commit(
+                        publication_conn,
+                        batch_id,
+                        "rejected",
+                        failure_reason="source_identity_mismatch",
+                    )
+                    return _result(
+                        promoted=False, reason="source_identity_mismatch"
+                    )
+
+                # Both publisher paths use this writer lock and coverage check,
+                # so precisely one overlapping canonical leaf can win.
+                covered = self._canonical_message_source_ids_no_commit(
+                    publication_conn, batch.session_id
+                )
                 if covered.intersection(covered_source_ids):
                     self._frontier.update_batch_state_no_commit(
                         publication_conn,
@@ -6980,15 +7196,43 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                         reason="canonical_source_overlap",
                     )
 
+                placeholders = ",".join("?" for _ in covered_source_ids)
+                bounds = publication_conn.execute(
+                    f"""
+                    SELECT MIN(timestamp), MAX(timestamp) FROM messages
+                    WHERE session_id = ? AND store_id IN ({placeholders})
+                    """,
+                    (batch.session_id, *covered_source_ids),
+                ).fetchone()
+                node = SummaryNode(
+                    session_id=batch.session_id,
+                    depth=0,
+                    summary=summary_text,
+                    token_count=leaf_tokens,
+                    source_token_count=source_tokens,
+                    source_ids=list(covered_source_ids),
+                    source_type="messages",
+                    created_at=time.time(),
+                    earliest_at=bounds[0] if bounds else None,
+                    latest_at=bounds[1] if bounds else None,
+                    expand_hint=expand_hint,
+                )
                 inserted_node_id = self._dag.add_node_no_commit(
                     publication_conn, node
                 )
                 _publication_boundary("after_canonical_insert")
 
-                frontier_items = [dict(item) for item in frontier_items_template]
-                for item in frontier_items:
-                    if item.get("kind") == "node" and int(item.get("ref_id") or 0) == -1:
-                        item["ref_id"] = int(inserted_node_id)
+                frontier_items = self._build_promoted_frontier_items_no_commit(
+                    publication_conn,
+                    conversation_id=batch.conversation_id,
+                    session_id=batch.session_id,
+                    node_id=int(inserted_node_id),
+                    covered_source_ids=covered_source_ids,
+                    frontier_end_store_id=int(batch.frontier_end_store_id or 0),
+                    base_generation=int(batch.base_generation),
+                )
+                if not frontier_items:
+                    raise RuntimeError("frontier_items_empty_after_promotion")
 
                 self._frontier._publication_phase_hook = _publication_boundary
                 try:
@@ -7079,8 +7323,9 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             )
             return _result(promoted=False, reason=f"promotion_error: {exc}")
 
-    def _build_promoted_frontier_items(
+    def _build_promoted_frontier_items_no_commit(
         self,
+        conn: sqlite3.Connection,
         *,
         conversation_id: str,
         session_id: str,
@@ -7089,41 +7334,49 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         frontier_end_store_id: int,
         base_generation: int,
     ) -> list[dict[str, Any]]:
-        """Build ordered frontier items for a just-promoted generation.
-
-        Layout:
-        1. One ``node`` item for the newly published DAG leaf, covering the
-           prepared source range.
-        2. Ordered ``message`` items for the uncovered raw tail (store_ids
-           strictly after the promoted frontier end), preserving monotonic
-           non-overlapping ranges.
-        """
+        """Build a frontier layout from the caller's locked SQLite snapshot."""
         items: list[dict[str, Any]] = []
-        # Carry forward already-published canonical nodes. A new leaf replaces
-        # only its covered raw range; it must not erase older summary members.
-        active = self._frontier.get_active_frontier(conversation_id)
+        active = conn.execute(
+            """
+            SELECT generation, session_id FROM lcm_active_frontiers
+            WHERE conversation_id = ? ORDER BY generation DESC LIMIT 1
+            """,
+            (conversation_id,),
+        ).fetchone()
         if (
             active is not None
-            and int(active.get("generation") or 0) == int(base_generation)
-            and str(active.get("session_id") or "") == session_id
+            and int(active[0] or 0) == int(base_generation)
+            and str(active[1] or "") == session_id
         ):
-            for item in self._frontier.get_frontier_items(
-                conversation_id, int(base_generation)
-            ):
-                if item.get("kind") != "node":
+            rows = conn.execute(
+                """
+                SELECT kind, ref_id, source_start, source_end
+                FROM lcm_frontier_items
+                WHERE conversation_id = ? AND generation = ?
+                ORDER BY ordinal
+                """,
+                (conversation_id, int(base_generation)),
+            ).fetchall()
+            for row in rows:
+                if str(row[0] or "") != "node":
                     continue
-                start = int(item.get("source_start") or 0)
-                end = int(item.get("source_end") or 0)
+                ref_id = int(row[1] or 0)
+                start = int(row[2] or 0)
+                end = int(row[3] or 0)
                 if start <= 0 or end < start:
                     continue
                 if any(start <= source_id <= end for source_id in covered_source_ids):
                     continue
-                if self._dag.get_node(int(item.get("ref_id") or 0)) is None:
+                exists = conn.execute(
+                    "SELECT 1 FROM summary_nodes WHERE node_id = ? AND session_id = ?",
+                    (ref_id, session_id),
+                ).fetchone()
+                if exists is None:
                     continue
                 items.append(
                     {
                         "kind": "node",
-                        "ref_id": int(item["ref_id"]),
+                        "ref_id": ref_id,
                         "source_start": start,
                         "source_end": end,
                     }
@@ -7137,33 +7390,27 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     "source_end": int(max(covered_source_ids)),
                 }
             )
-        # Uncovered fresh-tail raw messages after the promoted end.
         end_id = int(frontier_end_store_id or 0)
-        covered_set = {int(s) for s in covered_source_ids}
-        try:
-            all_stored = self._store.get_session_messages_after(
-                session_id, after_store_id=end_id,
-            )
-        except Exception:
-            all_stored = []
-        for row in all_stored:
-            try:
-                sid = int(row.get("store_id") or 0)
-            except (TypeError, ValueError):
-                continue
-            if sid <= 0 or sid in covered_set:
-                continue
-            if end_id > 0 and sid <= end_id:
+        covered_set = {int(source_id) for source_id in covered_source_ids}
+        rows = conn.execute(
+            """
+            SELECT store_id FROM messages
+            WHERE session_id = ? AND store_id > ? ORDER BY store_id
+            """,
+            (session_id, end_id),
+        ).fetchall()
+        for row in rows:
+            store_id = int(row[0] or 0)
+            if store_id <= 0 or store_id in covered_set:
                 continue
             items.append(
                 {
                     "kind": "message",
-                    "ref_id": sid,
-                    "source_start": sid,
-                    "source_end": sid,
+                    "ref_id": store_id,
+                    "source_start": store_id,
+                    "source_end": store_id,
                 }
             )
-        # Generation rows require strict source ordering and non-overlap.
         ordered = sorted(
             items,
             key=lambda item: (
@@ -7181,8 +7428,6 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 continue
             validated.append(item)
             previous_end = end
-        # If there is no uncovered tail (empty session after full cover), the
-        # node item alone still satisfies non-empty for source_end > 0.
         return validated
 
     def reconcile_itemless_frontier_generations(

@@ -274,3 +274,144 @@ def test_process_crash_exposes_only_wholly_old_or_wholly_new_publication(
         assert final_grep.get("results")
     finally:
         reopened.shutdown()
+
+
+def test_after_commit_crash_then_normal_compress_uses_authoritative_frontier(
+    tmp_path, monkeypatch
+):
+    """A host-retained pre-replacement context cannot be compacted a second time."""
+    db_path = tmp_path / "publication-after-commit-normal-recovery.db"
+    batch_id, old_generation, _old_lifecycle_frontier, messages = _prepare(
+        db_path, monkeypatch
+    )
+    crashed = _crash_promoter(
+        tmp_path,
+        db_path,
+        batch_id,
+        messages,
+        "after_commit",
+    )
+    assert crashed.returncode == 86, (crashed.stdout, crashed.stderr)
+
+    reopened = _open_engine(db_path)
+    monkeypatch.setattr(
+        reopened,
+        "_summarize_leaf_chunk_with_rescue",
+        lambda initial_chunk, focus_topic=None: (
+            list(initial_chunk),
+            100,
+            "invalid duplicate post-crash foreground summary",
+            1,
+            1,
+        ),
+    )
+    try:
+        before = reopened._frontier.get_active_frontier(CONVERSATION_ID)
+        assert before is not None
+        assert int(before["generation"]) == old_generation + 1
+
+        recovered = reopened.compress(
+            messages,
+            current_tokens=reopened.threshold_tokens + 1,
+            force=True,
+        )
+
+        after = reopened._frontier.get_active_frontier(CONVERSATION_ID)
+        assert after is not None
+        assert int(after["generation"]) == int(before["generation"])
+        assert int(after["source_end_store_id"]) > 0
+        nodes = reopened._dag.get_session_nodes(SESSION_ID)
+        assert len(nodes) == 1
+        assert all(node.source_ids for node in nodes)
+        assert all(min(node.source_ids) > 0 for node in nodes)
+        items = reopened._frontier.get_frontier_items(
+            CONVERSATION_ID, int(after["generation"])
+        )
+        assert items
+        assert {
+            int(item["ref_id"])
+            for item in items
+            if item["kind"] == "node"
+        } == {int(node.node_id) for node in nodes}
+        recovered_blob = "\n".join(
+            str(message.get("content") or "") for message in recovered
+        )
+        assert SUMMARY_SENTINEL in recovered_blob
+        assert "invalid duplicate post-crash foreground summary" not in recovered_blob
+    finally:
+        reopened.shutdown()
+
+
+def test_concurrent_maintenance_cannot_make_partial_publication_survive_crash(
+    tmp_path,
+):
+    """A flusher must wait for the owner transaction, never commit it."""
+    db_path = tmp_path / "maintenance-publication-crash.db"
+    package_root = tmp_path / "maintenance-package-root"
+    package_root.mkdir()
+    (package_root / "hermes_lcm").symlink_to(
+        Path(__file__).resolve().parents[1], target_is_directory=True
+    )
+    script = """
+import os
+import sys
+import threading
+from hermes_lcm.config import LCMConfig
+from hermes_lcm.engine import LCMEngine
+from hermes_lcm.maintenance import flush_engine_connections
+
+engine = LCMEngine(config=LCMConfig(database_path=sys.argv[1]))
+engine.on_session_start(
+    "crash-publication-session",
+    conversation_id="crash-publication-conversation",
+    platform="test",
+    context_length=50_000,
+)
+with engine._frontier.publication_transaction() as conn:
+    conn.execute(
+        '''
+        INSERT INTO summary_nodes
+            (session_id, depth, summary, token_count, source_token_count,
+             source_ids, source_type, created_at)
+        VALUES (?, 0, ?, 1, 1, '[]', 'messages', 1.0)
+        ''',
+        ("crash-publication-session", "maintenance partial publication"),
+    )
+    attempted = threading.Event()
+    finished = threading.Event()
+    def flush():
+        attempted.set()
+        flush_engine_connections(engine)
+        finished.set()
+    threading.Thread(target=flush, daemon=True).start()
+    if not attempted.wait(timeout=2):
+        raise SystemExit("maintenance did not start")
+    finished.wait(timeout=0.5)
+    os._exit(87)
+"""
+    env = dict(os.environ)
+    inherited_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(
+        value for value in (str(package_root), inherited_pythonpath) if value
+    )
+    crashed = subprocess.run(
+        [sys.executable, "-c", script, str(db_path)],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert crashed.returncode == 87, (crashed.stdout, crashed.stderr)
+
+    reopened = _open_engine(db_path)
+    try:
+        assert reopened._dag.get_session_nodes(SESSION_ID) == []
+        grep = json.loads(
+            reopened.handle_tool_call(
+                "lcm_grep", {"query": "maintenance partial publication"}
+            )
+        )
+        assert grep.get("results", []) == []
+    finally:
+        reopened.shutdown()

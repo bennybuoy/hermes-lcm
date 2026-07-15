@@ -233,15 +233,19 @@ def test_cross_session_model_metadata_is_redacted_and_bounded_on_success_and_fai
     tmp_path, monkeypatch
 ):
     engine = _engine(tmp_path)
-    engine._config.sensitive_patterns_enabled = True
-    secret = "cross-session-model-credential"
-    oversized_model = f"provider api_key={secret} " + ("oversized-model " * 10_000)
+    labeled_secret = "cross-session-model-credential"
+    standalone_secret = "sk-proj-cross-session-standalone-credential-123456789"
+    oversized_model = (
+        f"provider api_key={labeled_secret} fallback={standalone_secret} "
+        + ("oversized-model " * 10_000)
+    )
     node = engine._dag.get_node(_node(engine, "archive", "archive model metadata"))
     monkeypatch.setattr(engine._dag, "search", lambda *args, **kwargs: [node])
 
     def assert_safe_model_metadata(result):
         assert result["model_truncated"] is True
-        assert secret not in result["model"]
+        assert labeled_secret not in result["model"]
+        assert standalone_secret not in result["model"]
         assert "oversized-model " * 1_000 not in result["model"]
         assert len(result["model"]) <= lcm_tools._CROSS_SESSION_METADATA_MAX_CHARS
         assert count_tokens(result["model"]) <= lcm_tools._CROSS_SESSION_METADATA_MAX_TOKENS
