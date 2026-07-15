@@ -587,6 +587,182 @@ class FrontierStore:
                 conn.rollback()
                 raise
 
+    def create_batch_cas(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        base_generation: int,
+        source_end_store_id: int,
+        source_identity_hash: str,
+        source_ids: list[int],
+        policy_fingerprint: str,
+        route_fingerprint: str,
+        resolved_policy_json: str = "{}",
+        max_conversation_candidates: int | None = None,
+        max_profile_candidates: int | None = None,
+    ) -> tuple[int, str]:
+        """Create a preparing row only while ``base_generation`` is still active.
+
+        The generation check and insert share SQLite's writer lock.  A publisher
+        that wins before this transaction therefore makes the speculative work
+        stale without allowing a post-winner row to appear.
+        """
+        with self.publication_transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT generation FROM lcm_active_frontiers
+                WHERE conversation_id = ? ORDER BY generation DESC LIMIT 1
+                """,
+                (conversation_id,),
+            ).fetchone()
+            current_generation = int(row[0]) if row else 0
+            if current_generation != int(base_generation):
+                return 0, "generation-superseded"
+
+            if max_conversation_candidates is not None:
+                duplicate = conn.execute(
+                    """
+                    SELECT 1 FROM lcm_prepared_batches
+                    WHERE conversation_id = ?
+                      AND state IN ('preparing', 'ready')
+                      AND base_generation = ?
+                      AND policy_fingerprint = ?
+                      AND route_fingerprint = ?
+                      AND source_end_store_id >= ?
+                    LIMIT 1
+                    """,
+                    (
+                        conversation_id,
+                        int(base_generation),
+                        policy_fingerprint,
+                        route_fingerprint,
+                        int(source_end_store_id),
+                    ),
+                ).fetchone()
+                if duplicate:
+                    return 0, "candidate-already-covers-range"
+                conversation_count = int(conn.execute(
+                    """
+                    SELECT COUNT(*) FROM lcm_prepared_batches
+                    WHERE conversation_id = ? AND state IN ('preparing', 'ready')
+                    """,
+                    (conversation_id,),
+                ).fetchone()[0])
+                if conversation_count >= max(1, int(max_conversation_candidates)):
+                    return 0, "conversation-candidate-limit"
+                profile_count = int(conn.execute(
+                    """SELECT COUNT(*) FROM lcm_prepared_batches
+                       WHERE state IN ('preparing', 'ready')"""
+                ).fetchone()[0])
+                if profile_count >= max(1, int(max_profile_candidates or 1)):
+                    return 0, "profile-candidate-limit"
+
+            now = time.time()
+            cur = conn.execute(
+                """
+                INSERT INTO lcm_prepared_batches
+                    (conversation_id, session_id, base_generation,
+                     source_end_store_id, source_identity_hash, source_ids,
+                     policy_fingerprint, route_fingerprint, state,
+                     expected_leaf_count, frontier_end_store_id,
+                     created_at, updated_at, resolved_policy_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'preparing', 0, 0, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    session_id,
+                    int(base_generation),
+                    int(source_end_store_id),
+                    source_identity_hash,
+                    json.dumps([int(source_id) for source_id in source_ids]),
+                    policy_fingerprint,
+                    route_fingerprint,
+                    now,
+                    now,
+                    resolved_policy_json,
+                ),
+            )
+            return int(cur.lastrowid), ""
+
+    def finalize_batch_cas(
+        self,
+        batch_id: int,
+        *,
+        base_generation: int,
+        state: str,
+        expected_leaf_count: int,
+        frontier_end_store_id: int,
+        summary_payload: str,
+        payload_version: int,
+        source_end_store_id: int,
+        source_identity_hash: str,
+        source_ids: Sequence[int],
+    ) -> tuple[bool, str]:
+        """Finalize preparation only if its row and base generation are current."""
+        with self.publication_transaction() as conn:
+            batch_row = conn.execute(
+                """SELECT conversation_id, base_generation, state
+                   FROM lcm_prepared_batches WHERE batch_id = ?""",
+                (int(batch_id),),
+            ).fetchone()
+            if batch_row is None:
+                return False, "batch-not-found"
+            current_state = str(batch_row[2] or "")
+            if current_state != "preparing":
+                return False, f"batch-state-{current_state}"
+            row = conn.execute(
+                """
+                SELECT generation FROM lcm_active_frontiers
+                WHERE conversation_id = ? ORDER BY generation DESC LIMIT 1
+                """,
+                (str(batch_row[0]),),
+            ).fetchone()
+            current_generation = int(row[0]) if row else 0
+            if (
+                int(batch_row[1]) != int(base_generation)
+                or current_generation != int(base_generation)
+            ):
+                self.update_batch_state_no_commit(
+                    conn,
+                    int(batch_id),
+                    "superseded",
+                    failure_reason="generation-superseded-during-preparation",
+                )
+                return False, "generation-superseded"
+            self.update_batch_state_no_commit(
+                conn,
+                int(batch_id),
+                state,
+                expected_leaf_count=expected_leaf_count,
+                frontier_end_store_id=frontier_end_store_id,
+                summary_payload=summary_payload,
+                payload_version=payload_version,
+                source_end_store_id=source_end_store_id,
+                source_identity_hash=source_identity_hash,
+                source_ids=source_ids,
+            )
+            return True, ""
+
+    def settle_batch_if_preparing(
+        self,
+        batch_id: int,
+        state: str,
+        *,
+        failure_reason: str,
+    ) -> bool:
+        """Settle an owned preparing row without reviving a winner-settled row."""
+        with self.publication_transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE lcm_prepared_batches
+                SET state = ?, failure_reason = ?, updated_at = ?
+                WHERE batch_id = ? AND state = 'preparing'
+                """,
+                (state, failure_reason, time.time(), int(batch_id)),
+            )
+            return int(cur.rowcount or 0) > 0
+
     def list_pending_batches(self, conversation_id: str) -> list[PreparedBatch]:
         with self._lock:
             rows = self._conn.execute(
@@ -964,15 +1140,46 @@ def compute_source_identity_hash(
     session_id: str,
     source_ids: Sequence[int],
 ) -> str:
-    """Compute a SHA-256 hash of the content of the given source message IDs."""
+    """Hash every durable field that can change summarizer semantics."""
     h = hashlib.sha256()
-    for sid in source_ids:
-        row = conn.execute(
-            "SELECT store_id, role, content, timestamp FROM messages WHERE store_id = ? AND session_id = ?",
-            (sid, session_id),
-        ).fetchone()
+    normalized_ids = [int(source_id) for source_id in source_ids]
+    if not normalized_ids:
+        return h.hexdigest()[:32]
+    placeholders = ",".join("?" for _ in normalized_ids)
+    rows = conn.execute(
+        f"""SELECT store_id, session_id, role, content, tool_call_id, tool_calls
+            FROM messages WHERE session_id = ? AND store_id IN ({placeholders})""",
+        (session_id, *normalized_ids),
+    ).fetchall()
+    rows_by_id = {int(row[0]): row for row in rows}
+    for sid in normalized_ids:
+        row = rows_by_id.get(sid)
         if row:
-            h.update(f"{row[0]}|{row[1]}|{row[2]}|{row[3]}".encode())
+            tool_calls = row[5]
+            if tool_calls:
+                try:
+                    tool_calls = json.dumps(
+                        json.loads(tool_calls),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    tool_calls = str(tool_calls)
+            else:
+                tool_calls = ""
+            h.update(json.dumps(
+                [
+                    int(row[0]),
+                    str(row[1] or ""),
+                    str(row[2] or ""),
+                    str(row[3] or ""),
+                    str(row[4] or ""),
+                    tool_calls,
+                ],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8"))
         else:
             h.update(f"{sid}|missing".encode())
     return h.hexdigest()[:32]

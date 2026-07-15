@@ -2829,6 +2829,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         messages: List[Dict[str, Any]],
         *,
         conversation_id: str | None = None,
+        raise_on_read_error: bool = False,
     ) -> Optional[int]:
         try:
             stored_messages = self._store.get_range(
@@ -2838,6 +2839,8 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             )
         except Exception:
             logger.debug("LCM session-end prefix check failed", exc_info=True)
+            if raise_on_read_error:
+                raise
             return None
         if not stored_messages:
             return 0
@@ -3574,11 +3577,36 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         new_session_id: str,
         *,
         carry_over_context: bool,
+        final_tail: Sequence[tuple[Dict[str, Any], int]],
     ) -> int:
-        """Prune/own DAG and publish frontier+lifecycle in one transaction."""
+        """Publish final tail, DAG/frontier, batches, and lifecycle atomically."""
         moved = 0
         with self._frontier.publication_transaction() as conn:
             self._rollover_publication_boundary("after_begin")
+            for message, token_estimate in final_tail:
+                tool_calls = message.get("tool_calls")
+                conn.execute(
+                    """
+                    INSERT INTO messages
+                        (session_id, source, conversation_id, role, content,
+                         tool_call_id, tool_calls, tool_name, timestamp,
+                         token_estimate, pinned)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    """,
+                    (
+                        old_session_id,
+                        self._session_platform or "unknown",
+                        conversation_id,
+                        message.get("role", "unknown"),
+                        normalize_content_value(message.get("content")),
+                        message.get("tool_call_id"),
+                        json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None,
+                        message.get("tool_name"),
+                        time.time(),
+                        int(token_estimate),
+                    ),
+                )
+            self._rollover_publication_boundary("after_tail_ingest")
             active = conn.execute(
                 """
                 SELECT generation, session_id, source_end_store_id,
@@ -3655,6 +3683,16 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 base_generation,
                 reason="session_rollover_published",
             )
+            conn.execute(
+                """
+                UPDATE lcm_prepared_batches
+                SET state = 'superseded',
+                    failure_reason = 'session_rollover_published',
+                    updated_at = ?
+                WHERE conversation_id = ? AND state IN ('preparing', 'ready')
+                """,
+                (time.time(), conversation_id),
+            )
             self._rollover_publication_boundary("after_frontier")
 
             self._lifecycle.record_rollover_no_commit(
@@ -3669,6 +3707,46 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
 
         self._rollover_publication_boundary("after_commit")
         return moved
+
+    def _prepare_rollover_final_tail(
+        self,
+        old_session_id: str,
+        previous_messages: Sequence[Dict[str, Any]],
+        *,
+        conversation_id: str,
+    ) -> list[tuple[Dict[str, Any], int]]:
+        """Prepare only the host suffix missing from durable old-session storage.
+
+        This phase performs no database writes.  A mismatch is fail-closed: the
+        caller keeps its untouched host list and rollover does not prune or bind
+        the new session.
+        """
+        if not previous_messages:
+            return []
+        prefix_count = self._session_end_store_prefix_count(
+            old_session_id,
+            list(previous_messages),
+            conversation_id=conversation_id,
+            raise_on_read_error=True,
+        )
+        if prefix_count is None:
+            # The host replay may legitimately be a transformed active view
+            # (for example an objective plus an ignored-message placeholder)
+            # rather than a byte-for-byte durable prefix.  Preserve it in full
+            # instead of treating it as already durable or dropping it.
+            prefix_count = 0
+        suffix = list(previous_messages[int(prefix_count):])
+        if not suffix:
+            return []
+        protected = protect_messages_for_ingest(
+            suffix,
+            session_id=old_session_id,
+            config=self._config,
+            hermes_home=self._hermes_home,
+        )
+        return [
+            (message, count_message_tokens(message)) for message in protected
+        ]
 
     def rollover_session(
         self,
@@ -3745,15 +3823,21 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         published_rollover = False
         moved = 0
         if old_session_id and can_carry_over:
-            self.on_session_end(old_session_id, previous_messages)
-            self._on_session_reset_locked(persist_storage=False)
+            self._stop_async_worker()
+            final_tail = self._prepare_rollover_final_tail(
+                old_session_id,
+                previous_messages,
+                conversation_id=conversation_id,
+            )
             moved = self._publish_rollover_state(
                 conversation_id,
                 old_session_id,
                 new_session_id,
                 carry_over_context=carry_over_context,
+                final_tail=final_tail,
             )
             published_rollover = True
+            self._on_session_reset_locked(persist_storage=False)
             self._clear_pending_reset_boundary()
         elif old_session_id and not carry_over_context:
             logger.warning(
@@ -6466,27 +6550,72 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         return {int(row[0]) for row in rows} == set(normalized)
 
     @staticmethod
+    def _canonical_summarizer_message_identity(
+        *,
+        role: Any,
+        content: Any,
+        tool_call_id: Any,
+        tool_calls: Any,
+    ) -> tuple[str, str, str, str]:
+        """Canonicalize all message fields consumed by ``_serialize_messages``."""
+        normalized_tool_calls = tool_calls
+        if isinstance(normalized_tool_calls, str):
+            try:
+                normalized_tool_calls = json.loads(normalized_tool_calls)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        if normalized_tool_calls in (None, [], {}):
+            tool_calls_text = ""
+        elif isinstance(normalized_tool_calls, str):
+            tool_calls_text = normalized_tool_calls
+        else:
+            tool_calls_text = json.dumps(
+                normalized_tool_calls,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+        return (
+            str(role or "unknown"),
+            normalize_content_value(content) or "",
+            str(tool_call_id or ""),
+            tool_calls_text,
+        )
+
+    @staticmethod
     def _source_content_identity_hash_no_commit(
         conn: sqlite3.Connection,
         session_id: str,
         source_ids: Sequence[int],
     ) -> str:
-        """Hash exact source id/session/role/content identity in stable order."""
+        """Hash exact canonical summarizer input identity in stable source order."""
         h = hashlib.sha256()
-        for source_id in [int(value) for value in source_ids]:
-            row = conn.execute(
-                """
-                SELECT store_id, session_id, role, content
-                FROM messages WHERE store_id = ? AND session_id = ?
-                """,
-                (source_id, session_id),
-            ).fetchone()
+        normalized_ids = [int(value) for value in source_ids]
+        placeholders = ",".join("?" for _ in normalized_ids)
+        rows = conn.execute(
+            f"""
+            SELECT store_id, session_id, role, content, tool_call_id, tool_calls
+            FROM messages
+            WHERE session_id = ? AND store_id IN ({placeholders})
+            """,
+            (session_id, *normalized_ids),
+        ).fetchall() if normalized_ids else []
+        rows_by_id = {int(row[0]): row for row in rows}
+        for source_id in normalized_ids:
+            row = rows_by_id.get(source_id)
             if row is None:
                 h.update(f"{source_id}|missing".encode("utf-8"))
                 continue
+            semantic_identity = LCMEngine._canonical_summarizer_message_identity(
+                role=row[2],
+                content=row[3],
+                tool_call_id=row[4],
+                tool_calls=row[5],
+            )
             h.update(
                 json.dumps(
-                    [int(row[0]), str(row[1]), str(row[2] or ""), str(row[3] or "")],
+                    [int(row[0]), str(row[1]), *semantic_identity],
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ).encode("utf-8")
@@ -6514,11 +6643,19 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             stored = stored_by_id.get(source_id)
             if stored is None or str(stored.get("session_id") or "") != self._session_id:
                 return ""
-            active_role = str(active.get("role") or "unknown")
-            active_content = normalize_content_value(active.get("content")) or ""
-            stored_role = str(stored.get("role") or "unknown")
-            stored_content = normalize_content_value(stored.get("content")) or ""
-            if (active_role, active_content) == (stored_role, stored_content):
+            active_semantics = self._canonical_summarizer_message_identity(
+                role=active.get("role"),
+                content=active.get("content"),
+                tool_call_id=active.get("tool_call_id"),
+                tool_calls=active.get("tool_calls"),
+            )
+            stored_semantics = self._canonical_summarizer_message_identity(
+                role=stored.get("role"),
+                content=stored.get("content"),
+                tool_call_id=stored.get("tool_call_id"),
+                tool_calls=stored.get("tool_calls"),
+            )
+            if active_semantics == stored_semantics:
                 continue
             # Externalization/cleanup can intentionally make the durable form
             # differ while retaining an equivalent replay identity.
@@ -6536,13 +6673,18 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         h = hashlib.sha256()
         for source_id in wanted:
             stored = stored_by_id[source_id]
+            semantic_identity = self._canonical_summarizer_message_identity(
+                role=stored.get("role"),
+                content=stored.get("content"),
+                tool_call_id=stored.get("tool_call_id"),
+                tool_calls=stored.get("tool_calls"),
+            )
             h.update(
                 json.dumps(
                     [
                         source_id,
                         str(stored.get("session_id") or ""),
-                        str(stored.get("role") or ""),
-                        str(stored.get("content") or ""),
+                        *semantic_identity,
                     ],
                     ensure_ascii=False,
                     separators=(",", ":"),
@@ -7092,7 +7234,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             if not admission_acquired:
                 self._record_async_prepare_skip("admission-limited")
                 return None
-            batch_id, capacity_reason = self._frontier.create_batch_bounded(
+            batch_id, capacity_reason = self._frontier.create_batch_cas(
                 conversation_id=conv_id,
                 session_id=session_id,
                 base_generation=base_generation,
@@ -7113,7 +7255,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 self._record_async_prepare_skip(capacity_reason or "admission-limited")
                 return None
         else:
-            batch_id = self._frontier.create_batch(
+            batch_id, capacity_reason = self._frontier.create_batch_cas(
                 conversation_id=conv_id,
                 session_id=session_id,
                 base_generation=base_generation,
@@ -7122,9 +7264,13 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 source_ids=candidate_store_ids,
                 policy_fingerprint=policy_fp,
                 route_fingerprint=route_fp,
-                state="preparing",
                 resolved_policy_json=resolved_policy_json,
             )
+            if not batch_id:
+                self._record_async_prepare_skip(
+                    capacity_reason or "generation-superseded"
+                )
+                return None
 
         # Build leaf summaries using the existing _summarize_leaf_chunk_with_rescue.
         # Summaries stay private to this path — they are NOT inserted into the
@@ -7134,23 +7280,30 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             # Bail out early if shutdown was signaled while we were setting up.
             stop_event = self._async_worker_stop
             if stop_event is not None and stop_event.is_set():
-                self._frontier.update_batch_state(
+                self._frontier.settle_batch_if_preparing(
                     batch_id, "failed", failure_reason="shutdown_signaled",
                 )
                 return None
             # Foreground cutover has priority: do not start expensive LLM work
             # once compress() has claimed the critical section.
             if self._foreground_compress_active.is_set():
-                self._frontier.update_batch_state(
+                self._frontier.settle_batch_if_preparing(
                     batch_id, "failed", failure_reason="foreground_compress_priority",
                 )
                 return None
 
             # Convert stored messages to OpenAI format for the summarizer
-            candidate_messages = [
-                {"role": m["role"], "content": m.get("content") or ""}
-                for m in candidate_stored
-            ]
+            candidate_messages = []
+            for stored_message in candidate_stored:
+                candidate_message = {
+                    "role": stored_message["role"],
+                    "content": stored_message.get("content") or "",
+                }
+                if stored_message.get("tool_call_id"):
+                    candidate_message["tool_call_id"] = stored_message["tool_call_id"]
+                if stored_message.get("tool_calls"):
+                    candidate_message["tool_calls"] = stored_message["tool_calls"]
+                candidate_messages.append(candidate_message)
 
             # Use the engine's existing leaf summarization path
             compacted_chunk, source_tokens, summary_text, level, attempts = (
@@ -7184,12 +7337,12 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             # Check stop event again after the LLM call — if shutdown
             # was signaled during the API call, abandon the batch.
             if stop_event is not None and stop_event.is_set():
-                self._frontier.update_batch_state(
+                self._frontier.settle_batch_if_preparing(
                     batch_id, "failed", failure_reason="shutdown_signaled",
                 )
                 return None
             if self._foreground_compress_active.is_set():
-                self._frontier.update_batch_state(
+                self._frontier.settle_batch_if_preparing(
                     batch_id, "failed", failure_reason="foreground_compress_priority",
                 )
                 return None
@@ -7213,8 +7366,10 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 sort_keys=True,
             )
 
-            self._frontier.update_batch_state(
-                batch_id, leave_state,
+            finalized, _finalize_reason = self._frontier.finalize_batch_cas(
+                batch_id,
+                base_generation=int(base_generation),
+                state=leave_state,
                 expected_leaf_count=leaf_count,
                 frontier_end_store_id=summarized_source_end,
                 summary_payload=summary_payload,
@@ -7223,14 +7378,15 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 source_identity_hash=summarized_source_hash,
                 source_ids=summarized_store_ids,
             )
-            self._async_last_prepare_at = time.time()
-            if leave_state == "ready":
+            if finalized:
+                self._async_last_prepare_at = time.time()
+            if finalized and leave_state == "ready":
                 self._async_total_prepared = (
                     int(getattr(self, "_async_total_prepared", 0) or 0) + 1
                 )
         except Exception as exc:
             logger.warning("LCM background compaction prep failed: %s", exc)
-            self._frontier.update_batch_state(
+            self._frontier.settle_batch_if_preparing(
                 batch_id, "failed", failure_reason=str(exc),
             )
         finally:

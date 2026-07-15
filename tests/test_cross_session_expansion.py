@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import threading
+import time
+
+import pytest
 
 import hermes_lcm.tools as lcm_tools
 from hermes_lcm.config import LCMConfig
@@ -591,5 +594,211 @@ def test_cross_session_hard_bounds_override_caller_and_profile_values(tmp_path, 
         assert result["deadline_ms"] <= 120_000
         assert result["answer_truncated"] is True
         assert len(result["answer"]) < 100_000
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("evidence_kind", ["raw", "child", "root"])
+@pytest.mark.parametrize(
+    "secret, leaked_marker",
+    [
+        (
+            "-----BEGIN PRIVATE KEY-----\nBOUNDARY-PEM-MATERIAL\n-----END PRIVATE KEY-----",
+            "BEGIN PRIVATE KEY",
+        ),
+        ("ASIAABCDEFGHIJKLMNOP", "ASIA"),
+        ("github_pat_11AA22BB33CC44DD55EE66FF77GG88HH", "github_pat_"),
+    ],
+)
+def test_evidence_redaction_precedes_boundary_truncation_for_all_source_levels(
+    tmp_path, monkeypatch, evidence_kind, secret, leaked_marker
+):
+    engine = _engine(tmp_path)
+    prefix = "ordinary evidence " * 18
+    payload = prefix + secret + " trailing evidence"
+    leaf_id = _node(
+        engine,
+        "current",
+        payload if evidence_kind == "child" else "ordinary child summary",
+        content=payload if evidence_kind == "raw" else "ordinary raw evidence",
+    )
+    selected_id = leaf_id
+    if evidence_kind in {"child", "root"}:
+        selected_id = engine._dag.add_node(SummaryNode(
+            session_id="current",
+            depth=1,
+            summary=payload if evidence_kind == "root" else "ordinary root summary",
+            token_count=100,
+            source_token_count=200,
+            source_ids=[leaf_id],
+            source_type="nodes",
+            created_at=1,
+        ))
+    captured = {}
+
+    def synthesize(**kwargs):
+        captured["context"] = kwargs["context_blocks"]
+        return "safe answer"
+
+    monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", synthesize)
+    try:
+        result = json.loads(lcm_tools.lcm_expand_query(
+            {
+                "prompt": "inspect evidence",
+                "node_ids": [selected_id],
+                "max_tokens": 100,
+                "context_max_tokens": max(1, count_tokens(prefix + secret[:8])),
+            },
+            engine=engine,
+        ))
+        serialized_context = json.dumps(captured["context"])
+        serialized_result = json.dumps(result)
+        assert leaked_marker not in serialized_context
+        assert leaked_marker not in serialized_result
+        assert len(serialized_context) < 20_000
+        assert result["context_truncated"] is True
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("outcome", ["no-match", "success", "degraded"])
+def test_cross_session_prompt_and_query_are_always_mandatory_redacted_and_bounded(
+    tmp_path, monkeypatch, outcome
+):
+    engine = _engine(tmp_path)
+    prompt_secret = "github_pat_11AA22BB33CC44DD55EE66FF77GG88HH"
+    query_secret = "ASIAABCDEFGHIJKLMNOP"
+    prompt = ("question " * 2_200) + prompt_secret
+    query = ("archive " * 240) + query_secret
+    node = engine._dag.get_node(_node(engine, "archive", "archive response node"))
+    monkeypatch.setattr(
+        engine._dag,
+        "search",
+        (lambda *args, **kwargs: []) if outcome == "no-match" else (lambda *args, **kwargs: [node]),
+    )
+
+    def synthesize(**kwargs):
+        if outcome == "degraded":
+            raise RuntimeError("synthetic degradation")
+        return "safe answer"
+
+    monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", synthesize)
+    try:
+        result = json.loads(_invoke(engine, _args(prompt=prompt, query=query)))
+        serialized = json.dumps(result)
+        assert prompt_secret not in serialized
+        assert query_secret not in serialized
+        assert len(result["prompt"]) <= 20_000
+        assert len(result["query"]) <= 2_000
+        assert result["prompt_truncated"] is True
+        assert result["query_truncated"] is True
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("outcome", ["no-match", "success", "degraded"])
+def test_current_session_prompt_and_query_are_always_mandatory_redacted_and_bounded(
+    tmp_path, monkeypatch, outcome
+):
+    engine = _engine(tmp_path)
+    prompt_secret = "github_pat_11AA22BB33CC44DD55EE66FF77GG88HH"
+    query_secret = "ASIAABCDEFGHIJKLMNOP"
+    prompt = ("question " * 2_000) + prompt_secret
+    query = ("archive " * 220) + query_secret
+    node = engine._dag.get_node(_node(engine, "current", "current response node"))
+    monkeypatch.setattr(
+        engine._dag,
+        "search",
+        (lambda *args, **kwargs: [])
+        if outcome == "no-match"
+        else (lambda *args, **kwargs: [node]),
+    )
+    monkeypatch.setattr(
+        engine._store,
+        "search",
+        lambda *args, **kwargs: [],
+    )
+
+    def synthesize(**kwargs):
+        if outcome == "degraded":
+            raise RuntimeError("synthetic degradation")
+        return "safe answer"
+
+    monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", synthesize)
+    try:
+        result = json.loads(lcm_tools.lcm_expand_query(
+            {"prompt": prompt, "query": query},
+            engine=engine,
+        ))
+        serialized = json.dumps(result)
+        assert prompt_secret not in serialized
+        assert query_secret not in serialized
+        assert len(result["prompt"]) <= 20_000
+        assert len(result["query"]) <= 2_000
+        assert result["prompt_truncated"] is True
+        assert result["query_truncated"] is True
+    finally:
+        engine.shutdown()
+
+
+def test_1600_node_adversarial_provenance_is_bounded_deadline_aware_and_fail_closed(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path, max_sessions=10, per_session=20)
+    raw_id = engine._store.append(
+        "archive", {"role": "user", "content": "adversarial raw evidence"}
+    )
+    child_id = engine._dag.add_node(SummaryNode(
+        session_id="archive",
+        depth=0,
+        summary="archive adversarial leaf",
+        token_count=1,
+        source_token_count=1,
+        source_ids=[raw_id],
+        source_type="messages",
+        created_at=1,
+    ))
+    for index in range(1, 1600):
+        child_id = engine._dag.add_node(SummaryNode(
+            session_id="archive",
+            depth=index,
+            summary=f"archive adversarial node {index}",
+            token_count=1,
+            source_token_count=1,
+            source_ids=[child_id],
+            source_type="nodes",
+            created_at=index + 1,
+        ))
+    root = engine._dag.get_node(child_id)
+    monkeypatch.setattr(engine._dag, "search", lambda *args, **kwargs: [root] * 1600)
+    get_node_calls = {"count": 0}
+    original_get_node = engine._dag.get_node
+
+    def bounded_get_node(node_id):
+        get_node_calls["count"] += 1
+        if get_node_calls["count"] > 10_000:
+            raise AssertionError("authorization performed unbounded per-candidate graph queries")
+        return original_get_node(node_id)
+
+    monkeypatch.setattr(engine._dag, "get_node", bounded_get_node)
+    monkeypatch.setattr(
+        lcm_tools,
+        "_synthesize_expansion_answer",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("truncated authorization must not synthesize")),
+    )
+    started = time.monotonic()
+    try:
+        result = json.loads(_invoke(
+            engine,
+            _args(deadline_ms=25, context_max_tokens=100),
+            session_ids=["archive"],
+        ))
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.0
+        assert result["degraded"] is True
+        assert result["authorization_truncated"] or result["authorization_timed_out"]
+        assert result["node_ids"] == []
+        assert result["matches"] == []
+        assert get_node_calls["count"] <= 10_000
     finally:
         engine.shutdown()

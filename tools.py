@@ -71,6 +71,20 @@ _CROSS_SESSION_METADATA_MAX_TOKENS = 128
 _CROSS_SESSION_CONTEXT_MAX_DEPTH = 8
 _CROSS_SESSION_CONTEXT_MAX_ITEMS = 200
 _CROSS_SESSION_CONTENT_FIELDS = frozenset({"content", "summary", "transcript_content", "snippet"})
+_CROSS_SESSION_AUTH_MAX_CANDIDATES = 256
+_CROSS_SESSION_AUTH_MAX_NODES = 1_600
+_CROSS_SESSION_AUTH_MAX_MESSAGES = 6_400
+_CROSS_SESSION_AUTH_MAX_EDGES = 6_400
+_CROSS_SESSION_AUTH_MAX_DEPTH = 64
+_CROSS_SESSION_AUTH_QUERY_BATCH = 400
+_MANDATORY_REDACTION_LOOKAHEAD_CHARS = 8_192
+_MANDATORY_REDACTION_CHARS_PER_TOKEN = 16
+_BOUNDARY_PRIVATE_KEY_BEGIN_RE = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE
+)
+_BOUNDARY_STANDALONE_CREDENTIAL_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:github_pat_[A-Za-z0-9_]*|(?:AKIA|ASIA)[A-Z0-9]*)\Z"
+)
 
 
 def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
@@ -517,17 +531,41 @@ _LCM_INSPECT_REF_SCAN_MESSAGE_LIMIT = 10_000
 _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES = 16_384
 
 
-def _slice_content_for_response(content: str, max_tokens: int, content_offset: int = 0) -> dict[str, Any]:
+def _slice_content_for_response(
+    content: str,
+    max_tokens: int,
+    content_offset: int = 0,
+    *,
+    config=None,
+) -> dict[str, Any]:
     content = content or ""
     content_offset = min(max(0, content_offset), len(content))
-    sliced, _ = _truncate_text_to_token_budget(content[content_offset:], max_tokens)
+    source = content[content_offset:]
+    if config is None:
+        sliced, window_truncated = _truncate_text_to_token_budget(source, max_tokens)
+    else:
+        sliced, window_truncated = _bounded_cross_session_text(
+            source,
+            config,
+            max_tokens=max_tokens,
+            max_chars=None,
+        )
     if not sliced and content_offset < len(content):
         # A tiny token budget can fail to fit even the next character. Return one
         # character anyway so callers make deterministic, lossless cursor progress
         # instead of receiving has_more=true with the same content_offset forever.
-        sliced = content[content_offset:content_offset + 1]
-    next_content_offset = content_offset + len(sliced)
-    has_more = next_content_offset < len(content)
+        sliced = (
+            "[LCM redacted]"
+            if config is not None
+            else content[content_offset:content_offset + 1]
+        )
+    # Offsets are raw-source cursors. Redaction can change output length, so a
+    # bounded protected page advances by the raw window budget rather than by
+    # placeholder length. Non-truncated pages still consume the complete source.
+    raw_page_chars = max(1, int(max_tokens) * _MANDATORY_REDACTION_CHARS_PER_TOKEN)
+    raw_consumed = len(source) if not window_truncated else min(len(source), raw_page_chars)
+    next_content_offset = content_offset + raw_consumed
+    has_more = window_truncated or next_content_offset < len(content)
     return {
         "content": sliced,
         "content_chars": len(content),
@@ -741,7 +779,12 @@ def _expand_message_sources(
         if not hydrate_externalized_content and _is_compact_externalized_marker(content, ref):
             sliced = _full_content_slice(content, effective_content_offset)
         else:
-            sliced = _slice_content_for_response(content, remaining_tokens, effective_content_offset)
+            sliced = _slice_content_for_response(
+                content,
+                remaining_tokens,
+                effective_content_offset,
+                config=engine._config,
+            )
         expanded = {
             "store_id": stored["store_id"],
             "source_index": source_index,
@@ -855,25 +898,38 @@ def _expand_child_nodes(
     next_source_offset: int | None = None
     has_more = (source_offset + source_limit) < total_sources
     for source_index, child in children:
-        summary = child.summary
-        summary_truncated = False
-        if max_tokens is not None:
-            remaining_tokens = max_tokens - budget_used
-            if remaining_tokens <= 0:
-                next_source_offset = source_index
-                has_more = True
-                break
-            summary, summary_truncated = _truncate_text_to_token_budget(summary, remaining_tokens)
+        remaining_tokens = (
+            max_tokens - budget_used
+            if max_tokens is not None
+            else _CROSS_SESSION_METADATA_MAX_TOKENS
+        )
+        if remaining_tokens <= 0:
+            next_source_offset = source_index
+            has_more = True
+            break
+        summary, summary_truncated = _bounded_cross_session_text(
+            child.summary,
+            engine._config,
+            max_tokens=remaining_tokens,
+            max_chars=None if max_tokens is not None else 1000,
+        )
+        safe_hint, hint_truncated = _bounded_cross_session_text(
+            child.expand_hint,
+            engine._config,
+            max_tokens=_CROSS_SESSION_METADATA_MAX_TOKENS,
+            max_chars=_CROSS_SESSION_METADATA_MAX_CHARS,
+        )
         expanded.append(
             {
                 "node_id": child.node_id,
                 "source_index": source_index,
                 "depth": child.depth,
-                "summary": summary[:1000] if max_tokens is None else summary,
-                "summary_truncated": summary_truncated or (max_tokens is None and len(child.summary) > 1000),
+                "summary": summary,
+                "summary_truncated": summary_truncated,
                 "token_count": child.token_count,
                 "source_token_count": child.source_token_count,
-                "expand_hint": child.expand_hint,
+                "expand_hint": safe_hint,
+                "expand_hint_truncated": hint_truncated,
             }
         )
         budget_used += count_tokens(summary)
@@ -1018,7 +1074,18 @@ def _collect_context_blocks_for_node(
 ) -> list[dict[str, Any]]:
     from .tokens import count_tokens
 
-    summary, summary_truncated = _truncate_text_to_token_budget(node.summary, max_tokens)
+    summary, summary_truncated = _bounded_cross_session_text(
+        node.summary,
+        engine._config,
+        max_tokens=max_tokens,
+        max_chars=None,
+    )
+    safe_hint, hint_truncated = _bounded_cross_session_text(
+        node.expand_hint,
+        engine._config,
+        max_tokens=_CROSS_SESSION_METADATA_MAX_TOKENS,
+        max_chars=_CROSS_SESSION_METADATA_MAX_CHARS,
+    )
     blocks: list[dict[str, Any]] = [
         {
             "type": "summary",
@@ -1026,7 +1093,8 @@ def _collect_context_blocks_for_node(
             "depth": node.depth,
             "summary": summary,
             "summary_truncated": summary_truncated,
-            "expand_hint": node.expand_hint,
+            "expand_hint": safe_hint,
+            "expand_hint_truncated": hint_truncated,
             "token_count": node.token_count,
         }
     ]
@@ -1107,7 +1175,12 @@ def _collect_raw_match_context_block(
             break
         content = str(row.get("content") or "")
         match_offset = _content_offset_for_query_match(content, query)
-        content_slice = _slice_content_for_response(content, remaining_tokens, content_offset=match_offset)
+        content_slice = _slice_content_for_response(
+            content,
+            remaining_tokens,
+            content_offset=match_offset,
+            config=engine._config,
+        )
         content = content_slice["content"]
         item = {
             "store_id": store_id,
@@ -1209,11 +1282,35 @@ def _bounded_cross_session_text(
     max_chars: int | None,
 ) -> tuple[str, bool]:
     """Redact and bound one archive string before it reaches synthesis/output."""
-    text = str(value or "")
+    raw_text = str(value or "")
     truncated = False
-    # Redact the complete value first. Truncating first can split a PEM block or
-    # credential at the exact output boundary and turn it into an unmatched leak.
+    # Scan a bounded output window plus lookahead before any safe truncation.
+    # The lookahead closes credentials that straddle the visible boundary; the
+    # explicit tail guards fail closed for a PEM/token longer than the window.
+    visible_char_budget = (
+        max(0, int(max_chars))
+        if max_chars is not None
+        else max(1, int(max_tokens)) * _MANDATORY_REDACTION_CHARS_PER_TOKEN
+    )
+    scan_limit = min(
+        len(raw_text),
+        visible_char_budget + _MANDATORY_REDACTION_LOOKAHEAD_CHARS,
+    )
+    text = raw_text[:scan_limit]
+    truncated = scan_limit < len(raw_text)
     text = redact_sensitive_output_text(text)
+    pem_begin = _BOUNDARY_PRIVATE_KEY_BEGIN_RE.search(text)
+    if pem_begin is not None:
+        text = (
+            text[:pem_begin.start()]
+            + "[LCM sensitive redaction: name=private_key; boundary-truncated]"
+        )
+        truncated = True
+    text, boundary_credential_count = _BOUNDARY_STANDALONE_CREDENTIAL_RE.subn(
+        "[LCM sensitive redaction: name=standalone_credential; boundary-truncated]",
+        text,
+    )
+    truncated = truncated or bool(boundary_credential_count)
     if max_chars is not None and len(text) > max_chars:
         text = text[:max_chars]
         truncated = True
@@ -1221,43 +1318,197 @@ def _bounded_cross_session_text(
     return text, truncated or token_truncated
 
 
-def _node_provenance_is_authorized(
+def _authorize_node_provenance_bounded(
     engine: "LCMEngine",
-    node,
+    candidates: list[Any],
     allowed_session_ids: frozenset[str],
-) -> bool:
-    """Require complete node/raw provenance to remain inside the capability."""
-    stack = [node]
-    visited: set[int] = set()
-    remaining = _CROSS_SESSION_CONTEXT_MAX_ITEMS * _CROSS_SESSION_CONTEXT_MAX_DEPTH
-    while stack:
-        current = stack.pop()
-        node_id = int(current.node_id)
-        if node_id in visited:
+    *,
+    deadline: float,
+) -> tuple[list[Any], dict[str, Any]]:
+    """Authorize candidates with shared hard caps, bulk reads, and fail-closed gaps."""
+    diagnostics: dict[str, Any] = {
+        "authorization_truncated": len(candidates) > _CROSS_SESSION_AUTH_MAX_CANDIDATES,
+        "authorization_timed_out": False,
+        "authorization_candidates_seen": len(candidates),
+        "authorization_candidates_checked": 0,
+        "authorization_nodes_checked": 0,
+        "authorization_messages_checked": 0,
+        "authorization_edges_checked": 0,
+        "authorization_limits": {
+            "candidates": _CROSS_SESSION_AUTH_MAX_CANDIDATES,
+            "nodes": _CROSS_SESSION_AUTH_MAX_NODES,
+            "messages": _CROSS_SESSION_AUTH_MAX_MESSAGES,
+            "edges": _CROSS_SESSION_AUTH_MAX_EDGES,
+            "depth": _CROSS_SESSION_AUTH_MAX_DEPTH,
+        },
+    }
+    selected: list[Any] = []
+    selected_ids: set[int] = set()
+    for candidate in candidates[:_CROSS_SESSION_AUTH_MAX_CANDIDATES]:
+        node_id = int(candidate.node_id)
+        if node_id in selected_ids:
             continue
-        visited.add(node_id)
-        remaining -= 1
-        if remaining < 0 or current.session_id not in allowed_session_ids:
-            return False
-        if not current.source_ids:
-            return False
-        if current.source_type == "messages":
-            for source_id in current.source_ids:
-                row = engine._store._conn.execute(
-                    "SELECT session_id FROM messages WHERE store_id = ?",
-                    (int(source_id),),
-                ).fetchone()
-                if row is None or str(row[0] or "") not in allowed_session_ids:
-                    return False
-        elif current.source_type == "nodes":
-            for child_id in current.source_ids:
-                child = engine._dag.get_node(int(child_id))
-                if child is None:
-                    return False
-                stack.append(child)
+        selected_ids.add(node_id)
+        selected.append(candidate)
+
+    graph: dict[int, tuple[str, str, list[int]] | None] = {}
+    incomplete: set[int] = set()
+    queued: set[int] = set()
+    queue: list[tuple[int, int]] = []
+    for candidate in selected:
+        node_id = int(candidate.node_id)
+        graph[node_id] = (
+            str(candidate.session_id or ""),
+            str(candidate.source_type or ""),
+            [int(source_id) for source_id in candidate.source_ids],
+        )
+        queue.append((node_id, 0))
+        queued.add(node_id)
+
+    message_ids: set[int] = set()
+    expanded_nodes: set[int] = set()
+    while queue:
+        if time.monotonic() >= deadline:
+            diagnostics["authorization_timed_out"] = True
+            break
+        node_id, depth = queue.pop(0)
+        if node_id in expanded_nodes:
+            continue
+        if depth > _CROSS_SESSION_AUTH_MAX_DEPTH:
+            diagnostics["authorization_truncated"] = True
+            incomplete.add(node_id)
+            continue
+        missing_ids = [node_id] if node_id not in graph else []
+        if missing_ids:
+            missing_set = {node_id}
+            for queued_id, _queued_depth in queue:
+                if len(missing_ids) >= _CROSS_SESSION_AUTH_QUERY_BATCH:
+                    break
+                if queued_id in graph or queued_id in missing_set:
+                    continue
+                missing_ids.append(queued_id)
+                missing_set.add(queued_id)
+        if missing_ids:
+            remaining_nodes = _CROSS_SESSION_AUTH_MAX_NODES - len(graph)
+            if remaining_nodes <= 0:
+                diagnostics["authorization_truncated"] = True
+                incomplete.add(node_id)
+                break
+            missing_ids = missing_ids[:remaining_nodes]
+            placeholders = ",".join("?" for _ in missing_ids)
+            rows = engine._dag._conn.execute(
+                f"""SELECT node_id, session_id, source_ids, source_type
+                    FROM summary_nodes WHERE node_id IN ({placeholders})""",
+                missing_ids,
+            ).fetchall()
+            found_ids: set[int] = set()
+            for row in rows:
+                found_id = int(row[0])
+                found_ids.add(found_id)
+                try:
+                    source_ids = [int(value) for value in json.loads(row[2] or "[]")]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    source_ids = []
+                    incomplete.add(found_id)
+                graph[found_id] = (
+                    str(row[1] or ""), str(row[3] or ""), source_ids
+                )
+            for missing_id in set(missing_ids) - found_ids:
+                graph[missing_id] = None
+        record = graph.get(node_id)
+        expanded_nodes.add(node_id)
+        if record is None:
+            continue
+        session_id, source_type, source_ids = record
+        if not source_ids or session_id not in allowed_session_ids:
+            continue
+        remaining_edges = _CROSS_SESSION_AUTH_MAX_EDGES - int(
+            diagnostics["authorization_edges_checked"]
+        )
+        if len(source_ids) > remaining_edges:
+            diagnostics["authorization_truncated"] = True
+            incomplete.add(node_id)
+            source_ids = source_ids[:max(0, remaining_edges)]
+        diagnostics["authorization_edges_checked"] += len(source_ids)
+        if source_type == "messages":
+            message_ids.update(source_ids)
+        elif source_type == "nodes":
+            if depth >= _CROSS_SESSION_AUTH_MAX_DEPTH and source_ids:
+                diagnostics["authorization_truncated"] = True
+                incomplete.add(node_id)
+                continue
+            for child_id in source_ids:
+                if child_id not in queued:
+                    queue.append((child_id, depth + 1))
+                    queued.add(child_id)
         else:
+            incomplete.add(node_id)
+
+    diagnostics["authorization_nodes_checked"] = len(expanded_nodes)
+    if len(message_ids) > _CROSS_SESSION_AUTH_MAX_MESSAGES:
+        diagnostics["authorization_truncated"] = True
+    bounded_message_ids = list(message_ids)[:_CROSS_SESSION_AUTH_MAX_MESSAGES]
+    message_sessions: dict[int, str] = {}
+    for offset in range(0, len(bounded_message_ids), _CROSS_SESSION_AUTH_QUERY_BATCH):
+        if time.monotonic() >= deadline:
+            diagnostics["authorization_timed_out"] = True
+            break
+        batch = bounded_message_ids[offset:offset + _CROSS_SESSION_AUTH_QUERY_BATCH]
+        placeholders = ",".join("?" for _ in batch)
+        rows = engine._store._conn.execute(
+            f"SELECT store_id, session_id FROM messages WHERE store_id IN ({placeholders})",
+            batch,
+        ).fetchall()
+        message_sessions.update({int(row[0]): str(row[1] or "") for row in rows})
+    diagnostics["authorization_messages_checked"] = len(message_sessions)
+
+    if diagnostics["authorization_timed_out"]:
+        return [], diagnostics
+
+    memo: dict[int, bool] = {}
+    visiting: set[int] = set()
+
+    def authorized(node_id: int, depth: int = 0) -> bool:
+        if time.monotonic() >= deadline:
+            diagnostics["authorization_timed_out"] = True
             return False
-    return True
+        if depth > _CROSS_SESSION_AUTH_MAX_DEPTH or node_id in incomplete:
+            diagnostics["authorization_truncated"] = True
+            return False
+        if node_id in memo:
+            return memo[node_id]
+        if node_id in visiting:
+            memo[node_id] = False
+            return False
+        record = graph.get(node_id)
+        if record is None:
+            memo[node_id] = False
+            return False
+        session_id, source_type, source_ids = record
+        if session_id not in allowed_session_ids or not source_ids:
+            memo[node_id] = False
+            return False
+        visiting.add(node_id)
+        if source_type == "messages":
+            result = all(
+                message_sessions.get(source_id) in allowed_session_ids
+                for source_id in source_ids
+            )
+        elif source_type == "nodes":
+            result = all(authorized(child_id, depth + 1) for child_id in source_ids)
+        else:
+            result = False
+        visiting.discard(node_id)
+        memo[node_id] = result
+        return result
+
+    authorized_candidates = [
+        candidate for candidate in selected if authorized(int(candidate.node_id))
+    ]
+    diagnostics["authorization_candidates_checked"] = len(selected)
+    if diagnostics["authorization_timed_out"]:
+        return [], diagnostics
+    return authorized_candidates, diagnostics
 
 
 def _bound_cross_session_context(
@@ -1487,6 +1738,18 @@ def _cross_session_expand_query(
     )
     if error:
         return json.dumps({"error": error})
+    safe_prompt, prompt_truncated = _bounded_cross_session_text(
+        prompt,
+        engine._config,
+        max_tokens=2_000,
+        max_chars=20_000,
+    )
+    safe_query, query_truncated = _bounded_cross_session_text(
+        query,
+        engine._config,
+        max_tokens=_CROSS_SESSION_METADATA_MAX_TOKENS,
+        max_chars=2_000,
+    )
 
     guard_key = str(Path(engine._config.database_path or "<default>").resolve())
     with _CROSS_SESSION_EXPANSION_GUARD:
@@ -1516,12 +1779,15 @@ def _cross_session_expand_query(
         else:
             return json.dumps({"error": "Provide either query or node_ids"})
 
-        candidates = [
-            node
-            for node in candidates
-            if node.session_id in allowed_session_ids
-            and _node_provenance_is_authorized(engine, node, allowed_session_ids)
+        owner_scoped_candidates = [
+            node for node in candidates if node.session_id in allowed_session_ids
         ]
+        candidates, authorization = _authorize_node_provenance_bounded(
+            engine,
+            owner_scoped_candidates,
+            allowed_session_ids,
+            deadline=deadline,
+        )
 
         # Search order is relevance order. First bucket occurrence therefore
         # ranks sessions before any source expansion occurs.
@@ -1546,9 +1812,11 @@ def _cross_session_expand_query(
             for session_id in ranked_session_ids[max_sessions:]
         ]
         if not selected_session_ids:
-            return json.dumps({
-                "prompt": prompt,
-                "query": query,
+            payload = {
+                "prompt": safe_prompt,
+                "prompt_truncated": prompt_truncated,
+                "query": safe_query,
+                "query_truncated": query_truncated,
                 "answer": "No authorized matching summary nodes found in the selected LCM sessions.",
                 "cross_session": True,
                 "session_scope": scope,
@@ -1559,7 +1827,20 @@ def _cross_session_expand_query(
                 "skipped_buckets": skipped_buckets,
                 "context_truncated": False,
                 "externalized_refs": "metadata-only",
-            })
+                **authorization,
+            }
+            if (
+                authorization["authorization_truncated"]
+                or authorization["authorization_timed_out"]
+            ):
+                payload.update({
+                    "degraded": True,
+                    "timed_out": bool(
+                        authorization["authorization_timed_out"]
+                    ),
+                    "context_truncated": True,
+                })
+            return json.dumps(payload)
 
         context_blocks: list[dict[str, Any]] = []
         matches: list[dict[str, Any]] = []
@@ -1667,8 +1948,10 @@ def _cross_session_expand_query(
             item["truncated"] for item in session_status
         ) or bool(skipped_buckets)
         base_payload: dict[str, Any] = {
-            "prompt": prompt,
-            "query": query,
+            "prompt": safe_prompt,
+            "prompt_truncated": prompt_truncated,
+            "query": safe_query,
+            "query_truncated": query_truncated,
             "cross_session": True,
             "session_scope": scope,
             "max_sessions": max_sessions,
@@ -1685,6 +1968,7 @@ def _cross_session_expand_query(
             "matches": matches,
             "session_status": session_status,
             "skipped_buckets": skipped_buckets,
+            **authorization,
         }
         if not context_blocks:
             base_payload.update({
@@ -2311,7 +2595,12 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
         if payload is None:
             return json.dumps({"error": f"Externalized payload {externalized_ref} not found in current session"})
         content = payload.get("content", "")
-        sliced = _slice_content_for_response(content, max_tokens, content_offset)
+        sliced = _slice_content_for_response(
+            content,
+            max_tokens,
+            content_offset,
+            config=engine._config,
+        )
         return json.dumps(
             {
                 "externalized_ref": externalized_ref,
@@ -2341,7 +2630,12 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
         if stored is None:
             return json.dumps({"error": f"Message store_id {store_id} not found"})
         transcript_content = stored.get("content", "") or ""
-        sliced = _slice_content_for_response(transcript_content, max_tokens, content_offset)
+        sliced = _slice_content_for_response(
+            transcript_content,
+            max_tokens,
+            content_offset,
+            config=engine._config,
+        )
         engine_session_id = engine.current_session_id
         stored_session_id = stored.get("session_id", "")
         result: Dict[str, Any] = {
@@ -2770,6 +3064,11 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             f"lcm_expand_query synthesis timed out after {timeout:.3g}s",
             include_timeout=True,
         )
+    except Exception:
+        logger.warning(
+            "LCM expand_query synthesis failed after bounded evidence collection"
+        )
+        return _degraded_payload("lcm_expand_query synthesis failed")
 
     answer = str(answer).strip() if answer is not None else ""
     if not answer:

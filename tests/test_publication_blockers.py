@@ -442,3 +442,194 @@ def test_foreground_winner_atomically_supersedes_all_losing_base_batches(
         assert status["superseded_batches"] >= 2
     finally:
         engine.shutdown()
+
+
+def test_winner_committing_before_preparer_row_creation_cannot_leave_ready_batch(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    messages = _messages()
+    engine.ingest(messages)
+    hash_captured = threading.Event()
+    winner_committed = threading.Event()
+    original_hash = engine_module.compute_source_identity_hash
+
+    monkeypatch.setattr(
+        engine,
+        "_summarize_leaf_chunk_with_rescue",
+        lambda initial_chunk, focus_topic=None: (
+            list(initial_chunk), 100, "stale preparer summary", 1, 1
+        ),
+    )
+
+    def pause_after_snapshot(conn, session_id, source_ids):
+        value = original_hash(conn, session_id, source_ids)
+        if threading.current_thread().name == "in-flight-preparer" and not hash_captured.is_set():
+            hash_captured.set()
+            assert winner_committed.wait(timeout=3)
+        return value
+
+    monkeypatch.setattr(engine_module, "compute_source_identity_hash", pause_after_snapshot)
+    prepared = {}
+
+    def prepare():
+        prepared["batch"] = engine.prepare_background_compaction_once(messages)
+
+    thread = threading.Thread(target=prepare, name="in-flight-preparer")
+    try:
+        thread.start()
+        assert hash_captured.wait(timeout=2)
+        source_ids = engine._get_store_ids_for_messages(messages[1:-2])
+        winner = engine._publish_foreground_leaf(
+            node=SummaryNode(
+                session_id=SESSION_ID,
+                depth=0,
+                summary="foreground winner before row",
+                token_count=5,
+                source_token_count=100,
+                source_ids=source_ids,
+                source_type="messages",
+                created_at=1.0,
+            ),
+            source_end_store_id=max(source_ids),
+            covered_source_ids=source_ids,
+        )
+        assert winner["published"] is True
+        winner_committed.set()
+        thread.join(timeout=4)
+        assert not thread.is_alive()
+        batch = prepared.get("batch")
+        assert batch is None or batch.state in {"superseded", "rejected"}
+        assert engine.get_async_compaction_status()["prepared_batches"] == 0
+    finally:
+        winner_committed.set()
+        thread.join(timeout=2)
+        engine.shutdown()
+
+
+def test_winner_committing_before_preparer_ready_update_cannot_resurrect_batch(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    messages = _messages()
+    engine.ingest(messages)
+    summarizer_entered = threading.Event()
+    winner_committed = threading.Event()
+
+    def summarize(initial_chunk, focus_topic=None):
+        summarizer_entered.set()
+        assert winner_committed.wait(timeout=3)
+        return list(initial_chunk), 100, "stale ready update", 1, 1
+
+    monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", summarize)
+    prepared = {}
+
+    def prepare():
+        prepared["batch"] = engine.prepare_background_compaction_once(messages)
+
+    thread = threading.Thread(target=prepare, name="ready-update-preparer")
+    try:
+        thread.start()
+        assert summarizer_entered.wait(timeout=2)
+        preparing = engine._frontier.list_pending_batches(CONVERSATION_ID)
+        assert len(preparing) == 1 and preparing[0].state == "preparing"
+        source_ids = list(preparing[0].source_ids)
+        winner = engine._publish_foreground_leaf(
+            node=SummaryNode(
+                session_id=SESSION_ID,
+                depth=0,
+                summary="foreground winner before ready",
+                token_count=5,
+                source_token_count=100,
+                source_ids=source_ids,
+                source_type="messages",
+                created_at=1.0,
+            ),
+            source_end_store_id=max(source_ids),
+            covered_source_ids=source_ids,
+        )
+        assert winner["published"] is True
+        winner_committed.set()
+        thread.join(timeout=4)
+        assert not thread.is_alive()
+        settled = engine._frontier.get_batch(preparing[0].batch_id)
+        assert settled is not None
+        assert settled.state in {"superseded", "rejected"}
+        assert engine.get_async_compaction_status()["prepared_batches"] == 0
+    finally:
+        winner_committed.set()
+        thread.join(timeout=2)
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("mutation", ["tool_call_id", "tool_calls", "multimodal_content"])
+def test_foreground_identity_rejects_concurrent_semantic_field_mutation(
+    tmp_path, monkeypatch, mutation
+):
+    engine = _engine(tmp_path)
+    messages = [
+        {"role": "system", "content": "system prompt"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "semantic source"},
+                {"type": "image_url", "image_url": {"url": "https://example.invalid/a.png"}},
+            ],
+            "tool_calls": [
+                {"id": "call-original", "type": "function", "function": {"name": "lookup", "arguments": "{\"x\":1}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-original", "content": "tool result"},
+        {"role": "user", "content": "fresh one"},
+        {"role": "assistant", "content": "fresh two"},
+    ]
+    engine.ingest(messages)
+    monkeypatch.setattr(
+        engine_module,
+        "summarize_with_escalation",
+        lambda **kwargs: ("semantic identity summary", 0),
+    )
+    original_publish = engine._publish_foreground_leaf
+    mutation_done = threading.Event()
+
+    def publish_after_mutation(**kwargs):
+        source_ids = list(kwargs["covered_source_ids"])
+
+        def mutate():
+            conn = sqlite3.connect(str(engine._store.db_path), timeout=2)
+            try:
+                if mutation == "tool_call_id":
+                    conn.execute(
+                        "UPDATE messages SET tool_call_id = 'call-mutated' WHERE store_id = ?",
+                        (source_ids[-1],),
+                    )
+                elif mutation == "tool_calls":
+                    conn.execute(
+                        "UPDATE messages SET tool_calls = ? WHERE store_id = ?",
+                        ('[{"id":"call-mutated","type":"function","function":{"name":"other","arguments":"{}"}}]', source_ids[0]),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE messages SET content = ? WHERE store_id = ?",
+                        ('[{"type":"text","text":"mutated metadata"}]', source_ids[0]),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+                mutation_done.set()
+
+        mutator = threading.Thread(target=mutate, name=f"semantic-{mutation}")
+        mutator.start()
+        assert mutation_done.wait(timeout=2)
+        mutator.join(timeout=2)
+        return original_publish(**kwargs)
+
+    monkeypatch.setattr(engine, "_publish_foreground_leaf", publish_after_mutation)
+    try:
+        before = engine._frontier.get_active_frontier(CONVERSATION_ID)
+        engine.compress(messages, current_tokens=engine.threshold_tokens + 1, force=True)
+        assert mutation_done.is_set()
+        assert engine._dag.get_session_nodes(SESSION_ID) == []
+        assert engine._frontier.get_active_frontier(CONVERSATION_ID) == before
+    finally:
+        engine.shutdown()
