@@ -88,6 +88,7 @@ def register(ctx):
         LCM_DESCRIBE,
         LCM_EXPAND,
         LCM_EXPAND_QUERY,
+        LCM_FOCUS,
         LCM_STATUS,
         LCM_INSPECT,
         LCM_DOCTOR,
@@ -140,6 +141,7 @@ def register(ctx):
         ("lcm_describe", LCM_DESCRIBE, "📊"),
         ("lcm_expand", LCM_EXPAND, "🔎"),
         ("lcm_expand_query", LCM_EXPAND_QUERY, "❓"),
+        ("lcm_focus", LCM_FOCUS, "🎯"),
         ("lcm_status", LCM_STATUS, "💚"),
         ("lcm_inspect", LCM_INSPECT, "🧭"),
         ("lcm_doctor", LCM_DOCTOR, "🏥"),
@@ -191,6 +193,12 @@ def register(ctx):
         logger.info("LCM slash command registration disabled (set LCM_ENABLE_SLASH_COMMAND=1 to enable /lcm)")
     else:
         logger.info("LCM slash command registration unavailable on this Hermes host; continuing without /lcm")
+
+    # The standalone fresh-process doctor validates discovery, construction,
+    # schemas, and binding without attaching hooks to a real host singleton.
+    if bool(getattr(ctx, "preflight_only", False)):
+        logger.info("LCM plugin preflight registration complete")
+        return engine
 
     # Register a post_llm_call hook so every completed turn is persisted to
     # the durable store, regardless of whether compression triggers.  Without

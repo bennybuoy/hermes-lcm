@@ -27,7 +27,7 @@ class SchemaVersionTooNewError(RuntimeError):
     """
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 # Bounded busy wait for foreground cutover so compress() cannot hang
 # indefinitely behind a concurrent writer (gateway host holds compression_locks).
@@ -41,6 +41,7 @@ REQUIRED_CORE_TABLES = (
     "summary_nodes",
     "lcm_lifecycle_state",
     "lcm_migration_state",
+    "lcm_focus_briefs",
     "messages_fts",
     "nodes_fts",
 )
@@ -391,6 +392,70 @@ def ensure_prepared_batch_payload_columns(conn: sqlite3.Connection) -> None:
     add_column_if_missing(
         conn, columns, "payload_version",
         "ALTER TABLE lcm_prepared_batches ADD COLUMN payload_version INTEGER NOT NULL DEFAULT 0",
+    )
+
+
+def ensure_focus_and_policy_metadata(conn: sqlite3.Connection) -> None:
+    """Create schema-v8 immutable focus briefs and prepared-policy metadata."""
+    ensure_frontier_tables(conn)
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(lcm_prepared_batches)").fetchall()
+    }
+    add_column_if_missing(
+        conn,
+        columns,
+        "resolved_policy_json",
+        "ALTER TABLE lcm_prepared_batches ADD COLUMN resolved_policy_json TEXT NOT NULL DEFAULT '{}'",
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_focus_briefs (
+            focus_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            content TEXT NOT NULL,
+            source_node_ids TEXT NOT NULL DEFAULT '[]',
+            covered_generation INTEGER NOT NULL DEFAULT 0,
+            covered_store_id INTEGER NOT NULL DEFAULT 0,
+            token_count INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1)),
+            supersedes_focus_id INTEGER,
+            FOREIGN KEY(supersedes_focus_id) REFERENCES lcm_focus_briefs(focus_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_focus_one_active
+        ON lcm_focus_briefs(conversation_id) WHERE active = 1
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_focus_conversation_history
+        ON lcm_focus_briefs(conversation_id, focus_id DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS lcm_focus_briefs_immutable
+        BEFORE UPDATE ON lcm_focus_briefs
+        WHEN OLD.conversation_id != NEW.conversation_id
+          OR OLD.session_id != NEW.session_id
+          OR OLD.prompt != NEW.prompt
+          OR OLD.content != NEW.content
+          OR OLD.source_node_ids != NEW.source_node_ids
+          OR OLD.covered_generation != NEW.covered_generation
+          OR OLD.covered_store_id != NEW.covered_store_id
+          OR OLD.token_count != NEW.token_count
+          OR OLD.created_at != NEW.created_at
+          OR COALESCE(OLD.supersedes_focus_id, 0) != COALESCE(NEW.supersedes_focus_id, 0)
+        BEGIN
+            SELECT RAISE(ABORT, 'focus briefs are immutable');
+        END
+        """
     )
 
 
@@ -867,5 +932,10 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
         supersede_legacy_v1_ready_batches(conn)
         mark_migration_step_complete(conn, "v7_prepared_batch_summary_payload")
         current_version = 7
+
+    ensure_focus_and_policy_metadata(conn)
+    if current_version < 8:
+        mark_migration_step_complete(conn, "v8_focus_and_resolved_policy_metadata")
+        current_version = 8
 
     set_schema_version(conn, current_version)

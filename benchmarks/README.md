@@ -9,6 +9,26 @@ The benchmark harness is offline by default:
 - no live Hermes config mutation
 - writes isolated to the requested output directory
 
+## Cache-economics and prompt-selection trace report
+
+`scripts/lcm_policy_benchmark.py` aggregates operator-supplied per-turn traces
+for chronological, prompt-aware, discounted-route, or no-discount strategies:
+
+```bash
+python scripts/lcm_policy_benchmark.py \
+  benchmarks/fixtures/policy_strategy_synthetic.json --pretty
+```
+
+The report covers input tokens, observed cache-read telemetry, explicitly
+reported billable input, summary spend, cutover frequency, prefix churn,
+retrieval/recall scores, and assembly latency. Billable input remains `null`
+unless every trace row supplies `billable_input_tokens`; the harness never
+turns cache-read tokens into a presumed discount. The committed synthetic
+fixture and `benchmarks/artifacts/policy_strategy_synthetic_report.json` are a
+reproducibility contract, not provider measurements or a recommendation to
+enable prompt-aware selection. Real-provider results must come from an
+operator-recorded trace and must retain their provenance.
+
 ## Run the default replay suite
 
 ```bash

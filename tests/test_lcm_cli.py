@@ -8,9 +8,14 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+from pathlib import Path
 
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+HERMES_AGENT_ROOT = Path("/home/ben/hermes-agent-gil-pr")
 
 
 def _seed(tmp_path):
@@ -34,7 +39,7 @@ def _run(db, *args):
     return subprocess.run(
         [
             sys.executable,
-            "/tmp/hermes-lcm-codex-all-issues/lcm_cli.py",
+            str(REPO_ROOT / "lcm_cli.py"),
             "--database",
             str(db),
             *args,
@@ -44,7 +49,7 @@ def _run(db, *args):
             **os.environ,
             "PYTHONPATH": os.pathsep.join(
                 [
-                    "/tmp/hermes-lcm-codex-all-issues",
+                    str(REPO_ROOT),
                     "/home/ben/hermes-agent-gil-pr",
                 ]
             ),
@@ -61,7 +66,7 @@ def test_cli_status_is_json_first_and_works_without_gateway(tmp_path):
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["database_path"] == str(db)
-    assert payload["schema_version"] == 7
+    assert payload["schema_version"] == 8
     assert payload["counts"]["messages"] == 2
     assert payload["read_only"] is True
 
@@ -126,14 +131,14 @@ def test_cli_config_show_exposes_only_lcm_section(tmp_path):
     result = subprocess.run(
         [
             sys.executable,
-            "/tmp/hermes-lcm-codex-all-issues/lcm_cli.py",
+            str(REPO_ROOT / "lcm_cli.py"),
             "--hermes-home",
             str(hermes_home),
             "config",
             "show",
         ],
         cwd=os.fspath(tmp_path),
-        env={**os.environ, "PYTHONPATH": "/tmp/hermes-lcm-codex-all-issues"},
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
         text=True,
         capture_output=True,
         check=False,
@@ -162,9 +167,11 @@ def test_packaged_console_script_runs_without_gateway(tmp_path):
     target = tmp_path / "site"
     source = tmp_path / "source"
     shutil.copytree(
-        "/tmp/hermes-lcm-codex-all-issues",
+        REPO_ROOT,
         source,
-        ignore=shutil.ignore_patterns(".git", "build", "*.egg-info", "__pycache__"),
+        ignore=shutil.ignore_patterns(
+            ".git", "build", "*.egg-info", "__pycache__", "CODEX_REPORT.md"
+        ),
     )
     install = subprocess.run(
         [
@@ -200,3 +207,41 @@ def test_packaged_console_script_runs_without_gateway(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["read_only"] is True
+
+    preflight = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_lcm.lcm_cli",
+            "--pretty",
+            "activation-preflight",
+        ],
+        env={
+            **os.environ,
+            "HOME": str(tmp_path / "preflight-home"),
+            "PYTHONPATH": os.pathsep.join([str(target), str(HERMES_AGENT_ROOT)]),
+        },
+        cwd=os.fspath(tmp_path),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert preflight.returncode == 0, preflight.stderr
+    preflight_payload = json.loads(preflight.stdout)
+    assert preflight_payload["status"] == "pass"
+    assert preflight_payload["host_activation_ordering_verified"] is False
+    assert set(preflight_payload["tool_names"]) == {
+        "lcm_grep",
+        "lcm_load_session",
+        "lcm_describe",
+        "lcm_expand",
+        "lcm_expand_query",
+        "lcm_focus",
+        "lcm_status",
+        "lcm_inspect",
+        "lcm_doctor",
+    }
+    assert (target / "hermes_lcm" / "plugin.yaml").is_file()
+    assert (
+        target / "hermes_lcm" / "docs" / "host-activation-contract.md"
+    ).is_file()

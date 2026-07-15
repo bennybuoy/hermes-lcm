@@ -1,0 +1,40 @@
+{
+  "economic_contract": "billable input is aggregated only when every trace turn supplies billable_input_tokens; cache_read_tokens remain observed telemetry",
+  "fixture_kind": "synthetic-contract-fixture-not-provider-results",
+  "provider_results_claimed": false,
+  "schema_version": 1,
+  "strategies": {
+    "chronological": {
+      "billable_input_source": "unavailable",
+      "cutover_frequency": 0.5,
+      "cutovers": 1,
+      "mean_assembly_latency_ms": 2.2,
+      "mean_recall_at_k": 0.5,
+      "mean_retrieval_score": 0.65,
+      "observed_cache_read_tokens": 900,
+      "observed_cache_reuse_ratio": 0.409091,
+      "prefix_churn_events": 1,
+      "prefix_churn_rate": 1.0,
+      "summary_input_tokens": 300,
+      "total_billable_input_tokens": null,
+      "total_input_tokens": 2200,
+      "turns": 2
+    },
+    "prompt-aware": {
+      "billable_input_source": "unavailable",
+      "cutover_frequency": 0.5,
+      "cutovers": 1,
+      "mean_assembly_latency_ms": 3.25,
+      "mean_recall_at_k": 0.85,
+      "mean_retrieval_score": 0.825,
+      "observed_cache_read_tokens": 650,
+      "observed_cache_reuse_ratio": 0.333333,
+      "prefix_churn_events": 1,
+      "prefix_churn_rate": 1.0,
+      "summary_input_tokens": 250,
+      "total_billable_input_tokens": null,
+      "total_input_tokens": 1950,
+      "turns": 2
+    }
+  }
+}

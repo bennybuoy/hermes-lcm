@@ -7,6 +7,8 @@ import json
 import os
 import sqlite3
 import sys
+import tempfile
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -17,7 +19,7 @@ EXIT_INVALID = 2
 EXIT_NOT_FOUND = 3
 EXIT_CONFIG = 4
 EXIT_DATABASE = 5
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class CliError(RuntimeError):
@@ -383,6 +385,182 @@ def _render(payload: Any, args: argparse.Namespace) -> str:
     return str(payload)
 
 
+def _maintenance(args: argparse.Namespace) -> dict[str, Any]:
+    from .maintenance import apply_dag_maintenance, plan_dag_maintenance
+
+    rewrites: dict[int, str] = {}
+    for value in args.rewrite or []:
+        if "=" not in value:
+            raise CliError("--rewrite must use NODE_ID=SUMMARY", EXIT_INVALID)
+        raw_id, summary = value.split("=", 1)
+        try:
+            rewrite_id = int(raw_id)
+        except ValueError as exc:
+            raise CliError("--rewrite node id must be an integer", EXIT_INVALID) from exc
+        if not summary.strip():
+            raise CliError("--rewrite summary cannot be empty", EXIT_INVALID)
+        rewrites[rewrite_id] = summary
+    kwargs = {
+        "operation": args.operation,
+        "conversation_id": args.conversation_id,
+        "node_id": args.node_id,
+        "rewrites": rewrites or None,
+        "target_session_id": args.target_session_id,
+        "target_conversation_id": args.target_conversation_id,
+    }
+    try:
+        if args.action == "plan":
+            return plan_dag_maintenance(_database_path(args), **kwargs)
+        return apply_dag_maintenance(
+            _database_path(args), confirmation=args.confirm, **kwargs
+        )
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        raise CliError(f"maintenance failed: {exc}", EXIT_DATABASE) from exc
+
+
+def _tui_snapshot(conn: sqlite3.Connection, path: Path) -> dict[str, Any]:
+    sessions = [dict(row) for row in conn.execute(
+        """
+        SELECT session_id, COUNT(*) AS messages, MAX(store_id) AS latest_store_id
+        FROM messages GROUP BY session_id ORDER BY latest_store_id DESC LIMIT 20
+        """
+    ).fetchall()]
+    frontiers = [dict(row) for row in conn.execute(
+        """
+        SELECT conversation_id, generation, session_id, source_end_store_id, updated_at
+        FROM lcm_active_frontiers ORDER BY updated_at DESC LIMIT 20
+        """
+    ).fetchall()] if _table_exists(conn, "lcm_active_frontiers") else []
+    lines = [f"hermes-lcm operator browser — {path}", "", "sessions"]
+    lines.extend(
+        f"  {row['session_id']}  messages={row['messages']} latest={row['latest_store_id']}"
+        for row in sessions
+    )
+    lines.extend(["", "active frontiers"])
+    lines.extend(
+        f"  {row['conversation_id']} gen={row['generation']} session={row['session_id']} end={row['source_end_store_id']}"
+        for row in frontiers
+    )
+    return {
+        "database_path": str(path),
+        "read_only": True,
+        "sessions": sessions,
+        "frontiers": frontiers,
+        "screen": "\n".join(lines),
+        "commands": ["r refresh", "q quit"],
+    }
+
+
+def _tui(args: argparse.Namespace) -> dict[str, Any]:
+    path = _database_path(args)
+    conn = _open_read_only(path)
+    try:
+        snapshot = _tui_snapshot(conn, path)
+        if args.once or not sys.stdin.isatty():
+            return snapshot
+        while True:
+            print("\033[2J\033[H" + snapshot["screen"])
+            command = input("[r]efresh [q]uit > ").strip().lower()
+            if command in {"q", "quit"}:
+                break
+            snapshot = _tui_snapshot(conn, path)
+        return {**snapshot, "closed": True}
+    finally:
+        conn.close()
+
+
+def _activation_preflight(args: argparse.Namespace) -> dict[str, Any]:
+    """Prove plugin discovery/registration/binding in this fresh CLI process."""
+    import hermes_lcm
+
+    phases: list[dict[str, Any]] = []
+    started = time.perf_counter()
+
+    def phase(name: str, phase_started: float, **details: Any) -> None:
+        phases.append({
+            "phase": name,
+            "duration_ms": round((time.perf_counter() - phase_started) * 1000.0, 3),
+            **details,
+        })
+
+    root = Path(hermes_lcm.__file__).resolve().parent
+    manifest = root / "plugin.yaml"
+    if not manifest.is_file():
+        raise CliError("plugin discovery failed: plugin.yaml missing", EXIT_CONFIG)
+    phase("discovery", started, plugin_path=str(root))
+
+    class Context:
+        preflight_only = True
+
+        def __init__(self):
+            self.engines = []
+
+        def register_context_engine(self, engine):
+            self.engines.append(engine)
+
+        def register_tool(self, **kwargs):
+            return None
+
+    with tempfile.TemporaryDirectory(prefix="hermes-lcm-activation-") as directory:
+        prior_database = os.environ.get("LCM_DATABASE_PATH")
+        prior_home = os.environ.get("HERMES_HOME")
+        os.environ["LCM_DATABASE_PATH"] = str(Path(directory) / "preflight.db")
+        os.environ["HERMES_HOME"] = directory
+        context = Context()
+        activation_started = time.perf_counter()
+        try:
+            hermes_lcm.register(context)
+        finally:
+            if prior_database is None:
+                os.environ.pop("LCM_DATABASE_PATH", None)
+            else:
+                os.environ["LCM_DATABASE_PATH"] = prior_database
+            if prior_home is None:
+                os.environ.pop("HERMES_HOME", None)
+            else:
+                os.environ["HERMES_HOME"] = prior_home
+        phase("activation", activation_started)
+        if len(context.engines) != 1:
+            raise CliError(
+                f"registration failed: expected one context engine, got {len(context.engines)}",
+                EXIT_CONFIG,
+            )
+        engine = context.engines[0]
+        phase_started = time.perf_counter()
+        if getattr(engine, "name", "") != args.expected_engine:
+            engine.shutdown()
+            raise CliError(
+                f"engine resolution failed: expected {args.expected_engine}", EXIT_CONFIG
+            )
+        phase("registration", phase_started, engine_name=engine.name)
+        phase_started = time.perf_counter()
+        engine.on_session_start(
+            "activation-preflight-session",
+            conversation_id="activation-preflight-conversation",
+            platform="preflight",
+        )
+        identity = engine.get_runtime_identity()
+        tool_names = [schema["name"] for schema in engine.get_tool_schemas()]
+        phase("session-binding", phase_started, session_id=identity["session_id"])
+        engine.shutdown()
+
+    return {
+        "status": "pass",
+        "fresh_process_pid": os.getpid(),
+        "expected_engine": args.expected_engine,
+        "effective_engine": "lcm",
+        "plugin_name": identity["plugin_name"],
+        "plugin_version": identity["plugin_version"],
+        "plugin_path": identity["plugin_path"],
+        "tool_names": tool_names,
+        "phases": phases,
+        "total_duration_ms": round((time.perf_counter() - started) * 1000.0, 3),
+        "host_activation_ordering_verified": False,
+        "host_contract": "docs/host-activation-contract.md",
+        "note": "This proves plugin-side registration in a fresh process; Hermes host startup ordering remains host-owned.",
+    }
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hermes-lcm")
     parser.add_argument("--database")
@@ -393,6 +571,22 @@ def _parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
     sub.add_parser("doctor")
+    tui = sub.add_parser("tui")
+    tui.add_argument("--once", action="store_true")
+    activation = sub.add_parser("activation-preflight")
+    activation.add_argument("--expected-engine", default="lcm")
+
+    maintenance = sub.add_parser("maintenance").add_subparsers(dest="action", required=True)
+    for action in ("plan", "apply"):
+        mutation = maintenance.add_parser(action)
+        mutation.add_argument("operation", choices=("rewrite-subtree", "dissolve", "copy-subtree"))
+        mutation.add_argument("--conversation-id", required=True)
+        mutation.add_argument("--node-id", type=int, required=True)
+        mutation.add_argument("--rewrite", action="append", default=[])
+        mutation.add_argument("--target-session-id", default="")
+        mutation.add_argument("--target-conversation-id", default="")
+        if action == "apply":
+            mutation.add_argument("--confirm", required=True)
 
     sessions = sub.add_parser("sessions").add_subparsers(dest="action", required=True)
     sessions_list = sessions.add_parser("list")
@@ -450,6 +644,12 @@ def main(argv: list[str] | None = None) -> int:
             raise CliError("--pretty and --table are mutually exclusive", EXIT_INVALID)
         if args.command == "config":
             payload = _config(args)
+        elif args.command == "maintenance":
+            payload = _maintenance(args)
+        elif args.command == "tui":
+            payload = _tui(args)
+        elif args.command == "activation-preflight":
+            payload = _activation_preflight(args)
         else:
             path = _database_path(args)
             conn = _open_read_only(path)

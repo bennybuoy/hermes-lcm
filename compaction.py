@@ -33,6 +33,16 @@ logger = logging.getLogger(__name__)
 
 
 class CompactionMixin:
+    def _request_preflight_or_defer_hot_cache(
+        self,
+        messages: List[Dict[str, Any]],
+        observed_tokens: int,
+    ) -> bool:
+        defer = getattr(self, "_should_defer_compaction_for_hot_cache", None)
+        if callable(defer) and defer(messages, observed_tokens=observed_tokens):
+            return False
+        return self._mark_preflight_compression_requested()
+
     def _maybe_reclassify_late_auxiliary_before_compaction_write(self) -> None:
         maybe_reclassify = getattr(
             self,
@@ -128,19 +138,27 @@ class CompactionMixin:
                 return False
             eligible, reason = self._leaf_compaction_candidate_status(replay_messages)
             if eligible:
-                return self._mark_preflight_compression_requested()
+                return self._request_preflight_or_defer_hot_cache(
+                    replay_messages, replay_rough
+                )
             if self._has_ignored_backlog_outside_fresh_tail(replay_messages):
-                return self._mark_preflight_compression_requested()
+                return self._request_preflight_or_defer_hot_cache(
+                    replay_messages, replay_rough
+                )
             if self.threshold_tokens > 0 and replay_rough >= self.threshold_tokens:
                 if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
-                    return self._mark_preflight_compression_requested()
+                    return self._request_preflight_or_defer_hot_cache(
+                        replay_messages, replay_rough
+                    )
                 self._last_compression_status = "noop"
                 self._last_compression_noop_reason = reason
                 logger.info("LCM preflight compression no-op: %s", reason)
                 return False
             self._refresh_raw_backlog_debt(replay_messages, observed_tokens=replay_rough)
             if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
-                return self._mark_preflight_compression_requested()
+                return self._request_preflight_or_defer_hot_cache(
+                    replay_messages, replay_rough
+                )
             return False
         if self._compression_boundary_cooldown_active():
             return False
@@ -154,18 +172,18 @@ class CompactionMixin:
                 return False
             eligible, reason = self._leaf_compaction_candidate_status(messages)
             if eligible:
-                return self._mark_preflight_compression_requested()
+                return self._request_preflight_or_defer_hot_cache(messages, rough)
             if self._has_ignored_backlog_outside_fresh_tail(messages):
-                return self._mark_preflight_compression_requested()
+                return self._request_preflight_or_defer_hot_cache(messages, rough)
             if self._should_run_deferred_maintenance(messages, observed_tokens=rough):
-                return self._mark_preflight_compression_requested()
+                return self._request_preflight_or_defer_hot_cache(messages, rough)
             self._last_compression_status = "noop"
             self._last_compression_noop_reason = reason
             logger.info("LCM preflight compression no-op: %s", reason)
             return False
         self._refresh_raw_backlog_debt(messages, observed_tokens=rough)
         if self._should_run_deferred_maintenance(messages, observed_tokens=rough):
-            return self._mark_preflight_compression_requested()
+            return self._request_preflight_or_defer_hot_cache(messages, rough)
         return False
 
     def _replay_diff_requests_ingest_cleanup(
@@ -276,19 +294,19 @@ class CompactionMixin:
             return True, "forced overflow recovery"
 
         raw_tokens_outside_tail = count_messages_tokens(candidate_raw)
-        if self._config.dynamic_leaf_chunk_enabled:
+        if self._effective_dynamic_leaf_chunk_enabled():
             working_leaf_chunk_tokens = self._working_leaf_chunk_tokens(raw_tokens_outside_tail)
         else:
-            working_leaf_chunk_tokens = self._config.leaf_chunk_tokens
+            working_leaf_chunk_tokens = self._effective_leaf_chunk_tokens()
         if raw_tokens_outside_tail < working_leaf_chunk_tokens:
             return False, "raw backlog outside fresh tail is below leaf chunk threshold"
         return True, "eligible raw backlog outside fresh tail"
 
     def _working_leaf_chunk_tokens(self, raw_tokens_outside_tail: int) -> int:
-        base = max(1, self._config.leaf_chunk_tokens)
-        if not self._config.dynamic_leaf_chunk_enabled:
+        base = self._effective_leaf_chunk_tokens()
+        if not self._effective_dynamic_leaf_chunk_enabled():
             return base
-        ceiling = max(base, self._config.dynamic_leaf_chunk_max)
+        ceiling = self._effective_dynamic_leaf_chunk_max()
         working = base
         while working < ceiling and raw_tokens_outside_tail > working * 2:
             working = min(ceiling, working * 2)
@@ -662,6 +680,13 @@ class CompactionMixin:
                 force=force,
             )
 
+        if self._effective_full_sweep_compaction_enabled():
+            return self._compress_full_sweep(
+                messages,
+                current_tokens=current_tokens,
+                focus_topic=focus_topic,
+            )
+
         observed_prompt_tokens = current_tokens if current_tokens is not None else None
         force_overflow = self._should_force_overflow_recovery(
             observed_tokens=observed_prompt_tokens,
@@ -729,7 +754,7 @@ class CompactionMixin:
         )
         if deferred_maintenance_active:
             self._lifecycle.record_maintenance_attempt(self._conversation_id)
-        base_max_leaf_passes = 4 if self._config.dynamic_leaf_chunk_enabled else 1
+        base_max_leaf_passes = 4 if self._effective_dynamic_leaf_chunk_enabled() else 1
         max_leaf_passes = base_max_leaf_passes
         if deferred_maintenance_active:
             max_leaf_passes = max(1, self._config.deferred_maintenance_max_passes)
@@ -768,17 +793,17 @@ class CompactionMixin:
             and post_compaction_target is not None
             and estimated_active_tokens > post_compaction_target
         ):
-            if self._config.dynamic_leaf_chunk_enabled:
+            if self._effective_dynamic_leaf_chunk_enabled():
                 chunk_hint = max(
                     1,
                     int(
-                        self._config.dynamic_leaf_chunk_max
-                        or self._config.leaf_chunk_tokens
+                        self._effective_dynamic_leaf_chunk_max()
+                        or self._effective_leaf_chunk_tokens()
                         or 1
                     ),
                 )
             else:
-                chunk_hint = max(1, int(self._config.leaf_chunk_tokens or 1))
+                chunk_hint = self._effective_leaf_chunk_tokens()
             gap = int(estimated_active_tokens) - int(post_compaction_target)
             needed = (gap // chunk_hint) + 2
             max_leaf_passes = max(base_max_leaf_passes, min(16, needed))
@@ -946,7 +971,7 @@ class CompactionMixin:
                 and post_compaction_target is not None
                 and estimated_active_tokens >= post_compaction_target
             )
-            if self._config.dynamic_leaf_chunk_enabled:
+            if self._effective_dynamic_leaf_chunk_enabled():
                 working_leaf_chunk_tokens = self._working_leaf_chunk_tokens(raw_tokens_outside_tail)
                 if raw_tokens_outside_tail < working_leaf_chunk_tokens and not force_overflow:
                     if not (
@@ -962,7 +987,7 @@ class CompactionMixin:
                 else:
                     to_compact = self._select_oldest_leaf_chunk(candidate_raw, working_leaf_chunk_tokens)
             else:
-                if raw_tokens_outside_tail < self._config.leaf_chunk_tokens and not force_overflow:
+                if raw_tokens_outside_tail < self._effective_leaf_chunk_tokens() and not force_overflow:
                     if not (
                         (deferred_maintenance_active and critical_budget_pressure)
                         or converging_to_target

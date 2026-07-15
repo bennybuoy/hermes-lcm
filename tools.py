@@ -5,7 +5,9 @@ from __future__ import annotations
 import codecs
 import json
 import logging
+import multiprocessing
 import re
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -52,6 +54,11 @@ _LCM_GREP_EXTERNALIZED_MAX_FILES = 500
 _LCM_GREP_EXTERNALIZED_DEFAULT_CHARS = 65_536
 _LCM_GREP_EXTERNALIZED_MAX_CHARS = 1_000_000
 _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES = 4_000_000
+_LCM_GREP_REGEX_FILE_DEADLINE_SECONDS = 0.075
+_LCM_GREP_REGEX_OPERATION_DEADLINE_SECONDS = 1.0
+_LCM_GREP_REGEX_MAX_PATTERN_CHARS = 2_000
+_CROSS_SESSION_EXPANSION_GUARD = threading.Lock()
+_ACTIVE_CROSS_SESSION_EXPANSIONS: set[str] = set()
 
 
 def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
@@ -172,6 +179,55 @@ def _externalized_literal_match(content: str, query: str) -> re.Match[str] | Non
     return re.search(re.escape(terms[0]), content, flags=re.IGNORECASE)
 
 
+def _regex_span_worker(query: str, content: str, connection) -> None:
+    try:
+        match = re.search(query, content, flags=re.IGNORECASE)
+        connection.send(match.span() if match is not None else None)
+    except BaseException as exc:
+        connection.send({"error": type(exc).__name__})
+    finally:
+        connection.close()
+
+
+def _bounded_regex_span(
+    query: str,
+    content: str,
+    *,
+    timeout_seconds: float,
+) -> tuple[tuple[int, int] | None, str]:
+    """Run stdlib regex in a child that can be terminated on CPU deadline."""
+    try:
+        context = multiprocessing.get_context("fork")
+    except ValueError:  # pragma: no cover - non-POSIX fallback
+        context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(target=_regex_span_worker, args=(query, content, child))
+    process.daemon = True
+    process.start()
+    child.close()
+    process.join(max(0.001, float(timeout_seconds)))
+    if process.is_alive():
+        process.terminate()
+        process.join(0.1)
+        if process.is_alive() and hasattr(process, "kill"):
+            process.kill()
+            process.join(0.1)
+        parent.close()
+        return None, "regex_timeout"
+    try:
+        payload = parent.recv() if parent.poll() else None
+    except (EOFError, OSError):
+        payload = None
+    finally:
+        parent.close()
+        process.close()
+    if isinstance(payload, dict):
+        return None, f"regex_error:{payload.get('error', 'unknown')}"
+    if payload is None:
+        return None, ""
+    return (int(payload[0]), int(payload[1])), ""
+
+
 def _search_externalized_payloads(
     engine: "LCMEngine",
     *,
@@ -194,8 +250,8 @@ def _search_externalized_payloads(
             hermes_home=engine._hermes_home,
             create=False,
         ).resolve()
-    except (OSError, ValueError) as exc:
-        return [], [{"ref": ref or "", "error": str(exc)}], {
+    except (OSError, ValueError):
+        return [], [{"ref": ref or "", "error": "storage_root_unavailable"}], {
             "files_scanned": 0,
             "bytes_scanned": 0,
             "matches": 0,
@@ -218,7 +274,8 @@ def _search_externalized_payloads(
     if len(paths) > max_files:
         paths = paths[:max_files]
         scan_truncated = True
-    compiled = re.compile(query, flags=re.IGNORECASE) if regex_mode else None
+    regex_deadline = time.monotonic() + _LCM_GREP_REGEX_OPERATION_DEADLINE_SECONDS
+    regex_timeouts = 0
     for path in paths:
         if bytes_scanned >= _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES:
             scan_truncated = True
@@ -240,8 +297,8 @@ def _search_externalized_payloads(
         try:
             with resolved.open("rb") as handle:
                 raw = handle.read(read_limit + 1)
-        except OSError as exc:
-            diagnostics.append({"ref": path.name, "error": str(exc)})
+        except OSError:
+            diagnostics.append({"ref": path.name, "error": "unreadable"})
             continue
         files_scanned += 1
         bytes_scanned += min(len(raw), read_limit)
@@ -264,10 +321,33 @@ def _search_externalized_payloads(
         except ValueError:
             diagnostics.append({"ref": path.name, "error": "invalid_payload"})
             continue
-        match = compiled.search(content) if compiled is not None else _externalized_literal_match(content, query)
-        if match is None:
-            continue
-        start, end = match.span()
+        if regex_mode:
+            remaining_regex_time = regex_deadline - time.monotonic()
+            if remaining_regex_time <= 0:
+                scan_truncated = True
+                diagnostics.append({"ref": path.name, "error": "regex_operation_deadline"})
+                break
+            span, regex_error = _bounded_regex_span(
+                query,
+                content,
+                timeout_seconds=min(
+                    _LCM_GREP_REGEX_FILE_DEADLINE_SECONDS,
+                    remaining_regex_time,
+                ),
+            )
+            if regex_error:
+                diagnostics.append({"ref": path.name, "error": regex_error})
+                if regex_error == "regex_timeout":
+                    regex_timeouts += 1
+                continue
+            if span is None:
+                continue
+            start, end = span
+        else:
+            match = _externalized_literal_match(content, query)
+            if match is None:
+                continue
+            start, end = match.span()
         line = content.count("\n", 0, start) + 1
         line_start = content.rfind("\n", 0, start) + 1
         line_end = content.find("\n", end)
@@ -314,6 +394,9 @@ def _search_externalized_payloads(
         "max_files": max_files,
         "max_payload_chars": max_payload_chars,
         "max_total_bytes": _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES,
+        "regex_file_deadline_ms": int(_LCM_GREP_REGEX_FILE_DEADLINE_SECONDS * 1000),
+        "regex_operation_deadline_ms": int(_LCM_GREP_REGEX_OPERATION_DEADLINE_SECONDS * 1000),
+        "regex_timeouts": regex_timeouts,
     }
 
 
@@ -579,6 +662,7 @@ def _expand_message_sources(
     source_limit: int | None = None,
     content_offset: int = 0,
     hydrate_externalized_content: bool = False,
+    allowed_session_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     from .tokens import count_tokens
 
@@ -613,6 +697,13 @@ def _expand_message_sources(
             next_content_offset = 0
             has_more = next_source_offset < total_sources
             continue
+        # Authorization is established on the summary node before this helper
+        # is called.  Its exact source_ids are canonical provenance, and a
+        # retained rollover node intentionally keeps references to raw rows in
+        # the prior session.  Re-checking the row's session here breaks source
+        # closure and makes an authorized current-session node unexpandable.
+        # This does not enable archive discovery: callers still cannot select
+        # an arbitrary cross-session node without the explicit bounded gate.
         transcript_content = stored.get("content", "")
         content = transcript_content
         content_source = "message"
@@ -722,6 +813,7 @@ def _expand_child_nodes(
     *,
     source_offset: int = 0,
     source_limit: int | None = None,
+    allowed_session_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     from .tokens import count_tokens
 
@@ -736,7 +828,8 @@ def _expand_child_nodes(
     children: list[tuple[int, Any]] = []
     for relative_index, child_id in enumerate(selected_source_ids):
         child = engine._dag.get_node(child_id)
-        if child is None or child.session_id != engine.current_session_id:
+        effective_session_id = allowed_session_id or engine.current_session_id
+        if child is None or child.session_id != effective_session_id:
             continue
         children.append((source_offset + relative_index, child))
 
@@ -808,6 +901,7 @@ def _collect_descendant_evidence_blocks(
     visited_node_ids: set[int] | None = None,
     source_path: list[dict[str, int]] | None = None,
     remaining_node_visits: list[int] | None = None,
+    allowed_session_id: str | None = None,
 ) -> list[dict[str, Any]]:
     if max_tokens <= 0 or node.source_type != "nodes":
         return []
@@ -839,7 +933,8 @@ def _collect_descendant_evidence_blocks(
         stack.append((current, current_path, current_visited, source_index + 1))
         child_id = current.source_ids[source_index]
         child = engine._dag.get_node(child_id)
-        if child is None or child.session_id != engine.current_session_id:
+        effective_session_id = allowed_session_id or engine.current_session_id
+        if child is None or child.session_id != effective_session_id:
             continue
         child_node_id = int(child.node_id)
         if child_node_id in current_visited:
@@ -854,6 +949,7 @@ def _collect_descendant_evidence_blocks(
                 child,
                 max_tokens=remaining_tokens,
                 hydrate_externalized_content=hydrate_externalized_content,
+                allowed_session_id=effective_session_id,
             )
             if messages or pagination.get("has_more"):
                 block = {
@@ -871,7 +967,12 @@ def _collect_descendant_evidence_blocks(
             continue
 
         if child.source_type == "nodes":
-            children, pagination = _expand_child_nodes(engine, child, max_tokens=remaining_tokens)
+            children, pagination = _expand_child_nodes(
+                engine,
+                child,
+                max_tokens=remaining_tokens,
+                allowed_session_id=effective_session_id,
+            )
             if children or pagination.get("has_more"):
                 block = {
                     "type": "descendant_child_nodes",
@@ -896,6 +997,7 @@ def _collect_context_blocks_for_node(
     max_tokens: int,
     *,
     hydrate_externalized_content: bool = False,
+    allowed_session_id: str | None = None,
 ) -> list[dict[str, Any]]:
     from .tokens import count_tokens
 
@@ -919,6 +1021,7 @@ def _collect_context_blocks_for_node(
             node,
             max_tokens=remaining_tokens,
             hydrate_externalized_content=hydrate_externalized_content,
+            allowed_session_id=allowed_session_id,
         )
         if messages or pagination.get("has_more"):
             block = {
@@ -929,7 +1032,12 @@ def _collect_context_blocks_for_node(
             }
             blocks.append(block)
     elif node.source_type == "nodes":
-        children, pagination = _expand_child_nodes(engine, node, max_tokens=remaining_tokens)
+        children, pagination = _expand_child_nodes(
+            engine,
+            node,
+            max_tokens=remaining_tokens,
+            allowed_session_id=allowed_session_id,
+        )
         if children or pagination.get("has_more"):
             blocks.append(
                 {
@@ -948,6 +1056,7 @@ def _collect_context_blocks_for_node(
                     node,
                     max_tokens=descendant_tokens,
                     hydrate_externalized_content=hydrate_externalized_content,
+                    allowed_session_id=allowed_session_id,
                 )
             )
 
@@ -1106,6 +1215,282 @@ def _synthesize_expansion_answer(
         content = str(content) if content else ""
     from .escalation import _strip_reasoning_blocks
     return _strip_reasoning_blocks(content).strip()
+
+
+def _cross_session_expand_query(
+    engine: "LCMEngine",
+    args: Dict[str, Any],
+    *,
+    prompt: str,
+    query: str,
+    raw_node_ids: list[Any],
+    max_tokens: int,
+    context_max_tokens: int,
+    max_results: int,
+) -> str:
+    """Run one explicitly authorized, profile-bounded archive synthesis."""
+    if not engine._config.cross_session_expansion_enabled:
+        return json.dumps({"error": "cross-session expansion is disabled for this profile"})
+    if args.get("authorize_cross_session") is not True:
+        return json.dumps({
+            "error": "cross-session expansion requires authorize_cross_session=true",
+        })
+
+    scope = str(args.get("session_scope") or "").strip().lower()
+    raw_allowed = args.get("session_ids") or []
+    if not isinstance(raw_allowed, list) or any(not str(value or "").strip() for value in raw_allowed):
+        return json.dumps({"error": "session_ids must be an array of non-empty strings"})
+    allowed_session_ids = {str(value).strip() for value in raw_allowed}
+    if scope == "sessions":
+        if not allowed_session_ids:
+            return json.dumps({"error": "session_scope=sessions requires session_ids"})
+    elif scope == "all":
+        if allowed_session_ids:
+            return json.dumps({"error": "session_ids is not used with session_scope=all"})
+    else:
+        return json.dumps({
+            "error": "cross-session expansion requires explicit session_scope=all or sessions",
+        })
+
+    def _bounded_positive_int(name: str, default: int, hard_max: int) -> tuple[int | None, str | None]:
+        try:
+            value = int(args.get(name, default))
+        except (TypeError, ValueError):
+            return None, f"{name} must be an integer"
+        if value < 1:
+            return None, f"{name} must be positive"
+        return min(value, hard_max), None
+
+    max_sessions, error = _bounded_positive_int(
+        "max_sessions",
+        engine._config.cross_session_max_sessions,
+        engine._config.cross_session_max_sessions,
+    )
+    if error:
+        return json.dumps({"error": error})
+    per_session_limit = min(max_results, engine._config.cross_session_max_summaries_per_session)
+    configured_deadline_ms = min(
+        int(engine._config.cross_session_expansion_deadline_ms),
+        int(engine._config.expansion_timeout_ms),
+    )
+    deadline_ms, error = _bounded_positive_int(
+        "deadline_ms",
+        configured_deadline_ms,
+        configured_deadline_ms,
+    )
+    if error:
+        return json.dumps({"error": error})
+
+    guard_key = str(Path(engine._config.database_path or "<default>").resolve())
+    with _CROSS_SESSION_EXPANSION_GUARD:
+        if guard_key in _ACTIVE_CROSS_SESSION_EXPANSIONS:
+            return json.dumps({
+                "error": "cross-session expansion already active for this profile",
+                "reentry_blocked": True,
+            })
+        _ACTIVE_CROSS_SESSION_EXPANSIONS.add(guard_key)
+
+    started = time.monotonic()
+    deadline = started + (float(deadline_ms) / 1000.0)
+    try:
+        candidates = []
+        if raw_node_ids:
+            for raw_node_id in raw_node_ids:
+                try:
+                    node_id = int(raw_node_id)
+                except (TypeError, ValueError):
+                    return json.dumps({"error": "node_ids must contain only integers"})
+                node = engine._dag.get_node(node_id)
+                if node is not None:
+                    candidates.append(node)
+        elif query:
+            discovery_limit = max_sessions * per_session_limit * 8
+            candidates = engine._dag.search(query, session_id=None, limit=discovery_limit)
+        else:
+            return json.dumps({"error": "Provide either query or node_ids"})
+
+        if allowed_session_ids:
+            candidates = [node for node in candidates if node.session_id in allowed_session_ids]
+
+        # Search order is relevance order. First bucket occurrence therefore
+        # ranks sessions before any source expansion occurs.
+        buckets: dict[str, list[Any]] = {}
+        for node in candidates:
+            bucket = buckets.setdefault(node.session_id, [])
+            if len(bucket) < per_session_limit:
+                bucket.append(node)
+
+        ranked_session_ids = list(buckets)
+        selected_session_ids = ranked_session_ids[:max_sessions]
+        skipped_buckets = [
+            {"session_id": session_id, "reason": "max-sessions"}
+            for session_id in ranked_session_ids[max_sessions:]
+        ]
+        if not selected_session_ids:
+            return json.dumps({
+                "prompt": prompt,
+                "query": query,
+                "answer": "No authorized matching summary nodes found in the selected LCM sessions.",
+                "cross_session": True,
+                "session_scope": scope,
+                "contributing_session_ids": [],
+                "node_ids": [],
+                "matches": [],
+                "session_status": [],
+                "skipped_buckets": skipped_buckets,
+                "context_truncated": False,
+                "externalized_refs": "metadata-only",
+            })
+
+        context_blocks: list[dict[str, Any]] = []
+        matches: list[dict[str, Any]] = []
+        session_status: list[dict[str, Any]] = []
+        context_used = 0
+        timed_out = False
+        for session_id in selected_session_ids:
+            bucket_blocks_before = len(context_blocks)
+            expanded_nodes = 0
+            bucket_truncated = False
+            bucket_state = "complete"
+            for node in buckets[session_id]:
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    bucket_state = "timed-out"
+                    bucket_truncated = True
+                    break
+                remaining = max(0, context_max_tokens - context_used)
+                if remaining <= 0:
+                    bucket_state = "budget-exhausted"
+                    bucket_truncated = True
+                    break
+                blocks = _collect_context_blocks_for_node(
+                    engine,
+                    node,
+                    max_tokens=remaining,
+                    hydrate_externalized_content=False,
+                    allowed_session_id=session_id,
+                )
+                for block in blocks:
+                    block["session_id"] = session_id
+                context_blocks.extend(blocks)
+                context_used += _context_content_token_count(blocks)
+                expanded_nodes += 1
+                matches.append({
+                    "session_id": session_id,
+                    "node_id": node.node_id,
+                    "depth": node.depth,
+                    "summary": node.summary[:300],
+                    "expand_hint": node.expand_hint,
+                })
+                if any(
+                    block.get("summary_truncated")
+                    or block.get("pagination", {}).get("has_more")
+                    for block in blocks
+                ):
+                    bucket_truncated = True
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    bucket_state = "timed-out"
+                    bucket_truncated = True
+                    break
+            session_status.append({
+                "session_id": session_id,
+                "status": bucket_state,
+                "candidate_nodes": len(buckets[session_id]),
+                "expanded_nodes": expanded_nodes,
+                "context_blocks": len(context_blocks) - bucket_blocks_before,
+                "truncated": bucket_truncated,
+            })
+            if timed_out:
+                for skipped_session_id in selected_session_ids[len(session_status):]:
+                    skipped_buckets.append({
+                        "session_id": skipped_session_id,
+                        "reason": "deadline",
+                    })
+                break
+
+        contributing_session_ids = [
+            item["session_id"] for item in session_status if item["context_blocks"] > 0
+        ]
+        node_ids = [match["node_id"] for match in matches]
+        context_truncated = timed_out or context_used >= context_max_tokens or any(
+            item["truncated"] for item in session_status
+        ) or bool(skipped_buckets)
+        base_payload: dict[str, Any] = {
+            "prompt": prompt,
+            "query": query,
+            "cross_session": True,
+            "session_scope": scope,
+            "max_sessions": max_sessions,
+            "max_summaries_per_session": per_session_limit,
+            "max_tokens": max_tokens,
+            "context_max_tokens": context_max_tokens,
+            "context_tokens_used": context_used,
+            "deadline_ms": deadline_ms,
+            "timed_out": timed_out,
+            "context_truncated": context_truncated,
+            "externalized_refs": "metadata-only",
+            "contributing_session_ids": contributing_session_ids,
+            "node_ids": node_ids,
+            "matches": matches,
+            "session_status": session_status,
+            "skipped_buckets": skipped_buckets,
+        }
+        if not context_blocks:
+            base_payload.update({
+                "answer": "No evidence fit within the shared cross-session expansion bounds.",
+                "degraded": True,
+            })
+            return json.dumps(base_payload)
+
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            base_payload.update({
+                "error": "cross-session expansion deadline exhausted before synthesis",
+                "degraded": True,
+            })
+            return json.dumps(base_payload)
+        model = engine._config.expansion_model or engine._config.summary_model or ""
+        try:
+            answer = _synthesize_expansion_answer(
+                prompt=prompt,
+                context_blocks=context_blocks,
+                model=model,
+                max_tokens=max_tokens,
+                timeout=remaining_seconds,
+            )
+        except TimeoutError:
+            base_payload.update({
+                "error": "cross-session expansion synthesis timed out",
+                "degraded": True,
+                "timed_out": True,
+                "context_truncated": True,
+                "model": model,
+            })
+            return json.dumps(base_payload)
+        except Exception:
+            logger.warning(
+                "LCM cross-session synthesis failed after bounded evidence collection"
+            )
+            base_payload.update({
+                "error": "cross-session expansion synthesis failed",
+                "degraded": True,
+                "model": model,
+            })
+            return json.dumps(base_payload)
+        answer = str(answer or "").strip()
+        if not answer:
+            base_payload.update({
+                "error": "cross-session expansion synthesis returned an empty answer",
+                "degraded": True,
+                "model": model,
+            })
+            return json.dumps(base_payload)
+        base_payload.update({"answer": answer, "model": model})
+        return json.dumps(base_payload)
+    finally:
+        with _CROSS_SESSION_EXPANSION_GUARD:
+            _ACTIVE_CROSS_SESSION_EXPANSIONS.discard(guard_key)
 
 
 def _parse_load_session_roles(value: Any) -> tuple[list[str], str | None]:
@@ -1280,6 +1665,8 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         })
     regex_mode = bool(args.get("regex", False))
     if regex_mode:
+        if len(query) > _LCM_GREP_REGEX_MAX_PATTERN_CHARS:
+            return json.dumps({"error": "regex pattern exceeds 2000 character limit"})
         try:
             re.compile(query)
         except re.error as exc:
@@ -1828,6 +2215,20 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
 
     query = str(args.get("query") or "").strip()
     raw_node_ids = args.get("node_ids") or []
+    if not isinstance(raw_node_ids, list):
+        return json.dumps({"error": "node_ids must be an array"})
+
+    if args.get("cross_session") is True:
+        return _cross_session_expand_query(
+            engine,
+            args,
+            prompt=prompt,
+            query=query,
+            raw_node_ids=raw_node_ids,
+            max_tokens=max_tokens,
+            context_max_tokens=context_max_tokens,
+            max_results=max_results,
+        )
 
     nodes = []
     raw_results: list[dict[str, Any]] = []
@@ -2051,6 +2452,23 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             "raw_matches": raw_matches,
         }
     )
+
+
+def lcm_focus(args: Dict[str, Any], **kwargs) -> str:
+    """Create, inspect, refresh, or deactivate a persisted focus overlay."""
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
+    action = str(args.get("action") or "show").strip().lower()
+    if action == "show":
+        return json.dumps(engine.get_focus_status(preview_chars=500))
+    if action == "focus":
+        return json.dumps(engine.create_focus(str(args.get("prompt") or "")))
+    if action == "refocus":
+        return json.dumps(engine.create_focus(str(args.get("prompt") or ""), refocus=True))
+    if action == "unfocus":
+        return json.dumps(engine.unfocus())
+    return json.dumps({"error": "action must be show, focus, refocus, or unfocus"})
 
 
 def _leaf_health_stats(engine: "LCMEngine") -> dict[str, Any]:

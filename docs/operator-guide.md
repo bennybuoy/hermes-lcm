@@ -86,13 +86,13 @@ Expected signals:
 
 - plugin list includes `hermes-lcm`
 - selected context engine is `lcm`
-- tool list includes `lcm_grep`, `lcm_load_session`, `lcm_describe`, `lcm_expand`, `lcm_expand_query`, `lcm_status`, `lcm_inspect`, and `lcm_doctor`
+- tool list includes `lcm_grep`, `lcm_load_session`, `lcm_describe`, `lcm_expand`, `lcm_expand_query`, `lcm_focus`, `lcm_status`, `lcm_inspect`, and `lcm_doctor`
 
 Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-lcm v0.19.0 (8 tools)
+  ✓ hermes-lcm v0.19.0 (9 tools)
 
 Provider Plugins:
   Context Engine: lcm
@@ -120,7 +120,7 @@ LCM tools are still available through the context-engine schema/dispatch path
 registration (Path A) on those hosts because Path A would shadow Path B and lose
 current-turn ingest.
 
-Healthy signals are the same as above: selected context engine `lcm`, the eight
+Healthy signals are the same as above: selected context engine `lcm`, the nine
 `lcm_*` tools in the live tool list, and `lcm_status` / `lcm_inspect` / `lcm_doctor` responding
 after one normal message initializes the session.
 
@@ -154,6 +154,17 @@ reports the effective source.
 | `LCM_LEAF_CHUNK_TOKENS` | `20000` | Raw-backlog floor before leaf compaction; with dynamic chunking enabled, the base chunk target |
 | `LCM_DYNAMIC_LEAF_CHUNK_ENABLED` | `false` | Enable chunk-sized leaf compaction passes instead of compacting the whole non-tail raw backlog per pass |
 | `LCM_DYNAMIC_LEAF_CHUNK_MAX` | `40000` | Upper bound for dynamic leaf chunk targets |
+| `LCM_FULL_SWEEP_COMPACTION_ENABLED` | `false` | Opt into bounded private multi-leaf and mixed-depth candidate construction followed by one generation-scoped frontier publication |
+| `LCM_FULL_SWEEP_MAX_PASSES` | `32` | Operation-wide leaf-plus-condensation pass limit for a full sweep |
+| `LCM_FULL_SWEEP_DEADLINE_SECONDS` | `30` | Operation-wide full-sweep wall-clock deadline; completed work may publish once as a source-closed partial candidate |
+| `LCM_SUMMARY_PREFIX_TARGET_TOKENS` | `0` | Independent summarized-prefix target; when positive, permits the hard minimum fan-in only while the staged prefix remains above this target |
+| `LCM_ASYNC_PREPARATION_UTILITY_POLICY_ENABLED` | `false` | Opt into pressure, reduction, ready-coverage, TTL, candidate-cap, and profile-admission gates before speculative summary calls |
+| `LCM_ASYNC_PREPARATION_MIN_REDUCTION_TOKENS` | `512` | Minimum estimated source-to-summary token reduction for automatic preparation |
+| `LCM_ASYNC_CANDIDATE_REFRESH_MIN_TOKENS` | `2000` | Minimum new source debt beyond a compatible ready candidate before refreshing it |
+| `LCM_ASYNC_MAX_CANDIDATES_PER_CONVERSATION` | `2` | Hard ready/preparing candidate cap for one conversation |
+| `LCM_ASYNC_MAX_CANDIDATES_PER_PROFILE` | `16` | Hard ready/preparing candidate cap across one profile database |
+| `LCM_ASYNC_SUMMARY_ADMISSION_LIMIT` | `2` | Process-wide concurrent preparation-call limit shared by engine clones using one profile database |
+| `LCM_ASYNC_READY_TTL_SECONDS` | `3600` | TTL after which unused ready/preparing candidates are superseded without touching raw messages or canonical nodes |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |
 | `LCM_IGNORE_SESSION_PATTERNS` | empty | Comma-separated session globs excluded from LCM storage |
 | `LCM_STATELESS_SESSION_PATTERNS` | empty | Comma-separated session globs kept read-only |
@@ -170,6 +181,14 @@ reports the effective source.
 | `LCM_SUMMARY_CIRCUIT_BREAKER_COOLDOWN_SECONDS` | `300` | Seconds to skip an open summary route before retrying it |
 | `LCM_EXPANSION_MODEL` | summary model / auxiliary | Override `lcm_expand_query` synthesis model |
 | `LCM_EXPANSION_CONTEXT_TOKENS` | `32000` | Context budget used by the auxiliary LLM for `lcm_expand_query` |
+| `LCM_CROSS_SESSION_EXPANSION_ENABLED` | `false` | Permit explicitly authorized cross-session LCM DAG synthesis |
+| `LCM_CROSS_SESSION_MAX_SESSIONS` | `3` | Operation-wide archive session-bucket cap |
+| `LCM_CROSS_SESSION_MAX_SUMMARIES_PER_SESSION` | `3` | Per-session candidate summary cap |
+| `LCM_CROSS_SESSION_EXPANSION_DEADLINE_MS` | `120000` | Shared discovery, expansion, and synthesis deadline, capped by the normal expansion timeout |
+| `LCM_FOCUS_CONTEXT_TOKENS` | `16000` | Shared evidence budget for focus/refocus synthesis |
+| `LCM_FOCUS_OUTPUT_TOKENS` | `2000` | Maximum focus-brief output budget |
+| `LCM_FOCUS_TIMEOUT_MS` | `60000` | Focus/refocus synthesis deadline |
+| `LCM_FOCUS_MAX_SOURCE_NODES` | `12` | Maximum canonical source nodes per focus operation |
 | `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Timeout for one summarization call |
 | `LCM_EXPANSION_TIMEOUT_MS` | `120000` | Timeout for one `lcm_expand_query` synthesis call |
 | `LCM_DATABASE_PATH` | auto | SQLite database path. Empty config resolves to `HERMES_HOME/lcm.db`; plugin installs or operators may set this env var to another profile-scoped path such as `~/.hermes/hermes-lcm.db`. |
@@ -216,22 +235,46 @@ the digest to avoid making password-like values easier to dictionary-check.
 `lcm_status`, `lcm_inspect`, and `lcm_doctor` expose the enabled state, configured pattern names,
 unknown names, source, and placeholder format without exposing raw secret values.
 
-### Cache policy boundary
+### Cache-aware compaction contract
 
-LCM is **cache-friendly**, not fully cache-aware. It may avoid some follow-on
-condensation churn, but current cache usage counters are retrospective status
-data only; they do not tell the plugin whether the next prompt mutation will
-break a hot provider cache. For that reason LCM does **not** implement
-provider/model TTL heuristics, provider-family detection, cache-touch/cache-break
-tracking, TTL delays, or full cache-aware deferred compaction.
+Observed provider counters are retrospective telemetry. `cache_read_tokens`
+never implies a billing discount and never changes execution. Economic
+classification is a route-policy input and is reported separately from observed
+cache reads/writes.
+
+Cache-aware deferred execution requires an explicit host signal:
+`engine.record_cache_signal("write", source=..., ttl_seconds=...)`. LCM binds the
+signal to the current conversation and a hash of the provider/model/API route.
+Expiry, route changes, conversation changes, and explicit `"break"` signals make
+the prefix non-hot. Unknown state does not delay work; emergency pressure always
+bypasses a hot-cache delay. Operators or host integrations may call
+`engine.maintain(messages)` for bounded preparation after expiry. Status exposes
+the selected strategy, policy and route fingerprints, signal state/source/TTL,
+and explicitly marks that usage telemetry does not drive cache state. Signal
+sources should be stable non-secret identifiers, not provider credentials.
 
 `LCM_CRITICAL_BUDGET_PRESSURE_RATIO` is a narrow escape hatch. It is disabled by
 default (`0.0`). When set, LCM compares prompt pressure against the context
 window and only at or above that ratio may bypass the existing polite gates for
 bounded deferred maintenance catch-up and cache-friendly follow-on condensation.
-Below that pressure, simpler existing behavior is preserved. Revisit full
-cache-aware deferred compaction only after Hermes core exposes reliable cache
-state / cache-break signals.
+Below that pressure, simpler existing behavior is preserved. Until Hermes core
+supplies the explicit signal contract, cache state remains `unknown` and LCM
+uses the normal bounded route strategy.
+
+### Schema v8 deployment and rollback
+
+Schema v8 adds immutable `lcm_focus_briefs` records and the
+`resolved_policy_json` prepared-batch column. Startup migration is idempotent;
+existing v7 batches receive an empty metadata object, while new batches persist
+the complete resolved policy used at preparation. Focus content and evidence
+fields are protected by an immutability trigger; refocus publishes a new row.
+
+Older v7 plugin builds intentionally refuse a v8 database. Before upgrading,
+take a SQLite backup with `/lcm backup` or the maintenance backup primitive. A
+code rollback therefore requires restoring that pre-v8 database (including its
+matching WAL/SHM state if copied outside SQLite's backup API), not editing the
+schema-version marker. No production database should be migrated as part of
+package build or offline test installation.
 
 ### Threshold ownership
 
@@ -351,6 +394,13 @@ What the main knobs do:
 - `LCM_EXPANSION_CONTEXT_TOKENS` controls how much recovered material
   `lcm_expand_query` may feed to the auxiliary model. It does not change what
   LCM stores.
+- Cross-session DAG synthesis is off by default. Enabling its profile gate is
+  insufficient by itself: each call must request cross-session mode, acknowledge
+  authorization, and select all local LCM sessions or a specific allowlist.
+  Session ranking occurs before expansion; context, answer, and deadline limits
+  are shared across buckets. External refs remain metadata-only, completed
+  buckets survive later timeouts, and same-profile re-entry is rejected. Use
+  Hermes `session_search` for host-managed history outside this LCM database.
 - `LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED=true` helps when large tool outputs,
   logs, media payloads, or raw JSON blobs dominate token pressure.
 

@@ -14,6 +14,7 @@ for earlier separate sessions or broad cross-session history.
 | `lcm_describe` | Inspect the current-session DAG or preview an `externalized_ref` without loading full content. |
 | `lcm_expand` | Recover source messages, child summaries, or externalized payloads with pagination. Use `store_id` to fetch a single raw message regardless of session, suitable for drilling into a cross-session `lcm_grep` result. |
 | `lcm_expand_query` | Answer a question using expanded current-session LCM context while returning a bounded answer. |
+| `lcm_focus` | Show, create, delta-refocus, or deactivate the current conversation's persisted focus overlay. Focus briefs are immutable, evidence-backed, and bounded; failed refocus leaves the active brief unchanged, and unfocus preserves history. |
 | `lcm_status` | Show runtime health, context pressure, config, source lineage, and lifecycle stats. |
 | `lcm_inspect` | Read-only operator inventory for current-session lineage, message/frontier metadata, fresh tail, externalized refs/readability, compaction skip/no-op reasons, and matched ignore/stateless patterns. It returns metadata only; use `lcm_load_session`/`lcm_expand` when you need content. |
 | `lcm_doctor` | Run database, FTS, lifecycle, config, and context-pressure diagnostics. |
@@ -40,6 +41,15 @@ Carried-over summary nodes can become current-session content after `/new`, but
 their source eligibility still comes from the descendant raw messages. Expanding
 a carried-over current-session node recovers those original raw message sources
 even when the sources still belong to the previous session.
+
+### Focus overlay contract
+
+`lcm_focus(action='focus', prompt=...)` synthesizes a bounded immutable brief
+from canonical nodes in the current conversation and applies it during context
+assembly without rewriting the DAG. `action='refocus'` uses evidence added after
+the active brief's watermark and publishes a replacement only after synthesis
+succeeds. `action='show'` returns bounded metadata and a preview;
+`action='unfocus'` deactivates the overlay while retaining its audit history.
 
 ### Lossless raw recovery contract
 

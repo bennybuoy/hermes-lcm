@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
@@ -103,6 +104,33 @@ def test_externalized_regex_large_single_line_and_prefix_truncation(tmp_path):
         assert result["total_results"] == 1
         assert result["results"][0]["line"] == 1
         assert result["results"][0]["payload_truncated"] is True
+    finally:
+        engine.shutdown()
+
+
+def test_adversarial_regex_is_killed_at_cpu_deadline(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        ref = _payload(engine, ("a" * 80_000) + "!")
+        started = time.monotonic()
+        result = json.loads(
+            lcm_grep(
+                {
+                    "query": r"(a+)+$",
+                    "regex": True,
+                    "content_scope": "externalized",
+                    "ref": ref,
+                    "max_payload_chars": 100_000,
+                },
+                engine=engine,
+            )
+        )
+        elapsed = time.monotonic() - started
+        assert elapsed < 1.0
+        assert result["total_results"] == 0
+        assert result["diagnostics"] == [{"ref": ref, "error": "regex_timeout"}]
+        assert result["scan"]["regex_timeouts"] == 1
+        assert result["scan"]["regex_file_deadline_ms"] == 75
     finally:
         engine.shutdown()
 

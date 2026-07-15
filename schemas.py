@@ -296,6 +296,30 @@ LCM_STATUS = {
     },
 }
 
+LCM_FOCUS = {
+    "name": "lcm_focus",
+    "description": (
+        "Manage a persisted, non-destructive focus overlay for the current conversation. "
+        "show returns bounded metadata/preview; focus synthesizes from explicit canonical "
+        "LCM node evidence; refocus uses post-focus DAG deltas; unfocus preserves history."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["show", "focus", "refocus", "unfocus"],
+                "default": "show",
+            },
+            "prompt": {
+                "type": "string",
+                "description": "Required for focus; optional replacement objective for refocus",
+            },
+        },
+        "required": [],
+    },
+}
+
 LCM_INSPECT = {
     "name": "lcm_inspect",
     "description": (
@@ -336,11 +360,12 @@ LCM_DOCTOR = {
 LCM_EXPAND_QUERY = {
     "name": "lcm_expand_query",
     "description": (
-        "Answer a natural-language question using expanded LCM context from the current session. Provide a prompt, and either "
+        "Answer a natural-language question using expanded LCM context from the current session by default. Provide a prompt, and either "
         "query matching summaries/raw messages to expand or explicit node_ids to inspect. Uses the expansion path "
         "instead of the summarization path so retrieval/synthesis can use a different model or timeout. "
         "When expanding parent summary nodes, it recursively descends the DAG under the context budget to include leaf evidence where possible. "
-        "Prefer this for questions about the active conversation after compaction; for cross-session recall, use session_search first."
+        "Prefer this for questions about the active conversation after compaction; for host history, use session_search first. "
+        "An administrator-enabled archive mode can search LCM DAGs across explicitly authorized sessions with shared bounds; it never activates implicitly."
     ),
     "parameters": {
         "type": "object",
@@ -372,6 +397,34 @@ LCM_EXPAND_QUERY = {
                 "type": "integer",
                 "description": "Expanded serialized summary/raw/child-source/externalized fresh context budget for the auxiliary LLM before it returns the bounded answer (default max(answer max_tokens, 32000 or LCM_EXPANSION_CONTEXT_TOKENS))",
                 "default": 32000,
+            },
+            "cross_session": {
+                "type": "boolean",
+                "description": "Explicitly request profile-gated cross-session LCM DAG expansion (default false)",
+                "default": False,
+            },
+            "authorize_cross_session": {
+                "type": "boolean",
+                "description": "Required explicit authorization acknowledgment when cross_session=true",
+                "default": False,
+            },
+            "session_scope": {
+                "type": "string",
+                "enum": ["all", "sessions"],
+                "description": "Required in cross-session mode; all local LCM sessions or only session_ids",
+            },
+            "session_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Explicit authorized session allowlist for session_scope=sessions",
+            },
+            "max_sessions": {
+                "type": "integer",
+                "description": "Requested session-bucket cap, clamped to the profile maximum",
+            },
+            "deadline_ms": {
+                "type": "integer",
+                "description": "Requested operation-wide deadline, clamped to the profile and expansion timeout",
             },
         },
         "required": ["prompt"],

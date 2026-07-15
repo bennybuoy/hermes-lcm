@@ -328,6 +328,10 @@ class _EnvFieldSpec:
 ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("fresh_tail_count", "LCM_FRESH_TAIL_COUNT", int),
     _EnvFieldSpec("fresh_tail_max_tokens", "LCM_FRESH_TAIL_MAX_TOKENS", int),
+    _EnvFieldSpec("full_sweep_compaction_enabled", "LCM_FULL_SWEEP_COMPACTION_ENABLED", bool),
+    _EnvFieldSpec("full_sweep_max_passes", "LCM_FULL_SWEEP_MAX_PASSES", int),
+    _EnvFieldSpec("full_sweep_deadline_seconds", "LCM_FULL_SWEEP_DEADLINE_SECONDS", float),
+    _EnvFieldSpec("summary_prefix_target_tokens", "LCM_SUMMARY_PREFIX_TARGET_TOKENS", int),
     _EnvFieldSpec("leaf_chunk_tokens", "LCM_LEAF_CHUNK_TOKENS", int),
     _EnvFieldSpec("context_threshold", "LCM_CONTEXT_THRESHOLD", float),
     _EnvFieldSpec("incremental_max_depth", "LCM_INCREMENTAL_MAX_DEPTH", int),
@@ -339,6 +343,13 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("cache_economics", "LCM_CACHE_ECONOMICS", str),
     _EnvFieldSpec("compaction_mode", "LCM_COMPACTION_MODE", str),
     _EnvFieldSpec("cache_ttl_seconds", "LCM_CACHE_TTL_SECONDS", int),
+    _EnvFieldSpec("async_preparation_utility_policy_enabled", "LCM_ASYNC_PREPARATION_UTILITY_POLICY_ENABLED", bool),
+    _EnvFieldSpec("async_preparation_min_reduction_tokens", "LCM_ASYNC_PREPARATION_MIN_REDUCTION_TOKENS", int),
+    _EnvFieldSpec("async_candidate_refresh_min_tokens", "LCM_ASYNC_CANDIDATE_REFRESH_MIN_TOKENS", int),
+    _EnvFieldSpec("async_max_candidates_per_conversation", "LCM_ASYNC_MAX_CANDIDATES_PER_CONVERSATION", int),
+    _EnvFieldSpec("async_max_candidates_per_profile", "LCM_ASYNC_MAX_CANDIDATES_PER_PROFILE", int),
+    _EnvFieldSpec("async_summary_admission_limit", "LCM_ASYNC_SUMMARY_ADMISSION_LIMIT", int),
+    _EnvFieldSpec("async_ready_ttl_seconds", "LCM_ASYNC_READY_TTL_SECONDS", float),
     _EnvFieldSpec("prompt_aware_eviction_enabled", "LCM_PROMPT_AWARE_EVICTION_ENABLED", bool),
     _EnvFieldSpec("cache_friendly_min_debt_groups", "LCM_CACHE_FRIENDLY_MIN_DEBT_GROUPS", int),
     _EnvFieldSpec("deferred_maintenance_enabled", "LCM_DEFERRED_MAINTENANCE_ENABLED", bool),
@@ -366,6 +377,14 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("summary_spend_backoff_seconds", "LCM_SUMMARY_SPEND_BACKOFF_SECONDS", float),
     _EnvFieldSpec("expansion_model", "LCM_EXPANSION_MODEL", str),
     _EnvFieldSpec("expansion_context_tokens", "LCM_EXPANSION_CONTEXT_TOKENS", int),
+    _EnvFieldSpec("cross_session_expansion_enabled", "LCM_CROSS_SESSION_EXPANSION_ENABLED", bool),
+    _EnvFieldSpec("cross_session_max_sessions", "LCM_CROSS_SESSION_MAX_SESSIONS", int),
+    _EnvFieldSpec("cross_session_max_summaries_per_session", "LCM_CROSS_SESSION_MAX_SUMMARIES_PER_SESSION", int),
+    _EnvFieldSpec("cross_session_expansion_deadline_ms", "LCM_CROSS_SESSION_EXPANSION_DEADLINE_MS", int),
+    _EnvFieldSpec("focus_context_tokens", "LCM_FOCUS_CONTEXT_TOKENS", int),
+    _EnvFieldSpec("focus_output_tokens", "LCM_FOCUS_OUTPUT_TOKENS", int),
+    _EnvFieldSpec("focus_timeout_ms", "LCM_FOCUS_TIMEOUT_MS", int),
+    _EnvFieldSpec("focus_max_source_nodes", "LCM_FOCUS_MAX_SOURCE_NODES", int),
     _EnvFieldSpec("summary_timeout_ms", "LCM_SUMMARY_TIMEOUT_MS", int),
     _EnvFieldSpec("expansion_timeout_ms", "LCM_EXPANSION_TIMEOUT_MS", int),
     _EnvFieldSpec("database_path", "LCM_DATABASE_PATH", str),
@@ -500,6 +519,14 @@ class LCMConfig:
     model_policies: dict[str, dict[str, Any]] = field(default_factory=dict)
     # Optional protected-tail token rail; policy rules may override it.
     fresh_tail_max_tokens: int = 0
+    # Opt-in issue #8 sweep. Candidate construction is private and one mixed-
+    # depth generation is published after bounded leaf/condensation passes.
+    full_sweep_compaction_enabled: bool = False
+    full_sweep_max_passes: int = 32
+    full_sweep_deadline_seconds: float = 30.0
+    # Independent target for the provider-visible summary prefix (0 disables
+    # minimum-fanin pressure condensation).
+    summary_prefix_target_tokens: int = 0
     # Hard minimum fan-in used only by bounded pressure compaction.
     condensation_min_fanin: int = 2
     # Global route-economics defaults when no structured rule matches.
@@ -533,6 +560,15 @@ class LCMConfig:
     # When enabled, compress() tries to promote a ready prepared batch before
     # running the expensive foreground leaf-summarization path.
     async_background_compaction_promote_on_compress: bool = True
+    # Opt-in pressure/utility policy for speculative calls. Disabled by default
+    # to preserve pre-issue-19 deployments until operators select boundaries.
+    async_preparation_utility_policy_enabled: bool = False
+    async_preparation_min_reduction_tokens: int = 512
+    async_candidate_refresh_min_tokens: int = 2_000
+    async_max_candidates_per_conversation: int = 2
+    async_max_candidates_per_profile: int = 16
+    async_summary_admission_limit: int = 2
+    async_ready_ttl_seconds: float = 3_600.0
     # After this many consecutive prepare failures the worker enters cooldown.
     async_background_compaction_worker_max_consecutive_failures: int = 3
     # Seconds to wait after tripping the consecutive-failure circuit breaker
@@ -632,6 +668,16 @@ class LCMConfig:
     expansion_model: str = ""     # empty = fall back to summary_model / Hermes auxiliary model
     # Serialized summary/raw/child-source/externalized context budget fed to lcm_expand_query's auxiliary LLM before it returns a bounded answer.
     expansion_context_tokens: int = 32_000
+    # Archive DAG synthesis is disabled unless both this profile gate and the
+    # tool call's explicit cross-session authorization are present.
+    cross_session_expansion_enabled: bool = False
+    cross_session_max_sessions: int = 3
+    cross_session_max_summaries_per_session: int = 3
+    cross_session_expansion_deadline_ms: int = 120_000
+    focus_context_tokens: int = 16_000
+    focus_output_tokens: int = 2_000
+    focus_timeout_ms: int = 60_000
+    focus_max_source_nodes: int = 12
 
     # -- Timeouts ---
     summary_timeout_ms: int = 60_000
@@ -676,6 +722,12 @@ class LCMConfig:
         validate_policy_rules(self.policy_rules)
         if self.fresh_tail_max_tokens < 0:
             raise ValueError("fresh_tail_max_tokens must be non-negative")
+        if self.full_sweep_max_passes < 1:
+            raise ValueError("full_sweep_max_passes must be at least 1")
+        if self.full_sweep_deadline_seconds <= 0:
+            raise ValueError("full_sweep_deadline_seconds must be positive")
+        if self.summary_prefix_target_tokens < 0:
+            raise ValueError("summary_prefix_target_tokens must be non-negative")
         if self.condensation_min_fanin < 2:
             raise ValueError("condensation_min_fanin must be at least 2")
         if self.cache_economics not in {"discounted", "none", "unknown"}:
@@ -684,6 +736,34 @@ class LCMConfig:
             raise ValueError("compaction_mode must be inline or deferred")
         if self.cache_ttl_seconds < 0:
             raise ValueError("cache_ttl_seconds must be non-negative")
+        if self.async_preparation_min_reduction_tokens < 0:
+            raise ValueError("async_preparation_min_reduction_tokens must be non-negative")
+        if self.async_candidate_refresh_min_tokens < 0:
+            raise ValueError("async_candidate_refresh_min_tokens must be non-negative")
+        if self.async_max_candidates_per_conversation < 1:
+            raise ValueError("async_max_candidates_per_conversation must be at least 1")
+        if self.async_max_candidates_per_profile < 1:
+            raise ValueError("async_max_candidates_per_profile must be at least 1")
+        if self.async_summary_admission_limit < 1:
+            raise ValueError("async_summary_admission_limit must be at least 1")
+        if self.async_ready_ttl_seconds < 0:
+            raise ValueError("async_ready_ttl_seconds must be non-negative")
+        if self.expansion_context_tokens < 1:
+            raise ValueError("expansion_context_tokens must be positive")
+        if self.cross_session_max_sessions < 1:
+            raise ValueError("cross_session_max_sessions must be at least 1")
+        if self.cross_session_max_summaries_per_session < 1:
+            raise ValueError("cross_session_max_summaries_per_session must be at least 1")
+        if self.cross_session_expansion_deadline_ms < 1:
+            raise ValueError("cross_session_expansion_deadline_ms must be positive")
+        if self.focus_context_tokens < 1:
+            raise ValueError("focus_context_tokens must be positive")
+        if self.focus_output_tokens < 1:
+            raise ValueError("focus_output_tokens must be positive")
+        if self.focus_timeout_ms < 1:
+            raise ValueError("focus_timeout_ms must be positive")
+        if self.focus_max_source_nodes < 1:
+            raise ValueError("focus_max_source_nodes must be positive")
 
     @classmethod
     def from_env(cls) -> "LCMConfig":

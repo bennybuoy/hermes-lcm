@@ -56,6 +56,14 @@ class PreparedBatch:
     failure_reason: str = ""
     summary_payload: str = ""
     payload_version: int = 0
+    resolved_policy_json: str = "{}"
+
+    def resolved_policy(self) -> dict[str, Any]:
+        try:
+            value = json.loads(self.resolved_policy_json or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
 
     @property
     def has_summary_payload(self) -> bool:
@@ -401,6 +409,7 @@ class FrontierStore:
         policy_fingerprint: str,
         route_fingerprint: str,
         state: str = "preparing",
+        resolved_policy_json: str = "{}",
     ) -> int:
         """Insert a new prepared batch and return its batch_id."""
         with self._lock:
@@ -412,17 +421,194 @@ class FrontierStore:
                      source_end_store_id, source_identity_hash, source_ids,
                      policy_fingerprint, route_fingerprint, state,
                      expected_leaf_count, frontier_end_store_id,
-                     created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+                     created_at, updated_at, resolved_policy_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
                 """,
                 (conversation_id, session_id, base_generation,
                  source_end_store_id, source_identity_hash,
                  json.dumps(source_ids),
                  policy_fingerprint, route_fingerprint, state,
-                 now, now),
+                 now, now, resolved_policy_json),
             )
             self._conn.commit()
             return cur.lastrowid
+
+    def create_batch_bounded(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        base_generation: int,
+        source_end_store_id: int,
+        source_identity_hash: str,
+        source_ids: list[int],
+        policy_fingerprint: str,
+        route_fingerprint: str,
+        max_conversation_candidates: int,
+        max_profile_candidates: int,
+        resolved_policy_json: str = "{}",
+    ) -> tuple[int, str]:
+        """Atomically enforce speculative candidate caps and create a batch."""
+        with self._lock:
+            conn = self.conn
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                duplicate = conn.execute(
+                    """
+                    SELECT 1 FROM lcm_prepared_batches
+                    WHERE conversation_id = ?
+                      AND state IN ('preparing', 'ready')
+                      AND base_generation = ?
+                      AND policy_fingerprint = ?
+                      AND route_fingerprint = ?
+                      AND source_end_store_id >= ?
+                    LIMIT 1
+                    """,
+                    (
+                        conversation_id,
+                        int(base_generation),
+                        policy_fingerprint,
+                        route_fingerprint,
+                        int(source_end_store_id),
+                    ),
+                ).fetchone()
+                if duplicate:
+                    conn.rollback()
+                    return 0, "candidate-already-covers-range"
+                conversation_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) FROM lcm_prepared_batches
+                        WHERE conversation_id = ?
+                          AND state IN ('preparing', 'ready')
+                        """,
+                        (conversation_id,),
+                    ).fetchone()[0]
+                )
+                if conversation_count >= max(1, int(max_conversation_candidates)):
+                    conn.rollback()
+                    return 0, "conversation-candidate-limit"
+                profile_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) FROM lcm_prepared_batches
+                        WHERE state IN ('preparing', 'ready')
+                        """
+                    ).fetchone()[0]
+                )
+                if profile_count >= max(1, int(max_profile_candidates)):
+                    conn.rollback()
+                    return 0, "profile-candidate-limit"
+                now = time.time()
+                cur = conn.execute(
+                    """
+                    INSERT INTO lcm_prepared_batches
+                        (conversation_id, session_id, base_generation,
+                         source_end_store_id, source_identity_hash, source_ids,
+                         policy_fingerprint, route_fingerprint, state,
+                         expected_leaf_count, frontier_end_store_id,
+                         created_at, updated_at, resolved_policy_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'preparing', 0, 0, ?, ?, ?)
+                    """,
+                    (
+                        conversation_id,
+                        session_id,
+                        int(base_generation),
+                        int(source_end_store_id),
+                        source_identity_hash,
+                        json.dumps(source_ids),
+                        policy_fingerprint,
+                        route_fingerprint,
+                        now,
+                        now,
+                        resolved_policy_json,
+                    ),
+                )
+                conn.commit()
+                return int(cur.lastrowid), ""
+            except Exception:
+                conn.rollback()
+                raise
+
+    def list_pending_batches(self, conversation_id: str) -> list[PreparedBatch]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT batch_id, conversation_id, session_id, base_generation,
+                       source_end_store_id, source_identity_hash, source_ids,
+                       policy_fingerprint, route_fingerprint, state,
+                       expected_leaf_count, frontier_end_store_id, failure_reason,
+                       COALESCE(summary_payload, ''), COALESCE(payload_version, 0),
+                       COALESCE(resolved_policy_json, '{}')
+                FROM lcm_prepared_batches
+                WHERE conversation_id = ? AND state IN ('preparing', 'ready')
+                ORDER BY source_end_store_id DESC, batch_id DESC
+                """,
+                (conversation_id,),
+            ).fetchall()
+        return [self._row_to_batch(row) for row in rows]
+
+    def cleanup_pending_batches(
+        self,
+        *,
+        conversation_id: str,
+        current_generation: int,
+        policy_fingerprint: str,
+        route_fingerprint: str,
+        ttl_seconds: float,
+        now: float | None = None,
+    ) -> dict[str, int]:
+        """Supersede expired or incompatible speculative work only."""
+        current_time = time.time() if now is None else float(now)
+        counts = {
+            "ttl-expired": 0,
+            "generation-superseded": 0,
+            "policy-superseded": 0,
+        }
+        with self._lock:
+            conn = self.conn
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                if ttl_seconds > 0:
+                    cur = conn.execute(
+                        """
+                        UPDATE lcm_prepared_batches
+                        SET state = 'superseded', failure_reason = 'ttl-expired', updated_at = ?
+                        WHERE state IN ('preparing', 'ready') AND updated_at < ?
+                        """,
+                        (current_time, current_time - float(ttl_seconds)),
+                    )
+                    counts["ttl-expired"] = max(0, int(cur.rowcount))
+                cur = conn.execute(
+                    """
+                    UPDATE lcm_prepared_batches
+                    SET state = 'superseded', failure_reason = 'generation-superseded', updated_at = ?
+                    WHERE conversation_id = ? AND state IN ('preparing', 'ready')
+                      AND base_generation != ?
+                    """,
+                    (current_time, conversation_id, int(current_generation)),
+                )
+                counts["generation-superseded"] = max(0, int(cur.rowcount))
+                cur = conn.execute(
+                    """
+                    UPDATE lcm_prepared_batches
+                    SET state = 'superseded', failure_reason = 'policy-superseded', updated_at = ?
+                    WHERE conversation_id = ? AND state IN ('preparing', 'ready')
+                      AND (policy_fingerprint != ? OR route_fingerprint != ?)
+                    """,
+                    (
+                        current_time,
+                        conversation_id,
+                        policy_fingerprint,
+                        route_fingerprint,
+                    ),
+                )
+                counts["policy-superseded"] = max(0, int(cur.rowcount))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return counts
 
     def update_batch_state(
         self,
@@ -477,6 +663,7 @@ class FrontierStore:
             failure_reason=row[12] or "",
             summary_payload=(row[13] if len(row) > 13 else "") or "",
             payload_version=int(row[14]) if len(row) > 14 else 0,
+            resolved_policy_json=(row[15] if len(row) > 15 else "{}") or "{}",
         )
 
     def get_batch(self, batch_id: int) -> PreparedBatch | None:
@@ -487,7 +674,8 @@ class FrontierStore:
                        source_end_store_id, source_identity_hash, source_ids,
                        policy_fingerprint, route_fingerprint, state,
                        expected_leaf_count, frontier_end_store_id, failure_reason,
-                       COALESCE(summary_payload, ''), COALESCE(payload_version, 0)
+                       COALESCE(summary_payload, ''), COALESCE(payload_version, 0),
+                       COALESCE(resolved_policy_json, '{}')
                 FROM lcm_prepared_batches WHERE batch_id = ?
                 """,
                 (batch_id,),
@@ -521,7 +709,8 @@ class FrontierStore:
                        source_end_store_id, source_identity_hash, source_ids,
                        policy_fingerprint, route_fingerprint, state,
                        expected_leaf_count, frontier_end_store_id, failure_reason,
-                       COALESCE(summary_payload, ''), COALESCE(payload_version, 0)
+                       COALESCE(summary_payload, ''), COALESCE(payload_version, 0),
+                       COALESCE(resolved_policy_json, '{}')
                 FROM lcm_prepared_batches
                 WHERE conversation_id = ? AND state = 'ready'
                 ORDER BY batch_id DESC

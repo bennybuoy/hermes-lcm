@@ -1906,7 +1906,7 @@ class TestMessageStore:
         version = store._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("7",)
+        assert version == ("8",)
 
         results = store.search("docker", session_id="sess1")
         assert len(results) == 1
@@ -1955,7 +1955,7 @@ class TestMessageStore:
         version = store._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("7",)
+        assert version == ("8",)
 
         migration_state = store._conn.execute(
             "SELECT step_name FROM lcm_migration_state ORDER BY step_name"
@@ -2923,7 +2923,7 @@ class TestLifecycleStateStore:
         version = state._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()[0]
-        assert version == "7"
+        assert version == "8"
 
         tables = {
             row[0]
@@ -3503,7 +3503,7 @@ class TestSummaryDAG:
         version = dag._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("7",)
+        assert version == ("8",)
 
         results = dag.search("docker", session_id="s1")
         assert len(results) == 1
@@ -3555,7 +3555,7 @@ class TestSummaryDAG:
         version = dag._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("7",)
+        assert version == ("8",)
 
         migration_state = dag._conn.execute(
             "SELECT step_name FROM lcm_migration_state ORDER BY step_name"

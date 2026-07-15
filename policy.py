@@ -155,6 +155,8 @@ class ModelCompactionPolicy:
     cache_economics: str = "unknown"  # discounted | none | unknown
     compaction_mode: str = "inline"  # inline | deferred
     cache_ttl_seconds: int = 0
+    full_sweep_compaction_enabled: bool = False
+    summary_prefix_target_tokens: int = 0
 
     # Source reporting:
     source: str = "default"
@@ -207,6 +209,8 @@ class ModelCompactionPolicy:
             raise ValueError("compaction_mode must be inline or deferred")
         if self.cache_ttl_seconds < 0:
             raise ValueError("cache_ttl_seconds must be non-negative")
+        if self.summary_prefix_target_tokens < 0:
+            raise ValueError("summary_prefix_target_tokens must be non-negative")
 
     # -- Token boundary helpers -------------------------------------------
 
@@ -243,6 +247,14 @@ class ModelCompactionPolicy:
 
     def to_status_dict(self, context_length: int) -> dict[str, Any]:
         """Return a JSON-serializable status dict for lcm_status."""
+        if self.compaction_mode == "deferred":
+            selected_strategy = "cache-aware-deferred"
+        elif self.cache_economics == "none":
+            selected_strategy = "aggressive-inline"
+        elif self.cache_economics == "unknown":
+            selected_strategy = "conservative-inline"
+        else:
+            selected_strategy = "inline"
         return {
             "fingerprint": self.fingerprint,
             "source": self.source,
@@ -266,12 +278,20 @@ class ModelCompactionPolicy:
             "fresh_tail_count": self.fresh_tail_count,
             "fresh_tail_max_tokens": self.fresh_tail_max_tokens,
             "leaf_chunk_tokens": self.leaf_chunk_tokens,
+            "dynamic_leaf_chunk_enabled": self.dynamic_leaf_chunk_enabled,
+            "dynamic_leaf_chunk_max": self.dynamic_leaf_chunk_max,
             "condensation_fanin": self.condensation_fanin,
             "condensation_min_fanin": self.condensation_min_fanin,
             "incremental_max_depth": self.incremental_max_depth,
+            "cache_friendly_condensation_enabled": self.cache_friendly_condensation_enabled,
+            "output_reserve": self.output_reserve,
             "cache_economics": self.cache_economics,
             "compaction_mode": self.compaction_mode,
             "cache_ttl_seconds": self.cache_ttl_seconds,
+            "full_sweep_compaction_enabled": self.full_sweep_compaction_enabled,
+            "summary_prefix_target_tokens": self.summary_prefix_target_tokens,
+            "selected_strategy": selected_strategy,
+            "observed_cache_telemetry_is_economic_classification": False,
         }
 
 
@@ -305,6 +325,8 @@ def _compute_fingerprint(policy_fields: dict[str, Any]) -> str:
         "cache_economics",
         "compaction_mode",
         "cache_ttl_seconds",
+        "full_sweep_compaction_enabled",
+        "summary_prefix_target_tokens",
     ]
     semantic = {k: policy_fields.get(k) for k in semantic_keys}
     raw = json.dumps(semantic, sort_keys=True, default=str)
@@ -363,6 +385,8 @@ _RULE_OVERRIDE_FIELDS = frozenset({
     "cache_economics",
     "compaction_mode",
     "cache_ttl_seconds",
+    "full_sweep_compaction_enabled",
+    "summary_prefix_target_tokens",
 })
 
 
@@ -500,6 +524,8 @@ def resolve_policy(
     cache_economics: str = "unknown",
     compaction_mode: str = "inline",
     cache_ttl_seconds: int = 0,
+    full_sweep_compaction_enabled: bool = False,
+    summary_prefix_target_tokens: int = 0,
     # Config source tracking:
     context_threshold_source: str = "manual_or_default",
     config_sources: Optional[dict[str, str]] = None,
@@ -690,6 +716,8 @@ def resolve_policy(
         "cache_economics": str(selected_overrides.get("cache_economics", cache_economics)).lower(),
         "compaction_mode": str(selected_overrides.get("compaction_mode", compaction_mode)).lower(),
         "cache_ttl_seconds": int(selected_overrides.get("cache_ttl_seconds", cache_ttl_seconds)),
+        "full_sweep_compaction_enabled": bool(selected_overrides.get("full_sweep_compaction_enabled", full_sweep_compaction_enabled)),
+        "summary_prefix_target_tokens": int(selected_overrides.get("summary_prefix_target_tokens", summary_prefix_target_tokens)),
     }
 
     fingerprint = _compute_fingerprint(fields)

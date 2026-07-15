@@ -20,6 +20,9 @@ packages = ["hermes_lcm", "hermes_lcm.benchmarking"]
 hermes_lcm = "."
 "hermes_lcm.benchmarking" = "benchmarking"
 
+[tool.setuptools.package-data]
+hermes_lcm = ["plugin.yaml", "docs/host-activation-contract.md"]
+
 [tool.ruff]
 # Match the oldest runtime CI exercises; keeps lint aligned with the 3.11 leg.
 target-version = "py311"

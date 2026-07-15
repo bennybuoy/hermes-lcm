@@ -1,0 +1,13 @@
+{
+  "fixture_kind": "synthetic-contract-fixture-not-provider-results",
+  "strategies": {
+    "chronological": [
+      {"input_tokens": 1000, "cache_read_tokens": 400, "summary_input_tokens": 0, "cutover": false, "prefix_fingerprint": "a", "recall_at_k": 0.5, "retrieval_score": 0.6, "assembly_latency_ms": 2.0},
+      {"input_tokens": 1200, "cache_read_tokens": 500, "summary_input_tokens": 300, "cutover": true, "prefix_fingerprint": "b", "recall_at_k": 0.5, "retrieval_score": 0.7, "assembly_latency_ms": 2.4}
+    ],
+    "prompt-aware": [
+      {"input_tokens": 950, "cache_read_tokens": 350, "summary_input_tokens": 0, "cutover": false, "prefix_fingerprint": "p1", "recall_at_k": 0.8, "retrieval_score": 0.8, "assembly_latency_ms": 3.1},
+      {"input_tokens": 1000, "cache_read_tokens": 300, "summary_input_tokens": 250, "cutover": true, "prefix_fingerprint": "p2", "recall_at_k": 0.9, "retrieval_score": 0.85, "assembly_latency_ms": 3.4}
+    ]
+  }
+}

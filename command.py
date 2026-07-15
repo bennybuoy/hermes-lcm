@@ -82,6 +82,10 @@ def _help_text(error: str | None = None) -> str:
         "- /lcm preset show [name]: inspect shipped preset metadata and benchmark provenance",
         "- /lcm preset suggest: preview the best shipped preset for the current engine state",
         "- /lcm preset apply <name> --dry-run: preview env-var changes without mutating live config",
+        "- /lcm focus <prompt>: synthesize and persist an immutable evidence-backed focus overlay",
+        "- /lcm focus: show active focus metadata and a bounded preview",
+        "- /lcm refocus: update the active brief from post-focus DAG deltas",
+        "- /lcm unfocus: deactivate the overlay while preserving focus history",
         "- /lcm help: show this help",
     ])
     return "\n".join(lines)
@@ -1678,6 +1682,32 @@ def handle_lcm_command(raw_args: str | None, engine) -> str:
         if rest:
             return _help_text("`/lcm status` does not accept extra arguments.")
         return _status_text(engine)
+
+    if head == "focus":
+        prompt = (raw_args or "").strip()[len(tokens[0]):].strip()
+        result = (
+            engine.create_focus(prompt)
+            if prompt
+            else engine.get_focus_status(preview_chars=500)
+        )
+        return "LCM focus\n" + "\n".join(
+            f"{key}: {value}" for key, value in result.items()
+        )
+
+    if head == "refocus":
+        prompt = (raw_args or "").strip()[len(tokens[0]):].strip()
+        result = engine.create_focus(prompt, refocus=True)
+        return "LCM refocus\n" + "\n".join(
+            f"{key}: {value}" for key, value in result.items()
+        )
+
+    if head == "unfocus":
+        if rest:
+            return _help_text("`/lcm unfocus` does not accept extra arguments.")
+        result = engine.unfocus()
+        return "LCM unfocus\n" + "\n".join(
+            f"{key}: {value}" for key, value in result.items()
+        )
 
     if head == "doctor":
         if not rest:

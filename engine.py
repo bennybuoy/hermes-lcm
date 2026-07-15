@@ -23,9 +23,15 @@ from .codex_routing import (
     _codex_oauth_context_cap,
     _is_codex_gpt55_route,
 )
+from .cache_aware import CacheAwareSignalTracker
 from .config import LCMConfig
 from .dag import SummaryDAG, SummaryNode
-from .policy import DEFAULT_TARGET_RATIO, ModelCompactionPolicy, resolve_policy
+from .policy import (
+    DEFAULT_PREPARATION_RATIO,
+    DEFAULT_TARGET_RATIO,
+    ModelCompactionPolicy,
+    resolve_policy,
+)
 from .frontier import (
     FrontierStore,
     PREPARED_PAYLOAD_VERSION,
@@ -34,6 +40,7 @@ from .frontier import (
     compute_source_identity_hash,
     compute_route_fingerprint,
 )
+from .focus import FocusStore
 from .diagnostics import _enforce_state_db_containment
 from .engine_registry import (
     _ACTIVE_ENGINE_REGISTRY_LOCK,
@@ -91,6 +98,7 @@ from .schemas import (
     LCM_DOCTOR,
     LCM_EXPAND,
     LCM_EXPAND_QUERY,
+    LCM_FOCUS,
     LCM_GREP,
     LCM_INSPECT,
     LCM_LOAD_SESSION,
@@ -113,8 +121,14 @@ from .message_analysis import (
 from .message_patterns import compile_message_patterns, matches_message_pattern
 from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
+from .preparation import (
+    active_profile_admissions,
+    release_profile_admission,
+    try_acquire_profile_admission,
+)
 from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
 from .compaction import CompactionMixin
+from .sweep import FullSweepMixin
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .lifecycle_state import LifecycleStateStore
@@ -147,7 +161,7 @@ _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across co
 _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
 
 
-class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
+class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
     """Lossless Context Management engine.
 
     Automatic LCM compaction is routine background maintenance. Hosts that
@@ -254,6 +268,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         self._context_threshold_autoraised: dict[str, float] | None = None
         self._compaction_policy: Optional[ModelCompactionPolicy] = None
+        self._cache_signal_tracker = CacheAwareSignalTracker()
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
@@ -407,6 +422,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._async_total_prepare_attempts: int = 0
         self._async_total_promote_attempts: int = 0
         self._async_total_promote_succeeded: int = 0
+        self._async_total_prepared: int = 0
+        self._async_prepare_skip_reasons: dict[str, int] = {}
+        self._async_cleanup_counts: dict[str, int] = {}
+        self._async_last_pressure_signal: str = "none"
+        self._async_last_host_prompt_tokens: int = 0
+        self._async_last_source_tokens: int = 0
+        self._async_last_pressure_mismatch_tokens: int = 0
+        self._async_last_expected_reduction_tokens: int = 0
+        self._async_last_ready_coverage_tokens: int = 0
+        self._async_last_projected_headroom_tokens: int = 0
 
     def clone_for_agent(self) -> "LCMEngine":
         """Return a fresh runtime engine for one AIAgent instance.
@@ -486,10 +511,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._dag = SummaryDAG(db_path)
         self._lifecycle = LifecycleStateStore(db_path)
         self._frontier = FrontierStore(str(db_path))
+        self._focus = FocusStore(str(db_path))
 
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
-        for attr in ("_store", "_dag", "_lifecycle", "_frontier"):
+        for attr in ("_store", "_dag", "_lifecycle", "_frontier", "_focus"):
             helper = getattr(self, attr, None)
             close = getattr(helper, "close", None)
             if callable(close):
@@ -950,6 +976,100 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return 0.0
         return self.last_cache_read_tokens / self.last_prompt_tokens
 
+    def _main_route_fingerprint(self) -> str:
+        route = {
+            "provider": self.provider or "",
+            "model": self.model or "",
+            "api_mode": self.api_mode or "",
+            "base_url": self.base_url or "",
+        }
+        return hashlib.sha256(
+            json.dumps(route, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:24]
+
+    def record_cache_signal(
+        self,
+        event: str,
+        *,
+        source: str,
+        ttl_seconds: float | None = None,
+    ) -> None:
+        """Record an explicit host cache write/break signal.
+
+        Usage counters are never consulted. A route change makes the signal
+        inapplicable instead of silently transferring cache state.
+        """
+        policy = getattr(self, "_compaction_policy", None)
+        ttl = (
+            float(ttl_seconds)
+            if ttl_seconds is not None
+            else float(
+                policy.cache_ttl_seconds
+                if policy is not None
+                else self._config.cache_ttl_seconds
+            )
+        )
+        self._cache_signal_tracker.record(
+            event,
+            route_fingerprint=self._main_route_fingerprint(),
+            source=source,
+            ttl_seconds=ttl,
+            conversation_id=self.current_conversation_id,
+        )
+
+    def cache_signal_status(self) -> dict[str, object]:
+        return self._cache_signal_tracker.status(
+            route_fingerprint=self._main_route_fingerprint(),
+            conversation_id=self.current_conversation_id,
+        )
+
+    def _should_defer_compaction_for_hot_cache(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        observed_tokens: int,
+    ) -> bool:
+        policy = getattr(self, "_compaction_policy", None)
+        mode = policy.compaction_mode if policy is not None else self._config.compaction_mode
+        if mode != "deferred":
+            return False
+        if self._should_force_overflow_recovery(
+            observed_tokens=observed_tokens,
+            messages=messages,
+        ):
+            return False
+        signal = self.cache_signal_status()
+        if signal.get("state") != "hot":
+            return False
+        if self._conversation_id:
+            try:
+                self._lifecycle.record_debt(
+                    self._conversation_id,
+                    kind="hot_cache_deferred",
+                    size_estimate=max(0, int(observed_tokens)),
+                )
+            except Exception:
+                logger.debug("LCM could not persist hot-cache debt", exc_info=True)
+        self._last_compression_status = "noop"
+        self._last_compression_noop_reason = "hot-cache-deferred"
+        return True
+
+    def maintain(
+        self,
+        messages: List[Dict[str, Any]] | None = None,
+        *,
+        force: bool = False,
+    ) -> PreparedBatch | None:
+        """Run one deferred maintenance preparation after explicit cache heat ends."""
+        active_messages = list(messages or [])
+        if self.cache_signal_status().get("state") == "hot":
+            return None
+        return self.prepare_background_compaction_once(
+            active_messages,
+            host_prompt_tokens=self.last_prompt_tokens or None,
+            force=force,
+        )
+
     def _record_turn_compaction_telemetry(self) -> None:
         """Persist a per-conversation compaction-telemetry snapshot for this turn.
 
@@ -1341,7 +1461,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if len(current_chunk) <= 1:
             return []
 
-        floor_tokens = max(1, self._config.leaf_chunk_tokens)
+        floor_tokens = self._effective_leaf_chunk_tokens()
         shrink_targets = [
             max(floor_tokens, int(current_source_tokens * 0.75)),
             max(floor_tokens, int(current_source_tokens * 0.50)),
@@ -1360,6 +1480,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         initial_chunk: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
+        timeout_seconds: float | None = None,
     ) -> tuple[List[Dict[str, Any]], int, str, int, int]:
         attempt_chunk = list(initial_chunk)
         max_attempts = 3
@@ -1382,7 +1503,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     fallback_models=self._config.summary_fallback_models,
                     circuit_breaker=self._summary_circuit_breaker,
                     spend_guard=self._summary_spend_guard,
-                    timeout=self._config.summary_timeout_ms / 1000,
+                    timeout=(
+                        min(self._config.summary_timeout_ms / 1000, timeout_seconds)
+                        if timeout_seconds is not None
+                        else self._config.summary_timeout_ms / 1000
+                    ),
                     l2_budget_ratio=self._config.l2_budget_ratio,
                     l3_truncate_tokens=self._config.l3_truncate_tokens,
                     focus_topic=focus_topic or "",
@@ -1623,6 +1748,46 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return max(0, int(policy.fresh_tail_max_tokens))
         return max(0, int(self._config.fresh_tail_max_tokens or 0))
 
+    def _effective_policy_value(self, name: str):
+        policy = getattr(self, "_compaction_policy", None)
+        if policy is not None and hasattr(policy, name):
+            return getattr(policy, name)
+        return getattr(self._config, name)
+
+    def _effective_leaf_chunk_tokens(self) -> int:
+        return max(1, int(self._effective_policy_value("leaf_chunk_tokens") or 1))
+
+    def _effective_dynamic_leaf_chunk_enabled(self) -> bool:
+        return bool(self._effective_policy_value("dynamic_leaf_chunk_enabled"))
+
+    def _effective_dynamic_leaf_chunk_max(self) -> int:
+        return max(
+            self._effective_leaf_chunk_tokens(),
+            int(self._effective_policy_value("dynamic_leaf_chunk_max") or 0),
+        )
+
+    def _effective_condensation_fanin(self) -> int:
+        return max(2, int(self._effective_policy_value("condensation_fanin") or 2))
+
+    def _effective_condensation_min_fanin(self) -> int:
+        return max(2, int(self._effective_policy_value("condensation_min_fanin") or 2))
+
+    def _effective_incremental_max_depth(self) -> int:
+        return int(self._effective_policy_value("incremental_max_depth"))
+
+    def _effective_cache_friendly_condensation_enabled(self) -> bool:
+        return bool(
+            self._effective_policy_value("cache_friendly_condensation_enabled")
+        )
+
+    def _effective_full_sweep_compaction_enabled(self) -> bool:
+        return bool(self._effective_policy_value("full_sweep_compaction_enabled"))
+
+    def _effective_summary_prefix_target_tokens(self) -> int:
+        return max(
+            0, int(self._effective_policy_value("summary_prefix_target_tokens") or 0)
+        )
+
     def _fresh_tail_start(self, messages: List[Dict[str, Any]]) -> int:
         """Resolve the shared suffix protected by count and token rails."""
         n = len(messages)
@@ -1732,9 +1897,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return count_messages_tokens(backlog)
 
     def _raw_backlog_threshold(self, raw_tokens: int) -> int:
-        if self._config.dynamic_leaf_chunk_enabled:
+        if self._effective_dynamic_leaf_chunk_enabled():
             return self._working_leaf_chunk_tokens(raw_tokens)
-        return max(1, self._config.leaf_chunk_tokens)
+        return self._effective_leaf_chunk_tokens()
 
     def _has_raw_backlog_debt(self) -> bool:
         if not self._config.deferred_maintenance_enabled or not self._conversation_id:
@@ -3390,6 +3555,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             LCM_DESCRIBE,
             LCM_EXPAND,
             LCM_EXPAND_QUERY,
+            LCM_FOCUS,
             LCM_STATUS,
             LCM_INSPECT,
             LCM_DOCTOR,
@@ -3418,6 +3584,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "lcm_describe": lcm_tools.lcm_describe,
             "lcm_expand": lcm_tools.lcm_expand,
             "lcm_expand_query": lcm_tools.lcm_expand_query,
+            "lcm_focus": lcm_tools.lcm_focus,
             "lcm_status": lcm_tools.lcm_status,
             "lcm_inspect": lcm_tools.lcm_inspect,
             "lcm_doctor": lcm_tools.lcm_doctor,
@@ -3499,6 +3666,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "last_reasoning_tokens": self.last_reasoning_tokens,
             "cache_metrics_available": self.cache_metrics_available,
             "cache_read_ratio": round(self.cache_read_ratio, 4),
+            "hot_cache_signal": self.cache_signal_status(),
             "raw_context_length": self.raw_context_length,
             "context_length": self.context_length,
             "effective_context_length_cap": self.effective_context_length_cap,
@@ -3552,6 +3720,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),
             "async_compaction": self.get_async_compaction_status(),
+            "full_sweep": dict(getattr(
+                self,
+                "_last_full_sweep_status",
+                {
+                    "reason": "not-run",
+                    "passes": 0,
+                    "partial": False,
+                    "publication_count": 0,
+                    "leaf_count": 0,
+                    "condensation_count": 0,
+                    "used_minimum_fanin": False,
+                },
+            )),
+            "focus": self.get_focus_status(preview_chars=0),
         })
         session_id = self.current_session_id
         conversation_id = self.current_conversation_id
@@ -3685,6 +3867,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             cache_economics=self._config.cache_economics,
             compaction_mode=self._config.compaction_mode,
             cache_ttl_seconds=self._config.cache_ttl_seconds,
+            full_sweep_compaction_enabled=self._config.full_sweep_compaction_enabled,
+            summary_prefix_target_tokens=self._config.summary_prefix_target_tokens,
             context_threshold_source=self._context_threshold_source,
             config_sources=getattr(self._config, "config_sources", None),
         )
@@ -4789,31 +4973,31 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     for call_id in (_tool_call_id(tool_call) for tool_call in (msg.get("tool_calls") or []))
                     if call_id
                 ]
+                # Snapshot the entire contiguous result run before matching.
+                # Consuming one expected ID at a time used to discard a valid
+                # out-of-order result needed by a later call in the same
+                # assistant message. Bucket by ID, then emit provider order.
+                contiguous_results: dict[str, list[Dict[str, Any]]] = {}
+                while i + 1 < len(messages) and messages[i + 1].get("role") == "tool":
+                    next_msg = messages[i + 1]
+                    next_id = str(next_msg.get("tool_call_id") or "").strip()
+                    contiguous_results.setdefault(next_id, []).append(next_msg)
+                    i += 1
 
                 for expected_id in expected_ids:
-                    matched_direct_result = False
-                    while i + 1 < len(messages) and messages[i + 1].get("role") == "tool":
-                        next_msg = messages[i + 1]
-                        next_id = str(next_msg.get("tool_call_id") or "").strip()
-                        if next_id == expected_id:
-                            sanitized.append(next_msg)
-                            i += 1
-                            matched_direct_result = True
-                            break
-                        dropped_tool_results += 1
-                        i += 1
-
-                    if not matched_direct_result and insert_missing_tool_stubs:
+                    candidates = contiguous_results.get(expected_id) or []
+                    if candidates:
+                        sanitized.append(candidates.pop(0))
+                    elif insert_missing_tool_stubs:
                         sanitized.append({
                             "role": "tool",
                             "content": "[Result from earlier conversation — see context summary above]",
                             "tool_call_id": expected_id,
                         })
                         inserted_stub_results += 1
-
-                while i + 1 < len(messages) and messages[i + 1].get("role") == "tool":
-                    dropped_tool_results += 1
-                    i += 1
+                dropped_tool_results += sum(
+                    len(candidates) for candidates in contiguous_results.values()
+                )
 
             i += 1
 
@@ -4842,14 +5026,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     ) -> tuple[bool, str]:
         if not leaf_compacted_this_turn:
             return True, ""
-        if not self._config.cache_friendly_condensation_enabled:
+        if not self._effective_cache_friendly_condensation_enabled():
             return True, ""
         if force_overflow:
             return True, ""
         if critical_budget_pressure:
             return True, ""
 
-        fanin = max(1, self._config.condensation_fanin)
+        fanin = self._effective_condensation_fanin()
         debt_threshold = fanin * max(1, self._config.cache_friendly_min_debt_groups)
         if uncondensed_count >= debt_threshold:
             return True, ""
@@ -4868,7 +5052,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Check if any depth level has enough nodes for condensation."""
         self._last_condensation_suppressed_reason = ""
 
-        max_depth = self._config.incremental_max_depth
+        max_depth = self._effective_incremental_max_depth()
         if max_depth == 0:
             return  # condensation disabled
 
@@ -4888,7 +5072,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             uncondensed = self._dag.get_uncondensed_at_depth(
                 self._session_id, depth
             )
-            if len(uncondensed) < self._config.condensation_fanin:
+            fanin = self._effective_condensation_fanin()
+            if len(uncondensed) < fanin:
                 continue
 
             allow_condense, reason = self._should_allow_follow_on_condensation(
@@ -4902,7 +5087,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 continue
 
             # Take the first fanin nodes and condense
-            to_condense = uncondensed[:self._config.condensation_fanin]
+            to_condense = uncondensed[:fanin]
             combined_text = "\n\n---\n\n".join(n.summary for n in to_condense)
             source_tokens = sum(n.token_count for n in to_condense)
             token_budget = max(1000, int(source_tokens * 0.40))
@@ -4946,10 +5131,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 source_tokens, count_tokens(summary_text),
             )
 
-            if leaf_compacted_this_turn and self._config.cache_friendly_condensation_enabled:
+            if leaf_compacted_this_turn and self._effective_cache_friendly_condensation_enabled():
                 break
 
-        if not condensed_any and leaf_compacted_this_turn and self._config.cache_friendly_condensation_enabled:
+        if not condensed_any and leaf_compacted_this_turn and self._effective_cache_friendly_condensation_enabled():
             self._last_condensation_suppressed_reason = suppression_reason
 
     # -- Internal: context assembly ----------------------------------------
@@ -5063,6 +5248,215 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return self._build_preserved_objective_summary_part(message)
         return None
 
+    def _focus_node_max_store_id(self, node: SummaryNode) -> int:
+        """Return a bounded descendant raw watermark for one canonical node."""
+        maximum = 0
+        stack = [node]
+        visited: set[int] = set()
+        remaining = max(64, int(self._config.focus_max_source_nodes) * 64)
+        while stack and remaining > 0:
+            current = stack.pop()
+            node_id = int(current.node_id or 0)
+            if node_id in visited:
+                continue
+            visited.add(node_id)
+            remaining -= 1
+            if current.source_type == "messages":
+                for source_id in current.source_ids:
+                    try:
+                        maximum = max(maximum, int(source_id))
+                    except (TypeError, ValueError):
+                        continue
+                continue
+            if current.source_type == "nodes":
+                for child_id in current.source_ids:
+                    child = self._dag.get_node(int(child_id))
+                    if child is not None and child.session_id == current.session_id:
+                        stack.append(child)
+        return maximum
+
+    def get_focus_status(self, *, preview_chars: int = 0) -> Dict[str, Any]:
+        conversation_id = self.current_conversation_id
+        if not conversation_id:
+            return {"active": False, "reason": "no-bound-conversation"}
+        active = self._focus.get_active(conversation_id)
+        if active is None:
+            return {"active": False, "history_count": len(self._focus.history(conversation_id, limit=200))}
+        result = active.metadata(preview_chars=preview_chars)
+        result["active"] = True
+        result["history_count"] = len(self._focus.history(conversation_id, limit=200))
+        return redact_sensitive_value(result, self._config, parse_json_strings=True)
+
+    def create_focus(self, prompt: str, *, refocus: bool = False) -> Dict[str, Any]:
+        """Synthesize and atomically publish one immutable focus brief."""
+        prompt = str(prompt or "").strip()
+        conversation_id = self.current_conversation_id
+        session_id = self.current_session_id
+        if not conversation_id or not session_id:
+            return {"error": "focus requires a bound conversation and session"}
+        previous = self._focus.get_active(conversation_id)
+        if refocus:
+            if previous is None:
+                return {"error": "no active focus to refocus"}
+            if not prompt:
+                prompt = previous.prompt
+        elif not prompt:
+            return {"error": "focus prompt is required"}
+
+        max_nodes = max(1, int(self._config.focus_max_source_nodes))
+        if refocus:
+            # Rank matching nodes first, then fill from canonical session nodes;
+            # only post-watermark DAG deltas are eligible.
+            ranked = self._dag.search(prompt, session_id=session_id, limit=max_nodes * 4)
+            ranked_ids = {int(node.node_id) for node in ranked}
+            ranked.extend(
+                node for node in self._dag.get_session_nodes(session_id, limit=max_nodes * 16)
+                if int(node.node_id) not in ranked_ids
+            )
+            nodes = [
+                node for node in ranked
+                if self._focus_node_max_store_id(node) > int(previous.covered_store_id)
+            ][:max_nodes]
+            if not nodes:
+                return {
+                    "error": "no post-focus DAG delta is available",
+                    "previous_focus_preserved": True,
+                    "focus": previous.metadata(),
+                }
+        else:
+            nodes = self._dag.search(prompt, session_id=session_id, limit=max_nodes)
+            if not nodes:
+                return {"error": "no matching canonical LCM summary evidence found"}
+
+        context_budget = max(1, int(self._config.focus_context_tokens))
+        context_blocks: list[dict[str, Any]] = []
+        budget_used = 0
+        if refocus and previous is not None:
+            prior_block = {
+                "type": "previous_focus_brief",
+                "focus_id": previous.focus_id,
+                "content": previous.content,
+                "source_node_ids": list(previous.source_node_ids),
+            }
+            prior_tokens = lcm_tools._context_content_token_count([
+                {"type": "summary", "summary": previous.content}
+            ])
+            if prior_tokens <= context_budget:
+                context_blocks.append(prior_block)
+                budget_used += prior_tokens
+
+        selected_nodes: list[SummaryNode] = []
+        truncated = False
+        for node in nodes:
+            remaining = max(0, context_budget - budget_used)
+            if remaining <= 0:
+                truncated = True
+                break
+            blocks = lcm_tools._collect_context_blocks_for_node(
+                self,
+                node,
+                max_tokens=remaining,
+                hydrate_externalized_content=False,
+                allowed_session_id=session_id,
+            )
+            for block in blocks:
+                block["session_id"] = session_id
+            used = lcm_tools._context_content_token_count(blocks)
+            context_blocks.extend(blocks)
+            budget_used += used
+            selected_nodes.append(node)
+            truncated = truncated or any(
+                block.get("summary_truncated")
+                or block.get("pagination", {}).get("has_more")
+                for block in blocks
+            )
+
+        if not selected_nodes:
+            return {
+                "error": "no focus evidence fit within the context budget",
+                "previous_focus_preserved": bool(previous),
+            }
+        source_node_ids = list(dict.fromkeys(
+            ([*previous.source_node_ids] if refocus and previous is not None else [])
+            + [int(node.node_id) for node in selected_nodes]
+        ))
+        synthesis_prompt = (
+            f"Create an immutable focus brief for this objective: {prompt}\n"
+            "Cite material claims with [node N]. Mark unsupported or conflicting details as uncertain. "
+            "Preserve actionable decisions, constraints, and open work."
+        )
+        if refocus:
+            synthesis_prompt += " Update the previous brief using only the supplied post-focus DAG delta."
+        model = self._config.expansion_model or self._config.summary_model or ""
+        try:
+            content = lcm_tools._synthesize_expansion_answer(
+                prompt=synthesis_prompt,
+                context_blocks=context_blocks,
+                model=model,
+                max_tokens=max(1, int(self._config.focus_output_tokens)),
+                timeout=max(0.001, float(self._config.focus_timeout_ms) / 1000.0),
+            )
+        except TimeoutError:
+            return {
+                "error": "focus synthesis timed out",
+                "previous_focus_preserved": bool(previous),
+            }
+        except Exception:
+            logger.warning("LCM focus synthesis failed; preserving the active brief")
+            return {
+                "error": "focus synthesis failed",
+                "previous_focus_preserved": bool(previous),
+            }
+        content = str(content or "").strip()
+        if not content:
+            return {
+                "error": "focus synthesis returned an empty brief",
+                "previous_focus_preserved": bool(previous),
+            }
+        content = redact_sensitive_text(content, self._config)
+        frontier = self._frontier.get_active_frontier(conversation_id) or {}
+        covered_store_id = max(
+            [self._focus_node_max_store_id(node) for node in selected_nodes]
+            + ([int(previous.covered_store_id)] if previous is not None else [0])
+        )
+        brief = self._focus.publish(
+            conversation_id=conversation_id,
+            session_id=session_id,
+            prompt=prompt,
+            content=content,
+            source_node_ids=source_node_ids,
+            covered_generation=int(frontier.get("generation") or 0),
+            covered_store_id=covered_store_id,
+            token_count=count_tokens(content),
+            supersedes_focus_id=previous.focus_id if previous is not None else None,
+        )
+        result = redact_sensitive_value(
+            brief.metadata(preview_chars=500),
+            self._config,
+            parse_json_strings=True,
+        )
+        result.update({
+            "active": True,
+            "refocus": refocus,
+            "context_tokens_used": budget_used,
+            "context_truncated": truncated,
+            "model": model,
+        })
+        return result
+
+    def unfocus(self) -> Dict[str, Any]:
+        conversation_id = self.current_conversation_id
+        if not conversation_id:
+            return {"error": "unfocus requires a bound conversation"}
+        brief = self._focus.unfocus(conversation_id)
+        if brief is None:
+            return {"active": False, "reason": "no-active-focus"}
+        return {
+            "active": False,
+            "deactivated_focus_id": brief.focus_id,
+            "history_preserved": True,
+        }
+
     def _assemble_context(
         self,
         system_msg: Optional[Dict[str, Any]],
@@ -5169,7 +5563,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if anchor_source is not None:
             anchor_part = self._latest_user_context_anchor(anchor_source, tail_selected)
 
-        # Collect DAG summaries — highest depth first for context hierarchy
+        # Collect the immutable focus overlay plus canonical DAG summaries.
+        # Focus is an assembly-only view: it never mutates nodes/frontiers and
+        # the ordinary newer summaries and fresh tail remain eligible.
         summary_parts: list[str] = []
         last_role = result[-1].get("role", "system") if result else "system"
         if not result or result[-1].get("role") == "system":
@@ -5182,10 +5578,33 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             summary_role = "user"
         else:
             summary_role = "assistant" if last_role != "assistant" else "user"
+        protected_summary_parts: list[str] = []
         if anchor_part is not None:
             anchor_msg = {"role": summary_role, "content": anchor_part}
             if summary_budget is None or count_message_tokens(anchor_msg) <= summary_budget:
                 summary_parts.append(anchor_part)
+                protected_summary_parts.append(anchor_part)
+
+        active_focus = None
+        conversation_id = self.current_conversation_id
+        if conversation_id:
+            try:
+                active_focus = self._focus.get_active(conversation_id)
+            except Exception:
+                logger.warning("LCM could not load active focus overlay", exc_info=True)
+        if active_focus is not None:
+            focus_part = (
+                f"[Active Focus Brief #{active_focus.focus_id}; immutable evidence nodes: "
+                f"{', '.join(str(value) for value in active_focus.source_node_ids) or 'none'}]\n"
+                f"{active_focus.content}"
+            )
+            protected_candidate = "\n\n---\n\n".join(
+                [*protected_summary_parts, focus_part]
+            )
+            focus_msg = {"role": summary_role, "content": protected_candidate}
+            if summary_budget is None or count_message_tokens(focus_msg) <= summary_budget:
+                summary_parts.append(focus_part)
+                protected_summary_parts.append(focus_part)
 
         all_nodes = (
             authoritative_nodes
@@ -5218,11 +5637,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if summary_parts:
             selected_parts = summary_parts
             if summary_budget is not None:
-                anchor_indices = (
-                    [summary_parts.index(anchor_part)]
-                    if anchor_part is not None and anchor_part in summary_parts
-                    else []
-                )
+                anchor_indices = [
+                    index
+                    for index, part in enumerate(summary_parts)
+                    if part in protected_summary_parts
+                ]
                 candidate_order = [
                     index
                     for index in range(len(summary_parts))
@@ -5710,12 +6129,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
     def _async_route_fingerprint(self) -> str:
-        return compute_route_fingerprint(
+        summary_fingerprint = compute_route_fingerprint(
             self._config.summary_model,
             tuple(self._config.summary_fallback_models)
             if self._config.summary_fallback_models
             else (),
         )
+        return hashlib.sha256(
+            f"{self._main_route_fingerprint()}:{summary_fingerprint}".encode("utf-8")
+        ).hexdigest()[:32]
 
     def _note_foreground_async_frontier_advance(
         self,
@@ -5817,6 +6239,31 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "total_promote_succeeded": int(
                 getattr(self, "_async_total_promote_succeeded", 0) or 0
             ),
+            "total_prepared": int(getattr(self, "_async_total_prepared", 0) or 0),
+            "prepare_skip_reasons": dict(
+                getattr(self, "_async_prepare_skip_reasons", {}) or {}
+            ),
+            "cleanup_counts": dict(getattr(self, "_async_cleanup_counts", {}) or {}),
+            "last_pressure_signal": getattr(self, "_async_last_pressure_signal", "none"),
+            "last_host_prompt_tokens": int(
+                getattr(self, "_async_last_host_prompt_tokens", 0) or 0
+            ),
+            "last_source_tokens": int(
+                getattr(self, "_async_last_source_tokens", 0) or 0
+            ),
+            "last_pressure_mismatch_tokens": int(
+                getattr(self, "_async_last_pressure_mismatch_tokens", 0) or 0
+            ),
+            "last_expected_reduction_tokens": int(
+                getattr(self, "_async_last_expected_reduction_tokens", 0) or 0
+            ),
+            "last_ready_coverage_tokens": int(
+                getattr(self, "_async_last_ready_coverage_tokens", 0) or 0
+            ),
+            "last_projected_headroom_tokens": int(
+                getattr(self, "_async_last_projected_headroom_tokens", 0) or 0
+            ),
+            "profile_active_summary_calls": active_profile_admissions(self._store.db_path),
             "foreground_compress_active": bool(
                 getattr(self, "_foreground_compress_active", None)
                 and self._foreground_compress_active.is_set()
@@ -5848,11 +6295,35 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             **telemetry,
         }
 
+    def _record_async_prepare_skip(self, reason: str) -> None:
+        counters = getattr(self, "_async_prepare_skip_reasons", None)
+        if counters is None:
+            counters = {}
+            self._async_prepare_skip_reasons = counters
+        counters[reason] = int(counters.get(reason, 0)) + 1
+
+    def _async_preparation_threshold_tokens(self) -> int:
+        policy = getattr(self, "_compaction_policy", None)
+        if policy is not None and self.context_length > 0:
+            return int(policy.preparation_tokens(self.context_length))
+        if self.context_length > 0:
+            return max(
+                1,
+                int(
+                    self.context_length
+                    * float(self._config.context_threshold)
+                    * DEFAULT_PREPARATION_RATIO
+                ),
+            )
+        return max(1, int(self.threshold_tokens * DEFAULT_PREPARATION_RATIO))
+
     def prepare_background_compaction_once(
         self,
         messages: List[Dict[str, Any]],
         *,
         leave_state: str = "ready",
+        host_prompt_tokens: int | None = None,
+        force: bool = False,
     ) -> PreparedBatch | None:
         """Build a prepared compaction batch off-context.
 
@@ -5874,8 +6345,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             int(getattr(self, "_async_total_prepare_attempts", 0) or 0) + 1
         )
 
+        # Preparation can be invoked before a compatible host has supplied
+        # model metadata. Resolve the global/default policy against the known
+        # context/session so the batch still persists a complete policy, not
+        # only an opaque fingerprint.
+        if self._compaction_policy is None:
+            self._resolve_live_compaction_policy()
+
         policy_fp = self._async_policy_fingerprint()
         route_fp = self._async_route_fingerprint()
+        utility_policy_enabled = bool(
+            getattr(self._config, "async_preparation_utility_policy_enabled", False)
+        )
 
         # Get the current frontier
         frontier = self._frontier.get_active_frontier(conv_id)
@@ -5890,6 +6371,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         base_generation = frontier["generation"] if frontier else 1
         source_end = frontier["source_end_store_id"] if frontier else 0
 
+        if utility_policy_enabled:
+            cleanup_counts = self._frontier.cleanup_pending_batches(
+                conversation_id=conv_id,
+                current_generation=int(base_generation),
+                policy_fingerprint=policy_fp,
+                route_fingerprint=route_fp,
+                ttl_seconds=float(self._config.async_ready_ttl_seconds),
+            )
+            for cleanup_reason, cleanup_count in cleanup_counts.items():
+                if cleanup_count:
+                    self._async_cleanup_counts[cleanup_reason] = (
+                        int(self._async_cleanup_counts.get(cleanup_reason, 0))
+                        + int(cleanup_count)
+                    )
+
         # Get the raw messages that are candidates for compaction.
         all_stored = self._store.get_session_messages(session_id)
         if not all_stored:
@@ -5900,27 +6396,165 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if candidate_count <= 0:
             return None
 
-        candidate_stored = all_stored[:candidate_count]
+        candidate_stored = [
+            row
+            for row in all_stored[:candidate_count]
+            if int(row.get("store_id") or 0) > int(source_end or 0)
+        ]
+        if not candidate_stored:
+            if utility_policy_enabled:
+                self._record_async_prepare_skip("candidate-already-covers-range")
+            return None
         candidate_store_ids = [m["store_id"] for m in candidate_stored]
         actual_source_end = candidate_store_ids[-1] if candidate_store_ids else source_end
+
+        source_tokens_estimate = sum(
+            max(0, int(row.get("token_estimate") or 0)) for row in candidate_stored
+        )
+        if source_tokens_estimate <= 0:
+            source_tokens_estimate = count_messages_tokens(
+                [
+                    {"role": row.get("role"), "content": row.get("content") or ""}
+                    for row in candidate_stored
+                ]
+            )
+
+        if utility_policy_enabled:
+            observed_host_tokens = int(
+                host_prompt_tokens
+                if host_prompt_tokens is not None
+                else (self.last_prompt_tokens or 0)
+            )
+            if observed_host_tokens > 0:
+                pressure_tokens = observed_host_tokens
+                pressure_signal = "host"
+            else:
+                pressure_tokens = source_tokens_estimate
+                pressure_signal = "source-estimate"
+            self._async_last_pressure_signal = pressure_signal
+            self._async_last_host_prompt_tokens = max(0, observed_host_tokens)
+            self._async_last_source_tokens = max(0, source_tokens_estimate)
+            self._async_last_pressure_mismatch_tokens = (
+                abs(observed_host_tokens - source_tokens_estimate)
+                if observed_host_tokens > 0
+                else 0
+            )
+            expected_summary_tokens = max(1, int(source_tokens_estimate * 0.20))
+            expected_reduction = max(0, source_tokens_estimate - expected_summary_tokens)
+            self._async_last_expected_reduction_tokens = expected_reduction
+            self._async_last_projected_headroom_tokens = max(
+                0,
+                int(self.context_length or 0)
+                - max(0, pressure_tokens - expected_reduction),
+            )
+            if not force and pressure_tokens < self._async_preparation_threshold_tokens():
+                self._record_async_prepare_skip("below-preparation-pressure")
+                return None
+            if (
+                not force
+                and expected_reduction
+                < int(self._config.async_preparation_min_reduction_tokens)
+            ):
+                self._record_async_prepare_skip("insufficient-reduction")
+                return None
+
+            pending = [
+                batch
+                for batch in self._frontier.list_pending_batches(conv_id)
+                if int(batch.base_generation) == int(base_generation)
+                and batch.policy_fingerprint == policy_fp
+                and batch.route_fingerprint == route_fp
+            ]
+            if pending:
+                covered_end = max(int(batch.source_end_store_id) for batch in pending)
+                self._async_last_ready_coverage_tokens = sum(
+                    max(0, int(row.get("token_estimate") or 0))
+                    for row in candidate_stored
+                    if int(row.get("store_id") or 0) <= covered_end
+                )
+                refresh_tokens = sum(
+                    max(0, int(row.get("token_estimate") or 0))
+                    for row in candidate_stored
+                    if int(row.get("store_id") or 0) > covered_end
+                )
+                if covered_end >= int(actual_source_end) or (
+                    not force
+                    and refresh_tokens < int(self._config.async_candidate_refresh_min_tokens)
+                ):
+                    self._record_async_prepare_skip("candidate-already-covers-range")
+                    return None
+            else:
+                self._async_last_ready_coverage_tokens = 0
+
+            model_chain = [
+                self._config.summary_model,
+                *list(self._config.summary_fallback_models or []),
+            ]
+            if not model_chain:
+                model_chain = [""]
+            route_available = any(
+                self._summary_circuit_breaker.allows(model) for model in model_chain
+            )
+            if not self._summary_spend_guard.allows() or not route_available:
+                self._record_async_prepare_skip("spend-backoff")
+                return None
 
         # Compute source identity hash for CAS validation
         source_hash = compute_source_identity_hash(
             self._store._conn, session_id, candidate_store_ids,
         )
 
-        # Create the batch in "preparing" state
-        batch_id = self._frontier.create_batch(
-            conversation_id=conv_id,
-            session_id=session_id,
-            base_generation=base_generation,
-            source_end_store_id=actual_source_end,
-            source_identity_hash=source_hash,
-            source_ids=candidate_store_ids,
-            policy_fingerprint=policy_fp,
-            route_fingerprint=route_fp,
-            state="preparing",
+        admission_acquired = False
+        resolved_policy_json = json.dumps(
+            self._compaction_policy.to_status_dict(self.context_length)
+            if self._compaction_policy is not None
+            else {
+                "fingerprint": policy_fp,
+                "selection_reason": "runtime metadata unavailable at prepare",
+            },
+            sort_keys=True,
         )
+        if utility_policy_enabled:
+            admission_acquired = try_acquire_profile_admission(
+                self._store.db_path,
+                int(self._config.async_summary_admission_limit),
+            )
+            if not admission_acquired:
+                self._record_async_prepare_skip("admission-limited")
+                return None
+            batch_id, capacity_reason = self._frontier.create_batch_bounded(
+                conversation_id=conv_id,
+                session_id=session_id,
+                base_generation=base_generation,
+                source_end_store_id=actual_source_end,
+                source_identity_hash=source_hash,
+                source_ids=candidate_store_ids,
+                policy_fingerprint=policy_fp,
+                route_fingerprint=route_fp,
+                max_conversation_candidates=int(
+                    self._config.async_max_candidates_per_conversation
+                ),
+                max_profile_candidates=int(self._config.async_max_candidates_per_profile),
+                resolved_policy_json=resolved_policy_json,
+            )
+            if not batch_id:
+                release_profile_admission(self._store.db_path)
+                admission_acquired = False
+                self._record_async_prepare_skip(capacity_reason or "admission-limited")
+                return None
+        else:
+            batch_id = self._frontier.create_batch(
+                conversation_id=conv_id,
+                session_id=session_id,
+                base_generation=base_generation,
+                source_end_store_id=actual_source_end,
+                source_identity_hash=source_hash,
+                source_ids=candidate_store_ids,
+                policy_fingerprint=policy_fp,
+                route_fingerprint=route_fp,
+                state="preparing",
+                resolved_policy_json=resolved_policy_json,
+            )
 
         # Build leaf summaries using the existing _summarize_leaf_chunk_with_rescue.
         # Summaries stay private to this path — they are NOT inserted into the
@@ -5993,11 +6627,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 payload_version=PREPARED_PAYLOAD_VERSION,
             )
             self._async_last_prepare_at = time.time()
+            if leave_state == "ready":
+                self._async_total_prepared = (
+                    int(getattr(self, "_async_total_prepared", 0) or 0) + 1
+                )
         except Exception as exc:
             logger.warning("LCM background compaction prep failed: %s", exc)
             self._frontier.update_batch_state(
                 batch_id, "failed", failure_reason=str(exc),
             )
+        finally:
+            if admission_acquired:
+                release_profile_admission(self._store.db_path)
 
         return self._frontier.get_batch(batch_id)
 
@@ -6089,7 +6730,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             validation_ms = (time.perf_counter() - validation_started) * 1000.0
             return _result(promoted=False, reason="source_identity_mismatch")
 
-        # 2. Policy fingerprint check (always recompute from live config)
+        # 2. Policy fingerprint check (always recompute from live config).
+        # A freshly restarted engine may not yet have seen host route metadata;
+        # resolve the deterministic global/default policy before comparing so
+        # the same complete policy document prepared pre-restart remains valid.
+        if self._compaction_policy is None:
+            self._resolve_live_compaction_policy()
         current_policy_fp = self._async_policy_fingerprint()
         if batch.policy_fingerprint != current_policy_fp:
             self._frontier.update_batch_state(batch_id, "rejected", failure_reason="policy_fingerprint_mismatch")
