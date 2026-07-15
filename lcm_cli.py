@@ -40,6 +40,23 @@ _CLI_PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----",
     re.IGNORECASE | re.DOTALL,
 )
+_CLI_STANDALONE_CREDENTIAL_RE = re.compile(
+    r"""
+    (?<![A-Za-z0-9_])
+    (?:
+        sk-(?:proj-)?[A-Za-z0-9_-]{32,}
+        |(?:AKIA|ASIA)[A-Z0-9]{16}
+        |gh[pousr]_[A-Za-z0-9]{36}
+        |github_pat_[A-Za-z0-9_]{20,}
+        |glpat-[A-Za-z0-9_-]{20,}
+        |AIza[A-Za-z0-9_-]{35}
+        |sk_live_[A-Za-z0-9]{16,}
+        |xox[baprs]-[A-Za-z0-9-]{20,}
+    )
+    (?![A-Za-z0-9_-])
+    """,
+    re.VERBOSE,
+)
 
 
 class CliError(RuntimeError):
@@ -113,6 +130,7 @@ def _bounded_preview_chars(value: int) -> int:
 def _redact_cli_text(value: str) -> str:
     protected = _CLI_PRIVATE_KEY_RE.sub(_CLI_REDACTED, value)
     protected = _CLI_BEARER_RE.sub(_CLI_REDACTED, protected)
+    protected = _CLI_STANDALONE_CREDENTIAL_RE.sub(_CLI_REDACTED, protected)
     return _CLI_ASSIGNMENT_RE.sub(lambda match: match.group(1) + _CLI_REDACTED, protected)
 
 

@@ -65,6 +65,11 @@ _CROSS_SESSION_MAX_RESULTS = 20
 _CROSS_SESSION_MAX_ANSWER_TOKENS = 8_192
 _CROSS_SESSION_MAX_CONTEXT_TOKENS = 65_536
 _CROSS_SESSION_MAX_DEADLINE_MS = 120_000
+_CROSS_SESSION_METADATA_MAX_CHARS = 2_048
+_CROSS_SESSION_METADATA_MAX_TOKENS = 128
+_CROSS_SESSION_CONTEXT_MAX_DEPTH = 8
+_CROSS_SESSION_CONTEXT_MAX_ITEMS = 200
+_CROSS_SESSION_CONTENT_FIELDS = frozenset({"content", "summary", "transcript_content", "snippet"})
 
 
 def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
@@ -785,7 +790,9 @@ def _expand_message_sources(
                         hermes_home=engine._hermes_home,
                     )
                     if externalized is not None:
-                        expanded["externalized"] = externalized
+                        externalized_summary = dict(externalized)
+                        externalized_summary.pop("content", None)
+                        expanded["externalized"] = externalized_summary
                         break
         messages.append(expanded)
         budget_used += count_tokens(sliced["content"])
@@ -1163,29 +1170,120 @@ def _collect_store_ids_from_context_blocks(blocks: list[dict[str, Any]]) -> set[
 def _context_content_token_count(blocks: list[dict[str, Any]]) -> int:
     from .tokens import count_tokens
 
-    total = 0
+    def count_strings(value: Any) -> int:
+        if isinstance(value, str):
+            return count_tokens(value)
+        if isinstance(value, dict):
+            return sum(count_strings(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return sum(count_strings(item) for item in value)
+        return 0
+
+    total = count_strings(blocks)
     for block in blocks:
-        if block.get("type") == "summary":
-            total += count_tokens(str(block.get("summary") or ""))
-        if "source_path" in block:
-            total += count_tokens(
-                json.dumps(
-                    {
-                        "source_path": block.get("source_path") or [],
-                        "source_path_depth": block.get("source_path_depth"),
-                        "source_path_truncated": block.get("source_path_truncated", False),
-                    },
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
+        if not isinstance(block, dict) or "source_path" not in block:
+            continue
+        # Path entries are numeric, but their serialized structure grows with
+        # every descendant block and was already part of the context budget.
+        # Keep charging it in addition to all free-form string metadata.
+        total += count_tokens(
+            json.dumps(
+                {
+                    "source_path": block.get("source_path") or [],
+                    "source_path_depth": block.get("source_path_depth"),
+                    "source_path_truncated": block.get("source_path_truncated", False),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
             )
-        if block.get("type") in {"messages", "child_messages", "raw_messages"}:
-            for message in block.get("messages", []):
-                total += count_tokens(str(message.get("content") or ""))
-                total += count_tokens(str(message.get("transcript_content") or ""))
-        elif block.get("type") in {"child_nodes", "descendant_child_nodes"}:
-            total += sum(count_tokens(str(child.get("summary") or "")) for child in block.get("children", []))
+        )
     return total
+
+
+def _bounded_cross_session_text(
+    value: Any,
+    config,
+    *,
+    max_tokens: int,
+    max_chars: int | None,
+) -> tuple[str, bool]:
+    """Redact and bound one archive string before it reaches synthesis/output."""
+    text = str(value or "")
+    truncated = False
+    if max_chars is not None and len(text) > max_chars:
+        text = text[:max_chars]
+        truncated = True
+    text = redact_sensitive_text(text, config)
+    text, token_truncated = _truncate_text_to_token_budget(text, max_tokens)
+    return text, truncated or token_truncated
+
+
+def _bound_cross_session_context(
+    value: Any,
+    *,
+    max_tokens: int,
+    config,
+) -> tuple[Any, bool]:
+    """Recursively fit all archive context strings into one shared token budget."""
+    from .tokens import count_tokens
+
+    state = {"remaining": max(0, int(max_tokens)), "truncated": False}
+
+    def bound(item: Any, *, field_name: str = "", depth: int = 0) -> Any:
+        if depth > _CROSS_SESSION_CONTEXT_MAX_DEPTH:
+            state["truncated"] = True
+            return None
+        if isinstance(item, dict):
+            result: dict[str, Any] = {}
+            entries = list(item.items())[:_CROSS_SESSION_CONTEXT_MAX_ITEMS]
+            if len(item) > len(entries):
+                state["truncated"] = True
+            for raw_key, child in entries:
+                safe_key, key_truncated = _bounded_cross_session_text(
+                    raw_key,
+                    config,
+                    max_tokens=_CROSS_SESSION_METADATA_MAX_TOKENS,
+                    max_chars=256,
+                )
+                state["truncated"] = state["truncated"] or key_truncated
+                result[safe_key] = bound(
+                    child,
+                    field_name=safe_key,
+                    depth=depth + 1,
+                )
+            return result
+        if isinstance(item, (list, tuple)):
+            entries = list(item)[:_CROSS_SESSION_CONTEXT_MAX_ITEMS]
+            if len(item) > len(entries):
+                state["truncated"] = True
+            return [bound(child, field_name=field_name, depth=depth + 1) for child in entries]
+        if isinstance(item, str):
+            is_content = field_name in _CROSS_SESSION_CONTENT_FIELDS
+            field_tokens = state["remaining"]
+            if not is_content:
+                field_tokens = min(field_tokens, _CROSS_SESSION_METADATA_MAX_TOKENS)
+            protected, truncated = _bounded_cross_session_text(
+                item,
+                config,
+                max_tokens=field_tokens,
+                max_chars=None if is_content else _CROSS_SESSION_METADATA_MAX_CHARS,
+            )
+            used = count_tokens(protected)
+            state["remaining"] = max(0, state["remaining"] - used)
+            state["truncated"] = state["truncated"] or truncated
+            return protected
+        return item
+
+    bounded = bound(value)
+    if isinstance(bounded, list):
+        # Numeric descendant paths have a serialized structural cost in
+        # _context_content_token_count. The recursive string allocator cannot
+        # reserve that cost before it sees the complete block, so discard
+        # trailing evidence blocks until the fully-accounted payload fits.
+        while bounded and _context_content_token_count(bounded) > max_tokens:
+            bounded.pop()
+            state["truncated"] = True
+    return bounded, bool(state["truncated"])
 
 
 def _synthesize_expansion_answer(
@@ -1318,7 +1416,15 @@ def _cross_session_expand_query(
         ranked_session_ids = list(buckets)
         selected_session_ids = ranked_session_ids[:max_sessions]
         skipped_buckets = [
-            {"session_id": session_id, "reason": "max-sessions"}
+            {
+                "session_id": _bounded_cross_session_text(
+                    session_id,
+                    engine._config,
+                    max_tokens=_CROSS_SESSION_METADATA_MAX_TOKENS,
+                    max_chars=_CROSS_SESSION_METADATA_MAX_CHARS,
+                )[0],
+                "reason": "max-sessions",
+            }
             for session_id in ranked_session_ids[max_sessions:]
         ]
         if not selected_session_ids:
@@ -1343,6 +1449,12 @@ def _cross_session_expand_query(
         context_used = 0
         timed_out = False
         for session_id in selected_session_ids:
+            safe_session_id = _bounded_cross_session_text(
+                session_id,
+                engine._config,
+                max_tokens=_CROSS_SESSION_METADATA_MAX_TOKENS,
+                max_chars=_CROSS_SESSION_METADATA_MAX_CHARS,
+            )[0]
             bucket_blocks_before = len(context_blocks)
             expanded_nodes = 0
             bucket_truncated = False
@@ -1366,18 +1478,37 @@ def _cross_session_expand_query(
                     allowed_session_id=session_id,
                 )
                 for block in blocks:
-                    block["session_id"] = session_id
+                    block["session_id"] = safe_session_id
+                blocks, metadata_truncated = _bound_cross_session_context(
+                    blocks,
+                    max_tokens=remaining,
+                    config=engine._config,
+                )
                 context_blocks.extend(blocks)
                 context_used += _context_content_token_count(blocks)
                 expanded_nodes += 1
+                safe_summary, summary_truncated = _bounded_cross_session_text(
+                    node.summary,
+                    engine._config,
+                    max_tokens=_CROSS_SESSION_METADATA_MAX_TOKENS,
+                    max_chars=300,
+                )
+                safe_hint, hint_truncated = _bounded_cross_session_text(
+                    node.expand_hint,
+                    engine._config,
+                    max_tokens=_CROSS_SESSION_METADATA_MAX_TOKENS,
+                    max_chars=_CROSS_SESSION_METADATA_MAX_CHARS,
+                )
                 matches.append({
-                    "session_id": session_id,
+                    "session_id": safe_session_id,
                     "node_id": node.node_id,
                     "depth": node.depth,
-                    "summary": node.summary[:300],
-                    "expand_hint": node.expand_hint,
+                    "summary": safe_summary,
+                    "summary_truncated": summary_truncated,
+                    "expand_hint": safe_hint,
+                    "expand_hint_truncated": hint_truncated,
                 })
-                if any(
+                if metadata_truncated or any(
                     block.get("summary_truncated")
                     or block.get("pagination", {}).get("has_more")
                     for block in blocks
@@ -1389,7 +1520,7 @@ def _cross_session_expand_query(
                     bucket_truncated = True
                     break
             session_status.append({
-                "session_id": session_id,
+                "session_id": safe_session_id,
                 "status": bucket_state,
                 "candidate_nodes": len(buckets[session_id]),
                 "expanded_nodes": expanded_nodes,
@@ -1398,8 +1529,14 @@ def _cross_session_expand_query(
             })
             if timed_out:
                 for skipped_session_id in selected_session_ids[len(session_status):]:
+                    safe_skipped_session_id = _bounded_cross_session_text(
+                        skipped_session_id,
+                        engine._config,
+                        max_tokens=_CROSS_SESSION_METADATA_MAX_TOKENS,
+                        max_chars=_CROSS_SESSION_METADATA_MAX_CHARS,
+                    )[0]
                     skipped_buckets.append({
-                        "session_id": skipped_session_id,
+                        "session_id": safe_skipped_session_id,
                         "reason": "deadline",
                     })
                 break

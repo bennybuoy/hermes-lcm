@@ -209,6 +209,95 @@ def test_cli_config_output_redacts_nested_credentials_and_bounds_values(tmp_path
     assert len(result.stdout) < 150_000
 
 
+def test_cli_config_show_and_get_redact_unlabeled_standalone_credentials(tmp_path):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    credentials = {
+        "openai": "sk-proj-abcdefghijklmnopqrstuvwxyz012345",
+        "aws": "AKIAIOSFODNN7EXAMPLE",
+        "github_classic": "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij",
+        "github_fine_grained": "github_pat_11AA0_example0123456789abcdef0123456789",
+    }
+    config = {
+        "lcm": {
+            "custom_instructions": (
+                "Use these directly: "
+                + credentials["openai"]
+                + " and "
+                + credentials["github_classic"]
+            ),
+            "nested": {
+                "provider_values": [credentials["aws"], {"raw": credentials["github_fine_grained"]}],
+            },
+        }
+    }
+    (hermes_home / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
+
+    commands = [
+        ("config", "show"),
+        ("config", "get", "custom_instructions"),
+        ("config", "get", "nested"),
+    ]
+    for command in commands:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "lcm_cli.py"),
+                "--hermes-home",
+                str(hermes_home),
+                *command,
+            ],
+            cwd=os.fspath(tmp_path),
+            env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        for credential in credentials.values():
+            assert credential not in result.stdout
+        assert "[REDACTED" in result.stdout
+
+
+def test_cli_standalone_credential_patterns_preserve_non_secret_lookalikes(tmp_path):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    lookalikes = [
+        "sk-short",
+        "sk-proj-documentation-placeholder",
+        "AKIA prefix documentation",
+        "ghp_short",
+        "github_pat_example",
+    ]
+    (hermes_home / "config.yaml").write_text(
+        json.dumps({"lcm": {"custom_instructions": " | ".join(lookalikes)}}),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "lcm_cli.py"),
+            "--hermes-home",
+            str(hermes_home),
+            "config",
+            "get",
+            "custom_instructions",
+        ],
+        cwd=os.fspath(tmp_path),
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    for lookalike in lookalikes:
+        assert lookalike in result.stdout
+    assert "[REDACTED" not in result.stdout
+
+
 def test_cli_preview_bounds_apply_to_summary_and_prepared_show(tmp_path):
     db = _seed(tmp_path)
     summary = _run(db, "summaries", "show", "1", "--preview-chars", "20001")

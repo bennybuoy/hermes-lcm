@@ -27,8 +27,20 @@ def _engine(tmp_path, *, enabled=True, max_sessions=2, per_session=2):
     return engine
 
 
-def _node(engine, session_id, summary, *, content="raw evidence"):
-    store_id = engine._store.append(session_id, {"role": "user", "content": content})
+def _node(
+    engine,
+    session_id,
+    summary,
+    *,
+    content="raw evidence",
+    expand_hint="",
+    source="",
+):
+    store_id = engine._store.append(
+        session_id,
+        {"role": "user", "content": content},
+        source=source,
+    )
     return engine._dag.add_node(
         SummaryNode(
             session_id=session_id,
@@ -39,6 +51,7 @@ def _node(engine, session_id, summary, *, content="raw evidence"):
             source_ids=[store_id],
             source_type="messages",
             created_at=0,
+            expand_hint=expand_hint,
         )
     )
 
@@ -174,6 +187,43 @@ def test_context_and_answer_budgets_are_shared_not_per_bucket(tmp_path, monkeypa
         assert result["context_tokens_used"] <= 5
         assert result["context_max_tokens"] == 5
         assert result["context_truncated"] is True
+    finally:
+        engine.shutdown()
+
+
+def test_cross_session_metadata_is_redacted_bounded_and_charged_to_context(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    engine._config.sensitive_patterns_enabled = True
+    secret = "sk-proj-cross-session-super-secret"
+    node = engine._dag.get_node(_node(
+        engine,
+        "archive",
+        "x",
+        expand_hint=f"api_key: {secret} " + ("h" * 1_000_000),
+        source="custom-source-" + ("s" * 250_000),
+    ))
+    monkeypatch.setattr(engine._dag, "search", lambda *args, **kwargs: [node])
+    captured = {}
+
+    def synthesize(**kwargs):
+        captured.update(kwargs)
+        return "answer"
+
+    monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", synthesize)
+    try:
+        result = json.loads(_invoke(engine, _args(context_max_tokens=64)))
+        serialized_context = json.dumps(captured["context_blocks"])
+        serialized_result = json.dumps(result)
+
+        assert result["context_tokens_used"] <= 64
+        assert result["context_tokens_used"] == lcm_tools._context_content_token_count(
+            captured["context_blocks"]
+        )
+        assert secret not in serialized_context
+        assert secret not in serialized_result
+        assert len(serialized_context) < 10_000
+        assert len(serialized_result) < 10_000
+        assert len(result["matches"][0]["expand_hint"]) < 1_000
     finally:
         engine.shutdown()
 
