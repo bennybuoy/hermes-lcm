@@ -8,8 +8,10 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
+import hermes_lcm.lcm_cli as lcm_cli
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
@@ -296,6 +298,33 @@ def test_cli_standalone_credential_patterns_preserve_non_secret_lookalikes(tmp_p
     for lookalike in lookalikes:
         assert lookalike in result.stdout
     assert "[REDACTED" not in result.stdout
+
+
+def test_cli_redaction_bounds_pathological_private_key_scan_and_keeps_detection():
+    header = "-----BEGIN PRIVATE KEY-----\n"
+    pathological = (header * ((300 * 1024 // len(header)) + 1))[:300 * 1024]
+    private_key_body = "LEGITIMATE_PRIVATE_KEY_BODY_0123456789"
+    private_key = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        + private_key_body
+        + "\n-----END PRIVATE KEY-----"
+    )
+    standalone = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"
+
+    started = time.monotonic()
+    protected = lcm_cli._sanitize_output({
+        "pathological": pathological,
+        "private_key": private_key,
+        "standalone": standalone,
+    })
+    elapsed = time.monotonic() - started
+    serialized = json.dumps(protected)
+
+    assert elapsed < 2.0
+    assert private_key_body not in serialized
+    assert standalone not in serialized
+    assert serialized.count("[REDACTED by hermes-lcm CLI]") >= 2
+    assert len(protected["pathological"]) <= lcm_cli._CLI_MAX_PREVIEW_CHARS
 
 
 def test_cli_preview_bounds_apply_to_summary_and_prepared_show(tmp_path):

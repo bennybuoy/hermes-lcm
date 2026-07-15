@@ -1583,6 +1583,12 @@ def _cross_session_expand_query(
             })
             return json.dumps(base_payload)
         model = engine._config.expansion_model or engine._config.summary_model or ""
+        safe_model, model_truncated = _bounded_cross_session_text(
+            model,
+            engine._config,
+            max_tokens=_CROSS_SESSION_METADATA_MAX_TOKENS,
+            max_chars=_CROSS_SESSION_METADATA_MAX_CHARS,
+        )
         try:
             answer = _synthesize_expansion_answer(
                 prompt=prompt,
@@ -1597,7 +1603,8 @@ def _cross_session_expand_query(
                 "degraded": True,
                 "timed_out": True,
                 "context_truncated": True,
-                "model": model,
+                "model": safe_model,
+                "model_truncated": model_truncated,
             })
             return json.dumps(base_payload)
         except Exception:
@@ -1607,7 +1614,8 @@ def _cross_session_expand_query(
             base_payload.update({
                 "error": "cross-session expansion synthesis failed",
                 "degraded": True,
-                "model": model,
+                "model": safe_model,
+                "model_truncated": model_truncated,
             })
             return json.dumps(base_payload)
         answer = str(answer or "").strip()
@@ -1615,14 +1623,16 @@ def _cross_session_expand_query(
             base_payload.update({
                 "error": "cross-session expansion synthesis returned an empty answer",
                 "degraded": True,
-                "model": model,
+                "model": safe_model,
+                "model_truncated": model_truncated,
             })
             return json.dumps(base_payload)
         bounded_answer, answer_truncated = _truncate_text_to_token_budget(answer, max_tokens)
         base_payload.update({
             "answer": bounded_answer,
             "answer_truncated": answer_truncated,
-            "model": model,
+            "model": safe_model,
+            "model_truncated": model_truncated,
         })
         return json.dumps(base_payload)
     finally:

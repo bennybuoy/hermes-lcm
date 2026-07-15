@@ -28,6 +28,11 @@ _CLI_MAX_CONTAINER_ITEMS = 200
 _CLI_MAX_DEPTH = 8
 _CLI_TRUNCATED = "[TRUNCATED]"
 _CLI_REDACTED = "[REDACTED by hermes-lcm CLI]"
+# Redaction happens before serialization truncation. Bound every regex input,
+# while retaining enough lookahead to catch a normal PEM block or standalone
+# credential that begins immediately before the emitted preview boundary.
+_CLI_REDACTION_LOOKAHEAD_CHARS = 20_000
+_CLI_REDACTION_SCAN_MAX_CHARS = _CLI_MAX_PREVIEW_CHARS + _CLI_REDACTION_LOOKAHEAD_CHARS
 _CLI_SENSITIVE_KEY_RE = re.compile(
     r"(?:api[_-]?key|authorization|bearer[_-]?token|access[_-]?token|password|passwd|pwd|passphrase|client[_-]?secret|private[_-]?key|credential|secret|\btoken\b)",
     re.IGNORECASE,
@@ -127,11 +132,35 @@ def _bounded_preview_chars(value: int) -> int:
     return value
 
 
-def _redact_cli_text(value: str) -> str:
-    protected = _CLI_PRIVATE_KEY_RE.sub(_CLI_REDACTED, value)
+def _truncate_cli_text(value: str, limit: int, *, force: bool = False) -> str:
+    if not force and len(value) <= limit:
+        return value
+    if limit <= 0:
+        return ""
+    if limit < len(_CLI_TRUNCATED):
+        return value[:limit]
+    prefix_limit = limit - len(_CLI_TRUNCATED)
+    return value[:prefix_limit] + _CLI_TRUNCATED
+
+
+def _redact_cli_text(value: str, *, max_chars: int = _CLI_MAX_PREVIEW_CHARS) -> str:
+    output_limit = min(max(0, int(max_chars)), _CLI_MAX_PREVIEW_CHARS)
+    if output_limit == 0:
+        return ""
+    scan_limit = min(
+        _CLI_REDACTION_SCAN_MAX_CHARS,
+        output_limit + _CLI_REDACTION_LOOKAHEAD_CHARS,
+    )
+    input_truncated = len(value) > scan_limit
+    bounded = value[:scan_limit]
+    protected = _CLI_PRIVATE_KEY_RE.sub(_CLI_REDACTED, bounded)
     protected = _CLI_BEARER_RE.sub(_CLI_REDACTED, protected)
     protected = _CLI_STANDALONE_CREDENTIAL_RE.sub(_CLI_REDACTED, protected)
-    return _CLI_ASSIGNMENT_RE.sub(lambda match: match.group(1) + _CLI_REDACTED, protected)
+    protected = _CLI_ASSIGNMENT_RE.sub(
+        lambda match: match.group(1) + _CLI_REDACTED,
+        protected,
+    )
+    return _truncate_cli_text(protected, output_limit, force=input_truncated)
 
 
 def _sanitize_output(value: Any) -> Any:
@@ -151,11 +180,16 @@ def _sanitize_output(value: Any) -> Any:
             result = {}
             entries = list(item.items())[:_CLI_MAX_CONTAINER_ITEMS]
             for key, child in entries:
-                safe_key = _redact_cli_text(str(key))[:256]
+                raw_key = str(key)
+                safe_key = _redact_cli_text(raw_key, max_chars=256)
                 result[safe_key] = sanitize(
                     child,
                     depth=depth + 1,
-                    sensitive_key=bool(_CLI_SENSITIVE_KEY_RE.search(str(key))),
+                    sensitive_key=bool(
+                        _CLI_SENSITIVE_KEY_RE.search(
+                            raw_key[:_CLI_REDACTION_SCAN_MAX_CHARS]
+                        )
+                    ),
                 )
             if len(item) > len(entries):
                 result["output_truncated"] = True
@@ -167,11 +201,8 @@ def _sanitize_output(value: Any) -> Any:
                 result.append(_CLI_TRUNCATED)
             return result
         if isinstance(item, str):
-            protected = _redact_cli_text(item)
             limit = min(_CLI_MAX_PREVIEW_CHARS, max(0, state["chars"]))
-            if len(protected) > limit:
-                suffix = _CLI_TRUNCATED if limit >= len(_CLI_TRUNCATED) else ""
-                protected = protected[:max(0, limit - len(suffix))] + suffix
+            protected = _redact_cli_text(item, max_chars=limit)
             state["chars"] = max(0, state["chars"] - len(protected))
             return protected
         return item

@@ -10,6 +10,7 @@ from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.schemas import LCM_EXPAND_QUERY
+from hermes_lcm.tokens import count_tokens
 
 
 def _engine(tmp_path, *, enabled=True, max_sessions=2, per_session=2):
@@ -224,6 +225,53 @@ def test_cross_session_metadata_is_redacted_bounded_and_charged_to_context(tmp_p
         assert len(serialized_context) < 10_000
         assert len(serialized_result) < 10_000
         assert len(result["matches"][0]["expand_hint"]) < 1_000
+    finally:
+        engine.shutdown()
+
+
+def test_cross_session_model_metadata_is_redacted_and_bounded_on_success_and_failure(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    engine._config.sensitive_patterns_enabled = True
+    secret = "cross-session-model-credential"
+    oversized_model = f"provider api_key={secret} " + ("oversized-model " * 10_000)
+    node = engine._dag.get_node(_node(engine, "archive", "archive model metadata"))
+    monkeypatch.setattr(engine._dag, "search", lambda *args, **kwargs: [node])
+
+    def assert_safe_model_metadata(result):
+        assert result["model_truncated"] is True
+        assert secret not in result["model"]
+        assert "oversized-model " * 1_000 not in result["model"]
+        assert len(result["model"]) <= lcm_tools._CROSS_SESSION_METADATA_MAX_CHARS
+        assert count_tokens(result["model"]) <= lcm_tools._CROSS_SESSION_METADATA_MAX_TOKENS
+
+    try:
+        engine._config.expansion_model = oversized_model
+        successful_call = {}
+
+        def synthesize_success(**kwargs):
+            successful_call.update(kwargs)
+            return "bounded answer"
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", synthesize_success)
+        success = json.loads(_invoke(engine, _args()))
+        assert successful_call["model"] == oversized_model
+        assert success["answer"] == "bounded answer"
+        assert_safe_model_metadata(success)
+
+        engine._config.expansion_model = ""
+        engine._config.summary_model = oversized_model
+
+        def synthesize_failure(**kwargs):
+            assert kwargs["model"] == oversized_model
+            raise RuntimeError("synthetic synthesis failure")
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", synthesize_failure)
+        failure = json.loads(_invoke(engine, _args()))
+        assert failure["degraded"] is True
+        assert failure["error"] == "cross-session expansion synthesis failed"
+        assert_safe_model_metadata(failure)
     finally:
         engine.shutdown()
 
