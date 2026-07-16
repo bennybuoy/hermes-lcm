@@ -19,6 +19,7 @@ import stat
 import tempfile
 import time
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -862,6 +863,78 @@ def redact_sensitive_output_text(text: str) -> str:
         ),
         protected,
     )
+
+
+@dataclass(frozen=True)
+class SensitiveOutputSpan:
+    """One raw source span replaced at the mandatory output boundary."""
+
+    raw_start: int
+    raw_end: int
+    replacement: str
+
+
+def sensitive_output_spans(text: str) -> list[SensitiveOutputSpan]:
+    """Return deterministic, non-overlapping mandatory-redaction source spans.
+
+    Paging callers need raw coordinates, not only the transformed string: an
+    output placeholder may be shorter or longer than its source credential.
+    Spans cover the complete recognisable expression (including an assignment
+    label or ``Bearer`` prefix), while ``replacement`` preserves those benign
+    parts exactly as the established output redactor does.  Consequently a
+    continuation can stop at ``raw_start`` or advance to ``raw_end`` without
+    ever landing inside credential material.
+    """
+    if not isinstance(text, str) or not text:
+        return []
+
+    candidates: list[tuple[int, int, int, str]] = []
+    priority = 0
+    for name, pattern in _SENSITIVE_PATTERN_CATALOG.items():
+        if name == "private_key":
+            cursor = 0
+            while True:
+                begin = _PRIVATE_KEY_BEGIN_RE.search(text, cursor)
+                if begin is None:
+                    break
+                end = _PRIVATE_KEY_END_RE.search(text, begin.end())
+                if end is None:
+                    break
+                raw_end = end.end()
+                secret = text[begin.start():raw_end]
+                candidates.append((
+                    begin.start(), raw_end, priority,
+                    _sensitive_placeholder(name, secret),
+                ))
+                cursor = raw_end
+        else:
+            for match in pattern.finditer(text):
+                candidates.append((
+                    match.start(), match.end(), priority,
+                    _redact_match(name, match),
+                ))
+        priority += 1
+
+    for match in _STANDALONE_OUTPUT_CREDENTIAL_RE.finditer(text):
+        candidates.append((
+            match.start(), match.end(), priority,
+            _sensitive_placeholder(
+                "standalone_credential", match.group("secret")
+            ),
+        ))
+
+    # Prefer the earliest expression and, at the same start, the widest one.
+    # This makes ``api_key=sk-proj-...`` one assignment span rather than a
+    # nested standalone-token span.
+    candidates.sort(key=lambda item: (item[0], -(item[1] - item[0]), item[2]))
+    spans: list[SensitiveOutputSpan] = []
+    covered_until = 0
+    for raw_start, raw_end, _priority, replacement in candidates:
+        if raw_start < covered_until or raw_end <= raw_start:
+            continue
+        spans.append(SensitiveOutputSpan(raw_start, raw_end, replacement))
+        covered_until = raw_end
+    return spans
 
 
 def _redact_entire_sensitive_string(text: str, pattern_name: str) -> str:

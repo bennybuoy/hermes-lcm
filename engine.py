@@ -1447,6 +1447,11 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         compression runs later the same turn, already-ingested messages
         are skipped (no duplicates).
         """
+        with self._storage_lifetime_lock:
+            self._ingest_locked(messages)
+
+    def _ingest_locked(self, messages: List[Dict[str, Any]]) -> None:
+        """Run normal ingest inside the session/rollover lifetime boundary."""
         if self._maybe_reclassify_current_session_as_auxiliary_before_message_ingest():
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
             return

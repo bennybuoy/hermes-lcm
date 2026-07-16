@@ -1193,6 +1193,109 @@ def test_grep_database_search_bounds_content_and_tool_calls_before_python(
         engine.shutdown()
 
 
+@pytest.mark.parametrize(
+    ("query", "content"),
+    [
+        ("longcredentialfts", "api_key=" + ("A" * 20_000) + " longcredentialfts"),
+        ("long-credential-like", "api_key=" + ("B" * 20_000) + " long-credential-like"),
+    ],
+)
+def test_grep_fail_closes_window_start_inside_long_credential(
+    tmp_path, query, content
+):
+    engine = _engine(tmp_path)
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": "placeholder"}
+    )
+    engine._store._conn.execute(
+        "UPDATE messages SET content=? WHERE store_id=?", (content, store_id)
+    )
+    engine._store._conn.commit()
+    try:
+        response_text = tools_module.lcm_grep(
+            {"query": query, "session_scope": "current", "limit": 1},
+            engine=engine,
+        )
+        response = json.loads(response_text)
+        assert response["results"][0]["store_id"] == store_id
+        assert query in response["results"][0]["snippet"]
+        assert "A" * 64 not in response_text
+        assert "B" * 64 not in response_text
+        assert "LCM sensitive redaction" in response_text
+        assert len(response_text) < 10_000
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("session_scope", ["current", "session"])
+def test_grep_summary_projection_is_bounded_redacted_and_explicit(
+    tmp_path, monkeypatch, session_scope
+):
+    engine = _engine(tmp_path)
+    target_session = "current" if session_scope == "current" else "archive"
+    secret = "github_pat_" + ("Z" * 64)
+    store_id = engine._store.append(
+        target_session, {"role": "user", "content": "summary source"}
+    )
+    node_id = engine._dag.add_node(SummaryNode(
+        session_id=target_session,
+        depth=0,
+        summary="summaryprojection " + secret + ("s" * 1_000_000),
+        token_count=10,
+        source_token_count=20,
+        source_ids=[store_id],
+        source_type="messages",
+        created_at=1.0,
+        expand_hint="api_key=" + secret + ("h" * 1_000_000),
+    ))
+    original_row_to_node = engine._dag._row_to_node
+
+    def guarded_row_to_node(row):
+        if row is not None:
+            assert all(
+                not isinstance(value, str) or len(value) < 64_000 for value in row
+            ), "unbounded summary metadata reached Python"
+        return original_row_to_node(row)
+
+    monkeypatch.setattr(engine._dag, "_row_to_node", guarded_row_to_node)
+    statements: list[str] = []
+    engine._dag._conn.set_trace_callback(statements.append)
+    kwargs = {"engine": engine}
+    args = {
+        "query": "summaryprojection",
+        "session_scope": session_scope,
+        "source": "unknown",
+        "limit": 1,
+    }
+    if session_scope == "session":
+        args["session_id"] = target_session
+        kwargs["cross_session_capability"] = engine.issue_cross_session_capability(
+            [target_session]
+        )
+    try:
+        response_text = tools_module.lcm_grep(args, **kwargs)
+        response = json.loads(response_text)
+        summary_hits = [hit for hit in response["results"] if hit["type"] == "summary"]
+        assert summary_hits and summary_hits[0]["node_id"] == node_id
+        assert secret not in response_text
+        assert len(summary_hits[0]["snippet"]) <= 300
+        assert len(summary_hits[0]["expand_hint"]) <= 2_048
+        assert len(response_text) < 20_000
+        selects = [
+            statement.upper() for statement in statements
+            if "SUMMARY_NODES" in statement.upper()
+            and statement.lstrip().upper().startswith("SELECT")
+        ]
+        assert selects
+        assert all("SELECT *" not in statement and "SELECT N.*" not in statement
+                   for statement in selects)
+        assert any("SUBSTR" in statement and "LENGTH(CAST" in statement
+                   for statement in selects)
+    finally:
+        engine._dag._conn.set_trace_callback(None)
+        engine.shutdown()
+
+
 def test_load_session_requires_capability_and_bounds_redacts_nested_rows(tmp_path):
     engine = _engine(tmp_path)
     current_id = engine._store.append(

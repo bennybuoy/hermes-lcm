@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import tempfile
 
@@ -1186,7 +1187,6 @@ def test_load_session_redacts_secret_spanning_requested_content_boundary(tmp_pat
         returned = response["messages"][0]["content"]
         assert secret not in returned
         assert "github_pat" not in returned
-        assert "LCM sens" in returned
         assert len(returned) <= max_chars
     finally:
         engine.shutdown()
@@ -1220,25 +1220,100 @@ def test_load_session_redaction_shortening_preserves_source_truncation_metadata(
         assert item["content_returned_chars"] <= item["content_chars"] == len(content)
         assert item["serialized_truncated"] is True
 
-        # A redacted output length is not a raw-source cursor.  The load API
-        # must disable mapped continuation and advertise a safe restart boundary;
-        # following that boundary through lcm_expand must not expose a suffix of
-        # the credential that no longer matches the redaction pattern.
-        assert item["next_content_offset"] is None
-        assert item["content_continuation_disabled"] is True
-        assert item["safe_expand_content_offset"] == 0
-        expanded = json.loads(engine.handle_tool_call(
-            "lcm_expand",
+        # The cursor is a raw boundary immediately before the credential.
+        # Following it must redact that whole span and retain every benign byte
+        # after it instead of disabling continuation or claiming completion.
+        assert item["next_content_offset"] == len("prefix ")
+        assert item.get("content_continuation_disabled") is not True
+        pages = [item["content"]]
+        offset = item["next_content_offset"]
+        for _ in range(100):
+            expanded = json.loads(engine.handle_tool_call(
+                "lcm_expand",
+                {
+                    "store_id": item["store_id"],
+                    "content_offset": offset,
+                    "max_tokens": 64,
+                },
+            ))
+            expanded_text = json.dumps(expanded)
+            assert secret not in expanded_text
+            assert ("S" * 100) not in expanded_text
+            pages.append(expanded["content"])
+            if not expanded["has_more"]:
+                break
+            assert expanded["next_content_offset"] > offset
+            offset = expanded["next_content_offset"]
+        else:
+            pytest.fail("credential-safe expansion did not terminate")
+        recovered = re.sub(
+            r"\[LCM sensitive redaction:[^\]]*\]", "", "".join(pages)
+        )
+        assert recovered == "prefix  suffix " + ("x" * 10_000)
+    finally:
+        engine.shutdown()
+
+
+def test_load_then_expand_pages_long_credential_losslessly_at_raw_boundaries(
+    tmp_path,
+):
+    engine = _engine(tmp_path)
+    benign_prefix = "PAGE-PREFIX::"
+    assignment = "api_key="
+    secret = "S" * 20_000
+    benign_suffix = "::PAGE-SUFFIX::" + ("0123456789" * 100)
+    content = benign_prefix + assignment + secret + benign_suffix
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": "placeholder"}
+    )
+    engine._store._conn.execute(
+        "UPDATE messages SET content=? WHERE store_id=?", (content, store_id)
+    )
+    engine._store._conn.commit()
+    try:
+        loaded = json.loads(engine.handle_tool_call(
+            "lcm_load_session",
             {
-                "store_id": item["store_id"],
-                "content_offset": item["safe_expand_content_offset"],
-                "max_tokens": 32,
+                "session_id": "current",
+                "limit": 1,
+                "max_content_chars": len(benign_prefix),
             },
-        ))
-        expanded_text = json.dumps(expanded)
-        assert secret not in expanded_text
-        assert ("S" * 100) not in expanded_text
-        assert expanded["has_more"] is False
+        ))["messages"][0]
+        assert loaded["content"] == benign_prefix
+        assert loaded["has_more"] if "has_more" in loaded else loaded["content_truncated"]
+        assert isinstance(loaded["next_content_offset"], int)
+        assert loaded["next_content_offset"] == len(benign_prefix)
+
+        pages = [loaded["content"]]
+        offset = loaded["next_content_offset"]
+        seen_offsets = {offset}
+        for _ in range(100):
+            page = json.loads(engine.handle_tool_call(
+                "lcm_expand",
+                {
+                    "store_id": store_id,
+                    "content_offset": offset,
+                    "max_tokens": 64,
+                },
+            ))
+            encoded = json.dumps(page)
+            assert secret not in encoded
+            assert "S" * 32 not in encoded
+            pages.append(page["content"])
+            if not page["has_more"]:
+                break
+            next_offset = page["next_content_offset"]
+            assert next_offset > offset
+            assert next_offset not in seen_offsets
+            seen_offsets.add(next_offset)
+            offset = next_offset
+        else:
+            pytest.fail("redacted continuation did not terminate")
+
+        recovered = re.sub(r"\[LCM sensitive redaction:[^\]]*\]", "", "".join(pages))
+        assert recovered == benign_prefix + assignment + benign_suffix
+        assert recovered.count(benign_prefix) == 1
+        assert recovered.count(benign_suffix) == 1
     finally:
         engine.shutdown()
 

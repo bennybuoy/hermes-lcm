@@ -35,11 +35,13 @@ from .dag import (
 from .db_bootstrap import check_external_content_fts_integrity, inspect_lcm_schema_health
 from .extraction import sanitize_pre_compaction_content
 from .ingest_protection import (
+    SensitiveOutputSpan,
     externalized_payload_stats,
     extract_ingest_externalized_refs,
     restore_ingest_payload_placeholders,
     redact_sensitive_text,
     redact_sensitive_output_text,
+    sensitive_output_spans,
     scan_externalized_payload_integrity,
     scan_sqlite_payload_risks,
     sensitive_pattern_status,
@@ -555,6 +557,7 @@ def _parse_strict_int(value: Any, name: str) -> tuple[int | None, str | None]:
 
 _LCM_GREP_VALID_SCOPES = frozenset({"current", "all", "session"})
 _LCM_GREP_HARD_LIMIT_CAP = 200
+_LCM_GREP_SUMMARY_DEADLINE_SECONDS = 0.25
 _LCM_LOAD_SESSION_DEFAULT_LIMIT = 100
 _LCM_LOAD_SESSION_HARD_LIMIT_CAP = 200
 _LCM_LOAD_SESSION_DEFAULT_MAX_CONTENT_CHARS = 4000
@@ -584,72 +587,158 @@ def _slice_content_for_response(
     *,
     config=None,
 ) -> dict[str, Any]:
-    content = content or ""
-    content_offset = min(max(0, content_offset), len(content))
-    source = content[content_offset:]
-    if config is None:
-        sliced, window_truncated = _truncate_text_to_token_budget(source, max_tokens)
-    else:
-        sliced, window_truncated = _bounded_cross_session_text(
-            source,
-            config,
-            max_tokens=max_tokens,
-            max_chars=_CURRENT_SESSION_EXPAND_MAX_CHARS,
-        )
-    redaction_changed = False
-    boundary_mapping_destroyed = False
-    protected_probe = source
-    if config is not None:
-        probe_limit = min(
-            len(source),
-            max(1, int(max_tokens)) * _MANDATORY_REDACTION_CHARS_PER_TOKEN
-            + _MANDATORY_REDACTION_LOOKAHEAD_CHARS,
-        )
-        raw_probe = source[:probe_limit]
-        protected_probe = redact_sensitive_output_text(raw_probe)
-        redaction_changed = protected_probe != raw_probe
-        boundary_mapping_destroyed = bool(
-            probe_limit < len(source)
-            and (
-                _BOUNDARY_STANDALONE_CREDENTIAL_RE.search(raw_probe)
-                or _BOUNDARY_PRIVATE_KEY_BEGIN_RE.search(raw_probe)
-            )
-        )
-    if not sliced and content_offset < len(content):
-        # A tiny token budget can fail to fit even the next character. Return one
-        # character anyway so callers make deterministic, lossless cursor progress
-        # instead of receiving has_more=true with the same content_offset forever.
-        sliced = "[LCM redacted]" if redaction_changed else source[:1]
-    # Offsets are raw-source cursors. Redacted pages skip the complete inspected
-    # probe; ordinary pages advance only by visible raw text. Non-truncated pages
-    # consume the complete source.
-    if not window_truncated:
-        raw_consumed = len(source)
-    elif boundary_mapping_destroyed:
-        # The inspected window ends inside an unbounded credential/PEM span.
-        # No finite raw continuation boundary is provably safe, so consume the
-        # remaining source and fail closed rather than expose a suffix page.
-        raw_consumed = len(source)
-    elif redaction_changed:
-        # Skip the complete bounded probe that produced the placeholder.  This
-        # prevents a subsequent cursor from entering the middle of a secret.
-        raw_consumed = max(1, min(len(source), probe_limit))
-    else:
-        # For ordinary text output length and raw-source length are identical.
-        # Advance only by the visible page so tiny budgets remain lossless.
-        raw_consumed = max(1, min(len(source), len(sliced)))
-    next_content_offset = content_offset + raw_consumed
-    has_more = (
-        (window_truncated and not boundary_mapping_destroyed)
-        or next_content_offset < len(content)
+    del config  # Mandatory output redaction is deliberately configuration-free.
+    return _slice_redacted_raw_page(
+        str(content or ""),
+        content_offset=content_offset,
+        max_tokens=max_tokens,
+        max_chars=_CURRENT_SESSION_EXPAND_MAX_CHARS,
     )
+
+
+def _redaction_spans_with_incomplete_tail(
+    raw_text: str,
+    *,
+    source_truncated: bool,
+) -> tuple[list[SensitiveOutputSpan], int | None]:
+    """Return complete spans and the start of an unsafe truncated tail."""
+    spans = sensitive_output_spans(raw_text)
+    unsafe_tail_start: int | None = None
+    if source_truncated:
+        if spans and spans[-1].raw_end == len(raw_text):
+            # A bounded SQL prefix cannot prove that a credential ending at its
+            # right edge really ended there. Resume at the complete expression's
+            # start so the full-source expansion can classify it safely.
+            unsafe_tail_start = spans[-1].raw_start
+        standalone = _BOUNDARY_STANDALONE_CREDENTIAL_RE.search(raw_text)
+        pem_begin = _BOUNDARY_PRIVATE_KEY_BEGIN_RE.search(raw_text)
+        for match in (standalone, pem_begin):
+            if match is not None:
+                unsafe_tail_start = (
+                    match.start()
+                    if unsafe_tail_start is None
+                    else min(unsafe_tail_start, match.start())
+                )
+    return spans, unsafe_tail_start
+
+
+def _slice_redacted_raw_page(
+    raw_text: str,
+    *,
+    content_offset: int = 0,
+    max_tokens: int | None = None,
+    max_chars: int | None = None,
+    source_content_chars: int | None = None,
+    allow_incomplete_tail: bool = False,
+    allow_partial_redaction_without_progress: bool = False,
+) -> dict[str, Any]:
+    """Page mandatory-redacted output while retaining raw-source cursors."""
+    total_source_chars = (
+        int(source_content_chars)
+        if isinstance(source_content_chars, int) and source_content_chars >= 0
+        else len(raw_text)
+    )
+    source_truncated = total_source_chars > len(raw_text)
+    requested_offset = min(max(0, int(content_offset)), total_source_chars)
+    local_offset = min(requested_offset, len(raw_text))
+    spans, unsafe_tail_start = _redaction_spans_with_incomplete_tail(
+        raw_text, source_truncated=source_truncated and allow_incomplete_tail
+    )
+
+    segments: list[tuple[int, int, str, bool]] = []
+    page_raw_end = (
+        unsafe_tail_start if unsafe_tail_start is not None else len(raw_text)
+    )
+    cursor = 0
+    for span in spans:
+        if span.raw_start >= page_raw_end:
+            break
+        if cursor < span.raw_start:
+            benign_end = min(span.raw_start, page_raw_end)
+            segments.append((cursor, benign_end, raw_text[cursor:benign_end], False))
+        if span.raw_end > page_raw_end:
+            cursor = page_raw_end
+            break
+        segments.append((span.raw_start, span.raw_end, span.replacement, True))
+        cursor = span.raw_end
+    if cursor < page_raw_end:
+        segments.append((cursor, page_raw_end, raw_text[cursor:page_raw_end], False))
+
+    output = ""
+    raw_cursor = local_offset
+    redacted = False
+
+    def bounded_candidate(value: str) -> tuple[str, bool]:
+        candidate = value
+        truncated = False
+        if max_chars is not None and len(candidate) > max(0, int(max_chars)):
+            candidate = candidate[:max(0, int(max_chars))]
+            truncated = True
+        if max_tokens is not None:
+            candidate, token_truncated = _truncate_text_to_token_budget(
+                candidate, max(0, int(max_tokens))
+            )
+            truncated = truncated or token_truncated
+        return candidate, truncated
+
+    for raw_start, raw_end, rendered, sensitive in segments:
+        if raw_end <= raw_cursor:
+            continue
+        if raw_cursor > raw_start:
+            if sensitive:
+                # An arbitrary caller offset inside a credential is fail-closed.
+                raw_cursor = raw_end
+                redacted = True
+                continue
+            rendered = rendered[raw_cursor - raw_start:]
+            raw_start = raw_cursor
+
+        candidate, was_truncated = bounded_candidate(output + rendered)
+        if not was_truncated:
+            output = candidate
+            raw_cursor = raw_end
+            redacted = redacted or sensitive
+            continue
+
+        added = candidate[len(output):] if candidate.startswith(output) else ""
+        if sensitive:
+            redacted = True
+            if not output:
+                # A placeholder is atomic in raw coordinates. It may be visibly
+                # shortened for a tiny caller budget, but consumes the entire
+                # credential so the next raw cursor is safe and strictly advances.
+                output = candidate or "[LCM redacted]"
+                raw_cursor = raw_end
+            elif allow_partial_redaction_without_progress and added:
+                output = candidate
+                raw_cursor = raw_start
+            else:
+                raw_cursor = raw_start
+            break
+
+        output = candidate
+        raw_cursor = raw_start + len(added)
+        if raw_cursor == raw_start and raw_start < raw_end:
+            # Preserve deterministic progress even when one benign character is
+            # larger than a caller's token budget.
+            output += rendered[:1]
+            raw_cursor += 1
+        break
+
+    if unsafe_tail_start is not None and raw_cursor >= page_raw_end:
+        raw_cursor = unsafe_tail_start
+    raw_cursor = min(raw_cursor, total_source_chars)
+    has_more = raw_cursor < total_source_chars
     return {
-        "content": sliced,
-        "content_chars": len(content),
-        "content_offset": content_offset,
-        "content_returned_chars": len(sliced),
+        "content": output,
+        "content_chars": total_source_chars,
+        "content_offset": requested_offset,
+        "content_returned_chars": len(output),
         "content_truncated": has_more,
-        "next_content_offset": next_content_offset if has_more else 0,
+        "content_source_truncated": source_truncated,
+        "content_output_truncated": has_more or len(output) < len(raw_text),
+        "content_redacted": redacted or bool(spans) or unsafe_tail_start is not None,
+        "next_content_offset": raw_cursor if has_more else 0,
         "has_more": has_more,
     }
 
@@ -1411,11 +1500,24 @@ def _grep_safe_snippet(
     *,
     max_chars: int = 300,
     highlight_matches: bool = True,
+    left_boundary_truncated: bool = False,
 ) -> str:
     """Redact the complete bounded match window before choosing its snippet."""
     raw_window = str(value or "")
     if not raw_window:
         return ""
+    if left_boundary_truncated:
+        # The SQL match window intentionally starts near the query.  If its
+        # left edge is in a long assignment/token, no finite lookbehind proves
+        # that the leading run is benign. Fail closed through its first lexical
+        # delimiter while retaining the nearby query and relevance context.
+        leading = re.match(r"[^\s,\"'\]\}]+", raw_window)
+        if leading is not None and leading.end() > 0:
+            raw_window = (
+                "[LCM sensitive redaction: name=left_boundary_token; "
+                "boundary-truncated]"
+                + raw_window[leading.end():]
+            )
     protected, _truncated = _bounded_cross_session_text(
         raw_window,
         None,
@@ -2298,53 +2400,15 @@ def _slice_loaded_content(
         if isinstance(source_content_chars, int) and source_content_chars >= 0
         else len(raw_text)
     )
-    source_truncated = total_source_chars > len(raw_text)
-    text = redact_sensitive_output_text(raw_text)
-    content_redacted = text != raw_text
-    pem_begin = _BOUNDARY_PRIVATE_KEY_BEGIN_RE.search(text)
-    if pem_begin is not None:
-        text = (
-            text[:pem_begin.start()]
-            + "[LCM sensitive redaction: name=private_key; boundary-truncated]"
-        )
-        content_redacted = True
-    text, boundary_credential_count = _BOUNDARY_STANDALONE_CREDENTIAL_RE.subn(
-        "[LCM sensitive redaction: name=standalone_credential; boundary-truncated]",
-        text,
+    return _slice_redacted_raw_page(
+        raw_text,
+        content_offset=0,
+        max_tokens=max(1, max_content_chars * 2),
+        max_chars=min(max(0, int(max_content_chars)), total_source_chars),
+        source_content_chars=total_source_chars,
+        allow_incomplete_tail=True,
+        allow_partial_redaction_without_progress=False,
     )
-    content_redacted = content_redacted or bool(boundary_credential_count)
-    # A mandatory-redaction marker can be longer than a short credential. Keep
-    # returned/source counts ordered by fitting the visible representation to
-    # both the caller cap and the original source character count.
-    visible_limit = min(max(0, int(max_content_chars)), total_source_chars)
-    output_truncated = len(text) > visible_limit
-    sliced = text[:visible_limit]
-    sliced, token_truncated = _truncate_text_to_token_budget(
-        sliced, max(1, max_content_chars * 2)
-    )
-    output_truncated = output_truncated or token_truncated
-    has_more = source_truncated or output_truncated
-    continuation_disabled = bool(content_redacted and has_more)
-    result = {
-        "content": sliced,
-        "content_chars": total_source_chars,
-        "content_returned_chars": len(sliced),
-        "content_truncated": has_more,
-        "content_source_truncated": source_truncated,
-        "content_output_truncated": output_truncated,
-        "content_redacted": content_redacted,
-        # This cursor is in the raw source coordinate space.  Output length is
-        # valid only while the transformation is identity-preserving.  When
-        # mandatory redaction changes that mapping, fail closed and advertise
-        # an explicit safe restart boundary instead of pointing into a secret.
-        "next_content_offset": (
-            None if continuation_disabled else (len(sliced) if has_more else 0)
-        ),
-    }
-    if continuation_disabled:
-        result["content_continuation_disabled"] = True
-        result["safe_expand_content_offset"] = 0
-    return result
 
 
 def _bounded_loaded_nested_value(
@@ -2452,11 +2516,6 @@ def _serialize_loaded_message(engine: "LCMEngine", row: dict[str, Any], max_cont
         "next_content_offset": content_slice["next_content_offset"],
         "from_current_session": bool(engine.current_session_id) and stored_session_id == engine.current_session_id,
     }
-    if content_slice.get("content_continuation_disabled"):
-        item["content_continuation_disabled"] = True
-        item["safe_expand_content_offset"] = int(
-            content_slice.get("safe_expand_content_offset") or 0
-        )
     nested_truncated = False
     char_budget = [max(1, _LCM_LOAD_SESSION_MAX_ROW_SERIALIZED_BYTES // 2)]
     item_budget = [_LCM_LOAD_SESSION_MAX_NESTED_ITEMS]
@@ -2855,6 +2914,9 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                         highlight_matches=bool(
                             hit.get("_grep_highlight_matches", True)
                         ),
+                        left_boundary_truncated=(
+                            int(hit.get("_grep_window_start") or 1) > 1
+                        ),
                     ),
                     "from_current_session": has_current_session and hit["session_id"] == current_session_id,
                     "_sort_ts": timestamp_value,
@@ -2865,38 +2927,55 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
       except Exception as exc:
         logger.warning("Message search failed: %s", exc)
 
-    # Summary-node search is intentionally current-session only. Cross-session
-    # DAG expansion is deferred; returning summary hits without an expansion
-    # contract would push this tool toward a memory-system shape rather than
-    # a plugin-local archive search. Raw-message hits remain expandable across
-    # sessions via lcm_expand(store_id=...).
+    # Summary search uses an explicit SQL prefix projection for every scope.
+    # Cross-session rows are constrained by the already-validated host
+    # capability, just like raw-message rows.
     if (
         content_scope in {"database", "all"}
         and not regex_mode
-        and session_scope == "current"
         and not raw_message_filter_active
     ):
         try:
-            node_hits = engine._dag.search(
+            summary_search_sessions = (
+                sorted(allowed_cross_session_ids)
+                if session_scope == "all" and allowed_cross_session_ids is not None
+                else [str(search_session_id or "")]
+            )
+            node_hits = engine._dag.search_bounded_summary_candidates(
                 query,
-                session_id=search_session_id,
+                session_ids=summary_search_sessions,
                 limit=source_limit,
                 sort=sort,
                 source=source,
+                deadline=(
+                    time.monotonic() + _LCM_GREP_SUMMARY_DEADLINE_SECONDS
+                ),
             )
             for node in node_hits:
+                if (
+                    allowed_cross_session_ids is not None
+                    and node.session_id not in allowed_cross_session_ids
+                ):
+                    continue
                 results.append(
                     {
                         "type": "summary",
                         "depth": f"d{node.depth}",
                         "node_id": node.node_id,
-                        "session_id": node.session_id,
+                        "session_id": _grep_safe_text(
+                            node.session_id, max_chars=512
+                        ),
                         "snippet": _grep_safe_text(node.summary, max_chars=300),
                         "token_count": node.token_count,
-                        "expand_hint": node.expand_hint,
+                        "expand_hint": _grep_safe_text(
+                            node.expand_hint, max_chars=2_048
+                        ),
                         "earliest_at": node.earliest_at,
                         "latest_at": node.latest_at,
-                        "from_current_session": True,
+                        "from_current_session": (
+                            has_current_session
+                            and node.session_id == current_session_id
+                        ),
                         "_sort_ts": node.latest_at or node.created_at,
                         "_sort_rank": node.search_rank,
                         "_sort_directness": node.search_directness or 0.0,

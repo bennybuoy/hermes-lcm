@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -229,4 +230,73 @@ def test_final_tail_ingest_lock_error_aborts_rollover_and_keeps_host_tail_visibl
         assert previous_messages[-1]["content"] == TAIL
         assert _snapshot(db_path) == before
     finally:
+        engine.shutdown()
+
+
+def test_normal_ingest_serializes_across_rollover_snapshot_publication(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "rollover-ingest-race.db"
+    previous_messages, _retained_id, _pruned_id = _seed(db_path)
+    engine = LCMEngine(config=_config(db_path))
+    engine.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
+    snapshot_captured = threading.Event()
+    permit_publication = threading.Event()
+    ingest_finished = threading.Event()
+    failures: list[BaseException] = []
+    original_prepare = engine._prepare_rollover_final_tail
+
+    def pause_after_snapshot(*args, **kwargs):
+        tail = original_prepare(*args, **kwargs)
+        snapshot_captured.set()
+        assert permit_publication.wait(5)
+        return tail
+
+    monkeypatch.setattr(engine, "_prepare_rollover_final_tail", pause_after_snapshot)
+
+    def rollover_worker():
+        try:
+            engine.rollover_session(
+                OLD,
+                NEW,
+                previous_messages=previous_messages,
+                carry_over_context=True,
+                platform="test",
+            )
+        except BaseException as exc:  # pragma: no cover - assertion reports below
+            failures.append(exc)
+
+    def ingest_worker():
+        try:
+            engine.ingest([{"role": "user", "content": "CONCURRENT INGEST"}])
+        except BaseException as exc:  # pragma: no cover - assertion reports below
+            failures.append(exc)
+        finally:
+            ingest_finished.set()
+
+    rollover_thread = threading.Thread(target=rollover_worker)
+    ingest_thread = threading.Thread(target=ingest_worker)
+    try:
+        rollover_thread.start()
+        assert snapshot_captured.wait(5)
+        ingest_thread.start()
+        assert not ingest_finished.wait(0.25), (
+            "normal ingest crossed the captured rollover snapshot"
+        )
+        permit_publication.set()
+        rollover_thread.join(5)
+        ingest_thread.join(5)
+        assert not rollover_thread.is_alive()
+        assert not ingest_thread.is_alive()
+        assert failures == []
+
+        rows = engine._store._conn.execute(
+            "SELECT session_id, content FROM messages ORDER BY store_id"
+        ).fetchall()
+        assert rows.count((OLD, TAIL)) == 1
+        assert rows.count((NEW, "CONCURRENT INGEST")) == 1
+    finally:
+        permit_publication.set()
+        rollover_thread.join(5)
+        ingest_thread.join(5)
         engine.shutdown()

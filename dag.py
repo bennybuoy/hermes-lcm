@@ -18,7 +18,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from .db_bootstrap import (
     ExternalContentFtsSpec,
@@ -637,6 +637,114 @@ class SummaryDAG:
         nodes.sort(key=lambda node: _fallback_result_sort_key(node, None))
         return nodes[:bounded_limit]
 
+    def search_bounded_summary_candidates(
+        self,
+        query: str,
+        *,
+        session_ids: Sequence[str],
+        limit: int,
+        sort: str | None,
+        source: str | None,
+        deadline: float,
+    ) -> List[SummaryNode]:
+        """Search grep summaries without materializing an unbounded text field."""
+        bounded_sessions = [str(value) for value in session_ids if str(value)]
+        if not bounded_sessions or time.monotonic() >= deadline:
+            return []
+        safe_query = sanitize_fts5_query(query)
+        terms = extract_search_terms(safe_query)
+        phrases = extract_quoted_phrases(safe_query)
+        if not terms:
+            return []
+
+        bounded_limit = max(1, int(limit))
+        candidate_cap = min(compute_search_candidate_cap(bounded_limit), 5_000)
+        projection = self._cross_session_candidate_projection("n")
+        guard = self._cross_session_candidate_guard("n")
+        placeholders = ",".join("?" for _ in bounded_sessions)
+        session_clause = f"n.session_id IN ({placeholders})"
+        source_match_cache: dict[int, bool] = {}
+
+        if not requires_like_fallback(query):
+            order_by = _build_search_order_by(
+                sort, "COALESCE(n.latest_at, n.created_at)"
+            )
+            try:
+                rows = self._bounded_cross_session_rows(
+                    f"""SELECT {projection}, rank AS search_rank
+                        FROM nodes_fts fts
+                        JOIN summary_nodes n ON n.node_id = fts.rowid
+                        WHERE nodes_fts MATCH ? AND {session_clause} AND {guard}
+                        ORDER BY {order_by} LIMIT ?""",
+                    [safe_query, *bounded_sessions, candidate_cap],
+                    deadline=deadline,
+                )
+                nodes: list[SummaryNode] = []
+                for row in rows:
+                    node = self._cross_session_row_to_node(row, rank_index=27)
+                    if node is None:
+                        continue
+                    if source and not self._node_matches_source(
+                        node.node_id,
+                        source,
+                        cache=source_match_cache,
+                        deadline=deadline,
+                    ):
+                        continue
+                    node.search_directness = compute_directness_score(
+                        node.summary, terms, phrases
+                    )
+                    nodes.append(node)
+                nodes.sort(key=lambda node: _fts_result_sort_key(node, sort))
+                return nodes[:bounded_limit]
+            except sqlite3.Error as exc:
+                if time.monotonic() >= deadline:
+                    return []
+                logger.warning(
+                    "Bounded FTS summary grep failed, falling back to LIKE: %s",
+                    exc,
+                )
+
+        like_clauses = ["n.summary LIKE ? ESCAPE '\\'" for _term in terms]
+        like_args = [f"%{escape_like(term)}%" for term in terms]
+        rows = self._bounded_cross_session_rows(
+            f"""SELECT {projection}
+                FROM summary_nodes n
+                WHERE ({' OR '.join(like_clauses)})
+                  AND {session_clause} AND {guard}
+                LIMIT ?""",
+            [*like_args, *bounded_sessions, candidate_cap],
+            deadline=deadline,
+        )
+        collapse_risky_repeats = contains_risky_fts_ascii(query)
+        nodes = []
+        for row in rows:
+            node = self._cross_session_row_to_node(row)
+            if node is None:
+                continue
+            if source and not self._node_matches_source(
+                node.node_id,
+                source,
+                cache=source_match_cache,
+                deadline=deadline,
+            ):
+                continue
+            score = sum(
+                min(count_term_matches(node.summary, term), 1)
+                if collapse_risky_repeats
+                else count_term_matches(node.summary, term)
+                for term in terms
+            )
+            if score <= 0:
+                continue
+            node.search_rank = -float(score)
+            node.search_directness = compute_directness_score(
+                node.summary, terms, phrases
+            )
+            nodes.append(node)
+        nodes.sort(key=lambda node: _fallback_result_sort_key(node, sort))
+        return nodes[:bounded_limit]
+
     def get_session_nodes(self, session_id: str,
                           depth: int | None = None,
                           limit: int = 1000) -> List[SummaryNode]:
@@ -920,6 +1028,7 @@ class SummaryDAG:
         source: str,
         *,
         cache: dict[int, bool] | None = None,
+        deadline: float | None = None,
     ) -> bool:
         if not source:
             return True
@@ -927,35 +1036,58 @@ class SummaryDAG:
         if cache is not None and node_id in cache:
             return cache[node_id]
         legacy_blank_clause = _legacy_blank_source_clause("m.source")
-        row = self._conn.execute(
-            f"""
-            WITH RECURSIVE source_walk(source_type, source_id) AS (
-                SELECT n.source_type, CAST(j.value AS INTEGER)
-                FROM summary_nodes n, json_each(n.source_ids) j
-                WHERE n.node_id = ?
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
 
-                UNION ALL
+        def interrupt_after_deadline() -> int:
+            return int(deadline is not None and time.monotonic() >= deadline)
 
-                SELECT child.source_type, CAST(j.value AS INTEGER)
-                FROM summary_nodes child
-                JOIN source_walk walk
-                  ON walk.source_type = 'nodes'
-                 AND child.node_id = walk.source_id
-                JOIN json_each(child.source_ids) j
-            )
-            SELECT 1
-            FROM source_walk walk
-            JOIN messages m
-              ON walk.source_type = 'messages'
-             AND m.store_id = walk.source_id
-            WHERE CASE
-                    WHEN ? = ? THEN (m.source = ? OR {legacy_blank_clause})
-                    ELSE m.source = ?
-                  END
-            LIMIT 1
-            """,
-            (node_id, normalized_source, _UNKNOWN_SOURCE, normalized_source, normalized_source),
-        ).fetchone()
+        with self._db_lock:
+            if deadline is not None:
+                self._conn.set_progress_handler(interrupt_after_deadline, 1_000)
+            try:
+                row = self._conn.execute(
+                    f"""
+                    WITH RECURSIVE source_walk(source_type, source_id) AS (
+                        SELECT n.source_type, CAST(j.value AS INTEGER)
+                        FROM summary_nodes n, json_each(n.source_ids) j
+                        WHERE n.node_id = ?
+
+                        UNION ALL
+
+                        SELECT child.source_type, CAST(j.value AS INTEGER)
+                        FROM summary_nodes child
+                        JOIN source_walk walk
+                          ON walk.source_type = 'nodes'
+                         AND child.node_id = walk.source_id
+                        JOIN json_each(child.source_ids) j
+                    )
+                    SELECT 1
+                    FROM source_walk walk
+                    JOIN messages m
+                      ON walk.source_type = 'messages'
+                     AND m.store_id = walk.source_id
+                    WHERE CASE
+                            WHEN ? = ? THEN (m.source = ? OR {legacy_blank_clause})
+                            ELSE m.source = ?
+                          END
+                    LIMIT 1
+                    """,
+                    (
+                        node_id,
+                        normalized_source,
+                        _UNKNOWN_SOURCE,
+                        normalized_source,
+                        normalized_source,
+                    ),
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                if deadline is None or "interrupted" not in str(exc).lower():
+                    raise
+                row = None
+            finally:
+                if deadline is not None:
+                    self._conn.set_progress_handler(None, 0)
         matched = row is not None
         if cache is not None:
             cache[node_id] = matched
