@@ -300,3 +300,81 @@ def test_normal_ingest_serializes_across_rollover_snapshot_publication(
         rollover_thread.join(5)
         ingest_thread.join(5)
         engine.shutdown()
+
+
+@pytest.mark.parametrize("ingest_path", ["tool_call", "preflight", "compression"])
+def test_every_live_ingest_path_serializes_across_rollover_publication(
+    tmp_path, monkeypatch, ingest_path
+):
+    """No live writer may append against the old binding after tail capture."""
+    db_path = tmp_path / f"rollover-{ingest_path}-race.db"
+    previous_messages, _retained_id, _pruned_id = _seed(db_path)
+    engine = LCMEngine(config=_config(db_path))
+    engine.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
+    snapshot_captured = threading.Event()
+    permit_publication = threading.Event()
+    ingest_finished = threading.Event()
+    failures: list[BaseException] = []
+    original_prepare = engine._prepare_rollover_final_tail
+    live_messages = [{"role": "user", "content": f"CONCURRENT {ingest_path.upper()} INGEST"}]
+
+    def pause_after_snapshot(*args, **kwargs):
+        tail = original_prepare(*args, **kwargs)
+        snapshot_captured.set()
+        assert permit_publication.wait(5)
+        return tail
+
+    monkeypatch.setattr(engine, "_prepare_rollover_final_tail", pause_after_snapshot)
+
+    def rollover_worker():
+        try:
+            engine.rollover_session(
+                OLD,
+                NEW,
+                previous_messages=previous_messages,
+                carry_over_context=True,
+                platform="test",
+            )
+        except BaseException as exc:  # pragma: no cover - assertion reports below
+            failures.append(exc)
+
+    def ingest_worker():
+        try:
+            if ingest_path == "tool_call":
+                engine.handle_tool_call("lcm_status", {}, messages=live_messages)
+            elif ingest_path == "preflight":
+                engine.should_compress_preflight(live_messages)
+            else:
+                engine.compress(live_messages)
+        except BaseException as exc:  # pragma: no cover - assertion reports below
+            failures.append(exc)
+        finally:
+            ingest_finished.set()
+
+    rollover_thread = threading.Thread(target=rollover_worker)
+    ingest_thread = threading.Thread(target=ingest_worker)
+    try:
+        rollover_thread.start()
+        assert snapshot_captured.wait(5)
+        ingest_thread.start()
+        assert not ingest_finished.wait(0.25), (
+            f"{ingest_path} ingest crossed the captured rollover snapshot"
+        )
+        permit_publication.set()
+        rollover_thread.join(5)
+        ingest_thread.join(5)
+        assert not rollover_thread.is_alive()
+        assert not ingest_thread.is_alive()
+        assert failures == []
+
+        rows = engine._store._conn.execute(
+            "SELECT session_id, content FROM messages ORDER BY store_id"
+        ).fetchall()
+        assert rows.count((OLD, TAIL)) == 1
+        assert rows.count((NEW, live_messages[0]["content"])) == 1
+        assert rows.count((OLD, live_messages[0]["content"])) == 0
+    finally:
+        permit_publication.set()
+        rollover_thread.join(5)
+        ingest_thread.join(5)
+        engine.shutdown()

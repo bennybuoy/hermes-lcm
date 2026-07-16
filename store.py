@@ -15,7 +15,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .db_bootstrap import (
     ExternalContentFtsSpec,
@@ -68,6 +68,10 @@ _GREP_SEARCH_BOUNDARY_CHARS = 8_192
 _GREP_SEARCH_WINDOW_CHARS = (
     _GREP_SEARCH_VISIBLE_CHARS + (2 * _GREP_SEARCH_BOUNDARY_CHARS)
 )
+_EXPAND_SESSION_ID_MAX_CHARS = 512
+_EXPAND_SCALAR_MAX_CHARS = 8 * 1024
+_EXPAND_TOOL_CALLS_MAX_CHARS = 64 * 1024
+_EXPAND_CONTENT_LOOKBEHIND_CHARS = 8 * 1024
 
 
 def _grep_bounded_search_projection(
@@ -551,6 +555,144 @@ class MessageStore:
             f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id = ?", (store_id,)
         ).fetchone()
         return self._row_to_dict(row) if row else None
+
+    def get_for_expansion(
+        self,
+        store_id: int,
+        *,
+        authorize_session: Callable[[str], bool],
+        content_offset: int,
+        max_content_chars: int,
+        content_lookahead_chars: int,
+    ) -> Dict[str, Any]:
+        """Authorize bounded ownership metadata before reading payload columns.
+
+        Both reads share one SQLite savepoint/read snapshot.  The first query
+        projects only the row identity and a strictly guarded session owner;
+        an unauthorized row therefore never causes ``content`` or
+        ``tool_calls`` to be read by SQLite or materialized in Python.  After
+        authorization, the second query projects a bounded content window and
+        bounded scalar metadata from that same immutable snapshot.
+        """
+        savepoint = "lcm_expand_message_snapshot"
+        bounded_offset = max(0, int(content_offset))
+        visible_chars = max(1, int(max_content_chars))
+        lookahead_chars = max(0, int(content_lookahead_chars))
+        window_start = max(0, bounded_offset - _EXPAND_CONTENT_LOOKBEHIND_CHARS)
+        window_chars = (
+            (bounded_offset - window_start) + visible_chars + lookahead_chars
+        )
+        with self._write_lock:
+            self._conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                metadata = self._conn.execute(
+                    """SELECT
+                               CASE WHEN typeof(store_id) = 'integer' THEN store_id END,
+                               COALESCE(length(CAST(session_id AS BLOB)), 0),
+                               COALESCE(length(CAST(session_id AS TEXT)), 0),
+                               CASE WHEN typeof(session_id) = 'text'
+                                          AND COALESCE(length(CAST(session_id AS BLOB)), 0) <= ?
+                                          AND COALESCE(length(CAST(session_id AS TEXT)), 0) <= ?
+                                    THEN substr(CAST(session_id AS TEXT), 1, ?) END,
+                               typeof(session_id)
+                        FROM messages WHERE store_id = ? LIMIT 1""",
+                    (
+                        _EXPAND_SESSION_ID_MAX_CHARS * 4,
+                        _EXPAND_SESSION_ID_MAX_CHARS,
+                        _EXPAND_SESSION_ID_MAX_CHARS,
+                        store_id,
+                    ),
+                ).fetchone()
+                if metadata is None:
+                    result = {"status": "not_found"}
+                elif (
+                    metadata[0] is None
+                    or metadata[4] != "text"
+                    or int(metadata[1] or 0) > _EXPAND_SESSION_ID_MAX_CHARS * 4
+                    or int(metadata[2] or 0) > _EXPAND_SESSION_ID_MAX_CHARS
+                    or not isinstance(metadata[3], str)
+                ):
+                    result = {"status": "invalid_metadata"}
+                else:
+                    session_id = metadata[3]
+                    if not authorize_session(session_id):
+                        result = {
+                            "status": "unauthorized",
+                            "session_id": session_id,
+                        }
+                    else:
+                        scalar_columns = (
+                            "source", "role", "tool_call_id", "tool_name",
+                            "conversation_id",
+                        )
+                        scalar_projection = ", ".join(
+                            f"CASE WHEN {column} IS NULL THEN NULL "
+                            f"WHEN typeof({column}) = 'text' "
+                            f"AND COALESCE(length(CAST({column} AS TEXT)), 0) <= {_EXPAND_SCALAR_MAX_CHARS} "
+                            f"THEN substr(CAST({column} AS TEXT), 1, {_EXPAND_SCALAR_MAX_CHARS}) END"
+                            for column in scalar_columns
+                        )
+                        payload = self._conn.execute(
+                            f"""SELECT
+                                       CASE WHEN typeof(store_id) = 'integer' THEN store_id END,
+                                       substr(CAST(session_id AS TEXT), 1, {_EXPAND_SESSION_ID_MAX_CHARS}),
+                                       {scalar_projection},
+                                       CASE WHEN content IS NULL THEN NULL
+                                            WHEN typeof(content) = 'text'
+                                            THEN substr(CAST(content AS TEXT), ?, ?) END,
+                                       CASE WHEN tool_calls IS NULL THEN NULL
+                                            WHEN typeof(tool_calls) = 'text'
+                                             AND COALESCE(length(CAST(tool_calls AS TEXT)), 0) <= {_EXPAND_TOOL_CALLS_MAX_CHARS}
+                                            THEN substr(CAST(tool_calls AS TEXT), 1, {_EXPAND_TOOL_CALLS_MAX_CHARS}) END,
+                                       CASE WHEN typeof(timestamp) IN ('integer', 'real') THEN timestamp END,
+                                       CASE WHEN typeof(token_estimate) = 'integer' THEN token_estimate END,
+                                       CASE WHEN typeof(pinned) = 'integer' THEN pinned END,
+                                       COALESCE(length(CAST(content AS TEXT)), 0),
+                                       COALESCE(length(CAST(tool_calls AS TEXT)), 0),
+                                       typeof(content), typeof(tool_calls)
+                                FROM messages
+                                WHERE store_id = ?
+                                  AND session_id = ?
+                                  AND COALESCE(length(CAST(session_id AS BLOB)), 0) = ?
+                                  AND COALESCE(length(CAST(session_id AS TEXT)), 0) = ?
+                                LIMIT 1""",
+                            (
+                                window_start + 1,
+                                window_chars,
+                                store_id,
+                                session_id,
+                                int(metadata[1]),
+                                int(metadata[2]),
+                            ),
+                        ).fetchone()
+                        if payload is None:
+                            result = {"status": "changed"}
+                        else:
+                            # Reorder the explicit bounded projection into the
+                            # store's standard message shape without ever
+                            # constructing an unbounded row.
+                            standard_row = (
+                                payload[0], payload[1], payload[2], payload[3],
+                                payload[7], payload[4], payload[8], payload[5],
+                                payload[9], payload[10], payload[11], payload[6],
+                            )
+                            item = self._row_to_dict(standard_row)
+                            item["content_chars"] = int(payload[12] or 0)
+                            item["content_window_offset"] = window_start
+                            item["tool_calls_chars"] = int(payload[13] or 0)
+                            item["tool_calls_omitted"] = (
+                                int(payload[13] or 0) > _EXPAND_TOOL_CALLS_MAX_CHARS
+                            )
+                            if payload[14] not in {"text", "null"} or payload[15] not in {"text", "null"}:
+                                result = {"status": "invalid_payload"}
+                            else:
+                                result = {"status": "ok", "message": item}
+                self._conn.execute(f"RELEASE {savepoint}")
+                return result
+            except Exception:
+                self._conn.execute(f"ROLLBACK TO {savepoint}")
+                self._conn.execute(f"RELEASE {savepoint}")
+                raise
 
     def get_batch(self, store_ids: List[int]) -> Dict[int, Dict[str, Any]]:
         """Retrieve multiple messages by store_id in a single query.
@@ -1207,6 +1349,55 @@ class MessageStore:
 
     # -- Search -------------------------------------------------------------
 
+    def _grep_query_rows(
+        self,
+        sql: str,
+        args: list[Any],
+        *,
+        row_limit: int,
+        deadline: float | None,
+        materialization_budget: dict[str, int] | None = None,
+    ) -> list[tuple[Any, ...]]:
+        """Fetch a hard-bounded grep batch with an optional SQLite deadline."""
+        if row_limit <= 0 or (deadline is not None and time.monotonic() >= deadline):
+            return []
+
+        def interrupt_after_deadline() -> int:
+            return int(deadline is not None and time.monotonic() >= deadline)
+
+        rows: list[tuple[Any, ...]] = []
+        with self._write_lock:
+            if deadline is not None:
+                self._conn.set_progress_handler(interrupt_after_deadline, 1_000)
+            try:
+                cursor = self._conn.execute(sql, args)
+                while len(rows) < row_limit:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        break
+                    row = cursor.fetchone()
+                    if row is None:
+                        break
+                    row_bytes = sum(
+                        len(value.encode("utf-8", errors="surrogatepass"))
+                        for value in row
+                        if isinstance(value, str)
+                    )
+                    if materialization_budget is not None:
+                        if row_bytes > int(materialization_budget.get("remaining", 0)):
+                            materialization_budget["exhausted"] = 1
+                            break
+                        materialization_budget["remaining"] = (
+                            int(materialization_budget.get("remaining", 0)) - row_bytes
+                        )
+                    rows.append(tuple(row))
+            except sqlite3.OperationalError as exc:
+                if deadline is None or "interrupted" not in str(exc).lower():
+                    raise
+            finally:
+                if deadline is not None:
+                    self._conn.set_progress_handler(None, 0)
+        return rows
+
     def search(self, query: str, session_id: str | None = None,
                limit: int = 20, sort: str | None = None,
                source: str | None = None,
@@ -1214,7 +1405,10 @@ class MessageStore:
                role: str | None = None,
                time_from: float | None = None,
                time_to: float | None = None,
-               bounded_output: bool = False) -> List[Dict[str, Any]]:
+               bounded_output: bool = False,
+               max_candidate_rows: int | None = None,
+               deadline: float | None = None,
+               max_materialized_bytes: int | None = None) -> List[Dict[str, Any]]:
         """FTS5 search across raw messages.
 
         Retrieval contract:
@@ -1227,6 +1421,11 @@ class MessageStore:
         - ``conversation_id`` limits rows to one gateway conversation/session key
         """
         safe_query = sanitize_fts5_query(query)
+        materialization_budget = (
+            {"remaining": max(0, int(max_materialized_bytes)), "exhausted": 0}
+            if max_materialized_bytes is not None
+            else None
+        )
         terms = extract_search_terms(safe_query)
         phrases = extract_quoted_phrases(safe_query)
         if requires_like_fallback(query):
@@ -1241,6 +1440,9 @@ class MessageStore:
                 time_from=time_from,
                 time_to=time_to,
                 bounded_output=bounded_output,
+                max_candidate_rows=max_candidate_rows,
+                deadline=deadline,
+                max_materialized_bytes=max_materialized_bytes,
             )
 
         order_by = _build_search_order_by(
@@ -1250,6 +1452,9 @@ class MessageStore:
         )
         fetch_limit = compute_search_fetch_limit(limit, terms, phrases)
         candidate_cap = compute_search_candidate_cap(limit)
+        if max_candidate_rows is not None:
+            candidate_cap = min(candidate_cap, max(0, int(max_candidate_rows)))
+        fetch_limit = min(fetch_limit, candidate_cap)
         apply_directness_adjustment = should_apply_directness_rank_adjustment(terms, phrases)
         max_rank_bonus = compute_directness_rank_bonus_upper_bound(terms, phrases) * 3e-7
         source_clause, source_args = _source_filter_clause("m.source", source)
@@ -1296,14 +1501,17 @@ class MessageStore:
                         "rank AS search_rank, "
                         "snippet(messages_fts, 0, '>>>', '<<<', '...', 40) AS snippet"
                     )
-                rows = self._conn.execute(
+                rows = self._grep_query_rows(
                     f"""SELECT {select_sql}
                        FROM messages_fts fts
                        JOIN messages m ON m.store_id = fts.rowid
                        WHERE {' AND '.join(where)}
                        ORDER BY {order_by} LIMIT ? OFFSET ?""",
                     [*select_args, *args],
-                ).fetchall()
+                    row_limit=min(fetch_limit, max(0, candidate_cap - scanned_rows)),
+                    deadline=deadline,
+                    materialization_budget=materialization_budget,
+                )
                 scanned_rows += len(rows)
             except sqlite3.Error as exc:
                 logger.warning("FTS message search failed, falling back to LIKE: %s", exc)
@@ -1318,6 +1526,13 @@ class MessageStore:
                     time_from=time_from,
                     time_to=time_to,
                     bounded_output=bounded_output,
+                    max_candidate_rows=max_candidate_rows,
+                    deadline=deadline,
+                    max_materialized_bytes=(
+                        int(materialization_budget.get("remaining", 0))
+                        if materialization_budget is not None
+                        else None
+                    ),
                 )
 
             raw_primary_values: list[float] = []
@@ -1370,8 +1585,16 @@ class MessageStore:
                      role: str | None = None,
                      time_from: float | None = None,
                      time_to: float | None = None,
-                     bounded_output: bool = False) -> List[Dict[str, Any]]:
+                     bounded_output: bool = False,
+                     max_candidate_rows: int | None = None,
+                     deadline: float | None = None,
+                     max_materialized_bytes: int | None = None) -> List[Dict[str, Any]]:
         safe_query = sanitize_fts5_query(query)
+        materialization_budget = (
+            {"remaining": max(0, int(max_materialized_bytes)), "exhausted": 0}
+            if max_materialized_bytes is not None
+            else None
+        )
         terms = extract_search_terms(safe_query)
         phrases = extract_quoted_phrases(safe_query)
         if not terms:
@@ -1516,20 +1739,27 @@ class MessageStore:
                 bounded_select_args = []
                 message_select = _MESSAGE_SELECT_COLUMNS
             candidate_cap = compute_search_candidate_cap(limit)
+            hard_candidate_cap = candidate_cap
+            if max_candidate_rows is not None:
+                hard_candidate_cap = max(0, int(max_candidate_rows))
+                candidate_cap = min(candidate_cap, hard_candidate_cap)
             offset = 0
             scanned_rows = 0
             while True:
                 batch_limit = min(fetch_limit, candidate_cap - scanned_rows)
                 if batch_limit <= 0:
                     break
-                rows = self._conn.execute(
+                rows = self._grep_query_rows(
                     f"""SELECT {message_select}
                         FROM messages
                         WHERE {' AND '.join(where)}
                         {order_by}
                         LIMIT ? OFFSET ?""",
                     [*bounded_select_args, *base_args, *order_args, batch_limit, offset],
-                ).fetchall()
+                    row_limit=batch_limit,
+                    deadline=deadline,
+                    materialization_budget=materialization_budget,
+                )
                 scanned_rows += len(rows)
                 add_rows(rows)
                 offset += len(rows)
@@ -1539,16 +1769,27 @@ class MessageStore:
                     boundary_timestamp = rows[-1][8]
                     boundary_role_bias = _message_role_bias(rows[-1][3])
                     while True:
-                        tie_rows = self._conn.execute(
+                        # ``candidate_cap`` is the ordinary ranking window. A
+                        # recency/role tie may extend beyond it so Python can
+                        # apply JSON/directness penalties, but never beyond the
+                        # caller's operation-wide hard row reservation.
+                        tie_budget = hard_candidate_cap - scanned_rows
+                        if tie_budget <= 0:
+                            break
+                        tie_rows = self._grep_query_rows(
                             f"""SELECT {message_select}
                                 FROM messages
                                 WHERE {' AND '.join(where)}
                                 {order_by}
                                 LIMIT ? OFFSET ?""",
-                            [*bounded_select_args, *base_args, *order_args, fetch_limit, offset],
-                        ).fetchall()
+                            [*bounded_select_args, *base_args, *order_args, min(fetch_limit, tie_budget), offset],
+                            row_limit=min(fetch_limit, tie_budget),
+                            deadline=deadline,
+                            materialization_budget=materialization_budget,
+                        )
                         if not tie_rows:
                             break
+                        scanned_rows += len(tie_rows)
                         matching_tie_rows = []
                         reached_next_primary_group = False
                         for tie_row in tie_rows:
@@ -1596,6 +1837,8 @@ class MessageStore:
                 f"{role_bias} ASC, timestamp DESC, store_id DESC"
             )
             candidate_cap = compute_search_candidate_cap(limit)
+            if max_candidate_rows is not None:
+                candidate_cap = min(candidate_cap, max(0, int(max_candidate_rows)))
             if bounded_output:
                 select_columns, metadata_columns, bounded_select_args = (
                     _grep_bounded_search_projection(terms)
@@ -1607,14 +1850,17 @@ class MessageStore:
             offset = 0
             while offset < candidate_cap:
                 batch_limit = min(fetch_limit, candidate_cap - offset)
-                rows = self._conn.execute(
+                rows = self._grep_query_rows(
                     f"""SELECT {message_select}
                         FROM messages
                         WHERE {' AND '.join(where)}
                         {order_by}
                         LIMIT ? OFFSET ?""",
                     [*bounded_select_args, *base_args, *order_args, *exact_args, batch_limit, offset],
-                ).fetchall()
+                    row_limit=batch_limit,
+                    deadline=deadline,
+                    materialization_budget=materialization_budget,
+                )
                 if not rows:
                     break
                 add_rows(rows)

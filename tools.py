@@ -66,6 +66,11 @@ _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES = 4_000_000
 _LCM_GREP_REGEX_FILE_DEADLINE_SECONDS = 0.075
 _LCM_GREP_REGEX_OPERATION_DEADLINE_SECONDS = 1.0
 _LCM_GREP_REGEX_MAX_PATTERN_CHARS = 2_000
+_LCM_GREP_QUERY_MAX_CHARS = 2_000
+_LCM_GREP_QUERY_MAX_TOKENS = 512
+_LCM_GREP_OPERATION_MAX_ROWS = 1_000
+_LCM_GREP_OPERATION_MAX_BYTES = 2 * 1024 * 1024
+_LCM_GREP_OPERATION_DEADLINE_SECONDS = 1.0
 _CROSS_SESSION_EXPANSION_GUARD = threading.Lock()
 _ACTIVE_CROSS_SESSION_EXPANSIONS: set[str] = set()
 _CROSS_SESSION_MAX_SESSIONS = 10
@@ -85,6 +90,9 @@ _CROSS_SESSION_AUTH_MAX_MESSAGES = 6_400
 _CROSS_SESSION_AUTH_MAX_EDGES = 6_400
 _CROSS_SESSION_AUTH_MAX_DEPTH = 64
 _CROSS_SESSION_AUTH_QUERY_BATCH = 400
+_CROSS_SESSION_AUTH_SESSION_ID_CHARS = 256
+_CROSS_SESSION_AUTH_SOURCE_TYPE_CHARS = 32
+_CROSS_SESSION_AUTH_MAX_MATERIALIZED_BYTES = 4 * 1024 * 1024
 _CURRENT_SESSION_EXPAND_MAX_TOKENS = 65_536
 _CURRENT_SESSION_EXPAND_MAX_SOURCES = 200
 _CURRENT_SESSION_EXPAND_MAX_CHARS = 100_000
@@ -92,6 +100,9 @@ _MANDATORY_REDACTION_LOOKAHEAD_CHARS = 8_192
 _MANDATORY_REDACTION_CHARS_PER_TOKEN = 16
 _BOUNDARY_PRIVATE_KEY_BEGIN_RE = re.compile(
     r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE
+)
+_BOUNDARY_PRIVATE_KEY_END_RE = re.compile(
+    r"-----END [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE
 )
 _BOUNDARY_STANDALONE_CREDENTIAL_RE = re.compile(
     r"(?<![A-Za-z0-9_-])(?:"
@@ -282,6 +293,8 @@ def _search_externalized_payloads(
     limit: int,
     max_files: int,
     max_payload_chars: int,
+    max_total_bytes: int = _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES,
+    deadline: float | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, Any]]:
     diagnostics: list[dict[str, str]] = []
     hits: list[dict[str, Any]] = []
@@ -314,7 +327,14 @@ def _search_externalized_payloads(
             "max_files": max_files,
             "max_payload_chars": max_payload_chars,
         }
-    regex_deadline = time.monotonic() + _LCM_GREP_REGEX_OPERATION_DEADLINE_SECONDS
+    effective_total_bytes = min(
+        _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES,
+        max(0, int(max_total_bytes)),
+    )
+    regex_deadline = min(
+        time.monotonic() + _LCM_GREP_REGEX_OPERATION_DEADLINE_SECONDS,
+        deadline if deadline is not None else float("inf"),
+    )
     regex_timeouts = 0
     candidates_seen = 0
     paths: list[Path] = []
@@ -326,6 +346,9 @@ def _search_externalized_payloads(
         with os.scandir(root) as entries:
             iterator = iter(entries)
             while candidates_seen < max_files:
+                if deadline is not None and time.monotonic() >= deadline:
+                    scan_truncated = True
+                    break
                 try:
                     entry = next(iterator)
                 except StopIteration:
@@ -338,7 +361,10 @@ def _search_externalized_payloads(
             scan_truncated = True
 
     for path_index, path in enumerate(paths):
-        if bytes_scanned >= _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES:
+        if deadline is not None and time.monotonic() >= deadline:
+            scan_truncated = True
+            break
+        if bytes_scanned >= effective_total_bytes:
             scan_truncated = True
             break
         try:
@@ -353,7 +379,7 @@ def _search_externalized_payloads(
         if not resolved.is_file():
             diagnostics.append({"ref": path.name, "error": "not_a_file"})
             continue
-        remaining = _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES - bytes_scanned
+        remaining = effective_total_bytes - bytes_scanned
         read_limit = min(remaining, max(4_096, max_payload_chars * 6 + 4_096))
         try:
             with resolved.open("rb") as handle:
@@ -455,7 +481,7 @@ def _search_externalized_payloads(
         "scan_truncated": scan_truncated,
         "max_files": max_files,
         "max_payload_chars": max_payload_chars,
-        "max_total_bytes": _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES,
+        "max_total_bytes": effective_total_bytes,
         "regex_file_deadline_ms": int(_LCM_GREP_REGEX_FILE_DEADLINE_SECONDS * 1000),
         "regex_operation_deadline_ms": int(_LCM_GREP_REGEX_OPERATION_DEADLINE_SECONDS * 1000),
         "regex_timeouts": regex_timeouts,
@@ -1507,17 +1533,33 @@ def _grep_safe_snippet(
     if not raw_window:
         return ""
     if left_boundary_truncated:
-        # The SQL match window intentionally starts near the query.  If its
-        # left edge is in a long assignment/token, no finite lookbehind proves
-        # that the leading run is benign. Fail closed through its first lexical
-        # delimiter while retaining the nearby query and relevance context.
-        leading = re.match(r"[^\s,\"'\]\}]+", raw_window)
-        if leading is not None and leading.end() > 0:
-            raw_window = (
-                "[LCM sensitive redaction: name=left_boundary_token; "
-                "boundary-truncated]"
-                + raw_window[leading.end():]
-            )
+        # The SQL match window intentionally starts near the query.  A newline
+        # or space is not a safe terminator when the left edge is inside a
+        # quoted assignment or PEM body, so fail closed through an explicit
+        # quote/private-key terminator.  Preserve the historical unquoted-token
+        # case only when the leading run is long enough to be unambiguously a
+        # single token; otherwise uncertainty redacts the complete window.
+        boundary_end = None
+        boundary_name = "left_boundary_credential"
+        pem_end = _BOUNDARY_PRIVATE_KEY_END_RE.search(raw_window)
+        if pem_end is not None:
+            boundary_end = pem_end.end()
+            boundary_name = "private_key"
+        else:
+            quote_end = re.search(r"(?<!\\)[\"']", raw_window)
+            leading_token = re.match(r"[A-Za-z0-9_+./=-]+", raw_window)
+            if quote_end is not None:
+                boundary_end = quote_end.end()
+            elif leading_token is not None and leading_token.end() >= 64:
+                boundary_end = leading_token.end()
+                while boundary_end < len(raw_window) and raw_window[boundary_end] in ",;]}":
+                    boundary_end += 1
+            else:
+                boundary_end = len(raw_window)
+        raw_window = (
+            f"[LCM sensitive redaction: name={boundary_name}; boundary-truncated]"
+            + raw_window[boundary_end:]
+        )
     protected, _truncated = _bounded_cross_session_text(
         raw_window,
         None,
@@ -1626,6 +1668,7 @@ def _authorize_node_provenance_bounded(
 
     message_ids: set[int] = set()
     expanded_nodes: set[int] = set()
+    authorization_materialized_bytes = 0
     while queue:
         if time.monotonic() >= deadline:
             diagnostics["authorization_timed_out"] = True
@@ -1655,31 +1698,84 @@ def _authorize_node_provenance_bounded(
                 break
             missing_ids = missing_ids[:remaining_nodes]
             placeholders = ",".join("?" for _ in missing_ids)
-            rows = engine._dag._conn.execute(
-                f"""SELECT node_id, session_id,
+            cursor = engine._dag._conn.execute(
+                f"""SELECT
+                           CASE WHEN typeof(node_id) = 'integer' THEN node_id END,
+                           COALESCE(length(CAST(session_id AS BLOB)), 0),
+                           COALESCE(length(CAST(session_id AS TEXT)), 0),
+                           CASE WHEN typeof(session_id) = 'text'
+                                      AND COALESCE(length(CAST(session_id AS BLOB)), 0) <= ?
+                                      AND COALESCE(length(CAST(session_id AS TEXT)), 0) <= ?
+                                THEN substr(CAST(session_id AS TEXT), 1, ?) END,
                            COALESCE(length(CAST(source_ids AS BLOB)), 0),
-                           CASE
-                             WHEN typeof(source_ids) = 'text'
-                              AND COALESCE(length(CAST(source_ids AS BLOB)), 0) <= ?
-                             THEN substr(CAST(source_ids AS TEXT), 1, ?)
-                           END,
-                           source_type
-                    FROM summary_nodes WHERE node_id IN ({placeholders})""",
+                           CASE WHEN typeof(source_ids) = 'text'
+                                      AND COALESCE(length(CAST(source_ids AS BLOB)), 0) <= ?
+                                THEN substr(CAST(source_ids AS TEXT), 1, ?) END,
+                           COALESCE(length(CAST(source_type AS BLOB)), 0),
+                           COALESCE(length(CAST(source_type AS TEXT)), 0),
+                           CASE WHEN typeof(source_type) = 'text'
+                                      AND COALESCE(length(CAST(source_type AS BLOB)), 0) <= ?
+                                      AND COALESCE(length(CAST(source_type AS TEXT)), 0) <= ?
+                                THEN substr(CAST(source_type AS TEXT), 1, ?) END,
+                           typeof(session_id), typeof(source_ids), typeof(source_type)
+                    FROM summary_nodes WHERE node_id IN ({placeholders})
+                    LIMIT ?""",
                 [
+                    _CROSS_SESSION_AUTH_SESSION_ID_CHARS * 4,
+                    _CROSS_SESSION_AUTH_SESSION_ID_CHARS,
+                    _CROSS_SESSION_AUTH_SESSION_ID_CHARS,
                     MAX_SOURCE_IDS_JSON_CHARS,
                     MAX_SOURCE_IDS_JSON_CHARS + 1,
+                    _CROSS_SESSION_AUTH_SOURCE_TYPE_CHARS * 4,
+                    _CROSS_SESSION_AUTH_SOURCE_TYPE_CHARS,
+                    _CROSS_SESSION_AUTH_SOURCE_TYPE_CHARS,
                     *missing_ids,
+                    len(missing_ids),
                 ],
-            ).fetchall()
+            )
             found_ids: set[int] = set()
-            for row in rows:
+            while time.monotonic() < deadline:
+                row = cursor.fetchone()
+                if row is None:
+                    break
+                row_bytes = sum(
+                    len(value.encode("utf-8", errors="surrogatepass"))
+                    for value in row
+                    if isinstance(value, str)
+                )
+                if (
+                    authorization_materialized_bytes + row_bytes
+                    > _CROSS_SESSION_AUTH_MAX_MATERIALIZED_BYTES
+                ):
+                    diagnostics["authorization_truncated"] = True
+                    break
+                authorization_materialized_bytes += row_bytes
+                if row[0] is None:
+                    diagnostics["authorization_truncated"] = True
+                    continue
                 found_id = int(row[0])
                 found_ids.add(found_id)
-                raw_source_ids_bytes = int(row[2] or 0)
-                raw_source_ids = row[3]
+                session_id_bytes = int(row[1] or 0)
+                session_id_chars = int(row[2] or 0)
+                bounded_session_id = row[3]
+                raw_source_ids_bytes = int(row[4] or 0)
+                raw_source_ids = row[5]
+                source_type_bytes = int(row[6] or 0)
+                source_type_chars = int(row[7] or 0)
+                bounded_source_type = row[8]
+                valid_provenance_scalars = (
+                    row[9:12] == ("text", "text", "text")
+                    and session_id_bytes <= _CROSS_SESSION_AUTH_SESSION_ID_CHARS * 4
+                    and session_id_chars <= _CROSS_SESSION_AUTH_SESSION_ID_CHARS
+                    and isinstance(bounded_session_id, str)
+                    and source_type_bytes <= _CROSS_SESSION_AUTH_SOURCE_TYPE_CHARS * 4
+                    and source_type_chars <= _CROSS_SESSION_AUTH_SOURCE_TYPE_CHARS
+                    and isinstance(bounded_source_type, str)
+                )
                 encoded_too_large = (
                     raw_source_ids_bytes > MAX_SOURCE_IDS_JSON_CHARS
                     or not isinstance(raw_source_ids, str)
+                    or not valid_provenance_scalars
                 )
                 edge_count = (
                     raw_source_ids.strip().count(",") + 1
@@ -1708,7 +1804,9 @@ def _authorize_node_provenance_bounded(
                         source_ids = []
                         incomplete.add(found_id)
                 graph[found_id] = (
-                    str(row[1] or ""), str(row[4] or ""), source_ids
+                    str(bounded_session_id or ""),
+                    str(bounded_source_type or ""),
+                    source_ids,
                 )
             for missing_id in set(missing_ids) - found_ids:
                 graph[missing_id] = None
@@ -1752,11 +1850,51 @@ def _authorize_node_provenance_bounded(
             break
         batch = bounded_message_ids[offset:offset + _CROSS_SESSION_AUTH_QUERY_BATCH]
         placeholders = ",".join("?" for _ in batch)
-        rows = engine._store._conn.execute(
-            f"SELECT store_id, session_id FROM messages WHERE store_id IN ({placeholders})",
-            batch,
-        ).fetchall()
-        message_sessions.update({int(row[0]): str(row[1] or "") for row in rows})
+        cursor = engine._store._conn.execute(
+            f"""SELECT
+                       CASE WHEN typeof(store_id) = 'integer' THEN store_id END,
+                       COALESCE(length(CAST(session_id AS BLOB)), 0),
+                       COALESCE(length(CAST(session_id AS TEXT)), 0),
+                       CASE WHEN typeof(session_id) = 'text'
+                                  AND COALESCE(length(CAST(session_id AS BLOB)), 0) <= ?
+                                  AND COALESCE(length(CAST(session_id AS TEXT)), 0) <= ?
+                            THEN substr(CAST(session_id AS TEXT), 1, ?) END,
+                       typeof(session_id)
+                FROM messages WHERE store_id IN ({placeholders}) LIMIT ?""",
+            [
+                _CROSS_SESSION_AUTH_SESSION_ID_CHARS * 4,
+                _CROSS_SESSION_AUTH_SESSION_ID_CHARS,
+                _CROSS_SESSION_AUTH_SESSION_ID_CHARS,
+                *batch,
+                len(batch),
+            ],
+        )
+        while time.monotonic() < deadline:
+            row = cursor.fetchone()
+            if row is None:
+                break
+            row_bytes = sum(
+                len(value.encode("utf-8", errors="surrogatepass"))
+                for value in row
+                if isinstance(value, str)
+            )
+            if (
+                authorization_materialized_bytes + row_bytes
+                > _CROSS_SESSION_AUTH_MAX_MATERIALIZED_BYTES
+            ):
+                diagnostics["authorization_truncated"] = True
+                break
+            authorization_materialized_bytes += row_bytes
+            if (
+                row[0] is None
+                or row[4] != "text"
+                or int(row[1] or 0) > _CROSS_SESSION_AUTH_SESSION_ID_CHARS * 4
+                or int(row[2] or 0) > _CROSS_SESSION_AUTH_SESSION_ID_CHARS
+                or not isinstance(row[3], str)
+            ):
+                diagnostics["authorization_truncated"] = True
+                continue
+            message_sessions[int(row[0])] = row[3]
     diagnostics["authorization_messages_checked"] = len(message_sessions)
 
     if diagnostics["authorization_timed_out"]:
@@ -2728,9 +2866,27 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
 
-    query = args.get("query", "").strip()
+    operation_started = time.monotonic()
+    operation_deadline = operation_started + _LCM_GREP_OPERATION_DEADLINE_SECONDS
+    raw_query = args.get("query", "")
+    if not isinstance(raw_query, str):
+        return json.dumps({"error": "query must be a string"})
+    if len(raw_query) > _LCM_GREP_QUERY_MAX_CHARS:
+        return json.dumps({
+            "error": (
+                f"query exceeds the {_LCM_GREP_QUERY_MAX_CHARS} character hard limit"
+            ),
+        })
+    query = raw_query.strip()
     if not query:
         return json.dumps({"error": "No query provided"})
+    from .tokens import count_tokens
+    if count_tokens(query) > _LCM_GREP_QUERY_MAX_TOKENS:
+        return json.dumps({
+            "error": (
+                f"query exceeds the {_LCM_GREP_QUERY_MAX_TOKENS} token hard limit"
+            ),
+        })
 
     content_scope = str(args.get("content_scope") or "database").strip().lower()
     if content_scope == "files":
@@ -2742,7 +2898,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     regex_mode = bool(args.get("regex", False))
     if regex_mode:
         if len(query) > _LCM_GREP_REGEX_MAX_PATTERN_CHARS:
-            return json.dumps({"error": "regex pattern exceeds 2000 character limit"})
+            return json.dumps({"error": "regex pattern exceeds 2000 character hard limit"})
         try:
             re.compile(query)
         except re.error as exc:
@@ -2866,6 +3022,52 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     results: list[Dict[str, Any]] = []
     externalized_diagnostics: list[dict[str, str]] = []
     externalized_scan: dict[str, Any] | None = None
+    operation_rows_reserved = 0
+    operation_rows_materialized = 0
+    operation_bytes_materialized = len(query.encode("utf-8", errors="surrogatepass"))
+    operation_budget_exhausted = False
+
+    def reserve_discovery_rows(requested: int) -> int:
+        nonlocal operation_rows_reserved, operation_budget_exhausted
+        if time.monotonic() >= operation_deadline:
+            operation_budget_exhausted = True
+            return 0
+        remaining_rows = _LCM_GREP_OPERATION_MAX_ROWS - operation_rows_reserved
+        allowed = min(
+            max(0, int(requested)),
+            max(0, remaining_rows),
+        )
+        if allowed <= 0:
+            operation_budget_exhausted = True
+            return 0
+        operation_rows_reserved += allowed
+        return allowed
+
+    def charge_materialized(value: Any) -> bool:
+        nonlocal operation_rows_materialized, operation_bytes_materialized
+        nonlocal operation_budget_exhausted
+        if time.monotonic() >= operation_deadline:
+            operation_budget_exhausted = True
+            return False
+        try:
+            encoded = json.dumps(
+                value,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8", errors="surrogatepass")
+        except (TypeError, ValueError, OverflowError):
+            operation_budget_exhausted = True
+            return False
+        if (
+            operation_bytes_materialized + len(encoded)
+            > _LCM_GREP_OPERATION_MAX_BYTES
+        ):
+            operation_budget_exhausted = True
+            return False
+        operation_rows_materialized += 1
+        operation_bytes_materialized += len(encoded)
+        return True
 
     if content_scope in {"database", "all"} and not regex_mode:
       try:
@@ -2874,12 +3076,39 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
             if session_scope == "all" and allowed_cross_session_ids is not None
             else [search_session_id]
         )
-        msg_hits: list[dict[str, Any]] = []
-        for authorized_session_id in message_search_sessions:
-            msg_hits.extend(engine._store.search(
+        # Filters that suppress summaries, and raw-only all-session recovery,
+        # may use the full row budget. Mixed current/session searches reserve a
+        # larger share for summary discovery so source filtering and
+        # directness ranking can page past newer unrelated nodes.
+        raw_candidate_pool = min(
+            (
+                _LCM_GREP_OPERATION_MAX_ROWS
+                if raw_message_filter_active or session_scope == "all"
+                else 400
+            ),
+            _LCM_GREP_OPERATION_MAX_ROWS,
+        )
+        raw_candidates_reserved = 0
+        for session_index, authorized_session_id in enumerate(message_search_sessions):
+            sessions_remaining = len(message_search_sessions) - session_index
+            raw_candidates_remaining = raw_candidate_pool - raw_candidates_reserved
+            candidate_allowance = min(
+                raw_candidates_remaining,
+                max(
+                    1,
+                    (raw_candidates_remaining + sessions_remaining - 1)
+                    // max(1, sessions_remaining),
+                ),
+            )
+            candidate_limit = reserve_discovery_rows(candidate_allowance)
+            if candidate_limit <= 0:
+                break
+            raw_candidates_reserved += candidate_limit
+            call_limit = min(source_limit, candidate_limit)
+            msg_hits = engine._store.search(
                 query,
                 session_id=authorized_session_id,
-                limit=source_limit,
+                limit=call_limit,
                 sort=sort,
                 source=source,
                 conversation_id=conversation_id,
@@ -2887,43 +3116,57 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                 time_from=time_from,
                 time_to=time_to,
                 bounded_output=True,
-            ))
-        for hit in msg_hits:
-            if (
-                allowed_cross_session_ids is not None
-                and str(hit.get("session_id") or "") not in allowed_cross_session_ids
-            ):
-                continue
-            timestamp_value = hit.get("timestamp", 0) or 0
-            results.append(
-                {
-                    "type": "message",
-                    "depth": "raw",
-                    "store_id": hit["store_id"],
-                    "session_id": hit["session_id"],
-                    "source": _grep_safe_text(
-                        hit.get("source") or "", max_chars=512
-                    ),
-                    "conversation_id": hit.get("conversation_id") or "",
-                    "role": hit["role"],
-                    "timestamp": timestamp_value,
-                    "snippet": _grep_safe_snippet(
-                        hit.get("snippet", hit.get("content", "")),
-                        query,
-                        max_chars=300,
-                        highlight_matches=bool(
-                            hit.get("_grep_highlight_matches", True)
-                        ),
-                        left_boundary_truncated=(
-                            int(hit.get("_grep_window_start") or 1) > 1
-                        ),
-                    ),
-                    "from_current_session": has_current_session and hit["session_id"] == current_session_id,
-                    "_sort_ts": timestamp_value,
-                    "_sort_rank": hit.get("search_rank"),
-                    "_sort_directness": hit.get("_directness_score") or 0.0,
-                }
+                max_candidate_rows=candidate_limit,
+                deadline=operation_deadline,
+                max_materialized_bytes=max(
+                    0,
+                    _LCM_GREP_OPERATION_MAX_BYTES - operation_bytes_materialized,
+                ),
             )
+            for hit in msg_hits:
+                if not charge_materialized(hit):
+                    break
+                if (
+                    allowed_cross_session_ids is not None
+                    and str(hit.get("session_id") or "") not in allowed_cross_session_ids
+                ):
+                    continue
+                timestamp_value = hit.get("timestamp", 0) or 0
+                results.append(
+                    {
+                        "type": "message",
+                        "depth": "raw",
+                        "store_id": hit["store_id"],
+                        "session_id": _grep_safe_text(
+                            hit.get("session_id") or "", max_chars=512
+                        ),
+                        "source": _grep_safe_text(
+                            hit.get("source") or "", max_chars=512
+                        ),
+                        "conversation_id": _grep_safe_text(
+                            hit.get("conversation_id") or "", max_chars=512
+                        ),
+                        "role": _grep_safe_text(hit.get("role") or "", max_chars=128),
+                        "timestamp": timestamp_value,
+                        "snippet": _grep_safe_snippet(
+                            hit.get("snippet", hit.get("content", "")),
+                            query,
+                            max_chars=300,
+                            highlight_matches=bool(
+                                hit.get("_grep_highlight_matches", True)
+                            ),
+                            left_boundary_truncated=(
+                                int(hit.get("_grep_window_start") or 1) > 1
+                            ),
+                        ),
+                        "from_current_session": has_current_session and hit["session_id"] == current_session_id,
+                        "_sort_ts": timestamp_value,
+                        "_sort_rank": hit.get("search_rank"),
+                        "_sort_directness": hit.get("_directness_score") or 0.0,
+                    }
+                )
+            if operation_budget_exhausted:
+                break
       except Exception as exc:
         logger.warning("Message search failed: %s", exc)
 
@@ -2934,6 +3177,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         content_scope in {"database", "all"}
         and not regex_mode
         and not raw_message_filter_active
+        and session_scope != "all"
     ):
         try:
             summary_search_sessions = (
@@ -2941,17 +3185,39 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                 if session_scope == "all" and allowed_cross_session_ids is not None
                 else [str(search_session_id or "")]
             )
-            node_hits = engine._dag.search_bounded_summary_candidates(
-                query,
-                session_ids=summary_search_sessions,
-                limit=source_limit,
-                sort=sort,
-                source=source,
-                deadline=(
-                    time.monotonic() + _LCM_GREP_SUMMARY_DEADLINE_SECONDS
-                ),
+            summary_candidate_limit = reserve_discovery_rows(
+                _LCM_GREP_OPERATION_MAX_ROWS - operation_rows_reserved
+            )
+            node_hits = (
+                engine._dag.search_bounded_summary_candidates(
+                    query,
+                    session_ids=summary_search_sessions,
+                    limit=source_limit,
+                    sort=sort,
+                    source=source,
+                    deadline=min(
+                        operation_deadline,
+                        time.monotonic() + _LCM_GREP_SUMMARY_DEADLINE_SECONDS,
+                    ),
+                    max_materialized_bytes=max(
+                        0,
+                        _LCM_GREP_OPERATION_MAX_BYTES - operation_bytes_materialized,
+                    ),
+                    max_candidate_rows=summary_candidate_limit,
+                )
+                if summary_candidate_limit > 0
+                else []
             )
             for node in node_hits:
+                if not charge_materialized({
+                    "node_id": node.node_id,
+                    "session_id": node.session_id,
+                    "summary": node.summary,
+                    "expand_hint": node.expand_hint,
+                    "source_ids": node.source_ids,
+                    "source_type": node.source_type,
+                }):
+                    break
                 if (
                     allowed_cross_session_ids is not None
                     and node.session_id not in allowed_cross_session_ids
@@ -2984,7 +3250,11 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         except Exception as exc:
             logger.warning("Node search failed: %s", exc)
 
-    if content_scope in {"externalized", "all"}:
+    if (
+        content_scope in {"externalized", "all"}
+        and time.monotonic() < operation_deadline
+        and operation_bytes_materialized < _LCM_GREP_OPERATION_MAX_BYTES
+    ):
         external_hits, externalized_diagnostics, externalized_scan = (
             _search_externalized_payloads(
                 engine,
@@ -2995,9 +3265,16 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                 limit=limit,
                 max_files=max_files,
                 max_payload_chars=max_payload_chars,
+                max_total_bytes=max(
+                    0,
+                    _LCM_GREP_OPERATION_MAX_BYTES - operation_bytes_materialized,
+                ),
+                deadline=operation_deadline,
             )
         )
         for hit in external_hits:
+            if not charge_materialized(hit):
+                break
             if (
                 allowed_cross_session_ids is not None
                 and str(hit.get("session_id") or "") not in allowed_cross_session_ids
@@ -3009,6 +3286,13 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
             )
             results.append(hit)
 
+    # Discovery, ranking, redaction, and response construction all share the
+    # same deadline.  Once it expires, fail closed by dropping discovered
+    # payload rows; bounded/redacted metadata may still report the exhaustion.
+    if time.monotonic() >= operation_deadline:
+        operation_budget_exhausted = True
+        results = []
+
     if sort == "hybrid":
         max_message_directness = max(
             (float(result.get("_sort_directness") or 0.0) for result in results if result.get("type") == "message"),
@@ -3019,6 +3303,9 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                 result["_hybrid_summary_override"] = 1 if float(result.get("_sort_directness") or 0.0) >= (max_message_directness + 8.0) else 0
 
     results.sort(key=lambda result: _combined_result_sort_key(result, sort))
+    if time.monotonic() >= operation_deadline:
+        operation_budget_exhausted = True
+        results = []
     for result in results:
         result.pop("_sort_ts", None)
         result.pop("_sort_rank", None)
@@ -3036,6 +3323,15 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         "limit": limit,
         "total_results": len(results),
         "results": results[:limit],
+        "operation_budget": {
+            "rows_limit": _LCM_GREP_OPERATION_MAX_ROWS,
+            "rows_reserved": operation_rows_reserved,
+            "rows_materialized": operation_rows_materialized,
+            "bytes_limit": _LCM_GREP_OPERATION_MAX_BYTES,
+            "bytes_materialized": operation_bytes_materialized,
+            "deadline_ms": int(_LCM_GREP_OPERATION_DEADLINE_SECONDS * 1_000),
+            "exhausted": operation_budget_exhausted,
+        },
     }
     if externalized_scan is not None:
         response["scan"] = externalized_scan
@@ -3062,7 +3358,42 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
             "Unsupported session_scope; stayed on current. "
             "Valid values: current, all, session."
         )
-    return json.dumps(_mandatory_redact_grep_response(response))
+    # Redact response metadata first, then payload rows one at a time while the
+    # operation deadline remains.  Never return a row whose mandatory boundary
+    # redaction completed after the deadline.
+    response_results = response.pop("results")
+    protected_response = _mandatory_redact_grep_response(response)
+    protected_response["results"] = []
+    for response_result in response_results:
+        if time.monotonic() >= operation_deadline:
+            protected_response["operation_budget"]["exhausted"] = True
+            protected_response["operation_budget"]["deadline_exhausted"] = True
+            break
+        protected_result = _mandatory_redact_grep_response(response_result)
+        if time.monotonic() >= operation_deadline:
+            protected_response["operation_budget"]["exhausted"] = True
+            protected_response["operation_budget"]["deadline_exhausted"] = True
+            break
+        protected_response["results"].append(protected_result)
+    serialized = json.dumps(protected_response)
+    while (
+        len(serialized.encode("utf-8", errors="surrogatepass"))
+        > _LCM_GREP_OPERATION_MAX_BYTES
+        and protected_response.get("results")
+    ):
+        protected_response["results"].pop()
+        protected_response["operation_budget"]["exhausted"] = True
+        protected_response["operation_budget"]["response_truncated"] = True
+        serialized = json.dumps(protected_response)
+    if len(serialized.encode("utf-8", errors="surrogatepass")) > _LCM_GREP_OPERATION_MAX_BYTES:
+        return json.dumps({
+            "error": "grep response metadata exceeds operation byte budget",
+            "operation_budget": {
+                "bytes_limit": _LCM_GREP_OPERATION_MAX_BYTES,
+                "exhausted": True,
+            },
+        })
+    return serialized
 
 
 def lcm_describe(args: Dict[str, Any], **kwargs) -> str:
@@ -3218,30 +3549,112 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
             store_id = int(raw_store_id_arg)
         except (TypeError, ValueError, OverflowError):
             return json.dumps({"error": "store_id must be an integer"})
-        stored = engine._store.get(store_id)
-        if stored is None:
-            return json.dumps({"error": f"Message store_id {store_id} not found"})
-        transcript_content = stored.get("content", "") or ""
-        sliced = _slice_content_for_response(
-            transcript_content,
-            max_tokens,
-            content_offset,
-            config=engine._config,
-        )
         engine_session_id = engine.current_session_id
-        stored_session_id = stored.get("session_id", "")
-        if stored_session_id != engine_session_id:
-            allowed_session_ids = engine._authorized_cross_session_ids(
-                kwargs.get("cross_session_capability")
-            )
+        allowed_session_ids = engine._authorized_cross_session_ids(
+            kwargs.get("cross_session_capability")
+        )
+        authorization_failure = ""
+
+        def authorize_owner(stored_session_id: str) -> bool:
+            nonlocal authorization_failure
+            if stored_session_id == engine_session_id:
+                return True
             if not allowed_session_ids:
+                authorization_failure = "missing_capability"
+                return False
+            if stored_session_id not in allowed_session_ids:
+                authorization_failure = "session_not_allowed"
+                return False
+            return True
+
+        loaded = engine._store.get_for_expansion(
+            store_id,
+            authorize_session=authorize_owner,
+            content_offset=content_offset,
+            max_content_chars=_CURRENT_SESSION_EXPAND_MAX_CHARS,
+            content_lookahead_chars=_MANDATORY_REDACTION_LOOKAHEAD_CHARS,
+        )
+        status = loaded.get("status")
+        if status == "not_found":
+            return json.dumps({"error": f"Message store_id {store_id} not found"})
+        if status == "unauthorized":
+            if authorization_failure == "missing_capability":
                 return json.dumps({
                     "error": "cross-session store_id expansion requires a trusted host capability",
                 })
-            if stored_session_id not in allowed_session_ids:
+            if authorization_failure == "session_not_allowed":
                 return json.dumps({
                     "error": "store_id session is not authorized by the trusted host capability",
                 })
+            return json.dumps({"error": "store_id expansion authorization failed closed"})
+        if status != "ok":
+            return json.dumps({
+                "error": f"Message store_id {store_id} has invalid or changed bounded metadata",
+            })
+        stored = loaded["message"]
+        transcript_content = stored.get("content", "") or ""
+        total_content_chars = max(0, int(stored.get("content_chars") or 0))
+        window_offset = max(0, int(stored.get("content_window_offset") or 0))
+        if window_offset >= total_content_chars:
+            bounded_requested_offset = min(content_offset, total_content_chars)
+            sliced = {
+                "content": "",
+                "content_chars": total_content_chars,
+                "content_offset": bounded_requested_offset,
+                "content_returned_chars": 0,
+                "content_truncated": False,
+                "next_content_offset": None,
+                "has_more": False,
+            }
+        else:
+            local_offset = max(0, content_offset - window_offset)
+            sliced = _slice_redacted_raw_page(
+                transcript_content,
+                content_offset=local_offset,
+                max_tokens=max_tokens,
+                max_chars=_CURRENT_SESSION_EXPAND_MAX_CHARS,
+                source_content_chars=total_content_chars - window_offset,
+                allow_incomplete_tail=True,
+            )
+            sliced["content_chars"] = total_content_chars
+            sliced["content_offset"] = min(
+                total_content_chars,
+                window_offset + int(sliced["content_offset"]),
+            )
+            local_has_more = bool(sliced["has_more"])
+            if local_has_more:
+                sliced["next_content_offset"] = min(
+                    total_content_chars,
+                    window_offset + int(sliced["next_content_offset"]),
+                )
+            else:
+                # The raw paging contract uses zero (not None) as its terminal
+                # cursor.  Do not reinterpret that sentinel after translating
+                # window-local coordinates back to source coordinates.
+                sliced["next_content_offset"] = 0
+            sliced["has_more"] = bool(
+                local_has_more
+                and sliced["next_content_offset"] < total_content_chars
+            )
+            if (
+                sliced["has_more"]
+                and int(sliced["next_content_offset"] or 0) <= content_offset
+            ):
+                # The bounded SQL window ended inside a credential whose safe
+                # terminator lies beyond the lookahead.  Returning the same raw
+                # cursor would loop forever, while advancing an unmarked cursor
+                # could expose the continuation. Surface one atomic redaction
+                # and disable continuation for this pathological field.
+                sliced["content"] = (
+                    "[LCM sensitive redaction: name=bounded_credential; "
+                    "boundary-truncated]"
+                )
+                sliced["content_returned_chars"] = len(sliced["content"])
+                sliced["content_truncated"] = True
+                sliced["next_content_offset"] = 0
+                sliced["has_more"] = False
+                sliced["content_continuation_disabled"] = True
+        stored_session_id = stored.get("session_id", "")
         result: Dict[str, Any] = {
             "store_id": store_id,
             "source_type": "raw_message",
@@ -3260,6 +3673,8 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
             "next_content_offset": sliced["next_content_offset"],
             "has_more": sliced["has_more"],
         }
+        if sliced.get("content_continuation_disabled"):
+            result["content_continuation_disabled"] = True
         # Surface externalized-payload metadata when the row references one. Content
         # is not hydrated by default, mirroring the existing _expand_message_sources
         # default. Externalized lookup remains session-scoped (per the existing

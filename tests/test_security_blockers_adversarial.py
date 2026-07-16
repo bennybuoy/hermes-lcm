@@ -1227,6 +1227,269 @@ def test_grep_fail_closes_window_start_inside_long_credential(
         engine.shutdown()
 
 
+@pytest.mark.parametrize(
+    ("query", "secret_body"),
+    [
+        (
+            "quotedwindowfts",
+            'password="' + (("swordfish password words\n") * 700)
+            + "quotedwindowfts" + (("\nswordfish password words") * 20) + '"',
+        ),
+        (
+            "quoted-window-like",
+            'password="' + (("swordfish password words\n") * 700)
+            + "quoted-window-like" + (("\nswordfish password words") * 20) + '"',
+        ),
+        (
+            "pemwindowfts",
+            "-----BEGIN PRIVATE KEY-----\n"
+            + (("Qk9EWUxJTkVDQU5BUlk=" + "A" * 48 + "\n") * 220)
+            + "pemwindowfts\n-----END PRIVATE KEY-----",
+        ),
+        (
+            "pem-window-like",
+            "-----BEGIN PRIVATE KEY-----\n"
+            + (("Qk9EWUxJTkVDQU5BUlk=" + "B" * 48 + "\n") * 220)
+            + "pem-window-like\n-----END PRIVATE KEY-----",
+        ),
+    ],
+)
+def test_grep_left_boundary_fail_closes_quoted_and_pem_credentials(
+    tmp_path, query, secret_body
+):
+    engine = _engine(tmp_path)
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": secret_body + "\nafter credential"}
+    )
+    try:
+        response_text = tools_module.lcm_grep(
+            {"query": query, "session_scope": "current", "limit": 1},
+            engine=engine,
+        )
+        response = json.loads(response_text)
+        assert response["results"][0]["store_id"] == store_id
+        snippet = response["results"][0]["snippet"]
+        assert "swordfish" not in snippet.casefold()
+        assert "password words" not in snippet.casefold()
+        assert "Qk9EWUxJTkVDQU5BUlk" not in snippet
+        assert "PRIVATE KEY" not in snippet
+        assert "LCM sensitive redaction" in snippet
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("regex_mode", [False, True])
+def test_grep_rejects_oversized_query_before_any_discovery(tmp_path, monkeypatch, regex_mode):
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(
+        engine._store,
+        "search",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("oversized query reached raw discovery")
+        ),
+    )
+    try:
+        response = json.loads(tools_module.lcm_grep(
+            {"query": "q" * 2_001, "regex": regex_mode}, engine=engine
+        ))
+        assert "query" in response["error"] or "pattern" in response["error"]
+        assert "limit" in response["error"]
+    finally:
+        engine.shutdown()
+
+
+def test_grep_uses_one_discovery_and_response_budget_across_many_sessions(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    session_ids = [f"archive-{index}" for index in range(10)]
+    for session_id in session_ids:
+        for row_index in range(30):
+            engine._store.append(
+                session_id,
+                {
+                    "role": "user",
+                    "content": (
+                        f"operationwidegrep {session_id} {row_index} "
+                        + ("payload " * 2_000)
+                    ),
+                },
+            )
+    capability = engine.issue_cross_session_capability(session_ids)
+    original_search = engine._store.search
+    requested_rows = 0
+
+    def counted_search(*args, **kwargs):
+        nonlocal requested_rows
+        requested_rows += int(kwargs["limit"])
+        return original_search(*args, **kwargs)
+
+    monkeypatch.setattr(engine._store, "search", counted_search)
+    try:
+        response_text = tools_module.lcm_grep(
+            {
+                "query": "operationwidegrep",
+                "session_scope": "all",
+                "limit": 200,
+            },
+            engine=engine,
+            cross_session_capability=capability,
+        )
+        response = json.loads(response_text)
+        assert response["results"]
+        assert requested_rows <= 1_000
+        assert response.get("operation_budget", {}).get("rows_limit") == 1_000
+        assert len(response_text.encode("utf-8")) <= 2 * 1024 * 1024
+    finally:
+        engine.shutdown()
+
+
+def test_grep_deadline_is_rechecked_after_sort_before_redaction_and_echo(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    expired = False
+
+    class FakeClock:
+        @staticmethod
+        def monotonic():
+            return 2.0 if expired else 0.0
+
+        @staticmethod
+        def time():
+            return time.time()
+
+    monkeypatch.setattr(tools_module, "time", FakeClock)
+    monkeypatch.setattr(
+        engine._store,
+        "search",
+        lambda *_args, **_kwargs: [{
+            "store_id": 1,
+            "session_id": "current",
+            "source": "test",
+            "conversation_id": "conversation",
+            "role": "user",
+            "timestamp": 1.0,
+            "snippet": "deadlinecanary",
+            "_grep_window_start": 1,
+        }],
+    )
+    original_sort_key = tools_module._combined_result_sort_key
+
+    def expire_during_sort(result, sort):
+        nonlocal expired
+        expired = True
+        return original_sort_key(result, sort)
+
+    monkeypatch.setattr(tools_module, "_combined_result_sort_key", expire_during_sort)
+    try:
+        response = json.loads(tools_module.lcm_grep(
+            {
+                "query": "deadlinecanary",
+                "session_scope": "current",
+                "role": "user",
+                "limit": 1,
+            },
+            engine=engine,
+        ))
+        assert response["results"] == []
+        assert response["operation_budget"]["exhausted"] is True
+    finally:
+        engine.shutdown()
+
+
+def test_unauthorized_store_expand_never_reads_large_payload_columns(tmp_path):
+    engine = _engine(tmp_path)
+    foreign_id = engine._store.append(
+        "foreign", {"role": "user", "content": "X" * 1_000_000}
+    )
+
+    def deny_payload_read(action, _arg1, column, _db_name, _trigger):
+        if action == sqlite3.SQLITE_READ and column in {"content", "tool_calls"}:
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    engine._store._conn.set_authorizer(deny_payload_read)
+    try:
+        response = json.loads(tools_module.lcm_expand(
+            {"store_id": foreign_id}, engine=engine
+        ))
+        assert "trusted host capability" in response["error"]
+    finally:
+        engine._store._conn.set_authorizer(None)
+        engine.shutdown()
+
+
+def test_authorized_store_expand_materializes_only_bounded_redacted_payload(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    secret = "api_key=" + ("X" * 1_000_000)
+    foreign_id = engine._store.append(
+        "foreign", {"role": "user", "content": "placeholder"}
+    )
+    engine._store._conn.execute(
+        "UPDATE messages SET content=? WHERE store_id=?", (secret, foreign_id)
+    )
+    engine._store._conn.commit()
+    original_row_to_dict = engine._store._row_to_dict
+
+    def guarded_row_to_dict(row):
+        assert all(
+            not isinstance(value, str) or len(value) < 150_000 for value in row
+        ), "unbounded expansion payload reached Python"
+        return original_row_to_dict(row)
+
+    monkeypatch.setattr(engine._store, "_row_to_dict", guarded_row_to_dict)
+    capability = engine.issue_cross_session_capability(["foreign"])
+    try:
+        response_text = tools_module.lcm_expand(
+            {"store_id": foreign_id, "max_tokens": 128},
+            engine=engine,
+            cross_session_capability=capability,
+        )
+        response = json.loads(response_text)
+        assert response["store_id"] == foreign_id
+        assert response["content_chars"] == len(secret)
+        assert response["content_truncated"] is True
+        assert "X" * 64 not in response_text
+        assert "api_key=" not in response_text
+        assert "LCM sensitive redaction" in response_text
+    finally:
+        engine.shutdown()
+
+
+def test_store_expand_metadata_and_payload_reads_share_one_snapshot(tmp_path):
+    engine = _engine(tmp_path)
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": "snapshot-original"}
+    )
+    other = sqlite3.connect(str(engine._config.database_path), timeout=5)
+    try:
+        def authorize_and_rewrite(session_id):
+            assert session_id == "current"
+            other.execute(
+                "UPDATE messages SET content=? WHERE store_id=?",
+                ("snapshot-concurrent-rewrite", store_id),
+            )
+            other.commit()
+            return True
+
+        loaded = engine._store.get_for_expansion(
+            store_id,
+            authorize_session=authorize_and_rewrite,
+            content_offset=0,
+            max_content_chars=1_000,
+            content_lookahead_chars=0,
+        )
+        assert loaded["status"] == "ok"
+        assert loaded["message"]["content"] == "snapshot-original"
+        assert other.execute(
+            "SELECT content FROM messages WHERE store_id=?", (store_id,)
+        ).fetchone()[0] == "snapshot-concurrent-rewrite"
+    finally:
+        other.close()
+        engine.shutdown()
+
+
 @pytest.mark.parametrize("session_scope", ["current", "session"])
 def test_grep_summary_projection_is_bounded_redacted_and_explicit(
     tmp_path, monkeypatch, session_scope

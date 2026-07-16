@@ -419,7 +419,10 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         #   2. ``_async_worker_lock`` — worker thread / stop-event fields only.
         # Join waits for the worker may run while holding (1); they must not
         # attempt to re-acquire a non-reentrant outer lock. The worker loop
-        # itself must not acquire (1), or stop-under-(1) would deadlock.
+        # itself must not ingest messages or otherwise acquire (1), or
+        # stop-under-(1) would deadlock. Foreground compression acquires (1)
+        # only around its message-store ingestion primitive, never around LLM
+        # work or a worker join.
         #
         # ``_storage_lifetime_state``:
         #   "bound"    — helpers usable; worker starts allowed.
@@ -5092,6 +5095,18 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         return redacted_replay_messages
 
     def _ingest_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Persist messages inside the shared session/rollover boundary.
+
+        This is the single ingestion primitive used by live hooks, tool calls,
+        preflight, foreground compression, session finalization, and promotion.
+        Keeping the lifetime acquisition here makes a newly added caller safe
+        by default. ``RLock`` preserves existing callers that already hold the
+        boundary for a larger lifecycle transaction.
+        """
+        with self._storage_lifetime_lock:
+            return self._ingest_messages_locked(messages)
+
+    def _ingest_messages_locked(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
 
         Uses a cursor to track which portion of the current messages list

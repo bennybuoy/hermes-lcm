@@ -474,6 +474,7 @@ class SummaryDAG:
         args: list[Any] | tuple[Any, ...],
         *,
         deadline: float,
+        max_materialized_bytes: int = _CROSS_SESSION_QUERY_MAX_MATERIALIZED_BYTES,
     ) -> list[tuple[Any, ...]]:
         """Execute one bounded candidate query with a SQLite CPU deadline."""
         if time.monotonic() >= deadline:
@@ -499,7 +500,10 @@ class SummaryDAG:
                     )
                     if row_bytes > _CROSS_SESSION_ROW_MAX_BYTES:
                         continue
-                    if materialized_bytes + row_bytes > _CROSS_SESSION_QUERY_MAX_MATERIALIZED_BYTES:
+                    if materialized_bytes + row_bytes > min(
+                        _CROSS_SESSION_QUERY_MAX_MATERIALIZED_BYTES,
+                        max(0, int(max_materialized_bytes)),
+                    ):
                         break
                     materialized_bytes += row_bytes
                     rows.append(tuple(row))
@@ -646,6 +650,8 @@ class SummaryDAG:
         sort: str | None,
         source: str | None,
         deadline: float,
+        max_materialized_bytes: int = _CROSS_SESSION_QUERY_MAX_MATERIALIZED_BYTES,
+        max_candidate_rows: int | None = None,
     ) -> List[SummaryNode]:
         """Search grep summaries without materializing an unbounded text field."""
         bounded_sessions = [str(value) for value in session_ids if str(value)]
@@ -659,11 +665,18 @@ class SummaryDAG:
 
         bounded_limit = max(1, int(limit))
         candidate_cap = min(compute_search_candidate_cap(bounded_limit), 5_000)
+        if max_candidate_rows is not None:
+            candidate_cap = min(candidate_cap, max(0, int(max_candidate_rows)))
+        if candidate_cap <= 0:
+            return []
         projection = self._cross_session_candidate_projection("n")
         guard = self._cross_session_candidate_guard("n")
         placeholders = ",".join("?" for _ in bounded_sessions)
         session_clause = f"n.session_id IN ({placeholders})"
         source_match_cache: dict[int, bool] = {}
+        apply_directness_adjustment = should_apply_directness_rank_adjustment(
+            terms, phrases
+        )
 
         if not requires_like_fallback(query):
             order_by = _build_search_order_by(
@@ -678,6 +691,7 @@ class SummaryDAG:
                         ORDER BY {order_by} LIMIT ?""",
                     [safe_query, *bounded_sessions, candidate_cap],
                     deadline=deadline,
+                    max_materialized_bytes=max_materialized_bytes,
                 )
                 nodes: list[SummaryNode] = []
                 for row in rows:
@@ -694,6 +708,10 @@ class SummaryDAG:
                     node.search_directness = compute_directness_score(
                         node.summary, terms, phrases
                     )
+                    if apply_directness_adjustment and node.search_rank is not None:
+                        node.search_rank = float(node.search_rank) - (
+                            max(float(node.search_directness or 0.0), 0.0) * 3e-7
+                        )
                     nodes.append(node)
                 nodes.sort(key=lambda node: _fts_result_sort_key(node, sort))
                 return nodes[:bounded_limit]
@@ -715,6 +733,7 @@ class SummaryDAG:
                 LIMIT ?""",
             [*like_args, *bounded_sessions, candidate_cap],
             deadline=deadline,
+            max_materialized_bytes=max_materialized_bytes,
         )
         collapse_risky_repeats = contains_risky_fts_ascii(query)
         nodes = []

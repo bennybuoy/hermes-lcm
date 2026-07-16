@@ -866,6 +866,75 @@ def test_cross_session_lineage_is_length_guarded_before_python_materialization(
         engine.shutdown()
 
 
+@pytest.mark.parametrize("poisoned_column", ["session_id", "source_type"])
+def test_descendant_authorization_guards_all_text_provenance_before_fetchall(
+    tmp_path, monkeypatch, poisoned_column
+):
+    engine = _engine(tmp_path, max_sessions=2, per_session=2)
+    raw_id = engine._store.append(
+        "archive", {"role": "user", "content": "bounded descendant evidence"}
+    )
+    leaf_id = engine._dag.add_node(SummaryNode(
+        session_id="archive",
+        depth=0,
+        summary="bounded descendant leaf",
+        token_count=1,
+        source_token_count=1,
+        source_ids=[raw_id],
+        source_type="messages",
+        created_at=1,
+    ))
+    root_id = engine._dag.add_node(SummaryNode(
+        session_id="archive",
+        depth=1,
+        summary="bounded descendant root",
+        token_count=1,
+        source_token_count=1,
+        source_ids=[leaf_id],
+        source_type="nodes",
+        created_at=2,
+    ))
+    engine._dag._conn.execute(
+        f"UPDATE summary_nodes SET {poisoned_column}=? WHERE node_id=?",
+        (("oversized-" + ("z" * 1_000_000)), leaf_id),
+    )
+    engine._dag._conn.commit()
+    monkeypatch.setattr(
+        lcm_tools,
+        "_synthesize_expansion_answer",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid descendant provenance reached synthesis")
+        ),
+    )
+    statements: list[str] = []
+    engine._dag._conn.set_trace_callback(statements.append)
+    try:
+        result = json.loads(_invoke(
+            engine,
+            _args(query="", node_ids=[root_id], deadline_ms=1_000),
+            session_ids=["archive"],
+        ))
+        assert result.get("authorization_truncated") is True
+        descendant_selects = [
+            statement.upper()
+            for statement in statements
+            if "FROM SUMMARY_NODES WHERE NODE_ID IN" in statement.upper()
+        ]
+        assert descendant_selects
+        assert any(
+            "TYPEOF(SESSION_ID)" in statement
+            and "LENGTH(CAST(SESSION_ID AS BLOB))" in statement
+            and "SUBSTR(CAST(SESSION_ID AS TEXT)" in statement
+            and "TYPEOF(SOURCE_TYPE)" in statement
+            and "LENGTH(CAST(SOURCE_TYPE AS BLOB))" in statement
+            and "SUBSTR(CAST(SOURCE_TYPE AS TEXT)" in statement
+            for statement in descendant_selects
+        )
+    finally:
+        engine._dag._conn.set_trace_callback(None)
+        engine.shutdown()
+
+
 @pytest.mark.parametrize("query", ["archive", "archive-token"])
 @pytest.mark.parametrize("oversized_session", ["archive", "denied"])
 def test_cross_session_query_discovery_uses_bounded_sql_before_authorization(
