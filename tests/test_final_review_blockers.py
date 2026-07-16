@@ -11,11 +11,16 @@ import hermes_lcm.engine as engine_module
 import hermes_lcm.externalize as externalize_module
 import hermes_lcm.frontier as frontier_module
 import hermes_lcm.maintenance as maintenance_module
+import hermes_lcm.reconcile as reconcile_module
 import hermes_lcm.tools as tools_module
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
-from hermes_lcm.maintenance import _source_inventory, apply_dag_maintenance
+from hermes_lcm.maintenance import (
+    _source_inventory,
+    apply_dag_maintenance,
+    plan_dag_maintenance,
+)
 
 from .test_dag_maintenance import _fixture as maintenance_fixture
 
@@ -75,6 +80,182 @@ def test_foreground_identity_uses_incremental_bounded_sql_not_get_batch(
                    for statement in identity_selects)
     finally:
         engine._store._conn.set_trace_callback(None)
+        engine.shutdown()
+
+
+def test_source_mapper_bounds_rows_before_real_full_sweep_mapper_invocation(
+    tmp_path, monkeypatch
+):
+    engine = _engine(
+        tmp_path,
+        full_sweep_compaction_enabled=True,
+        full_sweep_max_passes=8,
+        full_sweep_deadline_seconds=30.0,
+        fresh_tail_count=1,
+        leaf_chunk_tokens=16,
+        condensation_fanin=2,
+        condensation_min_fanin=2,
+        summary_prefix_target_tokens=1,
+        context_threshold=0.10,
+    )
+    messages = [
+        {"role": "user" if index % 2 == 0 else "assistant",
+         "content": f"bounded-full-sweep-{index} " + ("payload " * 20)}
+        for index in range(8)
+    ]
+    statements: list[str] = []
+    engine._store._conn.set_trace_callback(statements.append)
+    monkeypatch.setattr(
+        engine._store,
+        "get_session_messages_after",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("real full sweep called the unbounded mapper reader")
+        ),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_summarize_leaf_chunk_with_rescue",
+        lambda chunk, **_kwargs: (list(chunk), 100, "leaf", 1, 1),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "summarize_with_escalation",
+        lambda **_kwargs: ("parent", 1),
+    )
+    try:
+        engine.compress(messages, current_tokens=9_000)
+        assert engine._last_full_sweep_status["publication_count"] == 1
+        mapper_selects = [
+            statement for statement in statements
+            if "FROM messages" in statement
+            and "store_id >" in statement
+            and statement.lstrip().upper().startswith(("SELECT", "WITH"))
+        ]
+        assert mapper_selects
+        assert any("SUBSTR" in statement.upper() for statement in mapper_selects)
+        assert any("LENGTH(CAST" in statement.upper() for statement in mapper_selects)
+        assert all("LIMIT" in statement.upper() for statement in mapper_selects)
+    finally:
+        engine._store._conn.set_trace_callback(None)
+        engine.shutdown()
+
+
+def test_source_mapper_bounds_rows_on_real_foreground_compaction_path(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path, fresh_tail_count=1, leaf_chunk_tokens=16)
+    messages = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"bounded-foreground-{index} " + ("payload " * 20),
+        }
+        for index in range(6)
+    ]
+    monkeypatch.setattr(
+        engine._store,
+        "get_session_messages_after",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("real foreground compaction called the unbounded mapper reader")
+        ),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "summarize_with_escalation",
+        lambda **_kwargs: ("foreground bounded summary", 1),
+    )
+    try:
+        engine.compress(
+            messages,
+            current_tokens=engine.threshold_tokens + 1,
+            force=True,
+        )
+        assert engine._dag.get_session_node_count("current") >= 1
+    finally:
+        engine.shutdown()
+
+
+def test_source_mapper_rejects_oversized_row_before_replay_identity(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    message = {"role": "user", "content": "mapper-canary-" + ("x" * 20_000)}
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": "small"},
+        conversation_id="conversation",
+    )
+    engine._store._conn.execute(
+        "UPDATE messages SET content=? WHERE store_id=?",
+        (message["content"], store_id),
+    )
+    engine._store._conn.commit()
+    monkeypatch.setattr(
+        engine,
+        "_new_locked_publication_read_budget",
+        lambda: {
+            "rows": 0,
+            "bytes": 0,
+            "max_rows": 10,
+            "max_bytes": 1_024,
+            "deadline_at": 1e30,
+        },
+    )
+    monkeypatch.setattr(
+        engine._store,
+        "get_session_messages_after",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("oversized mapper used full-row session loading")
+        ),
+    )
+    original_identity = engine._message_replay_identity
+
+    def guarded_identity(candidate, *args, **kwargs):
+        if kwargs.get("stored_row") and "mapper-canary" in str(candidate.get("content")):
+            raise AssertionError("oversized stored row reached replay identity")
+        return original_identity(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(engine, "_message_replay_identity", guarded_identity)
+    try:
+        with pytest.raises(RuntimeError, match="byte bound"):
+            engine._get_store_ids_for_messages([{"role": "user", "content": "small"}])
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("failure", ["nesting", "deadline"])
+def test_source_mapper_preflights_shared_nested_and_deadline_budget(
+    tmp_path, monkeypatch, failure
+):
+    engine = _engine(tmp_path)
+    nested: object = "leaf"
+    for _ in range(reconcile_module._RECONCILIATION_MAX_NESTED_DEPTH + 2):
+        nested = {"child": nested}
+    message = {"role": "user", "content": nested}
+    if failure == "deadline":
+        message = {"role": "user", "content": "deadline-canary"}
+        monkeypatch.setattr(
+            engine,
+            "_new_locked_publication_read_budget",
+            lambda: {
+                "rows": 0,
+                "bytes": 0,
+                "max_rows": 10,
+                "max_bytes": 10_000,
+                "deadline_at": 0.0,
+            },
+        )
+        monkeypatch.setattr(reconcile_module.time, "monotonic", lambda: 1.0)
+    original_identity = engine._message_replay_identity
+
+    def guarded_identity(candidate, *args, **kwargs):
+        if candidate is message:
+            raise AssertionError("unpreflighted active row reached replay identity")
+        return original_identity(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(engine, "_message_replay_identity", guarded_identity)
+    try:
+        with pytest.raises(RuntimeError, match="nested-depth|deadline"):
+            engine._get_store_ids_for_messages([message])
+    finally:
         engine.shutdown()
 
 
@@ -266,6 +447,104 @@ def test_copy_subtree_node_payload_shares_message_budget_and_rolls_back(
         conn.close()
 
 
+def _many_node_rewrite_fixture(tmp_path) -> tuple[object, int, dict[int, str]]:
+    path, parent, _ = maintenance_fixture(tmp_path)
+    conn = sqlite3.connect(path)
+    try:
+        previous = parent
+        node_ids = [parent]
+        for depth in range(2, 19):
+            cur = conn.execute(
+                """INSERT INTO summary_nodes
+                   (session_id, depth, summary, token_count, source_token_count,
+                    source_ids, source_type, created_at, expand_hint)
+                   VALUES ('source', ?, ?, 10, 10, ?, 'nodes', ?, ?)""",
+                (
+                    depth,
+                    f"many-node-summary-{depth}-" + ("s" * 700),
+                    json.dumps([previous]),
+                    float(depth),
+                    f"many-node-hint-{depth}-" + ("h" * 700),
+                ),
+            )
+            previous = int(cur.lastrowid)
+            node_ids.append(previous)
+        conn.execute(
+            """UPDATE summary_nodes SET summary=?, expand_hint=? WHERE node_id=?""",
+            ("many-node-root-" + ("r" * 700), "many-node-root-hint-" + ("q" * 700), parent),
+        )
+        conn.execute(
+            """UPDATE lcm_frontier_items SET ref_id=?
+               WHERE conversation_id='source-conv' AND generation=1 AND ordinal=0""",
+            (previous,),
+        )
+        conn.commit()
+        return path, previous, {
+            node_id: f"replacement-{index}" for index, node_id in enumerate(node_ids)
+        }
+    finally:
+        conn.close()
+
+
+def test_rewrite_plan_shares_payload_budget_across_many_nodes(tmp_path, monkeypatch):
+    path, root, rewrites = _many_node_rewrite_fixture(tmp_path)
+    monkeypatch.setattr(maintenance_module, "_MAINTENANCE_COPY_MAX_BYTES", 10_000)
+    with pytest.raises(ValueError, match="shared byte budget"):
+        plan_dag_maintenance(
+            path,
+            operation="rewrite-subtree",
+            conversation_id="source-conv",
+            node_id=root,
+            rewrites=rewrites,
+        )
+
+
+def test_rewrite_apply_shares_payload_budget_and_aborts_atomically(
+    tmp_path, monkeypatch
+):
+    path, root, rewrites = _many_node_rewrite_fixture(tmp_path)
+    conn = sqlite3.connect(path)
+    before = {
+        "nodes": conn.execute("SELECT COUNT(*) FROM summary_nodes").fetchone()[0],
+        "generation": conn.execute(
+            """SELECT generation FROM lcm_active_frontiers
+               WHERE conversation_id='source-conv'"""
+        ).fetchone()[0],
+        "items": conn.execute("SELECT COUNT(*) FROM lcm_frontier_items").fetchone()[0],
+    }
+    conn.close()
+
+    def lower_budget(phase):
+        if phase == "before_begin":
+            monkeypatch.setattr(
+                maintenance_module, "_MAINTENANCE_COPY_MAX_BYTES", 10_000
+            )
+
+    with pytest.raises(ValueError, match="shared byte budget"):
+        apply_dag_maintenance(
+            path,
+            operation="rewrite-subtree",
+            conversation_id="source-conv",
+            node_id=root,
+            rewrites=rewrites,
+            confirmation="APPLY rewrite-subtree",
+            snapshot_hook=lower_budget,
+        )
+    conn = sqlite3.connect(path)
+    try:
+        after = {
+            "nodes": conn.execute("SELECT COUNT(*) FROM summary_nodes").fetchone()[0],
+            "generation": conn.execute(
+                """SELECT generation FROM lcm_active_frontiers
+                   WHERE conversation_id='source-conv'"""
+            ).fetchone()[0],
+            "items": conn.execute("SELECT COUNT(*) FROM lcm_frontier_items").fetchone()[0],
+        }
+        assert after == before
+    finally:
+        conn.close()
+
+
 def test_promoted_frontier_rejects_declared_range_overlap_without_dropping_node(
     tmp_path
 ):
@@ -373,6 +652,54 @@ def test_rollover_externalized_placeholder_stats_before_file_read(tmp_path, monk
         engine.shutdown()
 
 
+def test_rollover_empty_store_preflights_unmatched_host_suffix(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    huge = {"role": "user", "content": "empty-store-suffix-" + ("x" * 20_000)}
+    monkeypatch.setattr(engine_module, "_PUBLICATION_LOCKED_MAX_SERIALIZED_BYTES", 1_024)
+    monkeypatch.setattr(
+        engine_module,
+        "protect_messages_for_ingest",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unbounded empty-store suffix reached normalization")
+        ),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="byte bound"):
+            engine.rollover_session("current", "next", previous_messages=[huge])
+        assert engine.current_session_id == "current"
+        assert engine._store.get_session_count("current") == 0
+    finally:
+        engine.shutdown()
+
+
+def test_rollover_matched_prefix_preflights_huge_unmatched_suffix_and_rolls_back(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    prefix = {"role": "user", "content": "durable-prefix"}
+    engine._store.append("current", prefix, conversation_id="conversation")
+    huge = {"role": "assistant", "content": "matched-prefix-suffix-" + ("y" * 20_000)}
+    before_frontier = engine._frontier.get_active_frontier("conversation")
+    monkeypatch.setattr(engine_module, "_PUBLICATION_LOCKED_MAX_SERIALIZED_BYTES", 2_048)
+    monkeypatch.setattr(
+        engine_module,
+        "protect_messages_for_ingest",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unbounded matched-prefix suffix reached normalization")
+        ),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="byte bound"):
+            engine.rollover_session(
+                "current", "next", previous_messages=[dict(prefix), huge]
+            )
+        assert engine.current_session_id == "current"
+        assert engine._store.get_session_count("current") == 1
+        assert engine._frontier.get_active_frontier("conversation") == before_frontier
+    finally:
+        engine.shutdown()
+
+
 def test_load_session_sql_substrings_valid_oversized_content_before_python(
     tmp_path
 ):
@@ -421,4 +748,48 @@ def test_load_session_rejects_numeric_affinity_text_before_materialization(tmp_p
         assert "invalid stored message scalar" in response["error"]
         assert numeric_canary not in json.dumps(response)
     finally:
+        engine.shutdown()
+
+
+def test_load_session_equal_length_reassignment_cannot_cross_filtered_payload_read(
+    tmp_path
+):
+    engine = _engine(tmp_path)
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": "current-secret"}
+    )
+    assert len("current") == len("foreign")
+    assert len("current-secret") == len("foreign-secret")
+    raced = {"value": False}
+
+    def race_unfiltered_payload(statement):
+        normalized = " ".join(statement.upper().split())
+        if (
+            not raced["value"]
+            and "FROM MESSAGES WHERE" in normalized
+            and "SUBSTR" in normalized
+        ):
+            raced["value"] = True
+            writer = sqlite3.connect(engine._store.db_path, timeout=2.0)
+            try:
+                writer.execute(
+                    "UPDATE messages SET session_id='foreign', content='foreign-secret' WHERE store_id=?",
+                    (store_id,),
+                )
+                writer.commit()
+            finally:
+                writer.close()
+
+    engine._store._conn.set_trace_callback(race_unfiltered_payload)
+    try:
+        response = json.loads(engine.handle_tool_call(
+            "lcm_load_session",
+            {"session_id": "current", "roles": ["user"], "limit": 1},
+        ))
+        encoded = json.dumps(response)
+        assert raced["value"] is True
+        assert "foreign-secret" not in encoded
+        assert all(message["session_id"] == "current" for message in response["messages"])
+    finally:
+        engine._store._conn.set_trace_callback(None)
         engine.shutdown()

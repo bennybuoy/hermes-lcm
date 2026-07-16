@@ -123,6 +123,98 @@ def test_full_sweep_builds_16_leaves_depth2_and_publishes_once(tmp_path, monkeyp
         engine.shutdown()
 
 
+def test_full_sweep_summary_inputs_publish_exact_leaf_condensation_and_frontier_closure(
+    tmp_path, monkeypatch
+):
+    engine = _engine(
+        tmp_path,
+        leaf_chunk_tokens=28,
+        condensation_fanin=2,
+        condensation_min_fanin=2,
+        summary_prefix_target_tokens=1,
+        full_sweep_max_passes=64,
+    )
+    messages = [{"role": "system", "content": "closure-system-anchor"}]
+    messages.extend(
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"DISTINGUISHABLE-RAW-{index:02d} " + (f"payload-{index} " * 18),
+        }
+        for index in range(12)
+    )
+    leaf_inputs: dict[str, list[str]] = {}
+    condensation_inputs: dict[str, list[str]] = {}
+    leaf_counter = {"value": 0}
+    parent_counter = {"value": 0}
+
+    def leaf(chunk, **_kwargs):
+        leaf_counter["value"] += 1
+        summary = f"closure-leaf-{leaf_counter['value']}"
+        leaf_inputs[summary] = [str(message["content"]) for message in chunk]
+        return list(chunk), 100, summary, 1, 1
+
+    def condense(**kwargs):
+        parent_counter["value"] += 1
+        summary = f"closure-parent-{parent_counter['value']}"
+        condensation_inputs[summary] = kwargs["text"].split("\n\n---\n\n")
+        return summary, 1
+
+    original_mapper = engine._get_store_id_map_for_messages
+    mapper_call_sizes: list[int] = []
+
+    def reject_prior_whole_context_remap(candidate_messages):
+        mapper_call_sizes.append(len(candidate_messages))
+        if len(candidate_messages) > 3:
+            raise AssertionError(
+                "prior full-sweep whole-context remapping path was invoked"
+            )
+        return original_mapper(candidate_messages)
+
+    monkeypatch.setattr(engine, "_get_store_id_map_for_messages", reject_prior_whole_context_remap)
+    monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", leaf)
+    monkeypatch.setattr(sweep_module, "summarize_with_escalation", condense)
+    try:
+        engine.compress(messages, current_tokens=1_900)
+        assert engine._last_full_sweep_status["publication_count"] == 1
+        assert mapper_call_sizes and max(mapper_call_sizes) <= 3
+        stored_rows = engine._store.get_session_messages("sweep-session")
+        store_id_by_content = {
+            str(row["content"]): int(row["store_id"]) for row in stored_rows
+        }
+        nodes = engine._dag.get_session_nodes("sweep-session")
+        node_by_summary = {node.summary: node for node in nodes}
+
+        published_leaf_ids: set[int] = set()
+        for summary, raw_inputs in leaf_inputs.items():
+            node = node_by_summary[summary]
+            expected = [store_id_by_content[content] for content in raw_inputs]
+            assert node.source_type == "messages"
+            assert node.source_ids == expected
+            published_leaf_ids.update(expected)
+
+        for summary, child_summaries in condensation_inputs.items():
+            node = node_by_summary[summary]
+            assert node.source_type == "nodes"
+            assert node.source_ids == [node_by_summary[item].node_id for item in child_summaries]
+
+        frontier = engine._frontier.get_active_frontier("sweep-conversation")
+        items = engine._frontier.get_frontier_items(
+            "sweep-conversation", int(frontier["generation"])
+        )
+        frontier_node_ids = [int(item["ref_id"]) for item in items if item["kind"] == "node"]
+        frontier_raw_ids = set().union(
+            *(_raw_descendants(engine, node_id) for node_id in frontier_node_ids)
+        )
+        assert frontier_raw_ids == published_leaf_ids
+        assert all(
+            int(item["source_start"]) == min(_raw_descendants(engine, int(item["ref_id"])))
+            and int(item["source_end"]) == max(_raw_descendants(engine, int(item["ref_id"])))
+            for item in items if item["kind"] == "node"
+        )
+    finally:
+        engine.shutdown()
+
+
 def test_full_sweep_pass_limit_publishes_one_consistent_partial_candidate(
     tmp_path, monkeypatch
 ):

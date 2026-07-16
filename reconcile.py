@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -50,6 +51,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+_RECONCILIATION_QUERY_BATCH = 400
+_RECONCILIATION_MAX_FIELD_BYTES = 2 * 1024 * 1024
+_RECONCILIATION_MAX_NESTED_DEPTH = 32
+_RECONCILIATION_MAX_NESTED_ITEMS = 20_000
 
 
 class ReconcileMixin:
@@ -124,7 +129,13 @@ class ReconcileMixin:
                 return False
         return True
 
-    def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
+    def _message_replay_identity(
+        self,
+        msg: Dict[str, Any],
+        *,
+        stored_row: bool = False,
+        read_budget: dict[str, float | int] | None = None,
+    ) -> tuple[str, str, str, str]:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
         if (
@@ -231,6 +242,10 @@ class ReconcileMixin:
                 ref,
                 config=self._config,
                 hermes_home=self._hermes_home,
+                read_budget=read_budget,
+                budget_label="source reconciliation externalized payload",
+                max_nested_depth=_RECONCILIATION_MAX_NESTED_DEPTH,
+                max_nested_items=_RECONCILIATION_MAX_NESTED_ITEMS,
             )
             if payload is not None and isinstance(payload.get("content"), str):
                 content = payload["content"]
@@ -938,6 +953,235 @@ class ReconcileMixin:
             str(msg.get("tool_call_id") or ""),
         )
 
+    @staticmethod
+    def _guard_reconciliation_nested_representation(
+        value: Any,
+        *,
+        read_budget: dict[str, float | int],
+    ) -> None:
+        """Reject hostile nesting before replay identity can decode a value."""
+        if time.monotonic() >= float(read_budget["deadline_at"]):
+            raise RuntimeError("source reconciliation deadline exceeded")
+        remaining_items = int(read_budget.setdefault("nested_items", 0))
+        if isinstance(value, str):
+            stripped = value.lstrip()
+            if not stripped.startswith(("{", "[")):
+                return
+            depth = 0
+            in_string = False
+            escaped = False
+            for index, character in enumerate(value):
+                if index % 4096 == 0 and time.monotonic() >= float(read_budget["deadline_at"]):
+                    raise RuntimeError("source reconciliation deadline exceeded")
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif character == "\\":
+                        escaped = True
+                    elif character == '"':
+                        in_string = False
+                    continue
+                if character == '"':
+                    in_string = True
+                elif character in "[{":
+                    depth += 1
+                    remaining_items += 1
+                    if depth > _RECONCILIATION_MAX_NESTED_DEPTH:
+                        raise RuntimeError("source reconciliation nested-depth bound exceeded")
+                elif character in "]}":
+                    depth = max(0, depth - 1)
+                elif character in ",:":
+                    remaining_items += 1
+                if remaining_items > _RECONCILIATION_MAX_NESTED_ITEMS:
+                    raise RuntimeError("source reconciliation nested-item bound exceeded")
+            read_budget["nested_items"] = remaining_items
+            return
+        pending = [(value, 0)]
+        while pending:
+            current, depth = pending.pop()
+            if isinstance(current, (dict, list, tuple)):
+                remaining_items += 1
+                if remaining_items > _RECONCILIATION_MAX_NESTED_ITEMS:
+                    raise RuntimeError("source reconciliation nested-item bound exceeded")
+                if depth > _RECONCILIATION_MAX_NESTED_DEPTH:
+                    raise RuntimeError("source reconciliation nested-depth bound exceeded")
+            if isinstance(current, dict):
+                pending.extend((key, depth + 1) for key in current)
+                pending.extend((item, depth + 1) for item in current.values())
+            elif isinstance(current, (list, tuple)):
+                pending.extend((item, depth + 1) for item in current)
+        read_budget["nested_items"] = remaining_items
+
+    def _charge_reconciliation_active_message(
+        self,
+        message: Dict[str, Any],
+        *,
+        read_budget: dict[str, float | int],
+    ) -> None:
+        """Bound an active row before normalization or externalized recovery."""
+        self._guard_reconciliation_nested_representation(
+            message, read_budget=read_budget
+        )
+        remaining = int(read_budget["max_bytes"]) - int(read_budget["bytes"])
+        encoded_bytes = 0
+        encoder = json.JSONEncoder(
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        for index, chunk in enumerate(encoder.iterencode(message)):
+            if index % 64 == 0 and time.monotonic() >= float(read_budget["deadline_at"]):
+                raise RuntimeError("source reconciliation deadline exceeded")
+            encoded_bytes += len(chunk.encode("utf-8", errors="replace"))
+            if encoded_bytes + 32 > remaining:
+                raise RuntimeError("source reconciliation serialized byte bound exceeded")
+        self._charge_locked_publication_read(
+            read_budget,
+            rows=1,
+            serialized_bytes=encoded_bytes + 32,
+            label="source reconciliation",
+        )
+
+    def _bounded_reconciliation_candidates(
+        self,
+        *,
+        read_budget: dict[str, float | int],
+    ) -> tuple[
+        list[int],
+        list[tuple[Any, ...]],
+        list[Optional[tuple[Any, ...]]],
+        list[tuple[str, str, str, str]],
+        dict[tuple[Any, ...], int],
+        dict[tuple[Any, ...], int],
+    ]:
+        """Incrementally reduce SQL-bounded rows to compact replay identities."""
+        fields = ("session_id", "role", "content", "tool_call_id", "tool_calls")
+        field_limit = min(
+            _RECONCILIATION_MAX_FIELD_BYTES,
+            int(read_budget["max_bytes"]),
+        )
+        store_ids: list[int] = []
+        identities: list[tuple[Any, ...]] = []
+        cleanup_identities: list[Optional[tuple[Any, ...]]] = []
+        raw_identities: list[tuple[str, str, str, str]] = []
+        identity_counts: dict[tuple[Any, ...], int] = {}
+        cleanup_counts: dict[tuple[Any, ...], int] = {}
+        last_store_id = int(self._last_compacted_store_id or 0)
+        length_aliases = [f"{field}_bytes" for field in fields]
+        length_exprs = [
+            f"COALESCE(length(CAST({field} AS BLOB)), 0) AS {alias}"
+            for field, alias in zip(fields, length_aliases)
+        ]
+        row_bytes_expr = " + ".join(length_aliases) + " + 64"
+        type_guard = " AND ".join(
+            f"typeof(m.{field}) IN ('text', 'null')" for field in fields
+        )
+        length_guard = " AND ".join(
+            f"b.{alias} <= {field_limit}" for alias in length_aliases
+        )
+        bounded_fields = [
+            f"CASE WHEN b.cumulative_bytes <= ? AND {length_guard} AND {type_guard} "
+            f"THEN CASE WHEN m.{field} IS NULL THEN NULL ELSE "
+            f"substr(CAST(m.{field} AS TEXT), 1, {field_limit + 1}) END END"
+            for field in fields
+        ]
+        while True:
+            if time.monotonic() >= float(read_budget["deadline_at"]):
+                raise RuntimeError("source reconciliation deadline exceeded")
+            remaining_rows = int(read_budget["max_rows"]) - int(read_budget["rows"])
+            remaining_bytes = int(read_budget["max_bytes"]) - int(read_budget["bytes"])
+            if remaining_rows <= 0:
+                raise RuntimeError("source reconciliation row bound exceeded")
+            if remaining_bytes <= 64:
+                raise RuntimeError("source reconciliation serialized byte bound exceeded")
+            page_limit = min(_RECONCILIATION_QUERY_BATCH, remaining_rows + 1)
+            rows = self._store._conn.execute(
+                f"""WITH candidate_lengths AS (
+                           SELECT store_id, {', '.join(length_exprs)}
+                           FROM messages
+                           WHERE session_id = ? AND store_id > ?
+                           ORDER BY store_id LIMIT ?
+                       ), budgeted AS (
+                           SELECT *, ({row_bytes_expr}) AS row_bytes,
+                                  SUM({row_bytes_expr}) OVER (ORDER BY store_id)
+                                      AS cumulative_bytes
+                           FROM candidate_lengths
+                       )
+                       SELECT b.store_id, {', '.join(bounded_fields)},
+                              {', '.join(f'b.{alias}' for alias in length_aliases)},
+                              b.row_bytes,
+                              CASE WHEN b.cumulative_bytes <= ?
+                                         AND {length_guard} AND {type_guard}
+                                   THEN 1 ELSE 0 END
+                       FROM budgeted AS b
+                       JOIN messages AS m ON m.store_id = b.store_id
+                       ORDER BY b.store_id LIMIT ?""",
+                (
+                    self._session_id,
+                    last_store_id,
+                    page_limit,
+                    *(remaining_bytes for _ in fields),
+                    remaining_bytes,
+                    page_limit,
+                ),
+            ).fetchall()
+            if not rows:
+                break
+            for row in rows:
+                if time.monotonic() >= float(read_budget["deadline_at"]):
+                    raise RuntimeError("source reconciliation deadline exceeded")
+                if not bool(row[-1]):
+                    if int(row[-2] or 0) > remaining_bytes:
+                        raise RuntimeError(
+                            "source reconciliation serialized byte bound exceeded"
+                        )
+                    raise RuntimeError("source reconciliation field byte bound exceeded")
+                row_bytes = int(row[-2] or 0)
+                self._charge_locked_publication_read(
+                    read_budget,
+                    rows=1,
+                    serialized_bytes=row_bytes,
+                    label="source reconciliation",
+                )
+                stored = dict(zip(fields, row[1:1 + len(fields)]))
+                for value in stored.values():
+                    self._guard_reconciliation_nested_representation(
+                        value, read_budget=read_budget
+                    )
+                raw_tool_calls = stored.get("tool_calls")
+                if isinstance(raw_tool_calls, str):
+                    try:
+                        stored["tool_calls"] = json.loads(raw_tool_calls)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        # Preserve legacy malformed text exactly; the replay
+                        # identity helper deliberately treats it as a scalar.
+                        pass
+                identity = self._message_replay_identity(
+                    stored, stored_row=True, read_budget=read_budget
+                )
+                if time.monotonic() >= float(read_budget["deadline_at"]):
+                    raise RuntimeError("source reconciliation deadline exceeded")
+                cleanup = self._active_cleanup_replay_identity(identity)
+                raw_identity = self._raw_externalized_placeholder_replay_identity(stored)
+                store_ids.append(int(row[0]))
+                identities.append(identity)
+                cleanup_identities.append(cleanup)
+                raw_identities.append(raw_identity)
+                identity_counts[identity] = identity_counts.get(identity, 0) + 1
+                if cleanup is not None:
+                    cleanup_counts[cleanup] = cleanup_counts.get(cleanup, 0) + 1
+                last_store_id = int(row[0])
+            if len(rows) < page_limit:
+                break
+        return (
+            store_ids,
+            identities,
+            cleanup_identities,
+            raw_identities,
+            identity_counts,
+            cleanup_counts,
+        )
+
     def _get_store_id_map_for_messages(self, messages: List[Dict[str, Any]]) -> dict[int, int]:
         """Map current raw message objects back to store_ids in stable order.
 
@@ -949,56 +1193,23 @@ class ReconcileMixin:
         synthetic/carry-over and left unmapped so they cannot steal later stored
         literal copies with the same content.
         """
-        candidates: list[Dict[str, Any]] = []
-        next_candidate_after = self._last_compacted_store_id
-        while True:
-            page = self._store.get_session_messages_after(
-                self._session_id,
-                after_store_id=next_candidate_after,
-            )
-            if not page:
-                break
-            candidates.extend(page)
-            next_candidate_after = page[-1]["store_id"]
+        read_budget = self._new_locked_publication_read_budget()
         active_identity_counts: dict[tuple[Any, ...], int] = {}
         for msg in messages:
-            identity = self._message_replay_identity(msg)
+            self._charge_reconciliation_active_message(msg, read_budget=read_budget)
+            identity = self._message_replay_identity(msg, read_budget=read_budget)
             active_identity_counts[identity] = active_identity_counts.get(identity, 0) + 1
-        stored_identity_counts: dict[tuple[Any, ...], int] = {}
-        stored_cleanup_identity_counts: dict[tuple[Any, ...], int] = {}
-        # Capture each candidate's identity (and its cleanup variant) here - both
-        # are already computed for the counts below, so this adds no work. The
-        # match-probe loops reuse them instead of recomputing
-        # _message_replay_identity(stored_row=True) for every (message, probe)
-        # pair. That call is expensive when a stored row carries an externalized
-        # payload (JSON canonicalization + a payload-file read), so eliminating
-        # the O(candidates^2) recomputes removes repeated disk reads on
-        # tool-output-heavy histories. Raw-placeholder identities stay lazy (see
-        # the memo below) since most rows never need them.
-        stored_identities: list[tuple[Any, ...]] = []
-        stored_cleanup_identities: list[Optional[tuple[Any, ...]]] = []
-        for stored in candidates:
-            identity = self._message_replay_identity(stored, stored_row=True)
-            stored_identities.append(identity)
-            cleanup_identity = self._active_cleanup_replay_identity(identity)
-            stored_cleanup_identities.append(cleanup_identity)
-            stored_identity_counts[identity] = stored_identity_counts.get(identity, 0) + 1
-            if cleanup_identity is not None:
-                stored_cleanup_identity_counts[cleanup_identity] = (
-                    stored_cleanup_identity_counts.get(cleanup_identity, 0) + 1
-                )
-
-        # Lazily memoize raw-placeholder identities: only the placeholder-ref
-        # paths need them, and most histories have few (or none), so computing
-        # them on demand keeps the common case free.
-        _raw_placeholder_identity_cache: dict[int, tuple[str, str, str, str]] = {}
+        (
+            candidate_store_ids,
+            stored_identities,
+            stored_cleanup_identities,
+            stored_raw_placeholder_identities,
+            stored_identity_counts,
+            stored_cleanup_identity_counts,
+        ) = self._bounded_reconciliation_candidates(read_budget=read_budget)
 
         def stored_raw_placeholder_identity(probe_idx: int) -> tuple[str, str, str, str]:
-            cached = _raw_placeholder_identity_cache.get(probe_idx)
-            if cached is None:
-                cached = self._raw_externalized_placeholder_replay_identity(candidates[probe_idx])
-                _raw_placeholder_identity_cache[probe_idx] = cached
-            return cached
+            return stored_raw_placeholder_identities[probe_idx]
         active_surplus_skips: dict[tuple[Any, ...], int] = {}
         generated_surplus_skip_message_ids: set[int] = set()
         generated_placeholder_message_ids = getattr(
@@ -1040,7 +1251,7 @@ class ReconcileMixin:
             start_idx: int,
         ) -> int | None:
             probe_idx = start_idx
-            while probe_idx < len(candidates):
+            while probe_idx < len(candidate_store_ids):
                 if stored_raw_placeholder_identity(probe_idx) == raw_identity:
                     return probe_idx
                 probe_idx += 1
@@ -1057,7 +1268,7 @@ class ReconcileMixin:
             message_identity = self._message_replay_identity(msg)
             wanted_cleanup_identity = self._active_cleanup_replay_identity(message_identity)
             probe_idx = start_idx
-            while probe_idx < len(candidates):
+            while probe_idx < len(candidate_store_ids):
                 stored_identity = stored_identities[probe_idx]
                 if stored_identity == message_identity:
                     return probe_idx
@@ -1112,7 +1323,7 @@ class ReconcileMixin:
                 if placeholder_identity_counts.get(raw_identity, 0) > 1:
                     match_idx = find_raw_placeholder_match_index(raw_identity, store_idx)
                     if match_idx is not None:
-                        ids_by_message_id[id(msg)] = candidates[match_idx]["store_id"]
+                        ids_by_message_id[id(msg)] = candidate_store_ids[match_idx]
                         store_idx = match_idx + 1
                 else:
                     # Prefer a later duplicate only when it does not orphan
@@ -1126,9 +1337,8 @@ class ReconcileMixin:
                         )
                     else:
                         baseline_suffix_ids = set()
-                    probe_idx = len(candidates) - 1
+                    probe_idx = len(candidate_store_ids) - 1
                     while first_match_idx is not None and probe_idx >= first_match_idx:
-                        stored = candidates[probe_idx]
                         if stored_raw_placeholder_identity(probe_idx) == raw_identity:
                             candidate_suffix_ids = matched_remaining_message_ids(
                                 msg_idx + 1,
@@ -1138,7 +1348,7 @@ class ReconcileMixin:
                             if not baseline_suffix_ids.issubset(candidate_suffix_ids):
                                 probe_idx -= 1
                                 continue
-                            ids_by_message_id[id(msg)] = stored["store_id"]
+                            ids_by_message_id[id(msg)] = candidate_store_ids[probe_idx]
                             store_idx = probe_idx + 1
                             break
                         probe_idx -= 1
@@ -1153,7 +1363,7 @@ class ReconcileMixin:
                 continue
             match_idx = find_message_match_index(msg, store_idx)
             if match_idx is not None:
-                ids_by_message_id[id(msg)] = candidates[match_idx]["store_id"]
+                ids_by_message_id[id(msg)] = candidate_store_ids[match_idx]
                 store_idx = match_idx + 1
 
         return ids_by_message_id

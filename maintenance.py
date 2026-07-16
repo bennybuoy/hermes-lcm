@@ -33,6 +33,7 @@ _MAINTENANCE_MAX_FRONTIER_ITEMS = 10_000
 _MAINTENANCE_QUERY_BATCH = 400
 _MAINTENANCE_COPY_MAX_BYTES = 16 * 1024 * 1024
 _MAINTENANCE_COPY_MAX_TOKENS = 1_000_000
+_MAINTENANCE_COPY_MAX_ROWS = _MAINTENANCE_MAX_NODES + _MAINTENANCE_MAX_MESSAGES
 _MAINTENANCE_COPY_MAX_FIELD_BYTES = 2 * 1024 * 1024
 _MAINTENANCE_COPY_MAX_NESTED_DEPTH = 32
 _MAINTENANCE_COPY_MAX_NESTED_ITEMS = 20_000
@@ -68,6 +69,7 @@ _MAINTENANCE_MESSAGE_TEXT_COLUMNS = {
 
 def _new_maintenance_copy_budget() -> dict[str, float | int]:
     return {
+        "rows": 0,
         "bytes": 0,
         "tokens": 0,
         "deadline_at": time.monotonic()
@@ -81,15 +83,20 @@ def _check_copy_deadline(budget: dict[str, float | int]) -> None:
 
 
 def _charge_copy_budget(
-    budget: dict[str, float | int], *, encoded_bytes: int, tokens: int = 0
+    budget: dict[str, float | int], *, encoded_bytes: int, tokens: int = 0,
+    rows: int = 0,
 ) -> None:
     _check_copy_deadline(budget)
+    next_rows = int(budget["rows"]) + max(0, int(rows))
+    if next_rows > _MAINTENANCE_COPY_MAX_ROWS:
+        raise ValueError("maintenance copy shared row budget exceeded")
     next_bytes = int(budget["bytes"]) + max(0, int(encoded_bytes))
     if next_bytes > _MAINTENANCE_COPY_MAX_BYTES:
         raise ValueError("maintenance copy shared byte budget exceeded")
     next_tokens = int(budget["tokens"]) + max(0, int(tokens))
     if next_tokens > _MAINTENANCE_COPY_MAX_TOKENS:
         raise ValueError("maintenance copy shared token budget exceeded")
+    budget["rows"] = next_rows
     budget["bytes"] = next_bytes
     budget["tokens"] = next_tokens
 
@@ -107,6 +114,18 @@ def _preflight_copy_token_budget(
     _check_copy_deadline(budget)
     if int(budget["tokens"]) + max(0, int(encoded_bytes)) > _MAINTENANCE_COPY_MAX_TOKENS:
         raise ValueError("maintenance copy shared token budget exceeded")
+
+
+def _charge_rewrite_summary_budget(
+    budget: dict[str, float | int], summary: str
+) -> None:
+    encoded_bytes = len(str(summary).encode("utf-8", errors="replace"))
+    _preflight_copy_token_budget(budget, encoded_bytes=encoded_bytes)
+    _charge_copy_budget(
+        budget,
+        encoded_bytes=encoded_bytes,
+        tokens=count_tokens(str(summary)),
+    )
 
 
 def _validate_copy_nested_value(value: Any) -> None:
@@ -152,7 +171,7 @@ def _bounded_copy_message_row(
         raise ValueError("maintenance copy field byte bound exceeded")
     row_bytes = sum(encoded_sizes)
     _preflight_copy_token_budget(budget, encoded_bytes=row_bytes)
-    _charge_copy_budget(budget, encoded_bytes=row_bytes)
+    _charge_copy_budget(budget, encoded_bytes=row_bytes, rows=1)
     bounded_columns: list[str] = []
     for column in message_columns:
         quoted_column = f'"{column}"'
@@ -589,7 +608,7 @@ def _node_row(
             for column in ("summary", "source_ids", "expand_hint")
         ),
     )
-    _charge_copy_budget(active_budget, encoded_bytes=sum(encoded_sizes))
+    _charge_copy_budget(active_budget, encoded_bytes=sum(encoded_sizes), rows=1)
     bounded_text = {
         column: (
             f"CASE WHEN {column} IS NULL THEN NULL ELSE "
@@ -654,6 +673,26 @@ def _node_session_id(conn: sqlite3.Connection, node_id: int) -> str:
     if row[0] is None or int(row[1] or 0) > _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES:
         raise ValueError("DAG lineage byte bound exceeded")
     return str(row[0])
+
+
+def _node_depth(
+    conn: sqlite3.Connection,
+    node_id: int,
+    *,
+    budget: dict[str, float | int],
+) -> int:
+    _check_copy_deadline(budget)
+    row = conn.execute(
+        """SELECT CASE WHEN typeof(depth) = 'integer' THEN depth END
+           FROM summary_nodes WHERE node_id=? LIMIT 1""",
+        (int(node_id),),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"summary node {node_id} not found")
+    if row[0] is None:
+        raise ValueError("maintenance copy invalid node scalar type")
+    _charge_copy_budget(budget, encoded_bytes=16, rows=1)
+    return int(row[0])
 
 
 def _json_ids(raw: Any) -> list[int]:
@@ -861,7 +900,9 @@ def _frontier_rows(
 def _active_frontier(conn: sqlite3.Connection, conversation_id: str) -> sqlite3.Row:
     row = conn.execute(
         """
-        SELECT * FROM lcm_active_frontiers WHERE conversation_id=?
+        SELECT conversation_id, generation, session_id, source_end_store_id,
+               policy_fingerprint, route_fingerprint, created_at, updated_at
+        FROM lcm_active_frontiers WHERE conversation_id=?
         ORDER BY generation DESC LIMIT 1
         """,
         (conversation_id,),
@@ -888,9 +929,7 @@ def plan_dag_maintenance(
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only=ON")
     try:
-        node_budget = (
-            _new_maintenance_copy_budget() if operation == "copy-subtree" else None
-        )
+        node_budget = _new_maintenance_copy_budget()
         row = _node_row(conn, node_id, budget=node_budget)
         source_start, source_end = _source_bounds(conn, node_id)
         frontier = _active_frontier(conn, conversation_id)
@@ -921,7 +960,7 @@ def plan_dag_maintenance(
                 raise ValueError("rewrite set is outside the selected subtree")
             parents: dict[int, set[int]] = {}
             for closure_id in closure_nodes:
-                closure_row = _node_row(conn, closure_id)
+                closure_row = _node_row(conn, closure_id, budget=node_budget)
                 if closure_row[7] == "nodes":
                     for child_id in _json_ids(closure_row[6]):
                         parents.setdefault(child_id, set()).add(closure_id)
@@ -940,7 +979,8 @@ def plan_dag_maintenance(
                     if parent_id != int(node_id):
                         pending.append(parent_id)
             for rewrite_id, summary in mapping.items():
-                rewrite_row = _node_row(conn, rewrite_id)
+                _charge_rewrite_summary_budget(node_budget, summary)
+                rewrite_row = _node_row(conn, rewrite_id, budget=node_budget)
                 if str(rewrite_row[1]) != str(row[1]):
                     raise ValueError("rewrite set crosses session boundary")
                 storage_token_delta += count_tokens(summary) - int(rewrite_row[4] or 0)
@@ -956,7 +996,10 @@ def plan_dag_maintenance(
             affected.extend(child_ids)
             frontier_item_rows_added = len(items) - 1 + len(child_ids)
             token_delta = (
-                sum(int(_node_row(conn, child_id)[4] or 0) for child_id in child_ids)
+                sum(
+                    int(_node_row(conn, child_id, budget=node_budget)[4] or 0)
+                    for child_id in child_ids
+                )
                 - int(row[4] or 0)
             )
         elif operation == "copy-subtree":
@@ -1178,9 +1221,7 @@ def apply_dag_maintenance(
         if callable(snapshot_hook):
             snapshot_hook("before_begin")
         conn.execute("BEGIN IMMEDIATE")
-        copy_budget = (
-            _new_maintenance_copy_budget() if operation == "copy-subtree" else None
-        )
+        copy_budget = _new_maintenance_copy_budget()
         root = _node_row(conn, node_id, budget=copy_budget)
         frontier = _active_frontier(conn, conversation_id)
         if int(frontier[1]) != int(plan["base_generation"]):
@@ -1199,11 +1240,19 @@ def apply_dag_maintenance(
         if operation == "rewrite-subtree":
             mapping = {int(key): str(value) for key, value in (rewrites or {}).items()}
             remap: dict[int, int] = {}
-            rewrite_rows = sorted(
-                (_node_row(conn, rewrite_id) for rewrite_id in mapping),
-                key=lambda row: int(row[2]),
+            rewrite_ids = sorted(
+                mapping,
+                key=lambda rewrite_id: (
+                    _node_depth(conn, rewrite_id, budget=copy_budget),
+                    rewrite_id,
+                ),
             )
-            for row in rewrite_rows:
+            preloaded_rows = {int(node_id): root}
+            for rewrite_id in rewrite_ids:
+                _charge_rewrite_summary_budget(copy_budget, mapping[rewrite_id])
+                row = preloaded_rows.pop(int(rewrite_id), None)
+                if row is None:
+                    row = _node_row(conn, rewrite_id, budget=copy_budget)
                 sources = [remap.get(source_id, source_id) for source_id in _json_ids(row[6])]
                 new_id = _insert_node_copy(
                     conn,
@@ -1260,7 +1309,6 @@ def apply_dag_maintenance(
             node_remap: dict[int, int] = {}
             _closure_nodes, closure_message_ids = _source_inventory(conn, int(node_id))
             message_columns = list(_MAINTENANCE_MESSAGE_COLUMNS)
-            assert copy_budget is not None
             preloaded_rows = {int(node_id): root}
 
             def copy_node(source_node_id: int) -> int:

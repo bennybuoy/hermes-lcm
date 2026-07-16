@@ -3985,6 +3985,26 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         suffix = list(previous_messages[int(prefix_count):])
         if not suffix:
             return []
+        # The durable-prefix comparison charges only rows it actually
+        # compares.  Charge every unmatched host row against that same budget
+        # before normalization, redaction, placeholder recovery, tokenization,
+        # or the writer transaction can materialize it.
+        for message in suffix:
+            encoded_bytes = self._bounded_rollover_active_encoded_bytes(
+                message,
+                read_budget=read_budget,
+                remaining_bytes=(
+                    int(read_budget["max_bytes"])
+                    - int(read_budget["bytes"])
+                    - 32
+                ),
+            )
+            self._charge_locked_publication_read(
+                read_budget,
+                rows=1,
+                serialized_bytes=encoded_bytes + 32,
+                label="rollover final tail",
+            )
         protected = protect_messages_for_ingest(
             suffix,
             session_id=old_session_id,

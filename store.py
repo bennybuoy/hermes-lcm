@@ -587,6 +587,48 @@ class MessageStore:
         max_serialized_bytes: int = _LOAD_SESSION_MAX_PAGE_MATERIALIZED_BYTES,
         max_row_serialized_bytes: int = _LOAD_SESSION_MAX_ROW_MATERIALIZED_BYTES,
     ) -> List[Dict[str, Any]]:
+        """Load a page from one immutable read snapshot.
+
+        The metadata preflight and bounded payload reads intentionally share a
+        SQLite read transaction.  The payload query also reapplies every
+        caller filter, so a concurrent reassignment or equal-length rewrite
+        can neither change the authorized snapshot nor bypass its predicates.
+        """
+        savepoint = "lcm_load_session_snapshot"
+        with self._write_lock:
+            self._conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                result = self._load_session_page_locked(
+                    session_id,
+                    after_store_id=after_store_id,
+                    limit=limit,
+                    roles=roles,
+                    time_from=time_from,
+                    time_to=time_to,
+                    max_content_chars=max_content_chars,
+                    max_serialized_bytes=max_serialized_bytes,
+                    max_row_serialized_bytes=max_row_serialized_bytes,
+                )
+                self._conn.execute(f"RELEASE {savepoint}")
+                return result
+            except Exception:
+                self._conn.execute(f"ROLLBACK TO {savepoint}")
+                self._conn.execute(f"RELEASE {savepoint}")
+                raise
+
+    def _load_session_page_locked(
+        self,
+        session_id: str,
+        *,
+        after_store_id: int = 0,
+        limit: int = 100,
+        roles: list[str] | None = None,
+        time_from: float | None = None,
+        time_to: float | None = None,
+        max_content_chars: int = 20_000,
+        max_serialized_bytes: int = _LOAD_SESSION_MAX_PAGE_MATERIALIZED_BYTES,
+        max_row_serialized_bytes: int = _LOAD_SESSION_MAX_ROW_MATERIALIZED_BYTES,
+    ) -> List[Dict[str, Any]]:
         """Load one ordered raw-message page for a session.
 
         ``after_store_id`` is exclusive so callers can use the previous page's
@@ -710,6 +752,27 @@ class MessageStore:
                     f"substr(CAST({column} AS TEXT), 1, {int(char_cap)}) "
                     "ELSE NULL END END"
                 )
+            payload_where = [*where[:-1], "store_id = ?"]
+            payload_args = [*args[:-1], store_id]
+            payload_where.extend(
+                [
+                    "timestamp IS ?",
+                    "token_estimate IS ?",
+                    "pinned IS ?",
+                    *(f"{expression} = ?" for expression in length_exprs),
+                    *(f"{expression} = ?" for expression in char_length_exprs),
+                    *(f"typeof({column}) IN ('text', 'null')" for column in text_columns),
+                ]
+            )
+            payload_args.extend(
+                [
+                    metadata[1],
+                    metadata[2],
+                    metadata[3],
+                    *encoded_lengths,
+                    *char_lengths,
+                ]
+            )
             row = self._conn.execute(
                 f"""SELECT
                            CASE WHEN typeof(store_id) = 'integer' THEN store_id END,
@@ -723,8 +786,8 @@ class MessageStore:
                            {bounded_sql['conversation_id']},
                            {', '.join(length_exprs)},
                            {', '.join(f"typeof({column}) IN ('text', 'null')" for column in text_columns)}
-                    FROM messages WHERE store_id=? LIMIT 1""",
-                (store_id,),
+                    FROM messages WHERE {' AND '.join(payload_where)} LIMIT 1""",
+                payload_args,
             ).fetchone()
             if row is None or any(row[index] is None for index in (0, 8, 9, 10)):
                 raise ValueError("invalid stored message scalar type")
