@@ -347,6 +347,67 @@ def test_restart_reconciliation_computes_each_identity_once_under_one_budget(
         engine.shutdown()
 
 
+def test_restart_reconciliation_large_no_match_checks_deadline_after_identity_capture(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    size = 1_200
+    messages = [
+        {"role": "user", "content": f"incoming-no-match-{index}"}
+        for index in range(size)
+    ]
+    active_identities = {
+        id(message): ("user", str(message["content"]), "", "")
+        for message in messages
+    }
+    stored_tail = [
+        ("assistant", f"durable-no-match-{index}", "", "")
+        for index in range(size)
+    ]
+    ticks = 0
+    # Identity capture is already complete. Allow the three linear setup
+    # passes, then expire during suffix-overlap matching. The old reverse
+    # cursor loop never consulted the deadline here and scanned all prefixes.
+    expire_after = (3 * size) + 25
+
+    def matching_clock():
+        nonlocal ticks
+        ticks += 1
+        return 2.0 if ticks > expire_after else 0.0
+
+    monkeypatch.setattr(reconcile_module.time, "monotonic", matching_clock)
+    monkeypatch.setattr(
+        engine,
+        "_message_replay_identity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("matching loop recaptured an active identity")
+        ),
+    )
+    budget = {
+        "rows": size,
+        "bytes": size * 64,
+        "files": 0,
+        "max_rows": size * 4,
+        "max_bytes": size * 1024,
+        "max_files": size * 4,
+        "deadline_at": 1.0,
+    }
+    try:
+        with pytest.raises(RuntimeError, match="reconciliation deadline"):
+            engine._find_reconciled_cursor_for_store_tail(
+                messages,
+                stored_tail,
+                allow_empty_prefix=False,
+                session_count=size,
+                raw_session_count=size,
+                read_budget=budget,
+                active_identities=active_identities,
+            )
+        assert ticks > expire_after
+    finally:
+        engine.shutdown()
+
+
 def test_source_mapper_persisted_output_recovery_uses_shared_byte_budget(
     tmp_path, monkeypatch
 ):
