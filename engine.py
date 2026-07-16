@@ -174,6 +174,9 @@ _PUBLICATION_LOCKED_QUERY_BATCH = 400
 _PUBLICATION_LOCKED_MAX_ROWS = 40_000
 _PUBLICATION_LOCKED_MAX_SERIALIZED_BYTES = 4 * 1024 * 1024
 _PUBLICATION_LOCKED_DEADLINE_SECONDS = 2.0
+_PUBLICATION_LOCKED_MAX_FIELD_BYTES = 2 * 1024 * 1024
+_PUBLICATION_LOCKED_MAX_NESTED_DEPTH = 32
+_PUBLICATION_LOCKED_MAX_NESTED_ITEMS = 20_000
 
 _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
 _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
@@ -2840,6 +2843,59 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             self._session_end_prefix_compare_tool_calls(message, session_id=session_id),
         )
 
+    @staticmethod
+    def _guard_rollover_nested_representation(
+        value: Any,
+        *,
+        read_budget: dict[str, float | int],
+    ) -> None:
+        if time.monotonic() >= float(read_budget["deadline_at"]):
+            raise RuntimeError("rollover prefix deadline exceeded")
+        if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+            depth = 0
+            items = 0
+            in_string = False
+            escaped = False
+            for index, character in enumerate(value):
+                if index % 4096 == 0 and time.monotonic() >= float(read_budget["deadline_at"]):
+                    raise RuntimeError("rollover prefix deadline exceeded")
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif character == "\\":
+                        escaped = True
+                    elif character == '"':
+                        in_string = False
+                    continue
+                if character == '"':
+                    in_string = True
+                elif character in "[{":
+                    depth += 1
+                    items += 1
+                    if depth > _PUBLICATION_LOCKED_MAX_NESTED_DEPTH:
+                        raise RuntimeError("rollover prefix nested-depth bound exceeded")
+                elif character in "]}":
+                    depth = max(0, depth - 1)
+                elif character in ",:":
+                    items += 1
+                if items > _PUBLICATION_LOCKED_MAX_NESTED_ITEMS:
+                    raise RuntimeError("rollover prefix nested-item bound exceeded")
+            return
+        pending = [(value, 0)]
+        items = 0
+        while pending:
+            current, depth = pending.pop()
+            items += 1
+            if items > _PUBLICATION_LOCKED_MAX_NESTED_ITEMS:
+                raise RuntimeError("rollover prefix nested-item bound exceeded")
+            if depth > _PUBLICATION_LOCKED_MAX_NESTED_DEPTH:
+                raise RuntimeError("rollover prefix nested-depth bound exceeded")
+            if isinstance(current, dict):
+                pending.extend((key, depth + 1) for key in current)
+                pending.extend((item, depth + 1) for item in current.values())
+            elif isinstance(current, (list, tuple)):
+                pending.extend((item, depth + 1) for item in current)
+
     def _session_end_store_prefix_count(
         self,
         session_id: str,
@@ -2847,39 +2903,138 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         *,
         conversation_id: str | None = None,
         raise_on_read_error: bool = False,
+        read_budget: dict[str, float | int] | None = None,
     ) -> Optional[int]:
+        if read_budget is None:
+            read_budget = self._new_locked_publication_read_budget()
         try:
-            stored_messages = self._store.get_range(
-                session_id,
-                limit=max(1, len(messages)),
-                conversation_id=conversation_id,
+            compared = 0
+            last_store_id = 0
+            fields = ("role", "content", "tool_call_id", "tool_name", "tool_calls")
+            field_limit = min(
+                _PUBLICATION_LOCKED_MAX_FIELD_BYTES,
+                int(read_budget["max_bytes"]),
             )
+            while True:
+                if time.monotonic() >= float(read_budget["deadline_at"]):
+                    raise RuntimeError("rollover prefix deadline exceeded")
+                remaining_rows = int(read_budget["max_rows"]) - int(read_budget["rows"])
+                remaining_bytes = int(read_budget["max_bytes"]) - int(read_budget["bytes"])
+                if remaining_rows <= 0:
+                    raise RuntimeError("rollover prefix row bound exceeded")
+                if remaining_bytes <= 64:
+                    raise RuntimeError("rollover prefix serialized byte bound exceeded")
+                max_row_bytes = min(
+                    int(read_budget["max_bytes"]),
+                    (len(fields) * field_limit) + 64,
+                )
+                byte_sized_rows = max(1, remaining_bytes // max(1, max_row_bytes))
+                page_limit = min(
+                    _PUBLICATION_LOCKED_QUERY_BATCH,
+                    remaining_rows + 1,
+                    byte_sized_rows,
+                )
+                row_payload_cap = max(
+                    0, remaining_bytes // max(1, page_limit) - 64
+                )
+                lengths = [
+                    f"COALESCE(length(CAST({field} AS BLOB)), 0)"
+                    for field in fields
+                ]
+                total_length = " + ".join(lengths)
+                guard = " AND ".join(
+                    [f"({total_length}) <= ?"]
+                    + [f"{length} <= ?" for length in lengths]
+                )
+                bounded = [
+                    f"CASE WHEN {guard} THEN "
+                    f"substr(CAST(COALESCE({field}, '') AS TEXT), 1, {field_limit + 1}) "
+                    "ELSE NULL END"
+                    for field in fields
+                ]
+                guard_params = (row_payload_cap, *(field_limit for _ in fields))
+                where = ["session_id = ?", "store_id > ?"]
+                query_params: list[Any] = [
+                    *(guard_params * len(fields)),
+                    session_id,
+                    last_store_id,
+                ]
+                if conversation_id:
+                    where.append("conversation_id = ?")
+                    query_params.append(str(conversation_id).strip())
+                query_params.append(page_limit)
+                rows = self._store._conn.execute(
+                    f"""SELECT store_id, {', '.join(bounded)}, {', '.join(lengths)}
+                        FROM messages WHERE {' AND '.join(where)}
+                        ORDER BY store_id LIMIT ?""",
+                    query_params,
+                ).fetchall()
+                if time.monotonic() >= float(read_budget["deadline_at"]):
+                    raise RuntimeError("rollover prefix deadline exceeded")
+                if not rows:
+                    return compared
+                for row in rows:
+                    if time.monotonic() >= float(read_budget["deadline_at"]):
+                        raise RuntimeError("rollover prefix deadline exceeded")
+                    if compared >= len(messages):
+                        return None
+                    row_lengths = [int(value or 0) for value in row[6:11]]
+                    row_bytes = sum(row_lengths)
+                    if row_bytes > row_payload_cap or any(
+                        length > field_limit for length in row_lengths
+                    ) or any(row[index] is None for index in range(1, 6)):
+                        raise RuntimeError("rollover prefix serialized byte bound exceeded")
+                    self._charge_locked_publication_read(
+                        read_budget,
+                        rows=1,
+                        serialized_bytes=row_bytes + 64,
+                        label="rollover prefix",
+                    )
+                    stored_msg = dict(zip(fields, row[1:6]))
+                    msg = messages[compared]
+                    for candidate in (
+                        msg.get("content"),
+                        msg.get("tool_calls"),
+                        stored_msg.get("content"),
+                        stored_msg.get("tool_calls"),
+                    ):
+                        self._guard_rollover_nested_representation(
+                            candidate,
+                            read_budget=read_budget,
+                        )
+                    message_identity = self._session_end_prefix_compare_identity(
+                        msg,
+                        session_id=session_id,
+                    )
+                    stored_identity = self._session_end_prefix_compare_identity(
+                        stored_msg,
+                        session_id=session_id,
+                    )
+                    if time.monotonic() >= float(read_budget["deadline_at"]):
+                        raise RuntimeError("rollover prefix deadline exceeded")
+                    message_encoded = json.dumps(
+                        message_identity,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    stored_encoded = json.dumps(
+                        stored_identity,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    if max(len(message_encoded), len(stored_encoded)) > row_payload_cap:
+                        raise RuntimeError("rollover prefix serialized byte bound exceeded")
+                    if hashlib.sha256(message_encoded).digest() != hashlib.sha256(stored_encoded).digest():
+                        return None
+                    compared += 1
+                    last_store_id = int(row[0])
+                if len(rows) < page_limit:
+                    return compared
         except Exception:
             logger.debug("LCM session-end prefix check failed", exc_info=True)
             if raise_on_read_error:
                 raise
             return None
-        if not stored_messages:
-            return 0
-        if len(messages) < len(stored_messages):
-            return None
-        for idx, stored_msg in enumerate(stored_messages):
-            msg = messages[idx]
-            try:
-                message_identity = self._session_end_prefix_compare_identity(
-                    msg,
-                    session_id=session_id,
-                )
-                stored_identity = self._session_end_prefix_compare_identity(
-                    stored_msg,
-                    session_id=session_id,
-                )
-            except Exception:
-                logger.debug("LCM session-end prefix compare normalization failed", exc_info=True)
-                return None
-            if message_identity != stored_identity:
-                return None
-        return len(stored_messages)
 
     @staticmethod
     def _lcm_bypass_message_fingerprint(message: Dict[str, Any]) -> str:
@@ -3738,11 +3893,13 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         """
         if not previous_messages:
             return []
+        read_budget = self._new_locked_publication_read_budget()
         prefix_count = self._session_end_store_prefix_count(
             old_session_id,
             list(previous_messages),
             conversation_id=conversation_id,
             raise_on_read_error=True,
+            read_budget=read_budget,
         )
         if prefix_count is None:
             # The host replay may legitimately be a transformed active view
@@ -6583,20 +6740,60 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             if time.monotonic() >= deadline_at:
                 raise RuntimeError("canonical DAG lineage deadline exceeded")
             remaining = int(max_rows) - rows_seen
-            page_limit = min(_CANONICAL_LINEAGE_QUERY_BATCH, remaining + 1)
+            lineage_bytes_remaining = int(max_bytes) - bytes_seen
+            shared_bytes_remaining: int | None = None
+            if read_budget is not None:
+                shared_bytes_remaining = (
+                    int(read_budget["max_bytes"]) - int(read_budget["bytes"])
+                )
+            if lineage_bytes_remaining < 0 or (
+                shared_bytes_remaining is not None and shared_bytes_remaining < 0
+            ):
+                raise RuntimeError("canonical DAG lineage byte bound exceeded")
+            local_byte_sized_rows = max(
+                1,
+                lineage_bytes_remaining // max(1, MAX_SOURCE_IDS_JSON_CHARS),
+            )
+            shared_byte_sized_rows = _CANONICAL_LINEAGE_QUERY_BATCH
+            if shared_bytes_remaining is not None:
+                shared_byte_sized_rows = max(
+                    1,
+                    shared_bytes_remaining // max(1, MAX_SOURCE_IDS_JSON_CHARS + 32),
+                )
+            page_limit = min(
+                _CANONICAL_LINEAGE_QUERY_BATCH,
+                remaining + 1,
+                local_byte_sized_rows,
+                shared_byte_sized_rows,
+            )
+            local_row_cap = max(
+                0, lineage_bytes_remaining // max(1, page_limit)
+            )
+            shared_row_cap = MAX_SOURCE_IDS_JSON_CHARS
+            if shared_bytes_remaining is not None:
+                shared_row_cap = max(
+                    0,
+                    shared_bytes_remaining // max(1, page_limit) - 32,
+                )
+            row_blob_cap = min(
+                MAX_SOURCE_IDS_JSON_CHARS,
+                local_row_cap,
+                shared_row_cap,
+            )
             rows = conn.execute(
                 """SELECT node_id, depth,
                           COALESCE(length(CAST(source_ids AS BLOB)), 0),
                           CASE
                             WHEN COALESCE(length(CAST(source_ids AS BLOB)), 0) <= ?
-                            THEN CAST(source_ids AS TEXT)
+                            THEN substr(CAST(source_ids AS TEXT), 1, ?)
                             ELSE NULL
                           END
                    FROM summary_nodes
                    WHERE session_id = ? AND source_type = 'messages' AND node_id > ?
                    ORDER BY node_id LIMIT ?""",
                 (
-                    min(MAX_SOURCE_IDS_JSON_CHARS, int(max_bytes)),
+                    row_blob_cap,
+                    row_blob_cap + 1,
                     session_id,
                     last_node_id,
                     page_limit,
@@ -6604,7 +6801,11 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             ).fetchall()
             if not rows:
                 return covered
+            if time.monotonic() >= deadline_at:
+                raise RuntimeError("canonical DAG lineage deadline exceeded")
             for node_id, depth, encoded_bytes, raw_source_ids in rows:
+                if time.monotonic() >= deadline_at:
+                    raise RuntimeError("canonical DAG lineage deadline exceeded")
                 if rows_seen >= int(max_rows):
                     raise RuntimeError("canonical DAG lineage row bound exceeded")
                 if int(depth or 0) > int(max_depth):
@@ -6612,6 +6813,8 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 encoded_bytes = int(encoded_bytes or 0)
                 if encoded_bytes > MAX_SOURCE_IDS_JSON_CHARS:
                     raise RuntimeError("canonical DAG lineage blob bound exceeded")
+                if encoded_bytes > row_blob_cap or raw_source_ids is None:
+                    raise RuntimeError("canonical DAG lineage byte bound exceeded")
                 bytes_seen += encoded_bytes
                 if bytes_seen > int(max_bytes):
                     raise RuntimeError("canonical DAG lineage byte bound exceeded")
@@ -6622,8 +6825,6 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                         serialized_bytes=encoded_bytes + 32,
                         label="canonical DAG lineage",
                     )
-                if raw_source_ids is None:
-                    raise RuntimeError("canonical DAG lineage blob bound exceeded")
                 try:
                     source_values = decode_source_ids(raw_source_ids or "[]")
                 except (TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -6707,118 +6908,6 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             str(tool_call_id or ""),
             tool_calls_text,
         )
-
-    @staticmethod
-    def _source_content_identity_hash_no_commit(
-        conn: sqlite3.Connection,
-        session_id: str,
-        source_ids: Sequence[int],
-    ) -> str:
-        """Hash exact canonical summarizer input identity in stable source order."""
-        h = hashlib.sha256()
-        normalized_ids = [int(value) for value in source_ids]
-        placeholders = ",".join("?" for _ in normalized_ids)
-        rows = conn.execute(
-            f"""
-            SELECT store_id, session_id, role, content, tool_call_id, tool_calls
-            FROM messages
-            WHERE session_id = ? AND store_id IN ({placeholders})
-            """,
-            (session_id, *normalized_ids),
-        ).fetchall() if normalized_ids else []
-        rows_by_id = {int(row[0]): row for row in rows}
-        for source_id in normalized_ids:
-            row = rows_by_id.get(source_id)
-            if row is None:
-                h.update(f"{source_id}|missing".encode("utf-8"))
-                continue
-            semantic_identity = LCMEngine._canonical_summarizer_message_identity(
-                role=row[2],
-                content=row[3],
-                tool_call_id=row[4],
-                tool_calls=row[5],
-            )
-            h.update(
-                json.dumps(
-                    [int(row[0]), str(row[1]), *semantic_identity],
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            )
-        return h.hexdigest()
-
-    @staticmethod
-    def _bounded_source_content_identity_hash_no_commit(
-        conn: sqlite3.Connection,
-        session_id: str,
-        source_ids: Sequence[int],
-        *,
-        read_budget: dict[str, float | int],
-    ) -> str:
-        """Incrementally hash source payloads after SQL-side size accounting.
-
-        Metadata pages contain lengths only. Complete content/tool payloads are
-        then fetched one row at a time, after the shared locked byte budget has
-        accepted that row, so a page can never materialize all covered payloads.
-        """
-        h = hashlib.sha256()
-        normalized_ids = [int(value) for value in source_ids]
-        for offset in range(0, len(normalized_ids), _PUBLICATION_LOCKED_QUERY_BATCH):
-            if time.monotonic() >= float(read_budget["deadline_at"]):
-                raise RuntimeError("locked source identity deadline exceeded")
-            page_ids = normalized_ids[offset:offset + _PUBLICATION_LOCKED_QUERY_BATCH]
-            placeholders = ",".join("?" for _ in page_ids)
-            metadata = conn.execute(
-                f"""SELECT store_id,
-                           COALESCE(length(CAST(session_id AS BLOB)), 0),
-                           COALESCE(length(CAST(role AS BLOB)), 0),
-                           COALESCE(length(CAST(content AS BLOB)), 0),
-                           COALESCE(length(CAST(tool_call_id AS BLOB)), 0),
-                           COALESCE(length(CAST(tool_calls AS BLOB)), 0)
-                    FROM messages
-                    WHERE session_id = ? AND store_id IN ({placeholders})
-                    ORDER BY store_id LIMIT ?""",
-                (session_id, *page_ids, len(page_ids) + 1),
-            ).fetchall()
-            sizes_by_id = {
-                int(row[0]): sum(max(0, int(value or 0)) for value in row[1:])
-                for row in metadata
-            }
-            for source_id in page_ids:
-                row_bytes = sizes_by_id.get(source_id)
-                if row_bytes is None:
-                    h.update(f"{source_id}|missing".encode("utf-8"))
-                    continue
-                LCMEngine._charge_locked_publication_read(
-                    read_budget,
-                    rows=1,
-                    serialized_bytes=row_bytes + 32,
-                    label="locked source identity",
-                )
-                row = conn.execute(
-                    """SELECT store_id, session_id, role, content,
-                              tool_call_id, tool_calls
-                       FROM messages WHERE session_id = ? AND store_id = ?
-                       LIMIT 1""",
-                    (session_id, source_id),
-                ).fetchone()
-                if row is None:
-                    h.update(f"{source_id}|missing".encode("utf-8"))
-                    continue
-                semantic_identity = LCMEngine._canonical_summarizer_message_identity(
-                    role=row[2],
-                    content=row[3],
-                    tool_call_id=row[4],
-                    tool_calls=row[5],
-                )
-                h.update(
-                    json.dumps(
-                        [int(row[0]), str(row[1]), *semantic_identity],
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                )
-        return h.hexdigest()
 
     def _foreground_source_identity_for_messages(
         self,
@@ -6957,8 +7046,13 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                         raise RuntimeError(
                             "foreground source identity changed before publication"
                         )
-                    locked_identity = self._source_content_identity_hash_no_commit(
-                        conn, session_id, source_ids
+                    locked_identity = compute_source_identity_hash(
+                        conn,
+                        session_id,
+                        source_ids,
+                        read_budget=read_budget,
+                        digest_chars=None,
+                        role_default="unknown",
                     )
                     if (
                         expected_source_identity_hash is not None
@@ -7039,8 +7133,13 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             ):
                 raise RuntimeError("foreground source identity changed before publication")
 
-            locked_identity = self._source_content_identity_hash_no_commit(
-                publication_conn, session_id, source_ids
+            locked_identity = compute_source_identity_hash(
+                publication_conn,
+                session_id,
+                source_ids,
+                read_budget=read_budget,
+                digest_chars=None,
+                role_default="unknown",
             )
             if (
                 expected_source_identity_hash is not None
@@ -7442,6 +7541,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         # Compute source identity hash for CAS validation
         source_hash = compute_source_identity_hash(
             self._store._conn, session_id, candidate_store_ids,
+            read_budget=self._new_locked_publication_read_budget(),
         )
 
         admission_acquired = False
@@ -7567,6 +7667,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 self._store._conn,
                 session_id,
                 summarized_store_ids,
+                read_budget=self._new_locked_publication_read_budget(),
             )
 
             # Check stop event again after the LLM call — if shutdown
@@ -7720,6 +7821,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         # 1. Source identity check
         current_source_hash = compute_source_identity_hash(
             self._store._conn, batch.session_id, batch.source_ids,
+            read_budget=self._new_locked_publication_read_budget(),
         )
         if current_source_hash != batch.source_identity_hash:
             self._frontier.update_batch_state(batch_id, "rejected", failure_reason="source_identity_mismatch")
@@ -7820,17 +7922,21 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 # narrow permitted source rewrite. Recheck exact membership and
                 # content identity after BEGIN IMMEDIATE, immediately before the
                 # first canonical insert; the writer lock closes the TOCTOU gap.
+                exact_sources_exist = self._exact_source_rows_exist_no_commit(
+                    publication_conn,
+                    batch.session_id,
+                    covered_source_ids,
+                    deadline_at=float(read_budget["deadline_at"]),
+                    read_budget=read_budget,
+                )
                 locked_source_hash = compute_source_identity_hash(
-                    publication_conn, batch.session_id, covered_source_ids
+                    publication_conn,
+                    batch.session_id,
+                    covered_source_ids,
+                    read_budget=read_budget,
                 )
                 if (
-                    not self._exact_source_rows_exist_no_commit(
-                        publication_conn,
-                        batch.session_id,
-                        covered_source_ids,
-                        deadline_at=float(read_budget["deadline_at"]),
-                        read_budget=read_budget,
-                    )
+                    not exact_sources_exist
                     or locked_source_hash != batch.source_identity_hash
                 ):
                     self._frontier.update_batch_state_no_commit(

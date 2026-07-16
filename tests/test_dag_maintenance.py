@@ -290,7 +290,8 @@ def test_maintenance_atomically_advances_lifecycle_and_settles_base_batch(tmp_pa
 
 def test_concurrent_winner_during_locked_snapshot_serializes_and_rejects(tmp_path):
     path, parent, leaf_ids = _fixture(tmp_path)
-    attempting = threading.Event()
+    allow_attempt = threading.Event()
+    begin_traced = threading.Event()
     acquired = threading.Event()
     finished = threading.Event()
     outcome: dict[str, str] = {}
@@ -298,8 +299,13 @@ def test_concurrent_winner_during_locked_snapshot_serializes_and_rejects(tmp_pat
     competitor_store = FrontierStore(str(path))
 
     def competing_publisher():
+        competitor_store._conn.set_trace_callback(
+            lambda statement: begin_traced.set()
+            if statement.strip().upper() == "BEGIN IMMEDIATE"
+            else None
+        )
         try:
-            attempting.set()
+            assert allow_attempt.wait(timeout=2)
             with competitor_store.publication_transaction() as conn:
                 acquired.set()
                 generation = competitor_store.publish_generation_state_no_commit(
@@ -321,6 +327,7 @@ def test_concurrent_winner_during_locked_snapshot_serializes_and_rejects(tmp_pat
                 outcome["generation"] = str(generation)
                 outcome["state"] = "published" if generation else "rejected"
         finally:
+            competitor_store._conn.set_trace_callback(None)
             finished.set()
 
     def start_during_locked_snapshot(phase):
@@ -329,14 +336,17 @@ def test_concurrent_winner_during_locked_snapshot_serializes_and_rejects(tmp_pat
         thread = threading.Thread(target=competing_publisher, name="maintenance-competitor")
         competitors.append(thread)
         thread.start()
-        assert attempting.wait(timeout=2)
-        assert not acquired.wait(timeout=0.05)
-        probe = sqlite3.connect(path, timeout=0.0)
-        try:
-            with pytest.raises(sqlite3.OperationalError, match="locked"):
-                probe.execute("BEGIN IMMEDIATE")
-        finally:
-            probe.close()
+        allow_attempt.set()
+        assert begin_traced.wait(timeout=2)
+        assert not acquired.is_set()
+
+    blocked_phases = []
+
+    def prove_blocked_through_mutation(phase):
+        if phase in {"after_frontier", "after_batches_superseded", "after_lifecycle"}:
+            assert begin_traced.is_set()
+            assert not acquired.is_set()
+            blocked_phases.append(phase)
 
     result = apply_dag_maintenance(
         path,
@@ -345,12 +355,16 @@ def test_concurrent_winner_during_locked_snapshot_serializes_and_rejects(tmp_pat
         node_id=parent,
         confirmation="APPLY dissolve",
         snapshot_hook=start_during_locked_snapshot,
+        publication_phase_hook=prove_blocked_through_mutation,
     )
     assert result["new_generation"] == 2
     assert competitors
     competitors[0].join(timeout=5)
     assert not competitors[0].is_alive()
     assert acquired.is_set() and finished.is_set()
+    assert blocked_phases == [
+        "after_frontier", "after_batches_superseded", "after_lifecycle"
+    ]
     assert outcome["state"] == "rejected"
     assert outcome["generation"] == "0"
     active, items = _active(path, "source-conv")
@@ -367,6 +381,50 @@ def test_concurrent_winner_during_locked_snapshot_serializes_and_rejects(tmp_pat
     finally:
         conn.close()
         competitor_store.close()
+
+
+def test_maintenance_lineage_aggregate_bytes_reject_before_next_blob_decode(
+    tmp_path, monkeypatch
+):
+    path, parent, leaf_ids = _fixture(tmp_path)
+    parent_raw = "[" + (" " * 60_000) + ",".join(map(str, leaf_ids)) + "]"
+    leaf_raw = "[" + (" " * 60_000) + "1]"
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "UPDATE summary_nodes SET source_ids=? WHERE node_id=?", (parent_raw, parent)
+    )
+    conn.execute(
+        "UPDATE summary_nodes SET source_ids=? WHERE node_id=?", (leaf_raw, leaf_ids[0])
+    )
+    conn.commit()
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    monkeypatch.setattr(
+        maintenance_module, "_MAINTENANCE_LINEAGE_MAX_BYTES", 70_000, raising=False
+    )
+    original_loads = maintenance_module.json.loads
+
+    def guarded_loads(raw, *args, **kwargs):
+        if raw == leaf_raw:
+            raise AssertionError("aggregate-over-budget child lineage was decoded")
+        return original_loads(raw, *args, **kwargs)
+
+    monkeypatch.setattr(maintenance_module.json, "loads", guarded_loads)
+    try:
+        with pytest.raises(ValueError, match="lineage.*byte"):
+            _source_inventory(conn, parent)
+        lineage_selects = [
+            statement
+            for statement in statements
+            if "FROM summary_nodes" in statement
+            and "source_ids" in statement
+            and statement.lstrip().upper().startswith("SELECT")
+        ]
+        assert lineage_selects
+        assert all("SUBSTR" in statement.upper() for statement in lineage_selects)
+    finally:
+        conn.close()
 
 
 def test_maintenance_source_inventory_batches_message_validation_and_rejects_fanout(

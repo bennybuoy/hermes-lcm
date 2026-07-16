@@ -492,6 +492,50 @@ def test_full_sweep_aborts_losslessly_on_shared_locked_byte_budget(
         engine.shutdown()
 
 
+def test_full_sweep_canonical_lineage_is_byte_paged_before_materialization(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    _stub_summaries(monkeypatch, engine)
+    conn = engine._dag.connection
+    assert conn is not None
+    for source_id in (100_001, 100_002, 100_003):
+        raw = "[" + (" " * 60_000) + str(source_id) + "]"
+        conn.execute(
+            """INSERT INTO summary_nodes
+               (session_id, depth, summary, token_count, source_token_count,
+                source_ids, source_type, created_at)
+               VALUES ('sweep-session', 0, ?, 1, 1, ?, 'messages', 1)""",
+            (f"unrelated-{source_id}", raw),
+        )
+    conn.commit()
+    monkeypatch.setattr(
+        sweep_module, "_FULL_SWEEP_MAX_LOCKED_SERIALIZED_BYTES", 70_000
+    )
+    statements: list[str] = []
+    engine._frontier._conn.set_trace_callback(statements.append)
+    try:
+        original = _messages(10)
+        result = engine.compress(original, current_tokens=1_900)
+        assert engine._last_full_sweep_status["reason"] == "publication-rolled-back"
+        lineage_selects = [
+            statement
+            for statement in statements
+            if "FROM summary_nodes" in statement
+            and "source_type = 'messages'" in statement
+        ]
+        assert lineage_selects
+        assert all("SUBSTR" in statement.upper() for statement in lineage_selects)
+        assert "LIMIT 1" in lineage_selects[0].upper()
+        assert engine._dag.get_session_node_count("sweep-session") == 3
+        assert [message["content"] for message in result] == [
+            message["content"] for message in original
+        ]
+    finally:
+        engine._frontier._conn.set_trace_callback(None)
+        engine.shutdown()
+
+
 def test_full_sweep_aborts_losslessly_on_locked_deadline(tmp_path, monkeypatch):
     engine = _engine(tmp_path)
     _stub_summaries(monkeypatch, engine)

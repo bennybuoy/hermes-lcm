@@ -42,6 +42,22 @@ _PENDING_BATCH_QUERY_PAGE = 200
 _PENDING_BATCH_MAX_ROWS = 2_000
 _PENDING_BATCH_MAX_SERIALIZED_BYTES = 2 * 1024 * 1024
 _PENDING_BATCH_DEADLINE_SECONDS = 0.5
+_PENDING_BATCH_SCALAR_MAX_BYTES = 8 * 1024
+_PENDING_BATCH_STATE_MAX_BYTES = 64
+_PENDING_BATCH_ROW_MAX_BYTES = (
+    MAX_SOURCE_IDS_JSON_CHARS
+    + (7 * _PENDING_BATCH_SCALAR_MAX_BYTES)
+    + _PENDING_BATCH_STATE_MAX_BYTES
+    + 128
+)
+_SOURCE_IDENTITY_QUERY_PAGE = 200
+_SOURCE_IDENTITY_MAX_COLUMN_BYTES = 2 * 1024 * 1024
+_SOURCE_IDENTITY_MAX_NESTED_DEPTH = 32
+_SOURCE_IDENTITY_MAX_NESTED_ITEMS = 20_000
+_BATCH_LOAD_MAX_SERIALIZED_BYTES = 4 * 1024 * 1024
+_BATCH_LOAD_MAX_SUMMARY_BYTES = 2 * 1024 * 1024
+_BATCH_LOAD_MAX_POLICY_BYTES = 512 * 1024
+_BATCH_LOAD_DEADLINE_SECONDS = 0.5
 
 
 @dataclass
@@ -833,16 +849,75 @@ class FrontierStore:
                 if time.monotonic() >= deadline_at:
                     raise RuntimeError("pending batch enumeration deadline exceeded")
                 remaining = _PENDING_BATCH_MAX_ROWS - rows_seen
-                page_limit = min(_PENDING_BATCH_QUERY_PAGE, remaining + 1)
+                remaining_bytes = (
+                    _PENDING_BATCH_MAX_SERIALIZED_BYTES - serialized_bytes
+                )
+                if remaining_bytes < 0:
+                    raise RuntimeError(
+                        "pending batch enumeration serialized byte bound exceeded"
+                    )
+                byte_sized_rows = max(
+                    1, remaining_bytes // max(1, _PENDING_BATCH_ROW_MAX_BYTES)
+                )
+                page_limit = min(
+                    _PENDING_BATCH_QUERY_PAGE,
+                    remaining + 1,
+                    byte_sized_rows,
+                )
+                row_byte_cap = min(
+                    _PENDING_BATCH_ROW_MAX_BYTES,
+                    max(0, remaining_bytes // max(1, page_limit)),
+                )
+                text_lengths = [
+                    "COALESCE(length(CAST(conversation_id AS BLOB)), 0)",
+                    "COALESCE(length(CAST(session_id AS BLOB)), 0)",
+                    "COALESCE(length(CAST(source_identity_hash AS BLOB)), 0)",
+                    "COALESCE(length(CAST(source_ids AS BLOB)), 0)",
+                    "COALESCE(length(CAST(policy_fingerprint AS BLOB)), 0)",
+                    "COALESCE(length(CAST(route_fingerprint AS BLOB)), 0)",
+                    "COALESCE(length(CAST(state AS BLOB)), 0)",
+                    "COALESCE(length(CAST(failure_reason AS BLOB)), 0)",
+                ]
+                total_length_sql = " + ".join(text_lengths)
+                scalar_limits = [
+                    _PENDING_BATCH_SCALAR_MAX_BYTES,
+                    _PENDING_BATCH_SCALAR_MAX_BYTES,
+                    _PENDING_BATCH_SCALAR_MAX_BYTES,
+                    MAX_SOURCE_IDS_JSON_CHARS,
+                    _PENDING_BATCH_SCALAR_MAX_BYTES,
+                    _PENDING_BATCH_SCALAR_MAX_BYTES,
+                    _PENDING_BATCH_STATE_MAX_BYTES,
+                    _PENDING_BATCH_SCALAR_MAX_BYTES,
+                ]
+                guard_sql = " AND ".join(
+                    [f"({total_length_sql}) <= ?"]
+                    + [f"{expr} <= ?" for expr in text_lengths]
+                )
+                bounded_columns = []
+                for column, limit in zip(
+                    (
+                        "conversation_id", "session_id", "source_identity_hash",
+                        "source_ids", "policy_fingerprint", "route_fingerprint",
+                        "state", "failure_reason",
+                    ),
+                    scalar_limits,
+                ):
+                    bounded_columns.append(
+                        f"CASE WHEN {guard_sql} THEN "
+                        f"substr(CAST(COALESCE({column}, '') AS TEXT), 1, {int(limit) + 1}) "
+                        "ELSE NULL END"
+                    )
+                guard_params = (row_byte_cap, *scalar_limits)
+                repeated_guard_params = guard_params * len(bounded_columns)
                 rows = self._conn.execute(
-                    """SELECT batch_id, conversation_id, session_id, base_generation,
-                              source_end_store_id, source_identity_hash,
-                              CASE WHEN COALESCE(length(CAST(source_ids AS BLOB)), 0) <= ?
-                                   THEN CAST(source_ids AS TEXT) ELSE NULL END,
-                              policy_fingerprint, route_fingerprint, state,
-                              expected_leaf_count, frontier_end_store_id, failure_reason,
-                              '', 0, '{}',
-                              COALESCE(length(CAST(source_ids AS BLOB)), 0)
+                    f"""SELECT batch_id, {bounded_columns[0]}, {bounded_columns[1]},
+                              base_generation, source_end_store_id,
+                              {bounded_columns[2]}, {bounded_columns[3]},
+                              {bounded_columns[4]}, {bounded_columns[5]},
+                              {bounded_columns[6]}, expected_leaf_count,
+                              frontier_end_store_id, {bounded_columns[7]},
+                              '', 0, '{{}}',
+                              {', '.join(text_lengths)}
                        FROM lcm_prepared_batches
                        WHERE conversation_id = ?
                          AND state IN ('preparing', 'ready')
@@ -853,7 +928,7 @@ class FrontierStore:
                        ORDER BY source_end_store_id DESC, batch_id DESC
                        LIMIT ?""",
                     (
-                        MAX_SOURCE_IDS_JSON_CHARS,
+                        *repeated_guard_params,
                         conversation_id,
                         last_source_end,
                         last_source_end,
@@ -864,26 +939,35 @@ class FrontierStore:
                 ).fetchall()
                 if not rows:
                     break
+                if time.monotonic() >= deadline_at:
+                    raise RuntimeError("pending batch enumeration deadline exceeded")
                 for row in rows:
+                    if time.monotonic() >= deadline_at:
+                        raise RuntimeError("pending batch enumeration deadline exceeded")
                     if rows_seen >= _PENDING_BATCH_MAX_ROWS:
                         raise RuntimeError("pending batch enumeration row bound exceeded")
                     rows_seen += 1
-                    source_bytes = int(row[16] or 0)
-                    scalar_bytes = sum(
-                        len(str(value or "").encode("utf-8", errors="replace"))
-                        for value in (*row[1:6], *row[7:13])
-                    )
-                    serialized_bytes += source_bytes + scalar_bytes
+                    encoded_lengths = [int(value or 0) for value in row[16:24]]
+                    row_bytes = sum(encoded_lengths)
+                    serialized_bytes += row_bytes
                     if serialized_bytes > _PENDING_BATCH_MAX_SERIALIZED_BYTES:
                         raise RuntimeError(
                             "pending batch enumeration serialized byte bound exceeded"
                         )
-                    if row[6] is None or source_bytes > MAX_SOURCE_IDS_JSON_CHARS:
+                    invalid_column = any(
+                        length > limit
+                        for length, limit in zip(encoded_lengths, scalar_limits)
+                    )
+                    if row_bytes > row_byte_cap:
+                        raise RuntimeError(
+                            "pending batch enumeration serialized byte bound exceeded"
+                        )
+                    if invalid_column or any(row[index] is None for index in (1, 2, 5, 6, 7, 8, 9, 12)):
                         self.update_batch_state_no_commit(
                             self._conn,
                             int(row[0]),
                             "rejected",
-                            failure_reason="invalid_source_ids:encoded-size hard cap exceeded",
+                            failure_reason="invalid_pending_metadata:encoded-size hard cap exceeded",
                         )
                     else:
                         try:
@@ -1066,21 +1150,109 @@ class FrontierStore:
         )
 
     def get_batch(self, batch_id: int) -> PreparedBatch | None:
+        deadline_at = time.monotonic() + max(0.0, _BATCH_LOAD_DEADLINE_SECONDS)
+        text_columns = (
+            "conversation_id", "session_id", "source_identity_hash", "source_ids",
+            "policy_fingerprint", "route_fingerprint", "state", "failure_reason",
+            "summary_payload", "resolved_policy_json",
+        )
+        text_limits = (
+            _PENDING_BATCH_SCALAR_MAX_BYTES,
+            _PENDING_BATCH_SCALAR_MAX_BYTES,
+            _PENDING_BATCH_SCALAR_MAX_BYTES,
+            MAX_SOURCE_IDS_JSON_CHARS,
+            _PENDING_BATCH_SCALAR_MAX_BYTES,
+            _PENDING_BATCH_SCALAR_MAX_BYTES,
+            _PENDING_BATCH_STATE_MAX_BYTES,
+            _PENDING_BATCH_SCALAR_MAX_BYTES,
+            _BATCH_LOAD_MAX_SUMMARY_BYTES,
+            _BATCH_LOAD_MAX_POLICY_BYTES,
+        )
         with self._lock:
+            owns_transaction = not self._conn.in_transaction
+            if time.monotonic() >= deadline_at:
+                raise RuntimeError("prepared batch load deadline exceeded")
+            length_exprs = [
+                f"COALESCE(length(CAST({column} AS BLOB)), 0)"
+                for column in text_columns
+            ]
+            metadata = self._conn.execute(
+                f"""SELECT batch_id, base_generation, source_end_store_id,
+                           expected_leaf_count, frontier_end_store_id,
+                           COALESCE(payload_version, 0), {', '.join(length_exprs)}
+                    FROM lcm_prepared_batches WHERE batch_id = ? LIMIT 1""",
+                (batch_id,),
+            ).fetchone()
+            if metadata is None:
+                return None
+            if time.monotonic() >= deadline_at:
+                raise RuntimeError("prepared batch load deadline exceeded")
+            encoded_lengths = [int(value or 0) for value in metadata[6:16]]
+            invalid = (
+                sum(encoded_lengths) > _BATCH_LOAD_MAX_SERIALIZED_BYTES
+                or any(
+                    length > limit
+                    for length, limit in zip(encoded_lengths, text_limits)
+                )
+            )
+            if invalid:
+                reason = "invalid_batch_payload:encoded-size hard cap exceeded"
+                self.update_batch_state_no_commit(
+                    self._conn,
+                    int(batch_id),
+                    "rejected",
+                    failure_reason=reason,
+                )
+                if owns_transaction:
+                    self._conn.commit()
+                return PreparedBatch(
+                    batch_id=int(batch_id),
+                    conversation_id="",
+                    session_id="",
+                    base_generation=int(metadata[1] or 0),
+                    source_end_store_id=int(metadata[2] or 0),
+                    source_identity_hash="",
+                    source_ids=[],
+                    policy_fingerprint="",
+                    route_fingerprint="",
+                    state="rejected",
+                    expected_leaf_count=int(metadata[3] or 0),
+                    frontier_end_store_id=int(metadata[4] or 0),
+                    failure_reason=reason,
+                    payload_version=int(metadata[5] or 0),
+                )
+            bounded = [
+                f"substr(CAST(COALESCE({column}, '') AS TEXT), 1, {limit + 1})"
+                for column, limit in zip(text_columns, text_limits)
+            ]
             row = self._conn.execute(
-                """
-                SELECT batch_id, conversation_id, session_id, base_generation,
-                       source_end_store_id, source_identity_hash, source_ids,
-                       policy_fingerprint, route_fingerprint, state,
-                       expected_leaf_count, frontier_end_store_id, failure_reason,
-                       COALESCE(summary_payload, ''), COALESCE(payload_version, 0),
-                       COALESCE(resolved_policy_json, '{}')
-                FROM lcm_prepared_batches WHERE batch_id = ?
-                """,
+                f"""SELECT batch_id, {bounded[0]}, {bounded[1]}, base_generation,
+                           source_end_store_id, {bounded[2]}, {bounded[3]},
+                           {bounded[4]}, {bounded[5]}, {bounded[6]},
+                           expected_leaf_count, frontier_end_store_id, {bounded[7]},
+                           {bounded[8]}, COALESCE(payload_version, 0), {bounded[9]}
+                    FROM lcm_prepared_batches WHERE batch_id = ? LIMIT 1""",
                 (batch_id,),
             ).fetchone()
         if not row:
             return None
+        if time.monotonic() >= deadline_at:
+            raise RuntimeError("prepared batch load deadline exceeded")
+        actual_text = (*row[1:3], *row[5:10], row[12], row[13], row[15])
+        if any(
+            len(str(value or "").encode("utf-8", errors="replace")) != expected
+            for value, expected in zip(actual_text, encoded_lengths)
+        ):
+            reason = "invalid_batch_payload:encoded-size hard cap exceeded"
+            self.update_batch_state(int(batch_id), "rejected", failure_reason=reason)
+            return PreparedBatch(
+                batch_id=int(batch_id), conversation_id="", session_id="",
+                base_generation=int(row[3] or 0), source_end_store_id=int(row[4] or 0),
+                source_identity_hash="", source_ids=[], policy_fingerprint="",
+                route_fingerprint="", state="rejected",
+                expected_leaf_count=int(row[10] or 0),
+                frontier_end_store_id=int(row[11] or 0), failure_reason=reason,
+            )
         try:
             return self._row_to_batch(row)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -1341,54 +1513,238 @@ def finalize_generation_winner_no_commit(
         phase_hook("after_lifecycle")
 
 
+def _charge_source_identity_budget(
+    read_budget: dict[str, float | int],
+    *,
+    rows: int,
+    serialized_bytes: int,
+) -> None:
+    if time.monotonic() >= float(read_budget["deadline_at"]):
+        raise RuntimeError("source identity deadline exceeded")
+    next_rows = int(read_budget["rows"]) + int(rows)
+    if next_rows > int(read_budget["max_rows"]):
+        raise RuntimeError("source identity row bound exceeded")
+    next_bytes = int(read_budget["bytes"]) + max(0, int(serialized_bytes))
+    if next_bytes > int(read_budget["max_bytes"]):
+        raise RuntimeError("source identity serialized byte bound exceeded")
+    read_budget["rows"] = next_rows
+    read_budget["bytes"] = next_bytes
+
+
+def _validate_source_identity_nested_value(value: Any) -> None:
+    pending = [(value, 0)]
+    items = 0
+    while pending:
+        current, depth = pending.pop()
+        items += 1
+        if items > _SOURCE_IDENTITY_MAX_NESTED_ITEMS:
+            raise RuntimeError("source identity nested-item bound exceeded")
+        if depth > _SOURCE_IDENTITY_MAX_NESTED_DEPTH:
+            raise RuntimeError("source identity nested-depth bound exceeded")
+        if isinstance(current, dict):
+            pending.extend((key, depth + 1) for key in current)
+            pending.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, (list, tuple)):
+            pending.extend((item, depth + 1) for item in current)
+
+
+def _preflight_source_identity_json_text(
+    raw: str,
+    *,
+    read_budget: dict[str, float | int],
+) -> None:
+    """Bound JSON nesting/tokens with a linear scan before ``json.loads``."""
+    depth = 0
+    items = 0
+    in_string = False
+    escaped = False
+    for index, character in enumerate(raw):
+        if index % 4096 == 0 and time.monotonic() >= float(read_budget["deadline_at"]):
+            raise RuntimeError("source identity deadline exceeded")
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            items += 1
+            if depth > _SOURCE_IDENTITY_MAX_NESTED_DEPTH:
+                raise RuntimeError("source identity nested-depth bound exceeded")
+        elif character in "]}":
+            depth = max(0, depth - 1)
+        elif character in ",:":
+            items += 1
+        if items > _SOURCE_IDENTITY_MAX_NESTED_ITEMS:
+            raise RuntimeError("source identity nested-item bound exceeded")
+
+
+def _canonical_identity_tool_calls(
+    raw: Any,
+    *,
+    read_budget: dict[str, float | int],
+) -> str:
+    if not raw:
+        return ""
+    if time.monotonic() >= float(read_budget["deadline_at"]):
+        raise RuntimeError("source identity deadline exceeded")
+    try:
+        if isinstance(raw, str) and raw.lstrip().startswith(("{", "[")):
+            _preflight_source_identity_json_text(raw, read_budget=read_budget)
+        decoded = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return str(raw)
+    _validate_source_identity_nested_value(decoded)
+    return json.dumps(
+        decoded,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
 def compute_source_identity_hash(
     conn: sqlite3.Connection,
     session_id: str,
     source_ids: Sequence[int],
+    *,
+    read_budget: dict[str, float | int],
+    digest_chars: int | None = 32,
+    role_default: str = "",
 ) -> str:
-    """Hash every durable field that can change summarizer semantics."""
+    """Incrementally hash semantic source identity under a caller-owned budget.
+
+    SQLite pages expose only scalar lengths. Each complete row is fetched with
+    strict SQL ``substr`` caps after row, column, aggregate-byte, and deadline
+    checks, so Python never receives a page of unchecked message payloads.
+    """
     h = hashlib.sha256()
     normalized_ids = [int(source_id) for source_id in source_ids]
     if not normalized_ids:
-        return h.hexdigest()[:32]
-    placeholders = ",".join("?" for _ in normalized_ids)
-    rows = conn.execute(
-        f"""SELECT store_id, session_id, role, content, tool_call_id, tool_calls
-            FROM messages WHERE session_id = ? AND store_id IN ({placeholders})""",
-        (session_id, *normalized_ids),
-    ).fetchall()
-    rows_by_id = {int(row[0]): row for row in rows}
-    for sid in normalized_ids:
-        row = rows_by_id.get(sid)
-        if row:
-            tool_calls = row[5]
-            if tool_calls:
+        digest = h.hexdigest()
+        return digest if digest_chars is None else digest[:int(digest_chars)]
+    max_column_bytes = min(
+        int(read_budget["max_bytes"]),
+        int(read_budget.get("max_column_bytes", _SOURCE_IDENTITY_MAX_COLUMN_BYTES)),
+    )
+    columns = ("session_id", "role", "content", "tool_call_id", "tool_calls")
+    for offset in range(0, len(normalized_ids), _SOURCE_IDENTITY_QUERY_PAGE):
+        if time.monotonic() >= float(read_budget["deadline_at"]):
+            raise RuntimeError("source identity deadline exceeded")
+        remaining_rows = int(read_budget["max_rows"]) - int(read_budget["rows"])
+        if remaining_rows <= 0:
+            raise RuntimeError("source identity row bound exceeded")
+        page_ids = normalized_ids[
+            offset:offset + min(_SOURCE_IDENTITY_QUERY_PAGE, remaining_rows + 1)
+        ]
+        placeholders = ",".join("?" for _ in page_ids)
+        metadata_exprs = []
+        for column in columns:
+            length_expr = f"COALESCE(length(CAST({column} AS BLOB)), 0)"
+            metadata_exprs.extend((
+                length_expr,
+                f"CASE WHEN {length_expr} <= ? THEN "
+                f"COALESCE(length(CAST(json_quote(CAST({column} AS TEXT)) AS BLOB)), 4) "
+                "ELSE NULL END",
+            ))
+        metadata = conn.execute(
+            f"""SELECT store_id, {', '.join(metadata_exprs)}
+                FROM messages
+                WHERE session_id = ? AND store_id IN ({placeholders})
+                ORDER BY store_id LIMIT ?""",
+            (
+                *(max_column_bytes for _ in columns),
+                session_id,
+                *page_ids,
+                len(page_ids) + 1,
+            ),
+        ).fetchall()
+        if time.monotonic() >= float(read_budget["deadline_at"]):
+            raise RuntimeError("source identity deadline exceeded")
+        metadata_by_id = {int(row[0]): row for row in metadata}
+        for source_id in page_ids:
+            meta = metadata_by_id.get(source_id)
+            if meta is None:
+                h.update(f"{source_id}|missing".encode())
+                continue
+            raw_lengths = [int(meta[index] or 0) for index in range(1, 11, 2)]
+            quoted_lengths = [meta[index] for index in range(2, 11, 2)]
+            if any(length > max_column_bytes for length in raw_lengths) or any(
+                length is None for length in quoted_lengths
+            ):
+                raise RuntimeError("source identity column byte bound exceeded")
+            serialized_upper_bound = (
+                sum(int(length or 0) for length in quoted_lengths) + 64
+            )
+            _charge_source_identity_budget(
+                read_budget,
+                rows=1,
+                serialized_bytes=serialized_upper_bound,
+            )
+            if time.monotonic() >= float(read_budget["deadline_at"]):
+                raise RuntimeError("source identity deadline exceeded")
+            row = conn.execute(
+                """SELECT store_id,
+                          substr(CAST(session_id AS TEXT), 1, ?),
+                          substr(CAST(role AS TEXT), 1, ?),
+                          substr(CAST(content AS TEXT), 1, ?),
+                          substr(CAST(tool_call_id AS TEXT), 1, ?),
+                          substr(CAST(tool_calls AS TEXT), 1, ?)
+                   FROM messages WHERE session_id = ? AND store_id = ? LIMIT 1""",
+                (
+                    *(max_column_bytes + 1 for _ in columns),
+                    session_id,
+                    source_id,
+                ),
+            ).fetchone()
+            if row is None:
+                h.update(f"{source_id}|missing".encode())
+                continue
+            if time.monotonic() >= float(read_budget["deadline_at"]):
+                raise RuntimeError("source identity deadline exceeded")
+            for value, expected_bytes in zip(row[1:], raw_lengths):
+                actual_bytes = len(str(value or "").encode("utf-8", errors="replace"))
+                if actual_bytes != expected_bytes or actual_bytes > max_column_bytes:
+                    raise RuntimeError("source identity column byte bound exceeded")
+            content = str(row[3] or "")
+            if content.lstrip().startswith(("{", "[")):
+                if time.monotonic() >= float(read_budget["deadline_at"]):
+                    raise RuntimeError("source identity deadline exceeded")
+                _preflight_source_identity_json_text(
+                    content, read_budget=read_budget
+                )
                 try:
-                    tool_calls = json.dumps(
-                        json.loads(tool_calls),
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
+                    nested_content = json.loads(content)
                 except (TypeError, ValueError, json.JSONDecodeError):
-                    tool_calls = str(tool_calls)
-            else:
-                tool_calls = ""
-            h.update(json.dumps(
+                    nested_content = None
+                if nested_content is not None:
+                    _validate_source_identity_nested_value(nested_content)
+            tool_calls = _canonical_identity_tool_calls(
+                row[5], read_budget=read_budget
+            )
+            encoded = json.dumps(
                 [
                     int(row[0]),
                     str(row[1] or ""),
-                    str(row[2] or ""),
-                    str(row[3] or ""),
+                    str(row[2] or role_default),
+                    content,
                     str(row[4] or ""),
                     tool_calls,
                 ],
                 ensure_ascii=False,
                 separators=(",", ":"),
-            ).encode("utf-8"))
-        else:
-            h.update(f"{sid}|missing".encode())
-    return h.hexdigest()[:32]
+            ).encode("utf-8")
+            if len(encoded) > serialized_upper_bound:
+                raise RuntimeError("source identity serialized byte bound exceeded")
+            h.update(encoded)
+    digest = h.hexdigest()
+    return digest if digest_chars is None else digest[:int(digest_chars)]
 
 
 def compute_route_fingerprint(summary_model: str, fallback_models: tuple[str, ...]) -> str:

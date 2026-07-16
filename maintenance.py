@@ -36,6 +36,9 @@ _MAINTENANCE_COPY_MAX_TOKENS = 1_000_000
 _MAINTENANCE_COPY_MAX_FIELD_BYTES = 2 * 1024 * 1024
 _MAINTENANCE_COPY_MAX_NESTED_DEPTH = 32
 _MAINTENANCE_COPY_MAX_NESTED_ITEMS = 20_000
+_MAINTENANCE_LINEAGE_MAX_BYTES = 4 * 1024 * 1024
+_MAINTENANCE_LINEAGE_DEADLINE_SECONDS = 2.0
+_MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES = 8 * 1024
 
 
 def _validate_copy_nested_value(value: Any) -> None:
@@ -481,9 +484,29 @@ def _source_inventory(
     messages: set[int] = set()
     adjacency: dict[int, list[int]] = {}
     edges = 0
+    lineage_bytes = 0
+    deadline_at = time.monotonic() + max(
+        0.0, float(_MAINTENANCE_LINEAGE_DEADLINE_SECONDS)
+    )
     while pending:
+        if time.monotonic() >= deadline_at:
+            raise ValueError("DAG lineage deadline exceeded")
+        remaining_bytes = _MAINTENANCE_LINEAGE_MAX_BYTES - lineage_bytes
+        if remaining_bytes < 0:
+            raise ValueError("DAG lineage byte bound exceeded")
+        max_row_bytes = (
+            MAX_SOURCE_IDS_JSON_CHARS
+            + (2 * _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES)
+            + 32
+        )
+        byte_sized_rows = max(1, remaining_bytes // max(1, max_row_bytes))
+        page_limit = min(_MAINTENANCE_QUERY_BATCH, byte_sized_rows)
+        row_byte_cap = min(
+            max_row_bytes,
+            max(0, remaining_bytes // max(1, page_limit)),
+        )
         batch: list[int] = []
-        while pending and len(batch) < _MAINTENANCE_QUERY_BATCH:
+        while pending and len(batch) < page_limit:
             candidate = pending.pop()
             if candidate not in nodes and candidate not in batch:
                 batch.append(candidate)
@@ -492,14 +515,64 @@ def _source_inventory(
         if len(nodes) + len(batch) > limit:
             raise ValueError("DAG source-closure bound exceeded")
         placeholders = ",".join("?" for _ in batch)
+        session_length = "COALESCE(length(CAST(session_id AS BLOB)), 0)"
+        source_length = "COALESCE(length(CAST(source_ids AS BLOB)), 0)"
+        type_length = "COALESCE(length(CAST(source_type AS BLOB)), 0)"
+        total_length = f"({session_length} + {source_length} + {type_length})"
+        guard = (
+            f"{total_length} <= ? AND {session_length} <= ? "
+            f"AND {source_length} <= ? AND {type_length} <= ?"
+        )
         rows = conn.execute(
-            f"SELECT * FROM summary_nodes WHERE node_id IN ({placeholders})", batch
+            f"""SELECT node_id,
+                       CASE WHEN {guard} THEN
+                            substr(CAST(session_id AS TEXT), 1, ?)
+                            ELSE NULL END,
+                       NULL, NULL, NULL, NULL,
+                       CASE WHEN {guard} THEN
+                            substr(CAST(source_ids AS TEXT), 1, ?)
+                            ELSE NULL END,
+                       CASE WHEN {guard} THEN
+                            substr(CAST(source_type AS TEXT), 1, ?)
+                            ELSE NULL END,
+                       {session_length}, {source_length}, {type_length}
+                FROM summary_nodes WHERE node_id IN ({placeholders})""",
+            (
+                row_byte_cap,
+                _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
+                MAX_SOURCE_IDS_JSON_CHARS,
+                _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
+                _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES + 1,
+                row_byte_cap,
+                _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
+                MAX_SOURCE_IDS_JSON_CHARS,
+                _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
+                MAX_SOURCE_IDS_JSON_CHARS + 1,
+                row_byte_cap,
+                _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
+                MAX_SOURCE_IDS_JSON_CHARS,
+                _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
+                _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES + 1,
+                *batch,
+            ),
         ).fetchall()
+        if time.monotonic() >= deadline_at:
+            raise ValueError("DAG lineage deadline exceeded")
         by_id = {int(row[0]): row for row in rows}
         if set(batch) != set(by_id):
             raise ValueError("DAG source closure references a missing node")
         for current_id in batch:
             row = by_id[current_id]
+            if time.monotonic() >= deadline_at:
+                raise ValueError("DAG lineage deadline exceeded")
+            row_bytes = sum(int(value or 0) for value in row[8:11])
+            if row_bytes > row_byte_cap or any(
+                row[index] is None for index in (1, 6, 7)
+            ):
+                raise ValueError("DAG lineage byte bound exceeded")
+            lineage_bytes += row_bytes
+            if lineage_bytes > _MAINTENANCE_LINEAGE_MAX_BYTES:
+                raise ValueError("DAG lineage byte bound exceeded")
             if str(row[1]) != root_session_id:
                 raise ValueError(f"node {current_id} crosses session boundary")
             nodes.add(current_id)

@@ -287,10 +287,10 @@ def test_source_identity_is_revalidated_under_publication_writer_lock(
     original_hash = engine_module.compute_source_identity_hash
     calls = 0
 
-    def synchronize_after_optimistic_hash(conn, session_id, source_ids):
+    def synchronize_after_optimistic_hash(conn, session_id, source_ids, **kwargs):
         nonlocal calls
         calls += 1
-        value = original_hash(conn, session_id, source_ids)
+        value = original_hash(conn, session_id, source_ids, **kwargs)
         if calls == 1:
             validation_complete.set()
             assert mutation_complete.wait(timeout=2)
@@ -462,8 +462,8 @@ def test_winner_committing_before_preparer_row_creation_cannot_leave_ready_batch
         ),
     )
 
-    def pause_after_snapshot(conn, session_id, source_ids):
-        value = original_hash(conn, session_id, source_ids)
+    def pause_after_snapshot(conn, session_id, source_ids, **kwargs):
+        value = original_hash(conn, session_id, source_ids, **kwargs)
         if threading.current_thread().name == "in-flight-preparer" and not hash_captured.is_set():
             hash_captured.set()
             assert winner_committed.wait(timeout=3)

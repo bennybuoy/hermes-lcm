@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 from .dag import SummaryNode
 from .escalation import summarize_with_escalation
+from .frontier import compute_source_identity_hash
 from .tokens import count_messages_tokens, count_tokens
 
 logger = logging.getLogger(__name__)
@@ -528,11 +529,13 @@ class FullSweepMixin:
                     read_budget=locked_read_budget,
                 ):
                     raise RuntimeError("full sweep source rows changed before publication")
-                locked_identity = self._bounded_source_content_identity_hash_no_commit(
+                locked_identity = compute_source_identity_hash(
                     publication_conn,
                     session_id,
                     covered_source_ids,
                     read_budget=locked_read_budget,
+                    digest_chars=None,
+                    role_default="unknown",
                 )
                 if locked_identity != expected_source_identity:
                     raise RuntimeError("full sweep source identity mismatch")
