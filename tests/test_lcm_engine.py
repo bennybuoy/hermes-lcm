@@ -3883,7 +3883,7 @@ class TestEngineABC:
         assert "data:image" not in anchor
         match = re.search(r";\s*ref=([^;\]\s]+)", anchor)
         assert match, anchor
-        expanded = json.loads(lcm_tools.lcm_expand({"externalized_ref": match.group(1), "max_tokens": 100_000}, engine=engine))
+        expanded = json.loads(lcm_tools.lcm_expand({"externalized_ref": match.group(1), "max_tokens": 8_192}, engine=engine))
         assert expanded["kind"] == "ingest_payload"
         assert expanded["content"] == data_uri
         assert expanded["field_path"] == "preserved_objective.content"
@@ -5084,6 +5084,9 @@ class TestEngineABC:
                     "conversation_id": target_conversation,
                     "limit": 5,
                 },
+                cross_session_capability=engine.issue_cross_session_capability(
+                    ["discord-topic-a", "discord-topic-b"]
+                ),
             )
         )
 
@@ -10028,7 +10031,7 @@ class TestEngineCompress:
             match = re.search(r";\s*ref=([^;\]\s]+)", serialized)
             assert match, serialized
             assert "literal XML docs" not in serialized
-            expanded = json.loads(lcm_tools.lcm_expand({"externalized_ref": match.group(1), "max_tokens": 100_000}, engine=instance))
+            expanded = json.loads(lcm_tools.lcm_expand({"externalized_ref": match.group(1), "max_tokens": 8_192}, engine=instance))
             assert expanded["content"] == payload
         finally:
             instance.shutdown()
@@ -22292,11 +22295,13 @@ class TestEngineTools:
     def test_handle_grep_session_scope_all_returns_cross_session_hits(self, engine):
         engine._store.append("test-session", {"role": "user", "content": "docker rollout current session"})
         engine._store.append("old-session", {"role": "user", "content": "docker rollout old session"})
+        capability = engine.issue_cross_session_capability(["test-session", "old-session"])
 
         result = json.loads(
             engine.handle_tool_call(
                 "lcm_grep",
                 {"query": "docker", "session_scope": "all", "limit": 10},
+                cross_session_capability=capability,
             )
         )
 
@@ -25805,8 +25810,9 @@ class TestHandleGrepCrossSession:
 
     def test_session_scope_all_returns_cross_session_messages(self, engine):
         self._seed_two_sessions(engine)
+        capability = engine.issue_cross_session_capability(["test-session", "old-session"])
         result = json.loads(
-            engine.handle_tool_call("lcm_grep", {"query": "docker", "session_scope": "all"})
+            engine.handle_tool_call("lcm_grep", {"query": "docker", "session_scope": "all"}, cross_session_capability=capability)
         )
         assert result["session_scope"] == "all"
         sessions_seen = {hit["session_id"] for hit in result["results"]}
@@ -25819,10 +25825,12 @@ class TestHandleGrepCrossSession:
 
     def test_session_scope_session_restricts_to_explicit_id(self, engine):
         self._seed_two_sessions(engine)
+        capability = engine.issue_cross_session_capability(["old-session"])
         result = json.loads(
             engine.handle_tool_call(
                 "lcm_grep",
                 {"query": "docker", "session_scope": "session", "session_id": "old-session"},
+                cross_session_capability=capability,
             )
         )
         assert result["session_scope"] == "session"
@@ -25921,7 +25929,11 @@ class TestHandleGrepCrossSession:
             )
         )
         result = json.loads(
-            engine.handle_tool_call("lcm_grep", {"query": "docker", "session_scope": "all"})
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "all"},
+                cross_session_capability=engine.issue_cross_session_capability(["old-session"]),
+            )
         )
         types_seen = {hit["type"] for hit in result["results"]}
         assert "message" in types_seen
@@ -25957,6 +25969,7 @@ class TestHandleGrepCrossSession:
             engine.handle_tool_call(
                 "lcm_grep",
                 {"query": "docker", "session_scope": "all", "source": "discord"},
+                cross_session_capability=engine.issue_cross_session_capability(["test-session", "old-session"]),
             )
         )
         assert result["session_scope"] == "all"
@@ -25984,7 +25997,8 @@ class TestHandleExpandStoreId:
             {"role": "user", "content": "cross session content body"},
             source="cli",
         )
-        result = json.loads(engine.handle_tool_call("lcm_expand", {"store_id": store_id}))
+        capability = engine.issue_cross_session_capability(["old-session"])
+        result = json.loads(engine.handle_tool_call("lcm_expand", {"store_id": store_id}, cross_session_capability=capability))
         assert result["source_type"] == "raw_message"
         assert result["store_id"] == store_id
         assert result["session_id"] == "old-session"
@@ -25998,9 +26012,11 @@ class TestHandleExpandStoreId:
         store_id = engine._store.append(
             "old-session", {"role": "user", "content": big_content}
         )
+        capability = engine.issue_cross_session_capability(["old-session"])
         first = json.loads(
             engine.handle_tool_call(
-                "lcm_expand", {"store_id": store_id, "max_tokens": 50}
+                "lcm_expand", {"store_id": store_id, "max_tokens": 50},
+                cross_session_capability=capability,
             )
         )
         assert first["content_truncated"] is True
@@ -26013,6 +26029,7 @@ class TestHandleExpandStoreId:
                     "max_tokens": 50,
                     "content_offset": first["next_content_offset"],
                 },
+                cross_session_capability=capability,
             )
         )
         assert second["content_offset"] == first["next_content_offset"]
@@ -26084,7 +26101,8 @@ class TestHandleExpandStoreId:
             "old-session",
             {"role": "tool", "content": placeholder, "tool_call_id": "call_abc"},
         )
-        result = json.loads(engine.handle_tool_call("lcm_expand", {"store_id": store_id}))
+        capability = engine.issue_cross_session_capability(["old-session"])
+        result = json.loads(engine.handle_tool_call("lcm_expand", {"store_id": store_id}, cross_session_capability=capability))
         assert result["source_type"] == "raw_message"
         assert result["from_current_session"] is False
         assert result["externalized_ref"] == "foreign_payload_ref.json"
@@ -26102,6 +26120,7 @@ class TestHandleExpandStoreId:
             engine.handle_tool_call(
                 "lcm_grep",
                 {"query": "phoenix", "session_scope": "all"},
+                cross_session_capability=engine.issue_cross_session_capability(["old-session"]),
             )
         )
         cross_hits = [
@@ -26113,7 +26132,8 @@ class TestHandleExpandStoreId:
 
         expand_result = json.loads(
             engine.handle_tool_call(
-                "lcm_expand", {"store_id": cross_hits[0]["store_id"]}
+                "lcm_expand", {"store_id": cross_hits[0]["store_id"]},
+                cross_session_capability=engine.issue_cross_session_capability(["old-session"]),
             )
         )
         assert expand_result["source_type"] == "raw_message"

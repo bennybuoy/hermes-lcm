@@ -158,6 +158,7 @@ _SENSITIVE_PATTERN_CATALOG: dict[str, re.Pattern[str]] = {
     "password_assignment": re.compile(
         r"(?P<prefix>\b(?:password|passwd|pwd|passphrase)\b\s*[\"']?\s*[:=]\s*)"
         r"(?:(?P<quote>[\"'])(?P<secret_quoted>[^\r\n\]\}]{6,}?)(?P=quote)|"
+        r"(?P<unterminated_quote>[\"'])(?P<secret_unterminated>[^\r\n\]\}]{6,})|"
         r"(?P<secret_unquoted>[^\s,\"'\]}]{6,}))",
         re.IGNORECASE,
     ),
@@ -744,7 +745,12 @@ def _sensitive_placeholder(pattern_name: str, secret: str) -> str:
 def _redact_match(pattern_name: str, match: re.Match[str]) -> str:
     group_names = match.re.groupindex
     secret_group = None
-    for candidate in ("secret", "secret_quoted", "secret_unquoted"):
+    for candidate in (
+        "secret",
+        "secret_quoted",
+        "secret_unterminated",
+        "secret_unquoted",
+    ):
         if candidate in group_names and match.groupdict().get(candidate) is not None:
             secret_group = candidate
             break

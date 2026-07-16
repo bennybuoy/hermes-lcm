@@ -7,6 +7,15 @@ import sys
 import importlib
 from pathlib import Path
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_default_lcm_storage(tmp_path, monkeypatch):
+    """Never let a test using default engine config open a real profile DB."""
+    monkeypatch.setenv("LCM_DATABASE_PATH", str(tmp_path / "default-lcm.db"))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+
 # Make the repo root importable (for agent.context_engine etc.)
 repo_root = str(Path(__file__).resolve().parent.parent.parent.parent)
 if repo_root not in sys.path:

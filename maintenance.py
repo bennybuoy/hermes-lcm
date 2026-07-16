@@ -21,7 +21,16 @@ import time
 from typing import Any
 
 from .db_bootstrap import configure_connection, read_existing_schema_version, SCHEMA_VERSION
+from .dag import MAX_SOURCE_IDS_JSON_CHARS, MAX_SOURCE_IDS_PER_NODE
+from .frontier import finalize_generation_winner_no_commit
 from .tokens import count_tokens
+
+
+_MAINTENANCE_MAX_NODES = 10_000
+_MAINTENANCE_MAX_EDGES = 40_000
+_MAINTENANCE_MAX_MESSAGES = 40_000
+_MAINTENANCE_MAX_FRONTIER_ITEMS = 10_000
+_MAINTENANCE_QUERY_BATCH = 400
 
 
 def _safe_database_path(db_path: str | Path) -> Path:
@@ -364,8 +373,18 @@ def _node_row(conn: sqlite3.Connection, node_id: int) -> sqlite3.Row:
 
 
 def _json_ids(raw: Any) -> list[int]:
+    if not isinstance(raw, str):
+        raise ValueError("source_ids must be encoded JSON text")
+    if len(raw) > MAX_SOURCE_IDS_JSON_CHARS:
+        raise ValueError("source_ids encoded-size hard cap exceeded")
+    stripped = raw.strip()
+    encoded_count = (
+        stripped.count(",") + 1 if stripped not in {"", "[]"} else 0
+    )
+    if encoded_count > MAX_SOURCE_IDS_PER_NODE:
+        raise ValueError("source_ids cardinality hard cap exceeded")
     try:
-        value = json.loads(raw or "[]")
+        value = json.loads(stripped or "[]")
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError("invalid source_ids JSON") from exc
     if not isinstance(value, list):
@@ -373,35 +392,8 @@ def _json_ids(raw: Any) -> list[int]:
     return [int(item) for item in value]
 
 
-def _source_bounds(conn: sqlite3.Connection, node_id: int, *, limit: int = 10_000) -> tuple[int, int]:
-    pending = [int(node_id)]
-    seen: set[int] = set()
-    source_ids: list[int] = []
-    while pending:
-        current_id = pending.pop()
-        if current_id in seen:
-            raise ValueError("cycle detected in DAG source closure")
-        seen.add(current_id)
-        if len(seen) > limit:
-            raise ValueError("DAG source-closure bound exceeded")
-        row = _node_row(conn, current_id)
-        ids = _json_ids(row[6])
-        if row[7] == "messages":
-            for store_id in ids:
-                message = conn.execute(
-                    "SELECT session_id FROM messages WHERE store_id=?", (store_id,)
-                ).fetchone()
-                if message is None or str(message[0]) != str(row[1]):
-                    raise ValueError(f"node {current_id} has missing/cross-session message source {store_id}")
-            source_ids.extend(ids)
-        elif row[7] == "nodes":
-            for child_id in ids:
-                child = _node_row(conn, child_id)
-                if str(child[1]) != str(row[1]):
-                    raise ValueError(f"node {current_id} has cross-session child {child_id}")
-            pending.extend(ids)
-        else:
-            raise ValueError(f"node {current_id} has unknown source_type")
+def _source_bounds(conn: sqlite3.Connection, node_id: int, *, limit: int = _MAINTENANCE_MAX_NODES) -> tuple[int, int]:
+    _nodes, source_ids = _source_inventory(conn, node_id, limit=limit)
     if not source_ids:
         raise ValueError(f"node {node_id} has no raw source closure")
     return min(source_ids), max(source_ids)
@@ -414,25 +406,91 @@ def _source_inventory(
     limit: int = 10_000,
 ) -> tuple[set[int], set[int]]:
     """Return the exact node/message closure beneath ``node_id``."""
+    root = _node_row(conn, node_id)
+    root_session_id = str(root[1])
     pending = [int(node_id)]
     nodes: set[int] = set()
     messages: set[int] = set()
+    adjacency: dict[int, list[int]] = {}
+    edges = 0
     while pending:
-        current_id = pending.pop()
-        if current_id in nodes:
+        batch: list[int] = []
+        while pending and len(batch) < _MAINTENANCE_QUERY_BATCH:
+            candidate = pending.pop()
+            if candidate not in nodes and candidate not in batch:
+                batch.append(candidate)
+        if not batch:
             continue
-        nodes.add(current_id)
-        if len(nodes) > limit:
+        if len(nodes) + len(batch) > limit:
             raise ValueError("DAG source-closure bound exceeded")
-        row = _node_row(conn, current_id)
-        ids = _json_ids(row[6])
-        if row[7] == "messages":
-            messages.update(ids)
-        elif row[7] == "nodes":
-            pending.extend(ids)
-        else:
-            raise ValueError(f"node {current_id} has unknown source_type")
+        placeholders = ",".join("?" for _ in batch)
+        rows = conn.execute(
+            f"SELECT * FROM summary_nodes WHERE node_id IN ({placeholders})", batch
+        ).fetchall()
+        by_id = {int(row[0]): row for row in rows}
+        if set(batch) != set(by_id):
+            raise ValueError("DAG source closure references a missing node")
+        for current_id in batch:
+            row = by_id[current_id]
+            if str(row[1]) != root_session_id:
+                raise ValueError(f"node {current_id} crosses session boundary")
+            nodes.add(current_id)
+            ids = _json_ids(row[6])
+            edges += len(ids)
+            if edges > _MAINTENANCE_MAX_EDGES:
+                raise ValueError("DAG source-edge bound exceeded")
+            if row[7] == "messages":
+                messages.update(ids)
+                if len(messages) > _MAINTENANCE_MAX_MESSAGES:
+                    raise ValueError("DAG source-message bound exceeded")
+            elif row[7] == "nodes":
+                adjacency[current_id] = ids
+                pending.extend(ids)
+            else:
+                raise ValueError(f"node {current_id} has unknown source_type")
+    indegree = {current_id: 0 for current_id in nodes}
+    for child_ids in adjacency.values():
+        for child_id in child_ids:
+            indegree[child_id] += 1
+    ready = [current_id for current_id, degree in indegree.items() if degree == 0]
+    visited = 0
+    while ready:
+        current_id = ready.pop()
+        visited += 1
+        for child_id in adjacency.get(current_id, []):
+            indegree[child_id] -= 1
+            if indegree[child_id] == 0:
+                ready.append(child_id)
+    if visited != len(nodes):
+        raise ValueError("cycle detected in DAG source closure")
+
+    message_ids = list(messages)
+    for offset in range(0, len(message_ids), _MAINTENANCE_QUERY_BATCH):
+        batch = message_ids[offset:offset + _MAINTENANCE_QUERY_BATCH]
+        placeholders = ",".join("?" for _ in batch)
+        rows = conn.execute(
+            f"SELECT store_id, session_id FROM messages WHERE store_id IN ({placeholders})",
+            batch,
+        ).fetchall()
+        if {int(row[0]) for row in rows} != set(batch) or any(
+            str(row[1]) != root_session_id for row in rows
+        ):
+            raise ValueError("DAG has missing/cross-session message sources")
     return nodes, messages
+
+
+def _frontier_rows(
+    conn: sqlite3.Connection, conversation_id: str, generation: int
+) -> list[sqlite3.Row]:
+    rows = conn.execute(
+        """SELECT kind, ref_id, source_start, source_end
+           FROM lcm_frontier_items WHERE conversation_id=? AND generation=?
+           ORDER BY ordinal LIMIT ?""",
+        (conversation_id, generation, _MAINTENANCE_MAX_FRONTIER_ITEMS + 1),
+    ).fetchall()
+    if len(rows) > _MAINTENANCE_MAX_FRONTIER_ITEMS:
+        raise ValueError("maintenance frontier-item bound exceeded")
+    return rows
 
 
 def _active_frontier(conn: sqlite3.Connection, conversation_id: str) -> sqlite3.Row:
@@ -470,12 +528,7 @@ def plan_dag_maintenance(
         frontier = _active_frontier(conn, conversation_id)
         if str(row[1]) != str(frontier[2]):
             raise ValueError("maintenance root does not belong to the active conversation session")
-        items = conn.execute(
-            """SELECT ordinal, kind, ref_id, source_start, source_end
-               FROM lcm_frontier_items WHERE conversation_id=? AND generation=?
-               ORDER BY ordinal""",
-            (conversation_id, frontier[1]),
-        ).fetchall()
+        items = _frontier_rows(conn, conversation_id, int(frontier[1]))
         if not items:
             raise ValueError("positive frontier generation is itemless")
         root_is_active = any(
@@ -545,12 +598,9 @@ def plan_dag_maintenance(
             target_base_generation = int(target_frontier[1])
             if str(target_frontier[2]) != str(target_session_id):
                 raise ValueError("target session does not own the target conversation frontier")
-            target_items = conn.execute(
-                """SELECT kind, ref_id, source_start, source_end
-                   FROM lcm_frontier_items WHERE conversation_id=? AND generation=?
-                   ORDER BY ordinal""",
-                (target_conversation_id, target_frontier[1]),
-            ).fetchall()
+            target_items = _frontier_rows(
+                conn, target_conversation_id, int(target_frontier[1])
+            )
             for target_item in target_items:
                 if target_item["kind"] != "node":
                     continue
@@ -648,6 +698,7 @@ def _publish_items(
     conversation_id: str,
     session_id: str,
     items: list[dict[str, int | str]],
+    phase_hook=None,
 ) -> int:
     base_generation = int(frontier[1])
     latest = _active_frontier(conn, conversation_id)
@@ -700,6 +751,15 @@ def _publish_items(
             for index, item in enumerate(items)
         ],
     )
+    finalize_generation_winner_no_commit(
+        conn,
+        conversation_id=conversation_id,
+        session_id=session_id,
+        source_end_store_id=max(int(item["source_end"]) for item in items),
+        base_generation=base_generation,
+        batch_reason="dag_maintenance_generation_published",
+        phase_hook=phase_hook,
+    )
     return generation
 
 
@@ -713,6 +773,8 @@ def apply_dag_maintenance(
     rewrites: dict[int, str] | None = None,
     target_session_id: str = "",
     target_conversation_id: str = "",
+    publication_phase_hook=None,
+    snapshot_hook=None,
 ) -> dict[str, Any]:
     """Backup, mutate privately, validate, then publish one new generation."""
     if confirmation != f"APPLY {operation}":
@@ -729,23 +791,31 @@ def apply_dag_maintenance(
         target_session_id=target_session_id,
         target_conversation_id=target_conversation_id,
     )
-    backup = create_verified_backup(db_path)
     conn = sqlite3.connect(str(path), timeout=5.0)
     conn.row_factory = sqlite3.Row
     configure_connection(conn)
     conn.execute("PRAGMA foreign_keys=ON")
     created_node_ids: list[int] = []
+    backup: dict[str, Any] | None = None
     try:
+        if callable(snapshot_hook):
+            snapshot_hook("before_begin")
         conn.execute("BEGIN IMMEDIATE")
         root = _node_row(conn, node_id)
         frontier = _active_frontier(conn, conversation_id)
         if int(frontier[1]) != int(plan["base_generation"]):
             raise ValueError("frontier changed after dry-run")
-        old_items = [dict(row) for row in conn.execute(
-            """SELECT kind, ref_id, source_start, source_end FROM lcm_frontier_items
-               WHERE conversation_id=? AND generation=? ORDER BY ordinal""",
-            (conversation_id, frontier[1]),
-        )]
+        if callable(snapshot_hook):
+            snapshot_hook("after_snapshot_locked")
+        # The writer lock closes the dry-run/backup/mutation gap.  A sibling
+        # read connection can take a consistent SQLite backup while no writer
+        # can change the mutation snapshot validated above.
+        backup = create_verified_backup(db_path)
+        old_items = [
+            dict(row) for row in _frontier_rows(
+                conn, conversation_id, int(frontier[1])
+            )
+        ]
         if operation == "rewrite-subtree":
             mapping = {int(key): str(value) for key, value in (rewrites or {}).items()}
             remap: dict[int, int] = {}
@@ -776,6 +846,7 @@ def apply_dag_maintenance(
                 conversation_id=conversation_id,
                 session_id=str(frontier[2]),
                 items=new_items,
+                phase_hook=publication_phase_hook,
             )
         elif operation == "dissolve":
             child_ids = _json_ids(root[6])
@@ -784,15 +855,14 @@ def apply_dag_maintenance(
             for item in old_items:
                 if item["kind"] == "node" and int(item["ref_id"]) == int(node_id):
                     found = True
-                    replacement.extend(
-                        {
+                    for child_id in child_ids:
+                        child_start, child_end = _source_bounds(conn, child_id)
+                        replacement.append({
                             "kind": "node",
                             "ref_id": child_id,
-                            "source_start": _source_bounds(conn, child_id)[0],
-                            "source_end": _source_bounds(conn, child_id)[1],
-                        }
-                        for child_id in child_ids
-                    )
+                            "source_start": child_start,
+                            "source_end": child_end,
+                        })
                 else:
                     replacement.append(item)
             if not found:
@@ -803,10 +873,24 @@ def apply_dag_maintenance(
                 conversation_id=conversation_id,
                 session_id=str(frontier[2]),
                 items=replacement,
+                phase_hook=publication_phase_hook,
             )
         elif operation == "copy-subtree":
             message_remap: dict[int, int] = {}
             node_remap: dict[int, int] = {}
+            _closure_nodes, closure_message_ids = _source_inventory(conn, int(node_id))
+            message_columns = [
+                description[1] for description in conn.execute("PRAGMA table_info(messages)")
+            ]
+            source_messages: dict[int, sqlite3.Row] = {}
+            bounded_message_ids = list(closure_message_ids)
+            for offset in range(0, len(bounded_message_ids), _MAINTENANCE_QUERY_BATCH):
+                batch = bounded_message_ids[offset:offset + _MAINTENANCE_QUERY_BATCH]
+                placeholders = ",".join("?" for _ in batch)
+                for message in conn.execute(
+                    f"SELECT * FROM messages WHERE store_id IN ({placeholders})", batch
+                ).fetchall():
+                    source_messages[int(message[0])] = message
 
             def copy_node(source_node_id: int) -> int:
                 if source_node_id in node_remap:
@@ -817,9 +901,10 @@ def apply_dag_maintenance(
                     copied_sources = []
                     for store_id in sources:
                         if store_id not in message_remap:
-                            message = conn.execute("SELECT * FROM messages WHERE store_id=?", (store_id,)).fetchone()
-                            columns = [description[1] for description in conn.execute("PRAGMA table_info(messages)")]
-                            values = dict(zip(columns, message))
+                            message = source_messages.get(store_id)
+                            if message is None:
+                                raise ValueError("copy source message disappeared from locked snapshot")
+                            values = dict(zip(message_columns, message))
                             values.pop("store_id", None)
                             values["session_id"] = target_session_id
                             values["conversation_id"] = target_conversation_id
@@ -846,11 +931,11 @@ def apply_dag_maintenance(
             target_frontier = _active_frontier(conn, target_conversation_id)
             if int(target_frontier[1]) != int(plan["target_base_generation"]):
                 raise ValueError("target frontier changed after dry-run")
-            target_items = [dict(row) for row in conn.execute(
-                """SELECT kind, ref_id, source_start, source_end FROM lcm_frontier_items
-                   WHERE conversation_id=? AND generation=? ORDER BY ordinal""",
-                (target_conversation_id, target_frontier[1]),
-            )]
+            target_items = [
+                dict(row) for row in _frontier_rows(
+                    conn, target_conversation_id, int(target_frontier[1])
+                )
+            ]
             start, end = _source_bounds(conn, copied_root)
             target_items.append({"kind": "node", "ref_id": copied_root, "source_start": start, "source_end": end})
             target_items.sort(key=lambda item: (int(item["source_start"]), int(item["source_end"])))
@@ -860,6 +945,7 @@ def apply_dag_maintenance(
                 conversation_id=target_conversation_id,
                 session_id=target_session_id,
                 items=target_items,
+                phase_hook=publication_phase_hook,
             )
         else:  # pragma: no cover - plan already validates
             raise ValueError("unknown maintenance operation")
@@ -871,11 +957,14 @@ def apply_dag_maintenance(
         if foreign or quick != "ok":
             raise sqlite3.DatabaseError("post-mutation integrity proof failed")
         conn.commit()
+        if callable(publication_phase_hook):
+            publication_phase_hook("after_commit")
     except Exception:
         conn.rollback()
         conn.close()
         raise
     conn.close()
+    assert backup is not None
     restore = verify_restore_proof(backup["backup_path"])
     audit_record = {
         "timestamp": time.time(),

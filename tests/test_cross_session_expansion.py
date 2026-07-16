@@ -679,7 +679,7 @@ def test_cross_session_prompt_and_query_are_always_mandatory_redacted_and_bounde
 
     def synthesize(**kwargs):
         if outcome == "degraded":
-            raise RuntimeError("synthetic degradation")
+            raise TimeoutError("synthetic degradation")
         return "safe answer"
 
     monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", synthesize)
@@ -721,7 +721,7 @@ def test_current_session_prompt_and_query_are_always_mandatory_redacted_and_boun
 
     def synthesize(**kwargs):
         if outcome == "degraded":
-            raise RuntimeError("synthetic degradation")
+            raise TimeoutError("synthetic degradation")
         return "safe answer"
 
     monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", synthesize)

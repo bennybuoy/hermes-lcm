@@ -2,14 +2,14 @@
 
 The sweep deliberately separates candidate construction from publication.  All
 leaf and condensation summaries are built in memory, then inserted into the DAG
-in topological order immediately before one frontier CAS.  DAG/frontier/lifecycle
-use separate SQLite connections, so publication uses compensation rather than
-claiming cross-connection atomicity.
+in topological order inside the same writer transaction that performs the
+frontier CAS, batch settlement, and lifecycle advance.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -363,80 +363,148 @@ class FullSweepMixin:
 
         previous_frontier_store_id = int(self._last_compacted_store_id or 0)
         new_generation = 0
-        try:
-            for item in staged:
-                source_ids = (
-                    [child.node_id for child in item.child_sources]
-                    if item.child_sources
-                    else list(item.message_source_ids)
-                )
-                if not source_ids or any(source_id <= 0 for source_id in source_ids):
-                    raise RuntimeError("full sweep source closure incomplete before DAG insert")
-                node = SummaryNode(
-                    session_id=session_id,
-                    depth=item.depth,
-                    summary=item.summary,
-                    token_count=item.token_count,
-                    source_token_count=item.source_token_count,
-                    source_ids=source_ids,
-                    source_type="nodes" if item.child_sources else "messages",
-                    created_at=item.created_at,
-                    earliest_at=item.earliest_at,
-                    latest_at=item.latest_at,
-                    expand_hint=self._extract_expand_hint(item.summary),
-                )
-                item.node_id = self._dag.add_node(node)
+        publication_committed = False
+        canonical_winner_observed = False
+        covered_source_ids = sorted(
+            {source_id for root in roots for source_id in root.raw_source_ids}
+        )
+        source_end = max(covered_source_ids)
+        source_message_map = self._get_store_id_map_for_messages(working_messages)
+        summarized_messages = [
+            message
+            for message in working_messages
+            if int(source_message_map.get(id(message)) or 0) in covered_source_ids
+        ]
+        expected_source_identity = self._foreground_source_identity_for_messages(
+            summarized_messages,
+            covered_source_ids,
+        )
+        if not expected_source_identity:
+            raise RuntimeError("full sweep could not lock summarized source identity")
 
-            covered_source_ids = sorted(
-                {source_id for root in roots for source_id in root.raw_source_ids}
-            )
-            source_end = max(covered_source_ids)
-            stored_tail = self._store.get_session_messages_after(
-                session_id, after_store_id=source_end
-            )
-            covered_start = min(covered_source_ids)
-            carried_items: list[dict[str, Any]] = []
-            for active_item in self._frontier.get_frontier_items(
-                conversation_id, int(frontier["generation"])
-            ):
-                start = int(active_item.get("source_start") or 0)
-                end = int(active_item.get("source_end") or 0)
-                if start <= 0 or end < start:
-                    continue
-                if not (end < covered_start or start > source_end):
-                    continue
-                if active_item.get("kind") == "node" and self._dag.get_node(
-                    int(active_item.get("ref_id") or 0)
-                ) is None:
-                    raise RuntimeError("full sweep carry-forward references missing DAG node")
-                carried_items.append(active_item)
-            frontier_items = self._full_sweep_frontier_items(
-                roots, stored_tail, carried_items
-            )
-            if not frontier_items:
-                raise RuntimeError("full sweep candidate produced an empty frontier")
-            new_generation = self._frontier.advance_frontier_generation_with_items(
-                conversation_id,
-                session_id,
-                source_end,
-                policy_fp,
-                route_fp,
-                int(frontier["generation"]),
-                frontier_items,
-            )
-            if not new_generation:
-                raise RuntimeError("full sweep frontier CAS mismatch")
-            self._last_compacted_store_id = source_end
-            self._persist_frontier_marker()
-        except Exception:
-            frontier_rolled_back = True
-            if new_generation:
-                try:
-                    frontier_rolled_back = self._frontier.rollback_frontier_generation(
-                        conversation_id, new_generation
+        def _publication_boundary(phase: str) -> None:
+            crash_hook = getattr(self, "_full_sweep_publish_crash_hook", None)
+            if callable(crash_hook):
+                crash_hook(phase)
+            elif crash_hook == phase:
+                os._exit(90)  # noqa: PLW1510 - subprocess crash injection
+            failure_hook = getattr(self, "_full_sweep_publish_failure_hook", None)
+            if callable(failure_hook):
+                failure_hook(phase)
+            elif failure_hook == phase:
+                raise RuntimeError("injected full-sweep publication failure")
+
+        try:
+            with self._frontier.publication_transaction() as publication_conn:
+                _publication_boundary("after_begin")
+                locked_frontier = publication_conn.execute(
+                    """SELECT generation, session_id, source_end_store_id
+                       FROM lcm_active_frontiers WHERE conversation_id=?
+                       ORDER BY generation DESC LIMIT 1""",
+                    (conversation_id,),
+                ).fetchone()
+                if (
+                    locked_frontier is None
+                    or int(locked_frontier[0]) != int(frontier["generation"])
+                    or str(locked_frontier[1] or "") != session_id
+                ):
+                    canonical_winner_observed = True
+                    raise RuntimeError("full sweep frontier CAS mismatch")
+                canonical_coverage = self._canonical_message_source_ids_no_commit(
+                    publication_conn, session_id
+                )
+                if canonical_coverage.intersection(covered_source_ids):
+                    canonical_winner_observed = True
+                    raise RuntimeError("full sweep canonical source overlap")
+                if not self._exact_source_rows_exist_no_commit(
+                    publication_conn, session_id, covered_source_ids
+                ):
+                    raise RuntimeError("full sweep source rows changed before publication")
+                locked_identity = self._source_content_identity_hash_no_commit(
+                    publication_conn, session_id, covered_source_ids
+                )
+                if locked_identity != expected_source_identity:
+                    raise RuntimeError("full sweep source identity mismatch")
+
+                for item in staged:
+                    source_ids = (
+                        [child.node_id for child in item.child_sources]
+                        if item.child_sources
+                        else list(item.message_source_ids)
                     )
-                except Exception:
-                    frontier_rolled_back = False
+                    if not source_ids or any(source_id <= 0 for source_id in source_ids):
+                        raise RuntimeError("full sweep source closure incomplete before DAG insert")
+                    node = SummaryNode(
+                        session_id=session_id,
+                        depth=item.depth,
+                        summary=item.summary,
+                        token_count=item.token_count,
+                        source_token_count=item.source_token_count,
+                        source_ids=source_ids,
+                        source_type="nodes" if item.child_sources else "messages",
+                        created_at=item.created_at,
+                        earliest_at=item.earliest_at,
+                        latest_at=item.latest_at,
+                        expand_hint=self._extract_expand_hint(item.summary),
+                    )
+                    item.node_id = self._dag.add_node_no_commit(publication_conn, node)
+                _publication_boundary("after_nodes")
+
+                covered_start = min(covered_source_ids)
+                active_rows = publication_conn.execute(
+                    """SELECT kind, ref_id, source_start, source_end
+                       FROM lcm_frontier_items
+                       WHERE conversation_id=? AND generation=? ORDER BY ordinal""",
+                    (conversation_id, int(frontier["generation"])),
+                ).fetchall()
+                carried_items: list[dict[str, Any]] = []
+                for kind, ref_id, start, end in active_rows:
+                    start, end = int(start or 0), int(end or 0)
+                    if start <= 0 or end < start or not (end < covered_start or start > source_end):
+                        continue
+                    if kind == "node" and publication_conn.execute(
+                        "SELECT 1 FROM summary_nodes WHERE node_id=?", (int(ref_id),)
+                    ).fetchone() is None:
+                        raise RuntimeError("full sweep carry-forward references missing DAG node")
+                    carried_items.append({
+                        "kind": str(kind), "ref_id": int(ref_id),
+                        "source_start": start, "source_end": end,
+                    })
+                stored_tail = [
+                    {"store_id": int(row[0])}
+                    for row in publication_conn.execute(
+                        """SELECT store_id FROM messages
+                           WHERE session_id=? AND store_id>? ORDER BY store_id""",
+                        (session_id, source_end),
+                    ).fetchall()
+                ]
+                frontier_items = self._full_sweep_frontier_items(
+                    roots, stored_tail, carried_items
+                )
+                if not frontier_items:
+                    raise RuntimeError("full sweep candidate produced an empty frontier")
+                new_generation = self._frontier.publish_generation_state_no_commit(
+                    publication_conn,
+                    conversation_id=conversation_id,
+                    session_id=session_id,
+                    source_end_store_id=source_end,
+                    policy_fingerprint=policy_fp,
+                    route_fingerprint=route_fp,
+                    base_generation=int(frontier["generation"]),
+                    items=frontier_items,
+                    batch_reason="full_sweep_generation_published",
+                    phase_hook=_publication_boundary,
+                )
+                if not new_generation:
+                    canonical_winner_observed = True
+                    raise RuntimeError("full sweep frontier CAS mismatch")
+            publication_committed = True
+            _publication_boundary("after_commit")
+            self._last_compacted_store_id = source_end
+        except Exception:
+            frontier_rolled_back = not (
+                publication_committed or canonical_winner_observed
+            )
             if frontier_rolled_back:
                 self._delete_staged_nodes_after_failed_sweep(staged)
                 self._last_compacted_store_id = previous_frontier_store_id

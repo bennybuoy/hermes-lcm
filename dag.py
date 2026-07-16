@@ -45,6 +45,26 @@ from .search_query import (
     sanitize_fts5_query,
     should_apply_directness_rank_adjustment,
 )
+
+MAX_SOURCE_IDS_PER_NODE = 6_400
+MAX_SOURCE_IDS_JSON_CHARS = 128_000
+
+
+def decode_source_ids(raw: Any) -> list[int]:
+    """Decode lineage only after cheap encoded-size/cardinality checks."""
+    if raw in (None, ""):
+        return []
+    if not isinstance(raw, str):
+        raise ValueError("source_ids must be encoded JSON text")
+    if len(raw) > MAX_SOURCE_IDS_JSON_CHARS:
+        raise ValueError("source_ids encoded-size hard cap exceeded")
+    stripped = raw.strip()
+    if stripped not in {"", "[]"} and stripped.count(",") + 1 > MAX_SOURCE_IDS_PER_NODE:
+        raise ValueError("source_ids cardinality hard cap exceeded")
+    value = json.loads(stripped or "[]")
+    if not isinstance(value, list) or len(value) > MAX_SOURCE_IDS_PER_NODE:
+        raise ValueError("source_ids must be a bounded list")
+    return [int(item) for item in value]
 from .store import _normalize_source_value, _UNKNOWN_SOURCE, _legacy_blank_source_clause
 
 
@@ -715,7 +735,7 @@ class SummaryDAG:
             summary=row[3],
             token_count=row[4],
             source_token_count=row[5],
-            source_ids=json.loads(row[6]) if row[6] else [],
+            source_ids=decode_source_ids(row[6]),
             source_type=row[7],
             created_at=row[8],
             earliest_at=row[9],

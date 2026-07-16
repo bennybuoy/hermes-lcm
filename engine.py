@@ -25,7 +25,7 @@ from .codex_routing import (
 )
 from .cache_aware import CacheAwareSignalTracker
 from .config import LCMConfig
-from .dag import SummaryDAG, SummaryNode
+from .dag import SummaryDAG, SummaryNode, decode_source_ids
 from .policy import (
     DEFAULT_PREPARATION_RATIO,
     DEFAULT_TARGET_RATIO,
@@ -157,6 +157,9 @@ _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 _AUTO_FOCUS_MAX_TURNS = 3
 _AUTO_FOCUS_TURN_MAX_CHARS = 260
 _AUTO_FOCUS_MAX_CHARS = 700
+_PROMPT_AWARE_MAX_TERMS = 64
+_PROMPT_AWARE_MAX_SUMMARIES = 512
+_PROMPT_AWARE_MAX_PROMPT_CHARS = 20_000
 
 _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
 _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
@@ -3935,7 +3938,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         handler = handlers.get(name)
         if handler:
             handler_kwargs = {"engine": self}
-            if name == "lcm_expand_query" and kwargs.get("cross_session_capability") is not None:
+            if name in {"lcm_grep", "lcm_expand", "lcm_expand_query"} and kwargs.get("cross_session_capability") is not None:
                 handler_kwargs["cross_session_capability"] = kwargs["cross_session_capability"]
             return handler(args, **handler_kwargs)
         return json.dumps({"error": f"Unknown LCM tool: {name}"})
@@ -6002,6 +6005,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     self._config.prompt_aware_eviction_enabled
                     and prompt_terms
                 ):
+                    candidate_order = candidate_order[-_PROMPT_AWARE_MAX_SUMMARIES:]
                     candidate_order.sort(
                         key=lambda index: (
                             -self._prompt_aware_relevance_score(
@@ -6108,11 +6112,18 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 prompt = normalize_content_value(message.get("content")) or ""
                 break
         stop = {"about", "after", "again", "could", "from", "have", "into", "that", "the", "this", "what", "when", "where", "which", "with", "would", "your"}
-        return list(dict.fromkeys(
-            term
-            for term in re.findall(r"[\w-]{2,}", prompt.lower())
-            if term not in stop
-        ))
+        terms: list[str] = []
+        seen: set[str] = set()
+        for term in re.findall(
+            r"[\w-]{2,}", prompt[:_PROMPT_AWARE_MAX_PROMPT_CHARS].lower()
+        ):
+            if term in stop or term in seen:
+                continue
+            seen.add(term)
+            terms.append(term)
+            if len(terms) >= _PROMPT_AWARE_MAX_TERMS:
+                break
+        return terms
 
     def _resolve_active_frontier_for_assembly(
         self,
@@ -6519,9 +6530,9 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         ).fetchall()
         for row in rows:
             try:
-                source_values = json.loads(row[0] or "[]")
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
+                source_values = decode_source_ids(row[0] or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("canonical DAG contains unbounded source lineage") from exc
             for source_id in source_values:
                 try:
                     covered.add(int(source_id))
@@ -7234,21 +7245,28 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             if not admission_acquired:
                 self._record_async_prepare_skip("admission-limited")
                 return None
-            batch_id, capacity_reason = self._frontier.create_batch_cas(
-                conversation_id=conv_id,
-                session_id=session_id,
-                base_generation=base_generation,
-                source_end_store_id=actual_source_end,
-                source_identity_hash=source_hash,
-                source_ids=candidate_store_ids,
-                policy_fingerprint=policy_fp,
-                route_fingerprint=route_fp,
-                max_conversation_candidates=int(
-                    self._config.async_max_candidates_per_conversation
-                ),
-                max_profile_candidates=int(self._config.async_max_candidates_per_profile),
-                resolved_policy_json=resolved_policy_json,
-            )
+            batch_creation_completed = False
+            try:
+                batch_id, capacity_reason = self._frontier.create_batch_cas(
+                    conversation_id=conv_id,
+                    session_id=session_id,
+                    base_generation=base_generation,
+                    source_end_store_id=actual_source_end,
+                    source_identity_hash=source_hash,
+                    source_ids=candidate_store_ids,
+                    policy_fingerprint=policy_fp,
+                    route_fingerprint=route_fp,
+                    max_conversation_candidates=int(
+                        self._config.async_max_candidates_per_conversation
+                    ),
+                    max_profile_candidates=int(self._config.async_max_candidates_per_profile),
+                    resolved_policy_json=resolved_policy_json,
+                )
+                batch_creation_completed = True
+            finally:
+                if admission_acquired and not batch_creation_completed:
+                    release_profile_admission(self._store.db_path)
+                    admission_acquired = False
             if not batch_id:
                 release_profile_admission(self._store.db_path)
                 admission_acquired = False

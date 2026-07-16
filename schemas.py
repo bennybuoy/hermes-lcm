@@ -74,8 +74,9 @@ LCM_GREP = {
                 "description": (
                     "Scope of the search across the plugin-local LCM database. "
                     "'current' (default) restricts to the active session and preserves historical behavior. "
-                    "'all' searches every session in the local LCM database. "
-                    "'session' restricts to the session_id supplied via the session_id parameter. "
+                    "'all' searches host-authorized sessions in the local LCM database. "
+                    "'session' restricts to the authorized session_id supplied via the session_id parameter. "
+                    "Both broader scopes require an opaque trusted-host capability that tool arguments cannot create. "
                     "Cross-session search returns snippets and message store_ids; cross-session summary node expansion is deferred. "
                     "For Hermes-tracked session history outside the LCM database, use session_search."
                 ),
@@ -243,7 +244,7 @@ LCM_EXPAND = {
             "store_id": {
                 "type": "integer",
                 "description": (
-                    "Raw message store_id to fetch. Works across sessions, so a store_id surfaced by "
+                    "Raw message store_id to fetch. Works across trusted-host-authorized sessions, so a store_id surfaced by "
                     "a cross-session lcm_grep result can be expanded directly. Returns the message's "
                     "content paged by content_offset. If the row references an externalized payload, "
                     "the ref is surfaced via 'externalized_ref'; payload metadata and content are "
@@ -253,7 +254,9 @@ LCM_EXPAND = {
             },
             "max_tokens": {
                 "type": "integer",
-                "description": "Token budget for returned content (default 4000)",
+                "minimum": 1,
+                "maximum": 65536,
+                "description": "Token budget for returned content (default 4000, hard cap 65536)",
                 "default": 4000,
             },
             "source_offset": {
@@ -263,7 +266,9 @@ LCM_EXPAND = {
             },
             "source_limit": {
                 "type": "integer",
-                "description": "Maximum number of immediate sources to return from source_offset (node_id mode only). Output still respects max_tokens.",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of immediate sources to return from source_offset (node_id mode only, hard cap 200). Output still respects max_tokens.",
             },
             "content_offset": {
                 "type": "integer",

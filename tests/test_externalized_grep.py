@@ -193,6 +193,9 @@ def test_cross_session_payload_search_requires_explicit_scope(tmp_path):
                     "session_id": "foreign-session",
                 },
                 engine=engine,
+                cross_session_capability=engine.issue_cross_session_capability(
+                    ["foreign-session"]
+                ),
             )
         )
         assert explicit["total_results"] == 1

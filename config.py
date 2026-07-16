@@ -793,12 +793,30 @@ class LCMConfig:
         c.model_thresholds = _load_model_thresholds_from_yaml(hermes_config)
         raw_model_thresholds = os.environ.get("LCM_MODEL_THRESHOLDS")
         if raw_model_thresholds is not None:
-            c.model_thresholds = _parse_model_thresholds_env(raw_model_thresholds)
+            parsed_model_thresholds = _parse_model_thresholds_env(raw_model_thresholds)
+            if parsed_model_thresholds or not raw_model_thresholds.strip():
+                c.model_thresholds = parsed_model_thresholds
+                _record("model_thresholds", "env:LCM_MODEL_THRESHOLDS")
+            else:
+                _record(
+                    "model_thresholds",
+                    "yaml" if c.model_thresholds else "default",
+                    f"invalid env LCM_MODEL_THRESHOLDS={raw_model_thresholds!r} ignored",
+                )
         c.policy_rules = _load_policy_rules_from_yaml(hermes_config)
         c.model_policies = _load_model_policies_from_yaml(hermes_config)
         raw_model_policies = os.environ.get("LCM_MODEL_POLICIES")
         if raw_model_policies is not None:
-            c.model_policies = _parse_model_policies_env(raw_model_policies)
+            parsed_model_policies = _parse_model_policies_env(raw_model_policies)
+            if parsed_model_policies or not raw_model_policies.strip():
+                c.model_policies = parsed_model_policies
+                _record("model_policies", "env:LCM_MODEL_POLICIES")
+            else:
+                _record(
+                    "model_policies",
+                    "yaml" if c.model_policies else "default",
+                    f"invalid env LCM_MODEL_POLICIES={raw_model_policies!r} ignored",
+                )
         c.codex_gpt55_autoraise_enabled, source = _hermes_codex_gpt55_autoraise_with_source(
             c.codex_gpt55_autoraise_enabled, hermes_config
         )

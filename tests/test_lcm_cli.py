@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import json
+from email.parser import Parser
 import os
 import shutil
 import sqlite3
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
+
+import yaml
 
 import hermes_lcm.lcm_cli as lcm_cli
 from hermes_lcm.config import LCMConfig
@@ -108,6 +112,68 @@ def test_cli_message_list_is_preview_only_and_keyset_paginated(tmp_path):
     assert second.returncode == 0
     second_payload = json.loads(second.stdout)
     assert second_payload["items"][0]["store_id"] > cursor
+
+
+def test_cli_message_tail_cursor_pages_toward_older_rows(tmp_path):
+    db = _seed(tmp_path)
+    conn = sqlite3.connect(db)
+    conn.executemany(
+        """INSERT INTO messages
+           (session_id, source, role, content, timestamp, token_estimate, pinned)
+           VALUES ('cli-session', 'test', 'user', ?, ?, 1, 0)""",
+        [(f"tail-{index}", float(index)) for index in range(6)],
+    )
+    conn.commit()
+    conn.close()
+
+    first = json.loads(_run(db, "messages", "tail", "--limit", "3").stdout)
+    first_ids = [item["store_id"] for item in first["items"]]
+    assert first_ids == sorted(first_ids)
+    assert first["next_cursor"] == min(first_ids)
+
+    second = json.loads(_run(
+        db,
+        "messages",
+        "tail",
+        "--limit",
+        "3",
+        "--after-store-id",
+        str(first["next_cursor"]),
+    ).stdout)
+    second_ids = [item["store_id"] for item in second["items"]]
+    assert second_ids
+    assert max(second_ids) < min(first_ids)
+    assert not set(first_ids).intersection(second_ids)
+
+
+def test_cli_frontier_items_are_sql_limited_before_materialization(tmp_path):
+    db = _seed(tmp_path)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """INSERT INTO lcm_active_frontiers
+           (conversation_id, generation, session_id, source_end_store_id,
+            policy_fingerprint, route_fingerprint, created_at, updated_at)
+           VALUES ('wide-frontier', 1, 'cli-session', 2000, '', '', 1, 1)"""
+    )
+    conn.executemany(
+        """INSERT INTO lcm_frontier_items
+           (conversation_id, generation, ordinal, kind, ref_id, source_start, source_end)
+           VALUES ('wide-frontier', 1, ?, 'message', ?, ?, ?)""",
+        [(index, index + 1, index + 1, index + 1) for index in range(2000)],
+    )
+    conn.commit()
+    conn.close()
+
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    from argparse import Namespace
+    payload = lcm_cli._frontier(
+        conn,
+        Namespace(conversation_id="wide-frontier"),
+    )
+    conn.close()
+    assert len(payload["items"]) == lcm_cli._FRONTIER_ITEMS_LIMIT
+    assert payload["items_truncated"] is True
 
 
 def test_cli_does_not_migrate_or_create_tables(tmp_path):
@@ -450,6 +516,11 @@ def test_packaged_console_script_runs_without_gateway(tmp_path):
     )
     assert create_venv.returncode == 0, create_venv.stderr
     wheel = next(wheelhouse.glob("hermes_lcm-*.whl"))
+    with zipfile.ZipFile(wheel) as archive:
+        metadata_name = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA"))
+        metadata = archive.read(metadata_name).decode("utf-8")
+    requirements = Parser().parsestr(metadata).get_all("Requires-Dist", [])
+    assert any(requirement.replace(" ", "") == "PyYAML>=6.0" for requirement in requirements)
     install = subprocess.run(
         [str(target / "bin" / "python"), "-m", "pip", "install", "--no-deps", str(wheel)],
         text=True,
@@ -472,6 +543,38 @@ def test_packaged_console_script_runs_without_gateway(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["read_only"] is True
+
+    # Populate the otherwise isolated venv with the installed runtime's actual
+    # PyYAML package, then exercise the wheel-only console script's config path.
+    purelib = subprocess.run(
+        [str(target / "bin" / "python"), "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    shutil.copytree(Path(yaml.__file__).parent, Path(purelib) / "yaml")
+    hermes_home = tmp_path / "clean-hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "lcm:\n  context_threshold: 0.42\n", encoding="utf-8"
+    )
+    config_result = subprocess.run(
+        [
+            str(target / "bin" / "hermes-lcm"),
+            "--hermes-home",
+            str(hermes_home),
+            "config",
+            "get",
+            "context_threshold",
+        ],
+        env={**os.environ},
+        cwd=os.fspath(tmp_path),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert config_result.returncode == 0, config_result.stderr
+    assert json.loads(config_result.stdout)["value"] == 0.42
 
     maintenance = subprocess.run(
         [

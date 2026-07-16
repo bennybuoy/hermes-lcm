@@ -101,7 +101,7 @@ def _extract_refs(text: str) -> list[str]:
 
 
 def _expand_ref(engine: LCMEngine, ref: str) -> dict:
-    return json.loads(lcm_tools.lcm_expand({"externalized_ref": ref, "max_tokens": 100_000}, engine=engine))
+    return json.loads(lcm_tools.lcm_expand({"externalized_ref": ref, "max_tokens": 65_536}, engine=engine))
 
 
 def _externalized_files(tmp_path: Path) -> list[Path]:
@@ -597,7 +597,7 @@ def test_ingest_externalizes_plain_data_uri_user_content_before_sqlite_write(tmp
     assert expanded["content"] == DATA_URI
     assert expanded["kind"] == "ingest_payload"
 
-    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
+    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 65_536}, engine=engine))
     assert raw_message["externalized_ref"] == ref
     assert raw_message["externalized"]["kind"] == "ingest_payload"
     assert raw_message["externalized"]["field_path"] == "content"
@@ -696,7 +696,7 @@ def test_ingest_externalizes_generic_long_base64url_string(tmp_path):
     ref = _extract_ref(content)
     expanded = _expand_ref(engine, ref)
     assert expanded["content"] == GENERIC_BASE64URL
-    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
+    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 65_536}, engine=engine))
     assert raw_message["externalized_ref"] == ref
     assert GENERIC_BASE64URL[:120] not in json.dumps(raw_message)
 
@@ -728,7 +728,7 @@ def test_ingest_externalizes_base64url_tool_call_arguments(tmp_path):
     assert parsed_args["blob"].startswith("[Externalized LCM ingest payload:")
     expanded = _expand_ref(engine, ref)
     assert expanded["content"] == GENERIC_BASE64URL
-    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
+    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 65_536}, engine=engine))
     assert raw_message["externalized_refs"] == [ref]
     assert GENERIC_BASE64URL[:120] not in json.dumps(raw_message)
 
@@ -762,7 +762,7 @@ def test_ingest_externalizes_data_uri_and_generic_base64_in_same_text(tmp_path):
     assert len(refs) == 2
     expanded_payloads = [_expand_ref(engine, ref)["content"] for ref in refs]
     assert expanded_payloads == [DATA_URI, GENERIC_BASE64]
-    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
+    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 65_536}, engine=engine))
     assert raw_message["externalized_refs"] == refs
 
 
@@ -1187,7 +1187,7 @@ def test_ingest_externalizes_tool_calls_function_arguments(tmp_path):
     parsed_tool_calls = json.loads(tool_calls)
     parsed_args = json.loads(parsed_tool_calls[0]["function"]["arguments"])
     assert parsed_args["image"].startswith("[Externalized LCM ingest payload:")
-    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
+    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 65_536}, engine=engine))
     assert raw_message["externalized_refs"] == [ref]
     assert raw_message["externalized_payloads"][0]["field_path"] == "tool_calls[0].function.arguments"
     assert "tool_calls" not in raw_message
@@ -1258,7 +1258,7 @@ def test_ingest_externalizes_tool_call_argument_payload_keys(tmp_path):
     assert parsed_args[protected_key] == "plain-value"
     expanded = _expand_ref(engine, ref)
     assert expanded["content"] == DATA_URI
-    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
+    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 65_536}, engine=engine))
     assert raw_message["externalized_refs"] == [ref]
     assert DATA_PAYLOAD[:80] not in json.dumps(raw_message)
 
@@ -1282,7 +1282,7 @@ def test_ingest_externalizes_structured_content_payload_keys(tmp_path):
     ref = _extract_ref(content)
     expanded = _expand_ref(engine, ref)
     assert expanded["content"] == DATA_URI
-    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
+    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 65_536}, engine=engine))
     assert raw_message["externalized_refs"] == [ref]
     assert DATA_PAYLOAD[:80] not in json.dumps(raw_message)
 
@@ -1422,7 +1422,7 @@ def test_ingest_externalizes_duplicate_key_json_argument_escaped_data_uri(tmp_pa
     expanded = _expand_ref(engine, refs[0])
     assert expanded["content"] == escaped_data_uri
     assert expanded["field_path"] == "tool_calls[0].function.arguments"
-    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
+    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 65_536}, engine=engine))
     assert raw_message["externalized_refs"] == refs
     assert medium_payload[:120] not in json.dumps(raw_message)
 
@@ -1533,7 +1533,7 @@ def test_ingest_ref_parser_ignores_ref_text_in_tool_argument_key(tmp_path):
     assert refs[0] != "bogus"
     expanded = _expand_ref(engine, refs[0])
     assert expanded["content"] == DATA_URI
-    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
+    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 65_536}, engine=engine))
     assert raw_message["externalized_refs"] == refs
     assert raw_message["externalized_payloads"][0]["field_path"] == "tool_calls[0].function.arguments"
     assert engine._store.count_session_load_messages(engine.current_session_id) == 2
@@ -1710,7 +1710,7 @@ def test_store_id_expand_never_returns_raw_historical_tool_calls(tmp_path):
     engine._store._conn.commit()
     store_id = engine._store._conn.execute("SELECT max(store_id) FROM messages").fetchone()[0]
 
-    raw_message_text = lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine)
+    raw_message_text = lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 65_536}, engine=engine)
     raw_message = json.loads(raw_message_text)
 
     assert "tool_calls" not in raw_message
@@ -2735,9 +2735,22 @@ def test_repetitive_assistant_output_is_quarantined_before_sqlite_and_fts(tmp_pa
     ref = _extract_ref(content)
     expanded = _expand_ref(engine, ref)
     assert expanded["kind"] == "quarantined_assistant_output"
-    assert expanded["content"] == broken
+    recovered = [expanded["content"]]
+    while expanded["has_more"]:
+        next_offset = expanded["next_content_offset"]
+        expanded = json.loads(lcm_tools.lcm_expand(
+            {
+                "externalized_ref": ref,
+                "max_tokens": 65_536,
+                "content_offset": next_offset,
+            },
+            engine=engine,
+        ))
+        assert expanded["content_offset"] == next_offset
+        recovered.append(expanded["content"])
+    assert "".join(recovered) == broken
 
-    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
+    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 65_536}, engine=engine))
     assert raw_message["externalized_ref"] == ref
     assert raw_message["externalized"]["kind"] == "quarantined_assistant_output"
 

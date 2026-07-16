@@ -6,6 +6,7 @@ import codecs
 import json
 import logging
 import multiprocessing
+import os
 import re
 import threading
 import time
@@ -25,7 +26,11 @@ from .diagnostics import (
     _state_db_path_for_engine,
     doctor_guidance_for_checks,
 )
-from .dag import build_nodes_fts_spec
+from .dag import (
+    MAX_SOURCE_IDS_JSON_CHARS,
+    MAX_SOURCE_IDS_PER_NODE,
+    build_nodes_fts_spec,
+)
 from .db_bootstrap import check_external_content_fts_integrity, inspect_lcm_schema_health
 from .extraction import sanitize_pre_compaction_content
 from .ingest_protection import (
@@ -77,6 +82,9 @@ _CROSS_SESSION_AUTH_MAX_MESSAGES = 6_400
 _CROSS_SESSION_AUTH_MAX_EDGES = 6_400
 _CROSS_SESSION_AUTH_MAX_DEPTH = 64
 _CROSS_SESSION_AUTH_QUERY_BATCH = 400
+_CURRENT_SESSION_EXPAND_MAX_TOKENS = 65_536
+_CURRENT_SESSION_EXPAND_MAX_SOURCES = 200
+_CURRENT_SESSION_EXPAND_MAX_CHARS = 100_000
 _MANDATORY_REDACTION_LOOKAHEAD_CHARS = 8_192
 _MANDATORY_REDACTION_CHARS_PER_TOKEN = 16
 _BOUNDARY_PRIVATE_KEY_BEGIN_RE = re.compile(
@@ -296,13 +304,23 @@ def _search_externalized_payloads(
             "max_files": max_files,
             "max_payload_chars": max_payload_chars,
         }
-    paths = [root / ref] if ref else sorted(root.glob("*.json"))
-    if len(paths) > max_files:
-        paths = paths[:max_files]
-        scan_truncated = True
+    def _candidate_paths():
+        if ref:
+            yield root / ref
+            return
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if entry.name.endswith(".json"):
+                    yield root / entry.name
+
     regex_deadline = time.monotonic() + _LCM_GREP_REGEX_OPERATION_DEADLINE_SECONDS
     regex_timeouts = 0
-    for path in paths:
+    candidates_seen = 0
+    for path in _candidate_paths():
+        if candidates_seen >= max_files:
+            scan_truncated = True
+            break
+        candidates_seen += 1
         if bytes_scanned >= _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES:
             scan_truncated = True
             break
@@ -548,22 +566,37 @@ def _slice_content_for_response(
             source,
             config,
             max_tokens=max_tokens,
-            max_chars=None,
+            max_chars=_CURRENT_SESSION_EXPAND_MAX_CHARS,
         )
+    redaction_changed = False
+    protected_probe = source
+    if config is not None:
+        probe_limit = min(
+            len(source),
+            max(1, int(max_tokens)) * _MANDATORY_REDACTION_CHARS_PER_TOKEN
+            + _MANDATORY_REDACTION_LOOKAHEAD_CHARS,
+        )
+        raw_probe = source[:probe_limit]
+        protected_probe = redact_sensitive_output_text(raw_probe)
+        redaction_changed = protected_probe != raw_probe
     if not sliced and content_offset < len(content):
         # A tiny token budget can fail to fit even the next character. Return one
         # character anyway so callers make deterministic, lossless cursor progress
         # instead of receiving has_more=true with the same content_offset forever.
-        sliced = (
-            "[LCM redacted]"
-            if config is not None
-            else content[content_offset:content_offset + 1]
-        )
-    # Offsets are raw-source cursors. Redaction can change output length, so a
-    # bounded protected page advances by the raw window budget rather than by
-    # placeholder length. Non-truncated pages still consume the complete source.
-    raw_page_chars = max(1, int(max_tokens) * _MANDATORY_REDACTION_CHARS_PER_TOKEN)
-    raw_consumed = len(source) if not window_truncated else min(len(source), raw_page_chars)
+        sliced = "[LCM redacted]" if redaction_changed else source[:1]
+    # Offsets are raw-source cursors. Redacted pages skip the complete inspected
+    # probe; ordinary pages advance only by visible raw text. Non-truncated pages
+    # consume the complete source.
+    if not window_truncated:
+        raw_consumed = len(source)
+    elif redaction_changed:
+        # Skip the complete bounded probe that produced the placeholder.  This
+        # prevents a subsequent cursor from entering the middle of a secret.
+        raw_consumed = max(1, min(len(source), probe_limit))
+    else:
+        # For ordinary text output length and raw-source length are identical.
+        # Advance only by the visible page so tiny budgets remain lossless.
+        raw_consumed = max(1, min(len(source), len(sliced)))
     next_content_offset = content_offset + raw_consumed
     has_more = window_truncated or next_content_offset < len(content)
     return {
@@ -1405,11 +1438,37 @@ def _authorize_node_provenance_bounded(
             for row in rows:
                 found_id = int(row[0])
                 found_ids.add(found_id)
-                try:
-                    source_ids = [int(value) for value in json.loads(row[2] or "[]")]
-                except (TypeError, ValueError, json.JSONDecodeError):
+                raw_source_ids = row[2] or "[]"
+                encoded_too_large = (
+                    not isinstance(raw_source_ids, str)
+                    or len(raw_source_ids) > MAX_SOURCE_IDS_JSON_CHARS
+                )
+                edge_count = (
+                    raw_source_ids.strip().count(",") + 1
+                    if isinstance(raw_source_ids, str)
+                    and raw_source_ids.strip() not in {"", "[]"}
+                    else 0
+                )
+                remaining_edges = _CROSS_SESSION_AUTH_MAX_EDGES - int(
+                    diagnostics["authorization_edges_checked"]
+                )
+                if (
+                    encoded_too_large
+                    or edge_count > MAX_SOURCE_IDS_PER_NODE
+                    or edge_count > remaining_edges
+                ):
                     source_ids = []
                     incomplete.add(found_id)
+                    diagnostics["authorization_truncated"] = True
+                else:
+                    try:
+                        decoded = json.loads(raw_source_ids)
+                        if not isinstance(decoded, list):
+                            raise ValueError("source_ids is not a list")
+                        source_ids = [int(value) for value in decoded]
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        source_ids = []
+                        incomplete.add(found_id)
                 graph[found_id] = (
                     str(row[1] or ""), str(row[3] or ""), source_ids
                 )
@@ -1770,12 +1829,26 @@ def _cross_session_expand_query(
                     node_id = int(raw_node_id)
                 except (TypeError, ValueError):
                     return json.dumps({"error": "node_ids must contain only integers"})
-                node = engine._dag.get_node(node_id)
+                try:
+                    node = engine._dag.get_node(node_id)
+                except ValueError:
+                    return json.dumps({
+                        "error": "node source_ids exceed authorization bounds",
+                        "authorization_truncated": True,
+                    })
                 if node is not None:
                     candidates.append(node)
         elif query:
             discovery_limit = max_sessions * per_session_limit * 8
-            candidates = engine._dag.search(query, session_id=None, limit=discovery_limit)
+            try:
+                candidates = engine._dag.search(
+                    query, session_id=None, limit=discovery_limit
+                )
+            except ValueError:
+                return json.dumps({
+                    "error": "candidate source_ids exceed authorization bounds",
+                    "authorization_truncated": True,
+                })
         else:
             return json.dumps({"error": "Provide either query or node_ids"})
 
@@ -2281,6 +2354,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         or conversation_id is not None
     )
 
+    allowed_cross_session_ids: frozenset[str] | None = None
     if requested_session_scope == "current":
         if explicit_session_id:
             return json.dumps({
@@ -2299,12 +2373,30 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
             return json.dumps({
                 "error": "session_id is not used with session_scope=all",
             })
+        allowed_cross_session_ids = engine._authorized_cross_session_ids(
+            kwargs.get("cross_session_capability")
+        )
+        if not allowed_cross_session_ids:
+            return json.dumps({
+                "error": "cross-session grep requires a trusted host capability",
+            })
         search_session_id = None
         session_scope = "all"
     elif requested_session_scope == "session":
         if not explicit_session_id:
             return json.dumps({
                 "error": "session_scope=session requires session_id",
+            })
+        allowed_cross_session_ids = engine._authorized_cross_session_ids(
+            kwargs.get("cross_session_capability")
+        )
+        if not allowed_cross_session_ids:
+            return json.dumps({
+                "error": "cross-session grep requires a trusted host capability",
+            })
+        if explicit_session_id not in allowed_cross_session_ids:
+            return json.dumps({
+                "error": "session is not authorized by the trusted host capability",
             })
         search_session_id = explicit_session_id
         session_scope = "session"
@@ -2328,18 +2420,30 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
 
     if content_scope in {"database", "all"} and not regex_mode:
       try:
-        msg_hits = engine._store.search(
-            query,
-            session_id=search_session_id,
-            limit=source_limit,
-            sort=sort,
-            source=source,
-            conversation_id=conversation_id,
-            role=role,
-            time_from=time_from,
-            time_to=time_to,
+        message_search_sessions = (
+            sorted(allowed_cross_session_ids)
+            if session_scope == "all" and allowed_cross_session_ids is not None
+            else [search_session_id]
         )
+        msg_hits: list[dict[str, Any]] = []
+        for authorized_session_id in message_search_sessions:
+            msg_hits.extend(engine._store.search(
+                query,
+                session_id=authorized_session_id,
+                limit=source_limit,
+                sort=sort,
+                source=source,
+                conversation_id=conversation_id,
+                role=role,
+                time_from=time_from,
+                time_to=time_to,
+            ))
         for hit in msg_hits:
+            if (
+                allowed_cross_session_ids is not None
+                and str(hit.get("session_id") or "") not in allowed_cross_session_ids
+            ):
+                continue
             timestamp_value = hit.get("timestamp", 0) or 0
             results.append(
                 {
@@ -2415,6 +2519,11 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
             )
         )
         for hit in external_hits:
+            if (
+                allowed_cross_session_ids is not None
+                and str(hit.get("session_id") or "") not in allowed_cross_session_ids
+            ):
+                continue
             hit["from_current_session"] = bool(
                 current_session_id
                 and hit.get("session_id") == current_session_id
@@ -2589,6 +2698,10 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
     source_limit_arg = args.get("source_limit")
     source_limit = _parse_positive_int(source_limit_arg, 0) if source_limit_arg is not None else None
     content_offset = _parse_non_negative_int(args.get("content_offset", 0), 0)
+    if max_tokens > _CURRENT_SESSION_EXPAND_MAX_TOKENS:
+        return json.dumps({"error": "max_tokens exceeds the 65536 hard cap"})
+    if source_limit is not None and source_limit > _CURRENT_SESSION_EXPAND_MAX_SOURCES:
+        return json.dumps({"error": "source_limit exceeds the 200 hard cap"})
 
     if externalized_ref:
         payload = _get_externalized_payload(engine, externalized_ref)
@@ -2638,6 +2751,18 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
         )
         engine_session_id = engine.current_session_id
         stored_session_id = stored.get("session_id", "")
+        if stored_session_id != engine_session_id:
+            allowed_session_ids = engine._authorized_cross_session_ids(
+                kwargs.get("cross_session_capability")
+            )
+            if not allowed_session_ids:
+                return json.dumps({
+                    "error": "cross-session store_id expansion requires a trusted host capability",
+                })
+            if stored_session_id not in allowed_session_ids:
+                return json.dumps({
+                    "error": "store_id session is not authorized by the trusted host capability",
+                })
         result: Dict[str, Any] = {
             "store_id": store_id,
             "source_type": "raw_message",
@@ -2754,6 +2879,8 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     prompt = str(args.get("prompt") or "").strip()
     if not prompt:
         return json.dumps({"error": "prompt is required"})
+    if len(prompt) > 20_000:
+        return json.dumps({"error": "prompt exceeds 20000 characters"})
 
     def _parse_int_arg(name: str, default: int) -> tuple[int | None, str | None]:
         raw_value = args.get(name, default)
@@ -2784,9 +2911,13 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     )
 
     query = str(args.get("query") or "").strip()
+    if len(query) > 2_000:
+        return json.dumps({"error": "query exceeds 2000 characters"})
     raw_node_ids = args.get("node_ids") or []
     if not isinstance(raw_node_ids, list):
         return json.dumps({"error": "node_ids must be an array"})
+    if len(raw_node_ids) > _CROSS_SESSION_MAX_RESULTS:
+        return json.dumps({"error": "node_ids exceeds the 20 item hard cap"})
 
     if args.get("cross_session") is True:
         if len(prompt) > 20_000:
@@ -3068,7 +3199,7 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
         logger.warning(
             "LCM expand_query synthesis failed after bounded evidence collection"
         )
-        return _degraded_payload("lcm_expand_query synthesis failed")
+        raise
 
     answer = str(answer).strip() if answer is not None else ""
     if not answer:

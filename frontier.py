@@ -360,6 +360,52 @@ class FrontierStore:
             phase_hook("after_frontier_items")
         return new_gen
 
+    def publish_generation_state_no_commit(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        conversation_id: str,
+        session_id: str,
+        source_end_store_id: int,
+        policy_fingerprint: str,
+        route_fingerprint: str,
+        base_generation: int,
+        items: list[dict[str, Any]],
+        batch_reason: str,
+        winner_batch_id: int | None = None,
+        phase_hook=None,
+    ) -> int:
+        """Atomically publish the complete canonical winner state.
+
+        The caller owns ``BEGIN IMMEDIATE`` and performs any DAG/message writes
+        first on ``conn``.  This shared finalizer advances the ordered frontier,
+        settles every losing batch for the replaced generation, and aligns the
+        lifecycle marker before the transaction may commit.
+        """
+        new_generation = self.advance_frontier_generation_with_items_no_commit(
+            conn,
+            conversation_id,
+            session_id,
+            int(source_end_store_id),
+            policy_fingerprint,
+            route_fingerprint,
+            int(base_generation),
+            items,
+        )
+        if not new_generation:
+            return 0
+        finalize_generation_winner_no_commit(
+            conn,
+            conversation_id=conversation_id,
+            session_id=session_id,
+            source_end_store_id=source_end_store_id,
+            base_generation=base_generation,
+            batch_reason=batch_reason,
+            winner_batch_id=winner_batch_id,
+            phase_hook=phase_hook,
+        )
+        return int(new_generation)
+
     def rollback_frontier_generation(self, conversation_id: str, generation: int) -> bool:
         """Remove the just-published generation when a later publish step fails.
 
@@ -1134,6 +1180,60 @@ class FrontierStore:
 
 
 # -- Helpers ---------------------------------------------------------------
+
+def finalize_generation_winner_no_commit(
+    conn: sqlite3.Connection,
+    *,
+    conversation_id: str,
+    session_id: str,
+    source_end_store_id: int,
+    base_generation: int,
+    batch_reason: str,
+    winner_batch_id: int | None = None,
+    phase_hook=None,
+) -> None:
+    """Settle batch/lifecycle winner state on a caller-owned transaction."""
+    if callable(phase_hook):
+        phase_hook("after_frontier")
+    FrontierStore.supersede_competing_batches_no_commit(
+        conn,
+        conversation_id,
+        int(base_generation),
+        winner_batch_id=winner_batch_id,
+        reason=batch_reason,
+    )
+    if callable(phase_hook):
+        phase_hook("after_batches_superseded")
+    now = time.time()
+    conn.execute(
+        """
+        INSERT INTO lcm_lifecycle_state(
+            conversation_id, current_session_id,
+            current_frontier_store_id, current_bound_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(conversation_id) DO UPDATE SET
+            current_session_id = excluded.current_session_id,
+            current_frontier_store_id = MAX(
+                lcm_lifecycle_state.current_frontier_store_id,
+                excluded.current_frontier_store_id
+            ),
+            current_bound_at = COALESCE(
+                lcm_lifecycle_state.current_bound_at,
+                excluded.current_bound_at
+            ),
+            updated_at = excluded.updated_at
+        """,
+        (
+            conversation_id,
+            session_id,
+            int(source_end_store_id),
+            now,
+            now,
+        ),
+    )
+    if callable(phase_hook):
+        phase_hook("after_lifecycle")
+
 
 def compute_source_identity_hash(
     conn: sqlite3.Connection,

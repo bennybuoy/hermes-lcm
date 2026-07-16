@@ -26,6 +26,7 @@ _CLI_MAX_OUTPUT_CHARS = 100_000
 _CLI_MAX_OUTPUT_NODES = 2_000
 _CLI_MAX_CONTAINER_ITEMS = 200
 _CLI_MAX_DEPTH = 8
+_FRONTIER_ITEMS_LIMIT = 1_000
 _CLI_TRUNCATED = "[TRUNCATED]"
 _CLI_REDACTED = "[REDACTED by hermes-lcm CLI]"
 # Redaction happens before serialization truncation. Bound every regex input,
@@ -320,8 +321,12 @@ def _messages(conn: sqlite3.Connection, args: argparse.Namespace) -> dict[str, A
     _require_table(conn, "messages")
     limit = _bounded_limit(args.limit)
     preview_chars = _bounded_preview_chars(args.preview_chars)
-    where = ["store_id > ?"]
-    values: list[Any] = [args.after_store_id]
+    if args.action == "tail":
+        where = ["store_id < ?"] if args.after_store_id > 0 else ["1=1"]
+        values: list[Any] = [args.after_store_id] if args.after_store_id > 0 else []
+    else:
+        where = ["store_id > ?"]
+        values = [args.after_store_id]
     if args.session_id:
         where.append("session_id = ?")
         values.append(args.session_id)
@@ -349,7 +354,12 @@ def _messages(conn: sqlite3.Connection, args: argparse.Namespace) -> dict[str, A
         "items": items,
         "limit": limit,
         "preview_only": not args.full,
-        "next_cursor": items[-1]["store_id"] if len(items) == limit else None,
+        "next_cursor": (
+            min(item["store_id"] for item in items)
+            if args.action == "tail" and len(items) == limit
+            else items[-1]["store_id"] if len(items) == limit
+            else None
+        ),
     }
 
 
@@ -416,14 +426,16 @@ def _frontier(conn: sqlite3.Connection, args: argparse.Namespace) -> dict[str, A
     if row is None:
         raise CliError("not found", EXIT_NOT_FOUND)
     payload = dict(row)
-    payload["items"] = [dict(item) for item in conn.execute(
+    item_rows = conn.execute(
         """
         SELECT ordinal, kind, ref_id, source_start, source_end
         FROM lcm_frontier_items WHERE conversation_id=? AND generation=?
-        ORDER BY ordinal
+        ORDER BY ordinal LIMIT ?
         """,
-        (payload["conversation_id"], payload["generation"]),
-    ).fetchall()]
+        (payload["conversation_id"], payload["generation"], _FRONTIER_ITEMS_LIMIT + 1),
+    ).fetchall()
+    payload["items_truncated"] = len(item_rows) > _FRONTIER_ITEMS_LIMIT
+    payload["items"] = [dict(item) for item in item_rows[:_FRONTIER_ITEMS_LIMIT]]
     return payload
 
 

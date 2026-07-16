@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
 import time
 
 import pytest
@@ -79,13 +84,13 @@ def test_full_sweep_builds_16_leaves_depth2_and_publishes_once(tmp_path, monkeyp
     engine = _engine(tmp_path)
     calls = _stub_summaries(monkeypatch, engine)
     publication_calls = []
-    original = engine._frontier.advance_frontier_generation_with_items
+    original = engine._frontier.publish_generation_state_no_commit
 
     def counted(*args, **kwargs):
         publication_calls.append((args, kwargs))
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(engine._frontier, "advance_frontier_generation_with_items", counted)
+    monkeypatch.setattr(engine._frontier, "publish_generation_state_no_commit", counted)
     try:
         result = engine.compress(_messages(20), current_tokens=1_900)
 
@@ -250,11 +255,7 @@ def test_full_sweep_ambiguous_post_publication_failure_returns_canonical_replace
     _stub_summaries(monkeypatch, engine)
     original = _messages(10)
 
-    def persist_failure():
-        raise RuntimeError("injected lifecycle failure")
-
-    monkeypatch.setattr(engine, "_persist_frontier_marker", persist_failure)
-    monkeypatch.setattr(engine._frontier, "rollback_frontier_generation", lambda *_: False)
+    engine._full_sweep_publish_failure_hook = "after_commit"
     try:
         result = engine.compress(original, current_tokens=1_900)
 
@@ -287,3 +288,139 @@ def test_full_sweep_pass_bound_is_hard(tmp_path, monkeypatch, max_passes):
         assert engine._last_full_sweep_status["passes"] <= max_passes
     finally:
         engine.shutdown()
+
+
+def test_full_sweep_revalidates_exact_sources_and_settles_base_batches(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    _stub_summaries(monkeypatch, engine)
+    messages = _messages(10)
+    engine.ingest(messages)
+    engine._frontier.ensure_frontier(
+        "sweep-conversation", "sweep-session", source_end_store_id=0
+    )
+    stored = engine._store.get_session_messages("sweep-session")
+    source_ids = [int(row["store_id"]) for row in stored[:-2] if row["role"] != "system"]
+    batch_id, _ = engine._frontier.create_batch_cas(
+        conversation_id="sweep-conversation",
+        session_id="sweep-session",
+        base_generation=1,
+        source_end_store_id=max(source_ids),
+        source_identity_hash="stale",
+        source_ids=source_ids,
+        policy_fingerprint="",
+        route_fingerprint="",
+    )
+    assert batch_id > 0
+    try:
+        engine.compress(messages, current_tokens=1_900)
+        active = engine._frontier.get_active_frontier("sweep-conversation")
+        lifecycle = engine._lifecycle.get_by_conversation("sweep-conversation")
+        batch = engine._frontier.get_batch(batch_id)
+        assert active is not None and lifecycle is not None and batch is not None
+        assert batch.state == "superseded"
+        assert lifecycle.current_frontier_store_id == active["source_end_store_id"]
+    finally:
+        engine.shutdown()
+
+
+def test_full_sweep_rejects_source_rewrite_between_summary_and_publication(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    _stub_summaries(monkeypatch, engine)
+    original_identity = engine._foreground_source_identity_for_messages
+    rewritten = {"done": False}
+
+    def identity_then_rewrite(messages, source_ids):
+        identity = original_identity(messages, source_ids)
+        if not rewritten["done"]:
+            rewritten["done"] = True
+            engine._store._conn.execute(
+                "UPDATE messages SET content='concurrent rewrite' WHERE store_id=?",
+                (int(source_ids[0]),),
+            )
+            engine._store._conn.commit()
+        return identity
+
+    monkeypatch.setattr(
+        engine, "_foreground_source_identity_for_messages", identity_then_rewrite
+    )
+    try:
+        engine.compress(_messages(10), current_tokens=1_900)
+        assert engine._dag.get_session_node_count("sweep-session") == 0
+        assert engine._frontier.get_active_frontier("sweep-conversation")["generation"] == 1
+        assert engine._last_full_sweep_status["publication_count"] == 0
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_generation"),
+    [("after_nodes", 1), ("after_commit", 2)],
+)
+def test_full_sweep_process_death_restarts_at_wholly_old_or_new_state(
+    tmp_path, phase, expected_generation
+):
+    db_path = tmp_path / f"sweep-crash-{phase}.db"
+    script = r'''
+import os, sys
+from hermes_lcm.config import LCMConfig
+from hermes_lcm.engine import LCMEngine
+import hermes_lcm.sweep as sweep_module
+
+engine = LCMEngine(config=LCMConfig(
+    database_path=sys.argv[1], fresh_tail_count=2, leaf_chunk_tokens=32,
+    condensation_fanin=4, condensation_min_fanin=2, incremental_max_depth=3,
+    full_sweep_compaction_enabled=True, full_sweep_max_passes=64,
+    full_sweep_deadline_seconds=30.0, summary_prefix_target_tokens=8,
+    context_threshold=0.10,
+))
+engine.on_session_start('sweep-session', conversation_id='sweep-conversation', platform='test', context_length=2000)
+def leaf(chunk, focus_topic=None, timeout_seconds=None):
+    return list(chunk), 100, 'crash-safe-sweep-summary', 1, 1
+engine._summarize_leaf_chunk_with_rescue = leaf
+sweep_module.summarize_with_escalation = lambda **kwargs: ('crash-safe-parent', 1)
+engine._full_sweep_publish_crash_hook = sys.argv[2]
+messages = [{'role':'system','content':'anchor'}] + [
+    {'role':'user' if i % 2 == 0 else 'assistant', 'content':f'turn {i} ' + 'payload '*24}
+    for i in range(10)
+]
+engine.compress(messages, current_tokens=1900)
+raise SystemExit('crash hook did not fire')
+'''
+    package_root = tmp_path / f"package-{phase}"
+    package_root.mkdir()
+    (package_root / "hermes_lcm").symlink_to(Path(__file__).resolve().parents[1])
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(package_root), "/home/ben/hermes-agent-gil-pr"]
+    )
+    crashed = subprocess.run(
+        [sys.executable, "-c", script, str(db_path), phase],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    assert crashed.returncode == 90, (crashed.stdout, crashed.stderr)
+    conn = sqlite3.connect(db_path)
+    active = conn.execute(
+        """SELECT generation, source_end_store_id FROM lcm_active_frontiers
+           WHERE conversation_id='sweep-conversation' ORDER BY generation DESC LIMIT 1"""
+    ).fetchone()
+    node_count = conn.execute("SELECT COUNT(*) FROM summary_nodes").fetchone()[0]
+    lifecycle = conn.execute(
+        """SELECT current_frontier_store_id FROM lcm_lifecycle_state
+           WHERE conversation_id='sweep-conversation'"""
+    ).fetchone()
+    conn.close()
+    assert active[0] == expected_generation
+    if phase == "after_nodes":
+        assert node_count == 0
+        assert lifecycle[0] == 0
+    else:
+        assert node_count > 0
+        assert lifecycle[0] == active[1]
