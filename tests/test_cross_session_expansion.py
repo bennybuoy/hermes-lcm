@@ -802,3 +802,65 @@ def test_1600_node_adversarial_provenance_is_bounded_deadline_aware_and_fail_clo
         assert get_node_calls["count"] <= 10_000
     finally:
         engine.shutdown()
+
+
+@pytest.mark.parametrize("oversized_location", ["explicit", "descendant"])
+def test_cross_session_lineage_is_length_guarded_before_python_materialization(
+    tmp_path, monkeypatch, oversized_location
+):
+    engine = _engine(tmp_path, max_sessions=2, per_session=2)
+    raw_id = engine._store.append(
+        "archive", {"role": "user", "content": "bounded lineage evidence"}
+    )
+    leaf_id = engine._dag.add_node(SummaryNode(
+        session_id="archive",
+        depth=0,
+        summary="lineage canary leaf",
+        token_count=1,
+        source_token_count=1,
+        source_ids=[raw_id],
+        source_type="messages",
+        created_at=1,
+    ))
+    root_id = leaf_id
+    if oversized_location == "descendant":
+        root_id = engine._dag.add_node(SummaryNode(
+            session_id="archive",
+            depth=1,
+            summary="lineage canary root",
+            token_count=1,
+            source_token_count=1,
+            source_ids=[leaf_id],
+            source_type="nodes",
+            created_at=2,
+        ))
+    poisoned_id = root_id if oversized_location == "explicit" else leaf_id
+    engine._dag._conn.execute(
+        "UPDATE summary_nodes SET source_ids=? WHERE node_id=?",
+        ("[" + ("1," * 1_000_000) + "1]", poisoned_id),
+    )
+    engine._dag._conn.commit()
+    original_row_to_node = engine._dag._row_to_node
+
+    def guarded_row_to_node(row):
+        if row is not None and len(row) > 6 and isinstance(row[6], str) and len(row[6]) > 128_000:
+            raise AssertionError("2MB source_ids reached Python materialization")
+        return original_row_to_node(row)
+
+    monkeypatch.setattr(engine._dag, "_row_to_node", guarded_row_to_node)
+    statements: list[str] = []
+    engine._dag._conn.set_trace_callback(statements.append)
+    try:
+        result = json.loads(_invoke(
+            engine,
+            _args(query="", node_ids=[root_id], deadline_ms=1_000),
+            session_ids=["archive"],
+        ))
+        assert result.get("authorization_truncated") is True or "source_ids" in result.get("error", "")
+        selects = [s.upper() for s in statements if "SUMMARY_NODES" in s.upper()]
+        assert selects
+        assert all("SELECT *" not in s and "SELECT N.*" not in s for s in selects)
+        assert any("LENGTH(CAST" in s and "SUBSTR" in s for s in selects)
+    finally:
+        engine._dag._conn.set_trace_callback(None)
+        engine.shutdown()

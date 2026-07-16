@@ -17,6 +17,7 @@ import hermes_lcm.tools as tools_module
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
+from hermes_lcm.externalize import externalize_ingest_payload
 from hermes_lcm.maintenance import (
     _source_inventory,
     apply_dag_maintenance,
@@ -343,6 +344,99 @@ def test_restart_reconciliation_computes_each_identity_once_under_one_budget(
         assert active_calls == {id(message): 1 for message in messages}
         assert stored_calls == {1: 1, 2: 1, 3: 1}
         assert len(budget_ids) == 1
+    finally:
+        engine.shutdown()
+
+
+def test_restart_reconciliation_sql_bounds_tail_before_python_materialization(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": "small"},
+        conversation_id="conversation",
+    )
+    engine._store._conn.execute(
+        "UPDATE messages SET content=? WHERE store_id=?",
+        ("restart-tail-canary-" + ("x" * 1_000_000), store_id),
+    )
+    engine._store._conn.commit()
+    monkeypatch.setattr(
+        engine,
+        "_new_locked_publication_read_budget",
+        lambda: {
+            "rows": 0, "bytes": 0, "files": 0,
+            "max_rows": 8, "max_bytes": 512, "max_files": 8,
+            "deadline_at": 1e30,
+        },
+    )
+    monkeypatch.setattr(
+        engine._store,
+        "get_session_tail",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("restart reconciliation used unbounded tail loading")
+        ),
+    )
+    monkeypatch.setattr(
+        engine._store,
+        "get_session_messages",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("restart reconciliation used unbounded head loading")
+        ),
+    )
+    original_identity = engine._message_replay_identity
+
+    def guarded_identity(row, *args, **kwargs):
+        if kwargs.get("stored_row") and len(str(row.get("content") or "")) > 128:
+            raise AssertionError("oversized restart row reached Python identity mapping")
+        return original_identity(row, *args, **kwargs)
+
+    monkeypatch.setattr(engine, "_message_replay_identity", guarded_identity)
+    statements: list[str] = []
+    engine._store._conn.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(RuntimeError, match="byte bound"):
+            engine._reconcile_ingest_cursor_from_store(
+                [{"role": "user", "content": "incoming"}]
+            )
+        selects = [s.upper() for s in statements if "FROM MESSAGES" in s.upper()]
+        assert any("LENGTH(CAST" in s for s in selects)
+        assert all("SELECT STORE_ID, SESSION_ID, SOURCE, ROLE, CONTENT" not in s for s in selects)
+    finally:
+        engine._store._conn.set_trace_callback(None)
+        engine.shutdown()
+
+
+def test_reconciliation_ingest_placeholder_restoration_uses_shared_budget(
+    tmp_path
+):
+    engine = _engine(tmp_path)
+    externalized = externalize_ingest_payload(
+        "I" * 1_000_000,
+        role="user",
+        session_id="current",
+        field_path="content",
+        config=engine._config,
+        hermes_home=engine._hermes_home,
+    )
+    assert externalized is not None
+    budget = {
+        "rows": 0, "bytes": 0, "files": 0,
+        "max_rows": 8, "max_bytes": 128, "max_files": 8,
+        "deadline_at": 1e30,
+    }
+    try:
+        with pytest.raises(RuntimeError, match="byte bound"):
+            engine._message_replay_identity(
+                {
+                    "session_id": "current",
+                    "role": "user",
+                    "content": externalized["placeholder"],
+                },
+                stored_row=True,
+                read_budget=budget,
+            )
+        assert budget["bytes"] <= budget["max_bytes"]
     finally:
         engine.shutdown()
 
@@ -928,6 +1022,50 @@ def test_rollover_matched_prefix_preflights_huge_unmatched_suffix_and_rolls_back
         engine.shutdown()
 
 
+def test_rollover_matched_ingest_placeholder_uses_budget_before_expansion(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    externalized = externalize_ingest_payload(
+        "R" * 1_000_000,
+        role="user",
+        session_id="current",
+        field_path="content",
+        config=engine._config,
+        hermes_home=engine._hermes_home,
+    )
+    assert externalized is not None
+    placeholder = externalized["placeholder"]
+    engine._store.append(
+        "current", {"role": "user", "content": placeholder},
+        conversation_id="conversation",
+    )
+    resolver_budget = {
+        "rows": 0, "bytes": 0, "files": 0,
+        "max_rows": 8, "max_bytes": 128, "max_files": 8,
+        "deadline_at": 1e30,
+    }
+    with pytest.raises(RuntimeError, match="byte bound"):
+        engine._session_end_prefix_compare_value(
+            placeholder,
+            session_id="current",
+            read_budget=resolver_budget,
+        )
+    assert resolver_budget["bytes"] <= resolver_budget["max_bytes"]
+    monkeypatch.setattr(engine_module, "_PUBLICATION_LOCKED_MAX_SERIALIZED_BYTES", 128)
+    before = engine._store.get_session_messages("current")
+    try:
+        with pytest.raises(RuntimeError, match="byte bound"):
+            engine.rollover_session(
+                "current", "next", previous_messages=[{"role": "user", "content": placeholder}]
+            )
+        assert engine.current_session_id == "current"
+        assert engine._store.get_session_messages("current") == before
+        assert engine._store.get_session_count("next") == 0
+    finally:
+        engine.shutdown()
+
+
 def test_rollover_unmatched_persisted_output_expansion_aborts_losslessly(
     tmp_path, monkeypatch
 ):
@@ -1050,6 +1188,31 @@ def test_load_session_redacts_secret_spanning_requested_content_boundary(tmp_pat
         assert "github_pat" not in returned
         assert "LCM sens" in returned
         assert len(returned) <= max_chars
+    finally:
+        engine.shutdown()
+
+
+def test_load_session_redaction_shortening_preserves_source_truncation_metadata(
+    tmp_path
+):
+    engine = _engine(tmp_path)
+    secret = "sk-proj-" + ("S" * 1_000)
+    content = "prefix " + secret + " suffix " + ("x" * 10_000)
+    engine._store.append("current", {"role": "user", "content": content})
+    try:
+        response = json.loads(engine.handle_tool_call(
+            "lcm_load_session",
+            {"session_id": "current", "limit": 1, "max_content_chars": 128},
+        ))
+        item = response["messages"][0]
+        assert secret not in item["content"]
+        assert "sk-proj-" not in item["content"]
+        assert item["content_redacted"] is True
+        assert item["content_source_truncated"] is True
+        assert item["content_truncated"] is True
+        assert item["content_returned_chars"] == len(item["content"])
+        assert item["content_returned_chars"] <= item["content_chars"] == len(content)
+        assert item["serialized_truncated"] is True
     finally:
         engine.shutdown()
 

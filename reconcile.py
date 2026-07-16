@@ -267,8 +267,11 @@ class ReconcileMixin:
             content = self._restore_ingest_payload_placeholders_in_content_identity(
                 content,
                 session_id=session_id,
+                read_budget=read_budget,
             )
-            tool_calls = self._restore_ingest_payload_placeholders_in_value(tool_calls, session_id=session_id)
+            tool_calls = self._restore_ingest_payload_placeholders_in_value(
+                tool_calls, session_id=session_id, read_budget=read_budget
+            )
         ref = extract_externalized_ref(content)
         if ref and "quarantined_assistant_output" not in content:
             payload = load_externalized_payload(
@@ -642,7 +645,9 @@ class ReconcileMixin:
             self._check_reconciliation_deadline(budget)
             identity = identity_for(msg)
             is_scaffold = self._is_replayed_context_scaffold_message(msg)
-            is_visible = not is_scaffold and not self._matches_ignore_message_patterns(msg)
+            is_visible = not is_scaffold and not self._matches_ignore_message_patterns(
+                msg, read_budget=budget
+            )
             text = text_content_for_pattern_matching(msg.get("content")) or ""
             is_quarantined_identity = self._is_quarantined_assistant_replay_identity(identity)
             is_filtered_placeholder = False
@@ -653,7 +658,9 @@ class ReconcileMixin:
                     or (
                         self._compiled_ignore_message_patterns
                         and is_quarantined_identity
-                        and self._matches_ignore_message_patterns(msg, stored_row=True)
+                        and self._matches_ignore_message_patterns(
+                            msg, stored_row=True, read_budget=budget
+                        )
                     )
                 )
                 visible_messages.append(msg)
@@ -838,7 +845,7 @@ class ReconcileMixin:
                             self._compiled_ignore_message_patterns
                             and self._is_quarantined_assistant_replay_identity(identity)
                             and self._matches_ignore_message_patterns(
-                                msg, stored_row=True
+                                msg, stored_row=True, read_budget=budget
                             )
                         )
                     )
@@ -1070,6 +1077,7 @@ class ReconcileMixin:
         messages: List[Dict[str, Any]],
         *,
         active_identities: dict[int, tuple[str, str, str, str]] | None = None,
+        read_budget: dict[str, float | int] | None = None,
     ) -> list[tuple[str, str, str, str]]:
         return [
             (
@@ -1079,7 +1087,9 @@ class ReconcileMixin:
             )
             for msg in messages
             if not self._is_replayed_context_scaffold_message(msg)
-            and not self._matches_ignore_message_patterns(msg)
+            and not self._matches_ignore_message_patterns(
+                msg, read_budget=read_budget
+            )
         ]
 
     def _is_suspicious_stale_no_overlap_snapshot(
@@ -1163,22 +1173,25 @@ class ReconcileMixin:
         def stored_identity(row: Dict[str, Any]) -> tuple[str, str, str, str]:
             store_id = int(row.get("store_id") or 0)
             if store_id not in stored_identity_cache:
-                self._charge_reconciliation_active_message(
-                    row, read_budget=read_budget
-                )
                 stored_identity_cache[store_id] = self._message_replay_identity(
                     row, stored_row=True, read_budget=read_budget
                 )
             return stored_identity_cache[store_id]
 
         tail_limit = min(max(len(messages) * 4, 64), session_count)
-        stored_rows = self._store.get_session_tail(self._session_id, limit=tail_limit)
+        stored_rows = self._bounded_reconciliation_session_rows(
+            limit=tail_limit,
+            tail=True,
+            read_budget=read_budget,
+        )
         if not stored_rows:
             return 0
         stored_tail_rows = [
             row
             for row in stored_rows
-            if not self._matches_ignore_message_patterns(row, stored_row=True)
+            if not self._matches_ignore_message_patterns(
+                row, stored_row=True, read_budget=read_budget
+            )
         ]
         stored_tail = [
             stored_identity(row)
@@ -1198,7 +1211,9 @@ class ReconcileMixin:
             reason = (
                 "skipped scaffold-only prefix"
                 if not self._effective_replay_identities(
-                    messages[:cursor], active_identities=active_identities
+                    messages[:cursor],
+                    active_identities=active_identities,
+                    read_budget=read_budget,
                 )
                 else "replayed durable tail"
             )
@@ -1211,7 +1226,9 @@ class ReconcileMixin:
                 stored_tail_count=len(stored_tail),
                 effective_incoming=len(
                     self._effective_replay_identities(
-                        messages, active_identities=active_identities
+                        messages,
+                        active_identities=active_identities,
+                        read_budget=read_budget,
                     )
                 ),
             )
@@ -1227,11 +1244,14 @@ class ReconcileMixin:
             return cursor
 
         incoming_identities = self._effective_replay_identities(
-            messages, active_identities=active_identities
+            messages,
+            active_identities=active_identities,
+            read_budget=read_budget,
         )
-        stored_head_rows = self._store.get_session_messages(
-            self._session_id,
+        stored_head_rows = self._bounded_reconciliation_session_rows(
             limit=tail_limit,
+            tail=False,
+            read_budget=read_budget,
         )
         stored_head = [stored_identity(row) for row in stored_head_rows]
         # Stale-snapshot proof uses the raw durable prefix.  Ignore-message
@@ -1384,6 +1404,138 @@ class ReconcileMixin:
             serialized_bytes=encoded_bytes + 32,
             label="source reconciliation",
         )
+
+    def _bounded_reconciliation_session_rows(
+        self,
+        *,
+        limit: int,
+        tail: bool,
+        read_budget: dict[str, float | int],
+    ) -> list[Dict[str, Any]]:
+        """Read a durable session head/tail without materializing unchecked fields."""
+        if limit <= 0:
+            return []
+        text_fields = (
+            "session_id", "source", "role", "content", "tool_call_id",
+            "tool_calls", "tool_name", "conversation_id",
+        )
+        field_limit = min(
+            _RECONCILIATION_MAX_FIELD_BYTES,
+            int(read_budget["max_bytes"]),
+        )
+        length_exprs = [
+            f"COALESCE(length(CAST({field} AS BLOB)), 0)"
+            for field in text_fields
+        ]
+        direction = "DESC" if tail else "ASC"
+        cursor = (1 << 63) - 1 if tail else 0
+        rows_out: list[Dict[str, Any]] = []
+        while len(rows_out) < int(limit):
+            self._check_reconciliation_deadline(read_budget)
+            remaining_rows = int(read_budget["max_rows"]) - int(read_budget["rows"])
+            remaining_bytes = int(read_budget["max_bytes"]) - int(read_budget["bytes"])
+            if remaining_rows <= 0:
+                raise RuntimeError("source reconciliation row bound exceeded")
+            if remaining_bytes <= 128:
+                raise RuntimeError("source reconciliation serialized byte bound exceeded")
+            page_limit = min(
+                _RECONCILIATION_QUERY_BATCH,
+                int(limit) - len(rows_out),
+                remaining_rows + 1,
+            )
+            comparison = "<" if tail else ">"
+            metadata_rows = self._store._conn.execute(
+                f"""SELECT
+                           CASE WHEN typeof(store_id) = 'integer' THEN store_id END,
+                           CASE WHEN typeof(timestamp) IN ('integer', 'real') THEN timestamp END,
+                           CASE WHEN typeof(token_estimate) = 'integer' THEN token_estimate END,
+                           CASE WHEN typeof(pinned) = 'integer' THEN pinned END,
+                           {', '.join(length_exprs)},
+                           {', '.join(f"typeof({field}) IN ('text', 'null')" for field in text_fields)}
+                    FROM messages
+                    WHERE session_id = ? AND store_id {comparison} ?
+                    ORDER BY store_id {direction} LIMIT ?""",
+                (self._session_id, cursor, page_limit),
+            ).fetchall()
+            if not metadata_rows:
+                break
+            for metadata in metadata_rows:
+                self._check_reconciliation_deadline(read_budget)
+                if any(value is None for value in metadata[:4]) or not all(
+                    bool(value) for value in metadata[12:20]
+                ):
+                    raise RuntimeError("source reconciliation field type bound exceeded")
+                encoded_lengths = [int(value or 0) for value in metadata[4:12]]
+                row_bytes = sum(encoded_lengths) + 128
+                if any(length > field_limit for length in encoded_lengths):
+                    raise RuntimeError("source reconciliation field byte bound exceeded")
+                if row_bytes > remaining_bytes:
+                    raise RuntimeError("source reconciliation serialized byte bound exceeded")
+                self._charge_locked_publication_read(
+                    read_budget,
+                    rows=1,
+                    serialized_bytes=row_bytes,
+                    label="source reconciliation",
+                )
+                guarded_fields = [
+                    f"CASE WHEN {field} IS NULL THEN NULL "
+                    f"WHEN typeof({field}) = 'text' AND {length_exprs[index]} = ? "
+                    f"AND {length_exprs[index]} <= {field_limit} "
+                    f"THEN substr(CAST({field} AS TEXT), 1, {field_limit + 1}) END"
+                    for index, field in enumerate(text_fields)
+                ]
+                payload = self._store._conn.execute(
+                    f"""SELECT
+                               CASE WHEN typeof(store_id) = 'integer' THEN store_id END,
+                               {', '.join(guarded_fields[:7])},
+                               CASE WHEN typeof(timestamp) IN ('integer', 'real') THEN timestamp END,
+                               CASE WHEN typeof(token_estimate) = 'integer' THEN token_estimate END,
+                               CASE WHEN typeof(pinned) = 'integer' THEN pinned END,
+                               {guarded_fields[7]},
+                               {', '.join(length_exprs)},
+                               {', '.join(f"typeof({field}) IN ('text', 'null')" for field in text_fields)}
+                        FROM messages
+                        WHERE session_id = ? AND store_id = ?
+                          AND timestamp IS ? AND token_estimate IS ? AND pinned IS ?
+                        LIMIT 1""",
+                    (
+                        *encoded_lengths,
+                        self._session_id,
+                        int(metadata[0]),
+                        metadata[1], metadata[2], metadata[3],
+                    ),
+                ).fetchone()
+                if payload is None or any(payload[index] is None for index in (0, 8, 9, 10)):
+                    raise RuntimeError("source reconciliation stored row changed during bounded read")
+                if [int(value or 0) for value in payload[12:20]] != encoded_lengths or not all(
+                    bool(value) for value in payload[20:28]
+                ):
+                    raise RuntimeError("source reconciliation stored row changed during bounded read")
+                item = dict(zip(
+                    (
+                        "store_id", "session_id", "source", "role", "content",
+                        "tool_call_id", "tool_calls", "tool_name", "timestamp",
+                        "token_estimate", "pinned", "conversation_id",
+                    ),
+                    payload[:12],
+                ))
+                for value in item.values():
+                    self._guard_reconciliation_nested_representation(
+                        value, read_budget=read_budget
+                    )
+                if item.get("tool_calls"):
+                    try:
+                        item["tool_calls"] = json.loads(item["tool_calls"])
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        pass
+                rows_out.append(item)
+                cursor = int(metadata[0])
+                remaining_bytes = int(read_budget["max_bytes"]) - int(read_budget["bytes"])
+            if len(metadata_rows) < page_limit:
+                break
+        if tail:
+            rows_out.reverse()
+        return rows_out
 
     def _bounded_reconciliation_candidates(
         self,

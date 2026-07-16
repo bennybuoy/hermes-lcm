@@ -354,6 +354,39 @@ class SummaryDAG:
         ).fetchone()
         return self._row_to_node(row) if row else None
 
+    def get_node_for_cross_session_authorization(
+        self, node_id: int
+    ) -> Optional[SummaryNode]:
+        """Load an explicit archive candidate with lineage guarded in SQLite."""
+        row = self._conn.execute(
+            f"""SELECT node_id, session_id, depth, summary, token_count,
+                       source_token_count,
+                       COALESCE(length(CAST(source_ids AS BLOB)), 0),
+                       CASE
+                         WHEN typeof(source_ids) = 'text'
+                          AND COALESCE(length(CAST(source_ids AS BLOB)), 0) <= ?
+                         THEN substr(CAST(source_ids AS TEXT), 1, ?)
+                       END,
+                       source_type, created_at, earliest_at, latest_at, expand_hint
+                FROM summary_nodes WHERE node_id = ?""",
+            (
+                MAX_SOURCE_IDS_JSON_CHARS,
+                MAX_SOURCE_IDS_JSON_CHARS + 1,
+                node_id,
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        raw_bytes = int(row[6] or 0)
+        raw_source_ids = row[7]
+        if raw_bytes > MAX_SOURCE_IDS_JSON_CHARS or raw_source_ids is None:
+            raise ValueError("source_ids encoded-size hard cap exceeded")
+        bounded_row = (
+            row[0], row[1], row[2], row[3], row[4], row[5], raw_source_ids,
+            row[8], row[9], row[10], row[11], row[12],
+        )
+        return self._row_to_node(bounded_row)
+
     def get_session_nodes(self, session_id: str,
                           depth: int | None = None,
                           limit: int = 1000) -> List[SummaryNode]:

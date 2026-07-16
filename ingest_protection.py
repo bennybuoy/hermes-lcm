@@ -1081,6 +1081,10 @@ def restore_ingest_payload_placeholders(
     config,
     hermes_home: str = "",
     session_id: str = "",
+    read_budget: dict[str, float | int] | None = None,
+    budget_label: str = "ingest payload restoration",
+    max_nested_depth: int = 32,
+    max_nested_items: int = 20_000,
 ) -> str:
     """Restore ingest placeholders in a stored identity string for matching only.
 
@@ -1092,7 +1096,15 @@ def restore_ingest_payload_placeholders(
 
     def replace(match: re.Match[str]) -> str:
         ref = match.group(1).strip()
-        payload = load_externalized_payload(ref, config=config, hermes_home=hermes_home)
+        payload = load_externalized_payload(
+            ref,
+            config=config,
+            hermes_home=hermes_home,
+            read_budget=read_budget,
+            budget_label=budget_label,
+            max_nested_depth=max_nested_depth,
+            max_nested_items=max_nested_items,
+        )
         if payload is None or payload.get("kind") != "ingest_payload":
             return match.group(0)
         payload_session_id = payload.get("session_id") or ""

@@ -1372,6 +1372,30 @@ def _bounded_cross_session_text(
     return text, truncated or token_truncated
 
 
+def _grep_safe_text(value: Any, *, max_chars: int) -> str:
+    """Mandatory-redact one grep response field before its output bound."""
+    return _bounded_cross_session_text(
+        value,
+        None,
+        max_tokens=max(1, max_chars * 2),
+        max_chars=max_chars,
+    )[0]
+
+
+def _mandatory_redact_grep_response(value: Any) -> Any:
+    """Fail-safe final boundary: no credential may survive in any grep field."""
+    if isinstance(value, str):
+        return redact_sensitive_output_text(value)
+    if isinstance(value, list):
+        return [_mandatory_redact_grep_response(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _mandatory_redact_grep_response(item)
+            for key, item in value.items()
+        }
+    return value
+
+
 def _authorize_node_provenance_bounded(
     engine: "LCMEngine",
     candidates: list[Any],
@@ -1451,18 +1475,30 @@ def _authorize_node_provenance_bounded(
             missing_ids = missing_ids[:remaining_nodes]
             placeholders = ",".join("?" for _ in missing_ids)
             rows = engine._dag._conn.execute(
-                f"""SELECT node_id, session_id, source_ids, source_type
+                f"""SELECT node_id, session_id,
+                           COALESCE(length(CAST(source_ids AS BLOB)), 0),
+                           CASE
+                             WHEN typeof(source_ids) = 'text'
+                              AND COALESCE(length(CAST(source_ids AS BLOB)), 0) <= ?
+                             THEN substr(CAST(source_ids AS TEXT), 1, ?)
+                           END,
+                           source_type
                     FROM summary_nodes WHERE node_id IN ({placeholders})""",
-                missing_ids,
+                [
+                    MAX_SOURCE_IDS_JSON_CHARS,
+                    MAX_SOURCE_IDS_JSON_CHARS + 1,
+                    *missing_ids,
+                ],
             ).fetchall()
             found_ids: set[int] = set()
             for row in rows:
                 found_id = int(row[0])
                 found_ids.add(found_id)
-                raw_source_ids = row[2] or "[]"
+                raw_source_ids_bytes = int(row[2] or 0)
+                raw_source_ids = row[3]
                 encoded_too_large = (
-                    not isinstance(raw_source_ids, str)
-                    or len(raw_source_ids) > MAX_SOURCE_IDS_JSON_CHARS
+                    raw_source_ids_bytes > MAX_SOURCE_IDS_JSON_CHARS
+                    or not isinstance(raw_source_ids, str)
                 )
                 edge_count = (
                     raw_source_ids.strip().count(",") + 1
@@ -1491,7 +1527,7 @@ def _authorize_node_provenance_bounded(
                         source_ids = []
                         incomplete.add(found_id)
                 graph[found_id] = (
-                    str(row[1] or ""), str(row[3] or ""), source_ids
+                    str(row[1] or ""), str(row[4] or ""), source_ids
                 )
             for missing_id in set(missing_ids) - found_ids:
                 graph[missing_id] = None
@@ -1851,7 +1887,9 @@ def _cross_session_expand_query(
                 except (TypeError, ValueError):
                     return json.dumps({"error": "node_ids must contain only integers"})
                 try:
-                    node = engine._dag.get_node(node_id)
+                    node = engine._dag.get_node_for_cross_session_authorization(
+                        node_id
+                    )
                 except ValueError:
                     return json.dumps({
                         "error": "node source_ids exceed authorization bounds",
@@ -2166,19 +2204,52 @@ def _parse_load_session_roles(value: Any) -> tuple[list[str], str | None]:
     return roles, None
 
 
-def _slice_loaded_content(content: Any, max_content_chars: int) -> dict[str, Any]:
-    text = str(content or "")
-    sliced, has_more = _bounded_cross_session_text(
-        text,
-        None,
-        max_tokens=max(1, max_content_chars * 2),
-        max_chars=max_content_chars,
+def _slice_loaded_content(
+    content: Any,
+    max_content_chars: int,
+    *,
+    source_content_chars: int | None = None,
+) -> dict[str, Any]:
+    raw_text = str(content or "")
+    total_source_chars = (
+        int(source_content_chars)
+        if isinstance(source_content_chars, int) and source_content_chars >= 0
+        else len(raw_text)
     )
+    source_truncated = total_source_chars > len(raw_text)
+    text = redact_sensitive_output_text(raw_text)
+    content_redacted = text != raw_text
+    pem_begin = _BOUNDARY_PRIVATE_KEY_BEGIN_RE.search(text)
+    if pem_begin is not None:
+        text = (
+            text[:pem_begin.start()]
+            + "[LCM sensitive redaction: name=private_key; boundary-truncated]"
+        )
+        content_redacted = True
+    text, boundary_credential_count = _BOUNDARY_STANDALONE_CREDENTIAL_RE.subn(
+        "[LCM sensitive redaction: name=standalone_credential; boundary-truncated]",
+        text,
+    )
+    content_redacted = content_redacted or bool(boundary_credential_count)
+    # A mandatory-redaction marker can be longer than a short credential. Keep
+    # returned/source counts ordered by fitting the visible representation to
+    # both the caller cap and the original source character count.
+    visible_limit = min(max(0, int(max_content_chars)), total_source_chars)
+    output_truncated = len(text) > visible_limit
+    sliced = text[:visible_limit]
+    sliced, token_truncated = _truncate_text_to_token_budget(
+        sliced, max(1, max_content_chars * 2)
+    )
+    output_truncated = output_truncated or token_truncated
+    has_more = source_truncated or output_truncated
     return {
         "content": sliced,
-        "content_chars": len(text),
+        "content_chars": total_source_chars,
         "content_returned_chars": len(sliced),
         "content_truncated": has_more,
+        "content_source_truncated": source_truncated,
+        "content_output_truncated": output_truncated,
+        "content_redacted": content_redacted,
         "next_content_offset": len(sliced) if has_more else 0,
     }
 
@@ -2253,15 +2324,16 @@ def _bounded_loaded_nested_value(
 
 def _serialize_loaded_message(engine: "LCMEngine", row: dict[str, Any], max_content_chars: int) -> dict[str, Any]:
     stored_session_id = row.get("session_id", "")
-    content_slice = _slice_loaded_content(row.get("content", "") or "", max_content_chars)
     stored_content_chars = row.get("content_chars")
-    if isinstance(stored_content_chars, int) and stored_content_chars >= 0:
-        returned_chars = len(content_slice["content"])
-        content_slice["content_chars"] = stored_content_chars
-        content_slice["content_truncated"] = stored_content_chars > returned_chars
-        content_slice["next_content_offset"] = (
-            returned_chars if stored_content_chars > returned_chars else 0
-        )
+    content_slice = _slice_loaded_content(
+        row.get("content", "") or "",
+        max_content_chars,
+        source_content_chars=(
+            stored_content_chars
+            if isinstance(stored_content_chars, int) and stored_content_chars >= 0
+            else None
+        ),
+    )
     safe_session_id, _ = _bounded_cross_session_text(
         stored_session_id, None, max_tokens=512, max_chars=512
     )
@@ -2281,6 +2353,9 @@ def _serialize_loaded_message(engine: "LCMEngine", row: dict[str, Any], max_cont
         "content_chars": content_slice["content_chars"],
         "content_returned_chars": content_slice["content_returned_chars"],
         "content_truncated": content_slice["content_truncated"],
+        "content_source_truncated": content_slice["content_source_truncated"],
+        "content_output_truncated": content_slice["content_output_truncated"],
+        "content_redacted": content_slice["content_redacted"],
         "next_content_offset": content_slice["next_content_offset"],
         "from_current_session": bool(engine.current_session_id) and stored_session_id == engine.current_session_id,
     }
@@ -2668,11 +2743,16 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                     "depth": "raw",
                     "store_id": hit["store_id"],
                     "session_id": hit["session_id"],
-                    "source": hit.get("source") or "",
+                    "source": _grep_safe_text(
+                        hit.get("source") or "", max_chars=512
+                    ),
                     "conversation_id": hit.get("conversation_id") or "",
                     "role": hit["role"],
                     "timestamp": timestamp_value,
-                    "snippet": hit.get("snippet", hit.get("content", "")[:200]),
+                    "snippet": _grep_safe_text(
+                        hit.get("snippet", hit.get("content", "")),
+                        max_chars=300,
+                    ),
                     "from_current_session": has_current_session and hit["session_id"] == current_session_id,
                     "_sort_ts": timestamp_value,
                     "_sort_rank": hit.get("search_rank"),
@@ -2708,7 +2788,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                         "depth": f"d{node.depth}",
                         "node_id": node.node_id,
                         "session_id": node.session_id,
-                        "snippet": node.summary[:300],
+                        "snippet": _grep_safe_text(node.summary, max_chars=300),
                         "token_count": node.token_count,
                         "expand_hint": node.expand_hint,
                         "earliest_at": node.earliest_at,
@@ -2800,7 +2880,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
             "Unsupported session_scope; stayed on current. "
             "Valid values: current, all, session."
         )
-    return json.dumps(response)
+    return json.dumps(_mandatory_redact_grep_response(response))
 
 
 def lcm_describe(args: Dict[str, Any], **kwargs) -> str:

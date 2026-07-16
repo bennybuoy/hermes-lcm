@@ -1084,6 +1084,46 @@ def test_cross_session_grep_and_store_expand_require_host_capability(tmp_path):
         engine.shutdown()
 
 
+def test_grep_mandatory_redacts_current_and_authorized_cross_session_fields(tmp_path):
+    engine = _engine(tmp_path)
+    token = "sk-proj-" + ("A" * 48)
+    current_id = engine._store.append(
+        "current",
+        {"role": "user", "content": f"credential canary {token}"},
+        source=token,
+    )
+    foreign_id = engine._store.append(
+        "foreign",
+        {"role": "user", "content": f"credential canary {token}"},
+        source=token,
+    )
+    capability = engine.issue_cross_session_capability(["foreign"])
+    try:
+        current = json.loads(tools_module.lcm_grep(
+            {"query": "credential", "session_scope": "current"}, engine=engine
+        ))
+        foreign = json.loads(tools_module.lcm_grep(
+            {
+                "query": "credential",
+                "session_scope": "session",
+                "session_id": "foreign",
+            },
+            engine=engine,
+            cross_session_capability=capability,
+        ))
+        assert current["results"][0]["store_id"] == current_id
+        assert foreign["results"][0]["store_id"] == foreign_id
+        for response in (current, foreign):
+            encoded = json.dumps(response, sort_keys=True)
+            assert token not in encoded
+            assert "LCM sensitive redaction" in encoded
+            for hit in response["results"]:
+                for field in ("snippet", "content", "title", "source"):
+                    assert token not in str(hit.get(field, ""))
+    finally:
+        engine.shutdown()
+
+
 def test_load_session_requires_capability_and_bounds_redacts_nested_rows(tmp_path):
     engine = _engine(tmp_path)
     current_id = engine._store.append(

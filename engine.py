@@ -2762,6 +2762,10 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             config=self._config,
             hermes_home=self._hermes_home,
             session_id=session_id,
+            read_budget=read_budget,
+            budget_label="rollover prefix ingest payload",
+            max_nested_depth=_PUBLICATION_LOCKED_MAX_NESTED_DEPTH,
+            max_nested_items=_PUBLICATION_LOCKED_MAX_NESTED_ITEMS,
         )
         stripped = text.strip()
         ingest_refs = extract_ingest_externalized_refs(stripped)
@@ -4671,7 +4675,12 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             logger.debug("LCM ingest cursor reconciliation probe failed: %s", exc)
             self._ingest_cursor_needs_reconcile = False
 
-    def _stored_row_externalized_text_parts_for_pattern_matching(self, msg: Dict[str, Any]) -> list[str]:
+    def _stored_row_externalized_text_parts_for_pattern_matching(
+        self,
+        msg: Dict[str, Any],
+        *,
+        read_budget: dict[str, float | int] | None = None,
+    ) -> list[str]:
         ref_sources: list[str] = []
         content = msg.get("content")
         if isinstance(content, str):
@@ -4694,6 +4703,10 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 ref,
                 config=self._config,
                 hermes_home=self._hermes_home,
+                read_budget=read_budget,
+                budget_label="source reconciliation ignore-pattern payload",
+                max_nested_depth=_PUBLICATION_LOCKED_MAX_NESTED_DEPTH,
+                max_nested_items=_PUBLICATION_LOCKED_MAX_NESTED_ITEMS,
             )
             if not payload:
                 continue
@@ -4705,8 +4718,17 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 parts.append(payload_content)
         return parts
 
-    def _stored_row_externalized_text_for_pattern_matching(self, msg: Dict[str, Any]) -> str:
-        return "\n".join(self._stored_row_externalized_text_parts_for_pattern_matching(msg))
+    def _stored_row_externalized_text_for_pattern_matching(
+        self,
+        msg: Dict[str, Any],
+        *,
+        read_budget: dict[str, float | int] | None = None,
+    ) -> str:
+        return "\n".join(
+            self._stored_row_externalized_text_parts_for_pattern_matching(
+                msg, read_budget=read_budget
+            )
+        )
 
     def _is_cached_active_replay_message_at_index(self, idx: int, msg: Dict[str, Any]) -> bool:
         if idx < 0 or idx >= len(self._last_active_replay_messages):
@@ -4715,7 +4737,13 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             self._last_active_replay_messages[idx]
         )
 
-    def _matches_ignore_message_patterns(self, msg: Dict[str, Any], *, stored_row: bool = False) -> bool:
+    def _matches_ignore_message_patterns(
+        self,
+        msg: Dict[str, Any],
+        *,
+        stored_row: bool = False,
+        read_budget: dict[str, float | int] | None = None,
+    ) -> bool:
         if not self._compiled_ignore_message_patterns:
             return False
         content = msg.get("content")
@@ -4727,7 +4755,9 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         if matches_message_pattern(text, self._compiled_ignore_message_patterns):
             return True
         if stored_row:
-            externalized_parts = self._stored_row_externalized_text_parts_for_pattern_matching(msg)
+            externalized_parts = self._stored_row_externalized_text_parts_for_pattern_matching(
+                msg, read_budget=read_budget
+            )
             for externalized_text in externalized_parts:
                 if externalized_text and matches_message_pattern(externalized_text, self._compiled_ignore_message_patterns):
                     return True
@@ -4848,26 +4878,51 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             )
         )
 
-    def _restore_ingest_payload_placeholders_in_value(self, value: Any, *, session_id: str) -> Any:
+    def _restore_ingest_payload_placeholders_in_value(
+        self,
+        value: Any,
+        *,
+        session_id: str,
+        read_budget: dict[str, float | int] | None = None,
+    ) -> Any:
         if isinstance(value, dict):
             return {
-                self._restore_ingest_payload_placeholders_in_value(key, session_id=session_id)
+                self._restore_ingest_payload_placeholders_in_value(
+                    key, session_id=session_id, read_budget=read_budget
+                )
                 if isinstance(key, str)
-                else key: self._restore_ingest_payload_placeholders_in_value(val, session_id=session_id)
+                else key: self._restore_ingest_payload_placeholders_in_value(
+                    val, session_id=session_id, read_budget=read_budget
+                )
                 for key, val in value.items()
             }
         if isinstance(value, list):
-            return [self._restore_ingest_payload_placeholders_in_value(item, session_id=session_id) for item in value]
+            return [
+                self._restore_ingest_payload_placeholders_in_value(
+                    item, session_id=session_id, read_budget=read_budget
+                )
+                for item in value
+            ]
         if isinstance(value, str):
             return restore_ingest_payload_placeholders(
                 value,
                 config=self._config,
                 hermes_home=self._hermes_home,
                 session_id=session_id,
+                read_budget=read_budget,
+                budget_label="source reconciliation ingest payload",
+                max_nested_depth=_PUBLICATION_LOCKED_MAX_NESTED_DEPTH,
+                max_nested_items=_PUBLICATION_LOCKED_MAX_NESTED_ITEMS,
             )
         return value
 
-    def _restore_ingest_payload_placeholders_in_content_identity(self, content: str, *, session_id: str) -> str:
+    def _restore_ingest_payload_placeholders_in_content_identity(
+        self,
+        content: str,
+        *,
+        session_id: str,
+        read_budget: dict[str, float | int] | None = None,
+    ) -> str:
         if not content:
             return content
         try:
@@ -4878,6 +4933,10 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 config=self._config,
                 hermes_home=self._hermes_home,
                 session_id=session_id,
+                read_budget=read_budget,
+                budget_label="source reconciliation ingest payload",
+                max_nested_depth=_PUBLICATION_LOCKED_MAX_NESTED_DEPTH,
+                max_nested_items=_PUBLICATION_LOCKED_MAX_NESTED_ITEMS,
             )
         restore_as_structured = False
         if isinstance(decoded, (dict, list)) and normalize_content_value(decoded) == content:
@@ -4886,6 +4945,10 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     ref,
                     config=self._config,
                     hermes_home=self._hermes_home,
+                    read_budget=read_budget,
+                    budget_label="source reconciliation ingest payload",
+                    max_nested_depth=_PUBLICATION_LOCKED_MAX_NESTED_DEPTH,
+                    max_nested_items=_PUBLICATION_LOCKED_MAX_NESTED_ITEMS,
                 )
                 payload_session_id = (payload or {}).get("session_id") or ""
                 if session_id and payload_session_id and payload_session_id != session_id:
@@ -4895,13 +4958,19 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     restore_as_structured = True
                     break
         if restore_as_structured:
-            restored = self._restore_ingest_payload_placeholders_in_value(decoded, session_id=session_id)
+            restored = self._restore_ingest_payload_placeholders_in_value(
+                decoded, session_id=session_id, read_budget=read_budget
+            )
             return normalize_content_value(restored) or ""
         return restore_ingest_payload_placeholders(
             content,
             config=self._config,
             hermes_home=self._hermes_home,
             session_id=session_id,
+            read_budget=read_budget,
+            budget_label="source reconciliation ingest payload",
+            max_nested_depth=_PUBLICATION_LOCKED_MAX_NESTED_DEPTH,
+            max_nested_items=_PUBLICATION_LOCKED_MAX_NESTED_ITEMS,
         )
 
     def _recovered_content_matches_durable_identity(self, recovered_content: str, durable_content: str) -> bool:
