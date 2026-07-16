@@ -63,6 +63,64 @@ _LOAD_SESSION_MAX_SESSION_TEXT_BYTES = 2 * 1024
 _LOAD_SESSION_MAX_ROLE_TEXT_BYTES = 512
 _LOAD_SESSION_MAX_ROW_MATERIALIZED_BYTES = 96 * 1024
 _LOAD_SESSION_MAX_PAGE_MATERIALIZED_BYTES = 2 * 1024 * 1024
+_GREP_SEARCH_VISIBLE_CHARS = 300
+_GREP_SEARCH_BOUNDARY_CHARS = 8_192
+_GREP_SEARCH_WINDOW_CHARS = (
+    _GREP_SEARCH_VISIBLE_CHARS + (2 * _GREP_SEARCH_BOUNDARY_CHARS)
+)
+
+
+def _grep_bounded_search_projection(
+    terms: list[str], *, alias: str = ""
+) -> tuple[str, str, list[str]]:
+    """Return an explicit grep projection and its SELECT-clause bind args."""
+    prefix = f"{alias}." if alias else ""
+    content = f"{prefix}content"
+    tool_calls = f"{prefix}tool_calls"
+    first_term = terms[0] if terms else ""
+    if first_term:
+        position = f"instr(lower(CAST({content} AS TEXT)), lower(?))"
+        window_start = (
+            f"CASE WHEN {position} > {_GREP_SEARCH_BOUNDARY_CHARS} "
+            f"THEN {position} - {_GREP_SEARCH_BOUNDARY_CHARS} ELSE 1 END"
+        )
+        # The position expression appears in both the bounded payload and its
+        # raw-start metadata, so each occurrence has its own bound parameters.
+        select_args = [first_term, first_term, first_term, first_term]
+    else:
+        window_start = "1"
+        select_args = []
+    bounded_content = (
+        f"CASE WHEN typeof({content}) = 'text' THEN "
+        f"substr(CAST({content} AS TEXT), {window_start}, {_GREP_SEARCH_WINDOW_CHARS}) END"
+    )
+    columns = ", ".join(
+        [
+            f"CASE WHEN typeof({prefix}store_id) = 'integer' THEN {prefix}store_id END",
+            f"substr(CAST({prefix}session_id AS TEXT), 1, 512)",
+            f"substr(CAST({prefix}source AS TEXT), 1, 512)",
+            f"substr(CAST({prefix}role AS TEXT), 1, 128)",
+            bounded_content,
+            f"substr(CAST({prefix}tool_call_id AS TEXT), 1, 512)",
+            "NULL",
+            f"substr(CAST({prefix}tool_name AS TEXT), 1, 512)",
+            f"CASE WHEN typeof({prefix}timestamp) IN ('integer', 'real') THEN {prefix}timestamp END",
+            f"CASE WHEN typeof({prefix}token_estimate) = 'integer' THEN {prefix}token_estimate END",
+            f"CASE WHEN typeof({prefix}pinned) = 'integer' THEN {prefix}pinned END",
+            f"substr(CAST({prefix}conversation_id AS TEXT), 1, 512)",
+        ]
+    )
+    metadata = ", ".join(
+        [
+            f"COALESCE(length(CAST({content} AS BLOB)), 0)",
+            f"COALESCE(length(CAST({content} AS TEXT)), 0)",
+            f"COALESCE(length(CAST({tool_calls} AS BLOB)), 0)",
+            window_start,
+            f"typeof({content})",
+            f"typeof({tool_calls})",
+        ]
+    )
+    return columns, metadata, select_args
 
 
 class SessionLoadPage(list[dict[str, Any]]):
@@ -1155,7 +1213,8 @@ class MessageStore:
                conversation_id: str | None = None,
                role: str | None = None,
                time_from: float | None = None,
-               time_to: float | None = None) -> List[Dict[str, Any]]:
+               time_to: float | None = None,
+               bounded_output: bool = False) -> List[Dict[str, Any]]:
         """FTS5 search across raw messages.
 
         Retrieval contract:
@@ -1181,6 +1240,7 @@ class MessageStore:
                 role=role,
                 time_from=time_from,
                 time_to=time_to,
+                bounded_output=bounded_output,
             )
 
         order_by = _build_search_order_by(
@@ -1220,16 +1280,29 @@ class MessageStore:
                     where.append("m.timestamp <= ?")
                     args.append(time_to)
                 args.extend([fetch_limit, offset])
+                if bounded_output:
+                    select_columns, metadata_columns, select_args = (
+                        _grep_bounded_search_projection(terms, alias="m")
+                    )
+                    select_sql = (
+                        f"{select_columns}, rank AS search_rank, '' AS snippet, "
+                        f"{metadata_columns}"
+                    )
+                else:
+                    select_args = []
+                    select_sql = (
+                        "m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id, "
+                        "m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned, m.conversation_id, "
+                        "rank AS search_rank, "
+                        "snippet(messages_fts, 0, '>>>', '<<<', '...', 40) AS snippet"
+                    )
                 rows = self._conn.execute(
-                    f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
-                              m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned, m.conversation_id,
-                              rank as search_rank,
-                              snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
+                    f"""SELECT {select_sql}
                        FROM messages_fts fts
                        JOIN messages m ON m.store_id = fts.rowid
                        WHERE {' AND '.join(where)}
                        ORDER BY {order_by} LIMIT ? OFFSET ?""",
-                    args,
+                    [*select_args, *args],
                 ).fetchall()
                 scanned_rows += len(rows)
             except sqlite3.Error as exc:
@@ -1244,6 +1317,7 @@ class MessageStore:
                     role=role,
                     time_from=time_from,
                     time_to=time_to,
+                    bounded_output=bounded_output,
                 )
 
             raw_primary_values: list[float] = []
@@ -1252,6 +1326,17 @@ class MessageStore:
                 base_columns = 12
                 d["search_rank"] = r[base_columns] if len(r) > base_columns else None
                 d["snippet"] = r[base_columns + 1] if len(r) > (base_columns + 1) else ""
+                if bounded_output:
+                    metadata_offset = base_columns + 2
+                    d["content_bytes"] = int(r[metadata_offset] or 0)
+                    d["content_chars"] = int(r[metadata_offset + 1] or 0)
+                    d["tool_calls_bytes"] = int(r[metadata_offset + 2] or 0)
+                    d["_grep_window_start"] = int(r[metadata_offset + 3] or 1)
+                    d["_grep_bounded"] = True
+                    d["_grep_highlight_matches"] = True
+                    if r[metadata_offset + 4] != "text" or r[metadata_offset + 5] not in {"text", "null"}:
+                        continue
+                    d["snippet"] = d.get("content") or ""
                 d["_directness_score"] = _message_directness_score(d.get("role"), d.get("content"), terms, phrases)
                 if apply_directness_adjustment and d["search_rank"] is not None:
                     rank_adjustment = max(float(d["_directness_score"]), 0.0)
@@ -1284,7 +1369,8 @@ class MessageStore:
                      conversation_id: str | None = None,
                      role: str | None = None,
                      time_from: float | None = None,
-                     time_to: float | None = None) -> List[Dict[str, Any]]:
+                     time_to: float | None = None,
+                     bounded_output: bool = False) -> List[Dict[str, Any]]:
         safe_query = sanitize_fts5_query(query)
         terms = extract_search_terms(safe_query)
         phrases = extract_quoted_phrases(safe_query)
@@ -1398,6 +1484,15 @@ class MessageStore:
         def add_rows(rows: list[sqlite3.Row]) -> None:
             for row in rows:
                 result = self._row_to_dict(row)
+                if bounded_output:
+                    result["content_bytes"] = int(row[12] or 0)
+                    result["content_chars"] = int(row[13] or 0)
+                    result["tool_calls_bytes"] = int(row[14] or 0)
+                    result["_grep_window_start"] = int(row[15] or 1)
+                    result["_grep_bounded"] = True
+                    result["_grep_highlight_matches"] = False
+                    if row[16] != "text" or row[17] not in {"text", "null"}:
+                        continue
                 content = result.get("content") or ""
                 score = sum(
                     min(count_term_matches(content, term), 1) if collapse_risky_repeats else count_term_matches(content, term)
@@ -1406,12 +1501,20 @@ class MessageStore:
                 if score <= 0:
                     continue
                 result["search_rank"] = -float(score)
-                result["snippet"] = build_snippet(content, terms)
+                result["snippet"] = content if bounded_output else build_snippet(content, terms)
                 result["_fallback_score"] = float(score)
                 result["_directness_score"] = _message_directness_score(result.get("role"), content, terms, phrases)
                 results.append(result)
 
         if normalized_sort == "recency":
+            if bounded_output:
+                select_columns, metadata_columns, bounded_select_args = (
+                    _grep_bounded_search_projection(terms)
+                )
+                message_select = f"{select_columns}, {metadata_columns}"
+            else:
+                bounded_select_args = []
+                message_select = _MESSAGE_SELECT_COLUMNS
             candidate_cap = compute_search_candidate_cap(limit)
             offset = 0
             scanned_rows = 0
@@ -1420,12 +1523,12 @@ class MessageStore:
                 if batch_limit <= 0:
                     break
                 rows = self._conn.execute(
-                    f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                    f"""SELECT {message_select}
                         FROM messages
                         WHERE {' AND '.join(where)}
                         {order_by}
                         LIMIT ? OFFSET ?""",
-                    [*base_args, *order_args, batch_limit, offset],
+                    [*bounded_select_args, *base_args, *order_args, batch_limit, offset],
                 ).fetchall()
                 scanned_rows += len(rows)
                 add_rows(rows)
@@ -1437,12 +1540,12 @@ class MessageStore:
                     boundary_role_bias = _message_role_bias(rows[-1][3])
                     while True:
                         tie_rows = self._conn.execute(
-                            f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                            f"""SELECT {message_select}
                                 FROM messages
                                 WHERE {' AND '.join(where)}
                                 {order_by}
                                 LIMIT ? OFFSET ?""",
-                            [*base_args, *order_args, fetch_limit, offset],
+                            [*bounded_select_args, *base_args, *order_args, fetch_limit, offset],
                         ).fetchall()
                         if not tie_rows:
                             break
@@ -1493,16 +1596,24 @@ class MessageStore:
                 f"{role_bias} ASC, timestamp DESC, store_id DESC"
             )
             candidate_cap = compute_search_candidate_cap(limit)
+            if bounded_output:
+                select_columns, metadata_columns, bounded_select_args = (
+                    _grep_bounded_search_projection(terms)
+                )
+                message_select = f"{select_columns}, {metadata_columns}"
+            else:
+                bounded_select_args = []
+                message_select = _MESSAGE_SELECT_COLUMNS
             offset = 0
             while offset < candidate_cap:
                 batch_limit = min(fetch_limit, candidate_cap - offset)
                 rows = self._conn.execute(
-                    f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                    f"""SELECT {message_select}
                         FROM messages
                         WHERE {' AND '.join(where)}
                         {order_by}
                         LIMIT ? OFFSET ?""",
-                    [*base_args, *order_args, *exact_args, batch_limit, offset],
+                    [*bounded_select_args, *base_args, *order_args, *exact_args, batch_limit, offset],
                 ).fetchall()
                 if not rows:
                     break

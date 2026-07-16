@@ -1196,9 +1196,15 @@ def test_load_session_redaction_shortening_preserves_source_truncation_metadata(
     tmp_path
 ):
     engine = _engine(tmp_path)
-    secret = "sk-proj-" + ("S" * 1_000)
+    secret = "sk-proj-" + ("S" * 20_000)
     content = "prefix " + secret + " suffix " + ("x" * 10_000)
-    engine._store.append("current", {"role": "user", "content": content})
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": "legacy placeholder"}
+    )
+    engine._store._conn.execute(
+        "UPDATE messages SET content=? WHERE store_id=?", (content, store_id)
+    )
+    engine._store._conn.commit()
     try:
         response = json.loads(engine.handle_tool_call(
             "lcm_load_session",
@@ -1213,6 +1219,64 @@ def test_load_session_redaction_shortening_preserves_source_truncation_metadata(
         assert item["content_returned_chars"] == len(item["content"])
         assert item["content_returned_chars"] <= item["content_chars"] == len(content)
         assert item["serialized_truncated"] is True
+
+        # A redacted output length is not a raw-source cursor.  The load API
+        # must disable mapped continuation and advertise a safe restart boundary;
+        # following that boundary through lcm_expand must not expose a suffix of
+        # the credential that no longer matches the redaction pattern.
+        assert item["next_content_offset"] is None
+        assert item["content_continuation_disabled"] is True
+        assert item["safe_expand_content_offset"] == 0
+        expanded = json.loads(engine.handle_tool_call(
+            "lcm_expand",
+            {
+                "store_id": item["store_id"],
+                "content_offset": item["safe_expand_content_offset"],
+                "max_tokens": 32,
+            },
+        ))
+        expanded_text = json.dumps(expanded)
+        assert secret not in expanded_text
+        assert ("S" * 100) not in expanded_text
+        assert expanded["has_more"] is False
+    finally:
+        engine.shutdown()
+
+
+def test_load_session_non_sensitive_raw_cursor_is_lossless_and_deterministic(tmp_path):
+    engine = _engine(tmp_path)
+    content = "".join(str(index % 10) for index in range(1_000))
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": content}
+    )
+    try:
+        loaded = json.loads(engine.handle_tool_call(
+            "lcm_load_session",
+            {"session_id": "current", "limit": 1, "max_content_chars": 128},
+        ))["messages"][0]
+        assert loaded["content_redacted"] is False
+        assert loaded["next_content_offset"] == len(loaded["content"]) == 128
+        assert loaded.get("content_continuation_disabled") is not True
+
+        first = json.loads(engine.handle_tool_call(
+            "lcm_expand",
+            {
+                "store_id": store_id,
+                "content_offset": loaded["next_content_offset"],
+                "max_tokens": 65_536,
+            },
+        ))
+        second = json.loads(engine.handle_tool_call(
+            "lcm_expand",
+            {
+                "store_id": store_id,
+                "content_offset": loaded["next_content_offset"],
+                "max_tokens": 65_536,
+            },
+        ))
+        assert first["content"] == second["content"]
+        assert loaded["content"] + first["content"] == content
+        assert first["has_more"] is False
     finally:
         engine.shutdown()
 

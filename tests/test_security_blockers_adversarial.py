@@ -1124,6 +1124,75 @@ def test_grep_mandatory_redacts_current_and_authorized_cross_session_fields(tmp_
         engine.shutdown()
 
 
+@pytest.mark.parametrize("query", ["boundedgrep", "bounded-grep"])
+def test_grep_database_search_bounds_content_and_tool_calls_before_python(
+    tmp_path, monkeypatch, query
+):
+    engine = _engine(tmp_path)
+    secret = "sk-proj-" + ("A" * 48)
+    content = f"boundedgrep bounded-grep credential {secret} " + ("x" * 1_000_000)
+    store_id = engine._store.append(
+        "current", {"role": "assistant", "content": "placeholder"}
+    )
+    tool_calls = json.dumps([
+        {
+            "id": "call_canary",
+            "type": "function",
+            "function": {"name": "canary", "arguments": "y" * 1_000_000},
+        }
+    ])
+    engine._store._conn.execute(
+        "UPDATE messages SET content=?, tool_calls=? WHERE store_id=?",
+        (content, tool_calls, store_id),
+    )
+    engine._store._conn.commit()
+
+    original_row_to_dict = engine._store._row_to_dict
+
+    def guarded_row_to_dict(row):
+        if row is not None:
+            assert not (len(row) > 4 and isinstance(row[4], str)
+                        and len(row[4]) > 32_000), "1 MB content reached Python"
+            assert not (len(row) > 6 and isinstance(row[6], str)
+                        and len(row[6]) > 32_000), "1 MB tool_calls reached Python"
+        return original_row_to_dict(row)
+
+    monkeypatch.setattr(engine._store, "_row_to_dict", guarded_row_to_dict)
+    statements: list[str] = []
+    engine._store._conn.set_trace_callback(statements.append)
+    try:
+        response = json.loads(tools_module.lcm_grep(
+            {"query": query, "session_scope": "current", "limit": 1},
+            engine=engine,
+        ))
+        assert response["results"][0]["store_id"] == store_id
+        snippet = response["results"][0]["snippet"]
+        assert "bounded" in snippet
+        assert secret not in snippet
+        assert "sk-proj-" not in snippet
+        assert "LCM sensitive redaction" in snippet
+        assert len(snippet) <= 300
+
+        selects = [
+            statement.upper()
+            for statement in statements
+            if "FROM MESSAGES" in statement.upper()
+            and statement.lstrip().upper().startswith("SELECT")
+        ]
+        assert selects
+        assert any("LENGTH(CAST(M.CONTENT AS BLOB))" in statement
+                   or "LENGTH(CAST(CONTENT AS BLOB))" in statement
+                   for statement in selects)
+        assert any("LENGTH(CAST(M.TOOL_CALLS AS BLOB))" in statement
+                   or "LENGTH(CAST(TOOL_CALLS AS BLOB))" in statement
+                   for statement in selects)
+        assert any("SUBSTR" in statement and "CONTENT" in statement
+                   for statement in selects)
+    finally:
+        engine._store._conn.set_trace_callback(None)
+        engine.shutdown()
+
+
 def test_load_session_requires_capability_and_bounds_redacts_nested_rows(tmp_path):
     engine = _engine(tmp_path)
     current_id = engine._store.append(

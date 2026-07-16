@@ -126,7 +126,7 @@ def test_sessions_are_ranked_before_bounded_expansion(tmp_path, monkeypatch):
     node_b2 = engine._dag.get_node(_node(engine, "archive-b", "archive b second"))
     node_a = engine._dag.get_node(_node(engine, "archive-a", "archive a"))
     node_c = engine._dag.get_node(_node(engine, "archive-c", "archive c"))
-    monkeypatch.setattr(engine._dag, "search", lambda *args, **kwargs: [node_b1, node_b2, node_a, node_c])
+    monkeypatch.setattr(engine._dag, "search_cross_session_candidates", lambda *args, **kwargs: [node_b1, node_b2, node_a, node_c])
     captured = {}
 
     def synthesize(**kwargs):
@@ -172,7 +172,7 @@ def test_context_and_answer_budgets_are_shared_not_per_bucket(tmp_path, monkeypa
     engine = _engine(tmp_path)
     first = engine._dag.get_node(_node(engine, "one", "archive one", content="x " * 100))
     second = engine._dag.get_node(_node(engine, "two", "archive two", content="y " * 100))
-    monkeypatch.setattr(engine._dag, "search", lambda *args, **kwargs: [first, second])
+    monkeypatch.setattr(engine._dag, "search_cross_session_candidates", lambda *args, **kwargs: [first, second])
     captured = {}
 
     def synthesize(**kwargs):
@@ -206,7 +206,7 @@ def test_cross_session_metadata_is_redacted_bounded_and_charged_to_context(tmp_p
         expand_hint=f"api_key: {secret} " + ("h" * 1_000_000),
         source="custom-source-" + ("s" * 250_000),
     ))
-    monkeypatch.setattr(engine._dag, "search", lambda *args, **kwargs: [node])
+    monkeypatch.setattr(engine._dag, "search_cross_session_candidates", lambda *args, **kwargs: [node])
     captured = {}
 
     def synthesize(**kwargs):
@@ -243,7 +243,7 @@ def test_cross_session_model_metadata_is_redacted_and_bounded_on_success_and_fai
         + ("oversized-model " * 10_000)
     )
     node = engine._dag.get_node(_node(engine, "archive", "archive model metadata"))
-    monkeypatch.setattr(engine._dag, "search", lambda *args, **kwargs: [node])
+    monkeypatch.setattr(engine._dag, "search_cross_session_candidates", lambda *args, **kwargs: [node])
 
     def assert_safe_model_metadata(result):
         assert result["model_truncated"] is True
@@ -287,7 +287,7 @@ def test_completed_bucket_survives_later_operation_deadline(tmp_path, monkeypatc
     engine = _engine(tmp_path)
     first = engine._dag.get_node(_node(engine, "one", "archive one"))
     second = engine._dag.get_node(_node(engine, "two", "archive two"))
-    monkeypatch.setattr(engine._dag, "search", lambda *args, **kwargs: [first, second])
+    monkeypatch.setattr(engine._dag, "search_cross_session_candidates", lambda *args, **kwargs: [first, second])
     clock = {"now": 0.0}
     monkeypatch.setattr(lcm_tools.time, "monotonic", lambda: clock["now"])
     original_collect = lcm_tools._collect_context_blocks_for_node
@@ -321,7 +321,7 @@ def test_externalized_payloads_are_metadata_only_in_archive_mode(tmp_path, monke
             content="[GC'd externalized tool output: chars=999; ref=payload.json]",
         )
     )
-    monkeypatch.setattr(engine._dag, "search", lambda *args, **kwargs: [node])
+    monkeypatch.setattr(engine._dag, "search_cross_session_candidates", lambda *args, **kwargs: [node])
     captured = {}
 
     def synthesize(**kwargs):
@@ -341,7 +341,7 @@ def test_externalized_payloads_are_metadata_only_in_archive_mode(tmp_path, monke
 def test_concurrent_reentry_is_rejected_deterministically(tmp_path, monkeypatch):
     engine = _engine(tmp_path)
     node = engine._dag.get_node(_node(engine, "archive", "archive result"))
-    monkeypatch.setattr(engine._dag, "search", lambda *args, **kwargs: [node])
+    monkeypatch.setattr(engine._dag, "search_cross_session_candidates", lambda *args, **kwargs: [node])
     entered = threading.Event()
     release = threading.Event()
 
@@ -508,7 +508,7 @@ def test_mandatory_redaction_precedes_truncation_and_covers_shared_credentials(
         "archive boundary",
         expand_hint=("x" * 2030) + pem + " " + asia + " " + github_pat,
     ))
-    monkeypatch.setattr(engine._dag, "search", lambda *args, **kwargs: [node])
+    monkeypatch.setattr(engine._dag, "search_cross_session_candidates", lambda *args, **kwargs: [node])
     monkeypatch.setattr(
         lcm_tools,
         "_synthesize_expansion_answer",
@@ -567,7 +567,7 @@ def test_current_session_expansion_uses_same_bounded_redacted_output_boundary(
 def test_cross_session_hard_bounds_override_caller_and_profile_values(tmp_path, monkeypatch):
     engine = _engine(tmp_path, max_sessions=1_000_000, per_session=1_000_000)
     node = engine._dag.get_node(_node(engine, "archive", "archive bounded"))
-    monkeypatch.setattr(engine._dag, "search", lambda *args, **kwargs: [node])
+    monkeypatch.setattr(engine._dag, "search_cross_session_candidates", lambda *args, **kwargs: [node])
     captured = {}
 
     def synthesize(**kwargs):
@@ -770,7 +770,7 @@ def test_1600_node_adversarial_provenance_is_bounded_deadline_aware_and_fail_clo
             created_at=index + 1,
         ))
     root = engine._dag.get_node(child_id)
-    monkeypatch.setattr(engine._dag, "search", lambda *args, **kwargs: [root] * 1600)
+    monkeypatch.setattr(engine._dag, "search_cross_session_candidates", lambda *args, **kwargs: [root] * 1600)
     get_node_calls = {"count": 0}
     original_get_node = engine._dag.get_node
 
@@ -861,6 +861,142 @@ def test_cross_session_lineage_is_length_guarded_before_python_materialization(
         assert selects
         assert all("SELECT *" not in s and "SELECT N.*" not in s for s in selects)
         assert any("LENGTH(CAST" in s and "SUBSTR" in s for s in selects)
+    finally:
+        engine._dag._conn.set_trace_callback(None)
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("query", ["archive", "archive-token"])
+@pytest.mark.parametrize("oversized_session", ["archive", "denied"])
+def test_cross_session_query_discovery_uses_bounded_sql_before_authorization(
+    tmp_path, monkeypatch, query, oversized_session
+):
+    engine = _engine(tmp_path, max_sessions=2, per_session=2)
+    normal_id = _node(
+        engine,
+        "archive",
+        "archive archive-token bounded discovery result",
+        content="bounded discovery evidence",
+    )
+    oversized_id = _node(
+        engine,
+        oversized_session,
+        "archive archive-token oversized discovery result",
+        content="oversized discovery evidence",
+    )
+    summary_canary = "summary-canary-" + ("s" * 1_000_000)
+    hint_canary = "hint-canary-" + ("h" * 1_000_000)
+    engine._dag._conn.execute(
+        "UPDATE summary_nodes SET summary=?, expand_hint=? WHERE node_id=?",
+        (f"archive archive-token {summary_canary}", hint_canary, oversized_id),
+    )
+    engine._dag._conn.commit()
+
+    monkeypatch.setattr(
+        engine._dag,
+        "search",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cross-session discovery called SummaryDAG.search")
+        ),
+    )
+    captured = {}
+
+    def synthesize(**kwargs):
+        captured["context"] = kwargs["context_blocks"]
+        return "bounded discovery answer"
+
+    monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", synthesize)
+    statements: list[str] = []
+    engine._dag._conn.set_trace_callback(statements.append)
+    try:
+        result = json.loads(_invoke(
+            engine,
+            _args(query=query, deadline_ms=1_000),
+            session_ids=["archive"],
+        ))
+        assert result["answer"] == "bounded discovery answer"
+        if oversized_session == "archive":
+            assert oversized_id in result["node_ids"]
+        else:
+            assert result["node_ids"] == [normal_id]
+        encoded = json.dumps({"result": result, "context": captured["context"]})
+        assert summary_canary not in encoded
+        assert hint_canary not in encoded
+
+        selects = [
+            statement.upper()
+            for statement in statements
+            if "SUMMARY_NODES" in statement.upper()
+            and statement.lstrip().upper().startswith(("SELECT", "WITH"))
+        ]
+        assert selects
+        assert all("SELECT *" not in statement and "SELECT N.*" not in statement
+                   for statement in selects)
+        discovery = [statement for statement in selects if "SUBSTR" in statement]
+        assert discovery
+        assert any("LENGTH(CAST" in statement for statement in discovery)
+        assert any("SUMMARY" in statement and "EXPAND_HINT" in statement
+                   and "SOURCE_IDS" in statement for statement in discovery)
+    finally:
+        engine._dag._conn.set_trace_callback(None)
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("oversized_session", ["archive", "denied"])
+def test_cross_session_explicit_candidates_bound_all_text_before_authorization(
+    tmp_path, monkeypatch, oversized_session
+):
+    engine = _engine(tmp_path, max_sessions=2, per_session=2)
+    normal_id = _node(
+        engine, "archive", "normal explicit archive", content="normal evidence"
+    )
+    oversized_id = _node(
+        engine,
+        oversized_session,
+        "oversized explicit archive",
+        content="oversized explicit evidence",
+    )
+    summary_canary = "explicit-summary-canary-" + ("s" * 1_000_000)
+    engine._dag._conn.execute(
+        "UPDATE summary_nodes SET summary=? WHERE node_id=?",
+        (summary_canary, oversized_id),
+    )
+    engine._dag._conn.commit()
+    monkeypatch.setattr(
+        engine._dag,
+        "get_node_for_cross_session_authorization",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("explicit authorization called the legacy node getter")
+        ),
+    )
+    monkeypatch.setattr(
+        lcm_tools, "_synthesize_expansion_answer", lambda **_kwargs: "explicit answer"
+    )
+    statements: list[str] = []
+    engine._dag._conn.set_trace_callback(statements.append)
+    try:
+        result = json.loads(_invoke(
+            engine,
+            _args(query="", node_ids=[oversized_id, normal_id], deadline_ms=1_000),
+            session_ids=["archive"],
+        ))
+        assert result["answer"] == "explicit answer"
+        if oversized_session == "archive":
+            assert oversized_id in result["node_ids"]
+        else:
+            assert result["node_ids"] == [normal_id]
+        assert summary_canary not in json.dumps(result)
+        selects = [
+            statement.upper()
+            for statement in statements
+            if "SUMMARY_NODES" in statement.upper()
+            and statement.lstrip().upper().startswith("SELECT")
+        ]
+        assert selects
+        assert all("SELECT *" not in statement and "SELECT N.*" not in statement
+                   for statement in selects)
+        assert any("SUBSTR" in statement and "LENGTH(CAST" in statement
+                   and "EXPAND_HINT" in statement for statement in selects)
     finally:
         engine._dag._conn.set_trace_callback(None)
         engine.shutdown()

@@ -92,7 +92,14 @@ _BOUNDARY_PRIVATE_KEY_BEGIN_RE = re.compile(
     r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE
 )
 _BOUNDARY_STANDALONE_CREDENTIAL_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])(?:github_pat_[A-Za-z0-9_]*|(?:AKIA|ASIA)[A-Z0-9]*)\Z"
+    r"(?<![A-Za-z0-9_-])(?:"
+    r"sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]*|"
+    r"(?:AKIA|ASIA)[A-Z0-9]*|"
+    r"gh[pousr]_[A-Za-z0-9]*|github_pat_[A-Za-z0-9_]*|"
+    r"glpat-[A-Za-z0-9_-]*|AIza[A-Za-z0-9_-]*|"
+    r"sk_live_[A-Za-z0-9]*|xox[baprs]-[A-Za-z0-9-]*"
+    r")\Z",
+    re.IGNORECASE,
 )
 
 
@@ -590,6 +597,7 @@ def _slice_content_for_response(
             max_chars=_CURRENT_SESSION_EXPAND_MAX_CHARS,
         )
     redaction_changed = False
+    boundary_mapping_destroyed = False
     protected_probe = source
     if config is not None:
         probe_limit = min(
@@ -600,6 +608,13 @@ def _slice_content_for_response(
         raw_probe = source[:probe_limit]
         protected_probe = redact_sensitive_output_text(raw_probe)
         redaction_changed = protected_probe != raw_probe
+        boundary_mapping_destroyed = bool(
+            probe_limit < len(source)
+            and (
+                _BOUNDARY_STANDALONE_CREDENTIAL_RE.search(raw_probe)
+                or _BOUNDARY_PRIVATE_KEY_BEGIN_RE.search(raw_probe)
+            )
+        )
     if not sliced and content_offset < len(content):
         # A tiny token budget can fail to fit even the next character. Return one
         # character anyway so callers make deterministic, lossless cursor progress
@@ -610,6 +625,11 @@ def _slice_content_for_response(
     # consume the complete source.
     if not window_truncated:
         raw_consumed = len(source)
+    elif boundary_mapping_destroyed:
+        # The inspected window ends inside an unbounded credential/PEM span.
+        # No finite raw continuation boundary is provably safe, so consume the
+        # remaining source and fail closed rather than expose a suffix page.
+        raw_consumed = len(source)
     elif redaction_changed:
         # Skip the complete bounded probe that produced the placeholder.  This
         # prevents a subsequent cursor from entering the middle of a secret.
@@ -619,7 +639,10 @@ def _slice_content_for_response(
         # Advance only by the visible page so tiny budgets remain lossless.
         raw_consumed = max(1, min(len(source), len(sliced)))
     next_content_offset = content_offset + raw_consumed
-    has_more = window_truncated or next_content_offset < len(content)
+    has_more = (
+        (window_truncated and not boundary_mapping_destroyed)
+        or next_content_offset < len(content)
+    )
     return {
         "content": sliced,
         "content_chars": len(content),
@@ -1382,6 +1405,62 @@ def _grep_safe_text(value: Any, *, max_chars: int) -> str:
     )[0]
 
 
+def _grep_safe_snippet(
+    value: Any,
+    query: str,
+    *,
+    max_chars: int = 300,
+    highlight_matches: bool = True,
+) -> str:
+    """Redact the complete bounded match window before choosing its snippet."""
+    raw_window = str(value or "")
+    if not raw_window:
+        return ""
+    protected, _truncated = _bounded_cross_session_text(
+        raw_window,
+        None,
+        max_tokens=max(1, len(raw_window) * 2),
+        max_chars=len(raw_window),
+    )
+    folded = protected.casefold()
+    match_start = -1
+    match_length = 0
+    for term in _query_terms_for_match_window(query):
+        index = folded.find(term.casefold())
+        if index >= 0 and (match_start < 0 or index < match_start):
+            match_start = index
+            match_length = len(term)
+    if match_start < 0:
+        match_start = 0
+    left = max(0, match_start - (max_chars // 3))
+    right = min(
+        len(protected),
+        max(left + max_chars, match_start + match_length + (max_chars // 3)),
+    )
+    if right - left > max_chars:
+        right = left + max_chars
+    snippet = protected[left:right]
+    local_match = match_start - left
+    if (
+        highlight_matches
+        and match_length > 0
+        and local_match >= 0
+        and local_match + match_length <= len(snippet)
+    ):
+        snippet = (
+            snippet[:local_match]
+            + ">>>"
+            + snippet[local_match:local_match + match_length]
+            + "<<<"
+            + snippet[local_match + match_length:]
+        )
+    if left > 0:
+        snippet = "..." + snippet
+    if right < len(protected):
+        snippet += "..."
+    return snippet[:max_chars]
+
+
 def _mandatory_redact_grep_response(value: Any) -> Any:
     """Fail-safe final boundary: no credential may survive in any grep field."""
     if isinstance(value, str):
@@ -1880,34 +1959,34 @@ def _cross_session_expand_query(
     deadline = started + (float(deadline_ms) / 1000.0)
     try:
         candidates = []
+        candidate_load_truncated = False
         if raw_node_ids:
             for raw_node_id in raw_node_ids:
+                if time.monotonic() >= deadline:
+                    candidate_load_truncated = True
+                    break
                 try:
                     node_id = int(raw_node_id)
                 except (TypeError, ValueError):
                     return json.dumps({"error": "node_ids must contain only integers"})
-                try:
-                    node = engine._dag.get_node_for_cross_session_authorization(
-                        node_id
-                    )
-                except ValueError:
-                    return json.dumps({
-                        "error": "node source_ids exceed authorization bounds",
-                        "authorization_truncated": True,
-                    })
+                node = engine._dag.get_cross_session_candidate(
+                    node_id, deadline=deadline
+                )
                 if node is not None:
                     candidates.append(node)
+                else:
+                    # Missing, malformed, oversized, and deadline-exhausted
+                    # candidates all fail closed.  Do not issue a second,
+                    # potentially unbounded getter merely to distinguish them.
+                    candidate_load_truncated = True
         elif query:
             discovery_limit = max_sessions * per_session_limit * 8
-            try:
-                candidates = engine._dag.search(
-                    query, session_id=None, limit=discovery_limit
-                )
-            except ValueError:
-                return json.dumps({
-                    "error": "candidate source_ids exceed authorization bounds",
-                    "authorization_truncated": True,
-                })
+            candidates = engine._dag.search_cross_session_candidates(
+                query,
+                limit=min(discovery_limit, _CROSS_SESSION_AUTH_MAX_CANDIDATES),
+                deadline=deadline,
+            )
+            candidate_load_truncated = time.monotonic() >= deadline
         else:
             return json.dumps({"error": "Provide either query or node_ids"})
 
@@ -1919,6 +1998,9 @@ def _cross_session_expand_query(
             owner_scoped_candidates,
             allowed_session_ids,
             deadline=deadline,
+        )
+        authorization["authorization_truncated"] = bool(
+            authorization["authorization_truncated"] or candidate_load_truncated
         )
 
         # Search order is relevance order. First bucket occurrence therefore
@@ -2242,7 +2324,8 @@ def _slice_loaded_content(
     )
     output_truncated = output_truncated or token_truncated
     has_more = source_truncated or output_truncated
-    return {
+    continuation_disabled = bool(content_redacted and has_more)
+    result = {
         "content": sliced,
         "content_chars": total_source_chars,
         "content_returned_chars": len(sliced),
@@ -2250,8 +2333,18 @@ def _slice_loaded_content(
         "content_source_truncated": source_truncated,
         "content_output_truncated": output_truncated,
         "content_redacted": content_redacted,
-        "next_content_offset": len(sliced) if has_more else 0,
+        # This cursor is in the raw source coordinate space.  Output length is
+        # valid only while the transformation is identity-preserving.  When
+        # mandatory redaction changes that mapping, fail closed and advertise
+        # an explicit safe restart boundary instead of pointing into a secret.
+        "next_content_offset": (
+            None if continuation_disabled else (len(sliced) if has_more else 0)
+        ),
     }
+    if continuation_disabled:
+        result["content_continuation_disabled"] = True
+        result["safe_expand_content_offset"] = 0
+    return result
 
 
 def _bounded_loaded_nested_value(
@@ -2359,6 +2452,11 @@ def _serialize_loaded_message(engine: "LCMEngine", row: dict[str, Any], max_cont
         "next_content_offset": content_slice["next_content_offset"],
         "from_current_session": bool(engine.current_session_id) and stored_session_id == engine.current_session_id,
     }
+    if content_slice.get("content_continuation_disabled"):
+        item["content_continuation_disabled"] = True
+        item["safe_expand_content_offset"] = int(
+            content_slice.get("safe_expand_content_offset") or 0
+        )
     nested_truncated = False
     char_budget = [max(1, _LCM_LOAD_SESSION_MAX_ROW_SERIALIZED_BYTES // 2)]
     item_budget = [_LCM_LOAD_SESSION_MAX_NESTED_ITEMS]
@@ -2729,6 +2827,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                 role=role,
                 time_from=time_from,
                 time_to=time_to,
+                bounded_output=True,
             ))
         for hit in msg_hits:
             if (
@@ -2749,9 +2848,13 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                     "conversation_id": hit.get("conversation_id") or "",
                     "role": hit["role"],
                     "timestamp": timestamp_value,
-                    "snippet": _grep_safe_text(
+                    "snippet": _grep_safe_snippet(
                         hit.get("snippet", hit.get("content", "")),
+                        query,
                         max_chars=300,
+                        highlight_matches=bool(
+                            hit.get("_grep_highlight_matches", True)
+                        ),
                     ),
                     "from_current_session": has_current_session and hit["session_id"] == current_session_id,
                     "_sort_ts": timestamp_value,

@@ -48,6 +48,14 @@ from .search_query import (
 
 MAX_SOURCE_IDS_PER_NODE = 6_400
 MAX_SOURCE_IDS_JSON_CHARS = 128_000
+_CROSS_SESSION_SESSION_ID_MAX_BYTES = 2 * 1024
+_CROSS_SESSION_SESSION_ID_PREFIX_CHARS = 512
+_CROSS_SESSION_SUMMARY_PREFIX_CHARS = 16 * 1024
+_CROSS_SESSION_EXPAND_HINT_PREFIX_CHARS = 4 * 1024
+_CROSS_SESSION_SOURCE_TYPE_MAX_BYTES = 128
+_CROSS_SESSION_SOURCE_TYPE_PREFIX_CHARS = 64
+_CROSS_SESSION_ROW_MAX_BYTES = 384 * 1024
+_CROSS_SESSION_QUERY_MAX_MATERIALIZED_BYTES = 8 * 1024 * 1024
 
 
 def decode_source_ids(raw: Any) -> list[int]:
@@ -386,6 +394,248 @@ class SummaryDAG:
             row[8], row[9], row[10], row[11], row[12],
         )
         return self._row_to_node(bounded_row)
+
+    @staticmethod
+    def _cross_session_candidate_projection(alias: str = "") -> str:
+        """Explicit, prefix-capped archive candidate projection.
+
+        The corresponding WHERE guard rejects over-limit source rows before
+        SQLite returns any text to Python.  Length and typeof metadata remain
+        in the result so the Python boundary can verify the SQL contract before
+        decoding lineage or constructing a SummaryNode.
+        """
+        prefix = f"{alias}." if alias else ""
+
+        def bounded(column: str, chars: int) -> str:
+            qualified = f"{prefix}{column}"
+            return (
+                f"CASE WHEN typeof({qualified}) = 'text' "
+                f"THEN substr(CAST({qualified} AS TEXT), 1, {chars}) END"
+            )
+
+        text_columns = ("session_id", "summary", "source_ids", "source_type", "expand_hint")
+        return ", ".join(
+            [
+                f"CASE WHEN typeof({prefix}node_id) = 'integer' THEN {prefix}node_id END",
+                bounded("session_id", _CROSS_SESSION_SESSION_ID_PREFIX_CHARS),
+                f"COALESCE(length(CAST({prefix}session_id AS BLOB)), 0)",
+                f"COALESCE(length(CAST({prefix}session_id AS TEXT)), 0)",
+                f"CASE WHEN typeof({prefix}depth) = 'integer' THEN {prefix}depth END",
+                bounded("summary", _CROSS_SESSION_SUMMARY_PREFIX_CHARS),
+                f"COALESCE(length(CAST({prefix}summary AS BLOB)), 0)",
+                f"COALESCE(length(CAST({prefix}summary AS TEXT)), 0)",
+                f"CASE WHEN typeof({prefix}token_count) = 'integer' THEN {prefix}token_count END",
+                f"CASE WHEN typeof({prefix}source_token_count) = 'integer' THEN {prefix}source_token_count END",
+                bounded("source_ids", MAX_SOURCE_IDS_JSON_CHARS + 1),
+                f"COALESCE(length(CAST({prefix}source_ids AS BLOB)), 0)",
+                f"COALESCE(length(CAST({prefix}source_ids AS TEXT)), 0)",
+                bounded("source_type", _CROSS_SESSION_SOURCE_TYPE_PREFIX_CHARS),
+                f"COALESCE(length(CAST({prefix}source_type AS BLOB)), 0)",
+                f"COALESCE(length(CAST({prefix}source_type AS TEXT)), 0)",
+                f"CASE WHEN typeof({prefix}created_at) IN ('integer', 'real') THEN {prefix}created_at END",
+                f"CASE WHEN {prefix}earliest_at IS NULL OR typeof({prefix}earliest_at) IN ('integer', 'real') THEN {prefix}earliest_at END",
+                f"CASE WHEN {prefix}latest_at IS NULL OR typeof({prefix}latest_at) IN ('integer', 'real') THEN {prefix}latest_at END",
+                bounded("expand_hint", _CROSS_SESSION_EXPAND_HINT_PREFIX_CHARS),
+                f"COALESCE(length(CAST({prefix}expand_hint AS BLOB)), 0)",
+                f"COALESCE(length(CAST({prefix}expand_hint AS TEXT)), 0)",
+                *(f"typeof({prefix}{column})" for column in text_columns),
+            ]
+        )
+
+    @staticmethod
+    def _cross_session_candidate_guard(alias: str = "") -> str:
+        prefix = f"{alias}." if alias else ""
+        lengths = {
+            column: f"COALESCE(length(CAST({prefix}{column} AS BLOB)), 0)"
+            for column in ("session_id", "summary", "source_ids", "source_type", "expand_hint")
+        }
+        return " AND ".join(
+            [
+                f"typeof({prefix}node_id) = 'integer'",
+                f"typeof({prefix}depth) = 'integer'",
+                f"typeof({prefix}token_count) = 'integer'",
+                f"typeof({prefix}source_token_count) = 'integer'",
+                f"typeof({prefix}created_at) IN ('integer', 'real')",
+                f"({prefix}earliest_at IS NULL OR typeof({prefix}earliest_at) IN ('integer', 'real'))",
+                f"({prefix}latest_at IS NULL OR typeof({prefix}latest_at) IN ('integer', 'real'))",
+                *(f"typeof({prefix}{column}) = 'text'" for column in lengths),
+                f"{lengths['session_id']} <= {_CROSS_SESSION_SESSION_ID_MAX_BYTES}",
+                f"COALESCE(length(CAST({prefix}session_id AS TEXT)), 0) <= {_CROSS_SESSION_SESSION_ID_PREFIX_CHARS}",
+                f"{lengths['source_ids']} <= {MAX_SOURCE_IDS_JSON_CHARS}",
+                f"COALESCE(length(CAST({prefix}source_ids AS TEXT)), 0) <= {MAX_SOURCE_IDS_JSON_CHARS}",
+                f"{lengths['source_type']} <= {_CROSS_SESSION_SOURCE_TYPE_MAX_BYTES}",
+                f"COALESCE(length(CAST({prefix}source_type AS TEXT)), 0) <= {_CROSS_SESSION_SOURCE_TYPE_PREFIX_CHARS}",
+            ]
+        )
+
+    def _bounded_cross_session_rows(
+        self,
+        sql: str,
+        args: list[Any] | tuple[Any, ...],
+        *,
+        deadline: float,
+    ) -> list[tuple[Any, ...]]:
+        """Execute one bounded candidate query with a SQLite CPU deadline."""
+        if time.monotonic() >= deadline:
+            return []
+        rows: list[tuple[Any, ...]] = []
+        materialized_bytes = 0
+
+        def interrupt_after_deadline() -> int:
+            return 1 if time.monotonic() >= deadline else 0
+
+        with self._db_lock:
+            self._conn.set_progress_handler(interrupt_after_deadline, 1_000)
+            try:
+                cursor = self._conn.execute(sql, args)
+                while time.monotonic() < deadline:
+                    row = cursor.fetchone()
+                    if row is None:
+                        break
+                    row_bytes = sum(
+                        len(value.encode("utf-8", errors="surrogatepass"))
+                        for value in row
+                        if isinstance(value, str)
+                    )
+                    if row_bytes > _CROSS_SESSION_ROW_MAX_BYTES:
+                        continue
+                    if materialized_bytes + row_bytes > _CROSS_SESSION_QUERY_MAX_MATERIALIZED_BYTES:
+                        break
+                    materialized_bytes += row_bytes
+                    rows.append(tuple(row))
+            except sqlite3.OperationalError as exc:
+                if "interrupted" not in str(exc).lower():
+                    raise
+            finally:
+                self._conn.set_progress_handler(None, 0)
+        return rows
+
+    @staticmethod
+    def _cross_session_row_to_node(row: tuple[Any, ...], *, rank_index: int | None = None) -> Optional[SummaryNode]:
+        """Validate bounded metadata, then decode lineage and build a node."""
+        if len(row) < 27 or any(row[index] is None for index in (0, 1, 4, 5, 8, 9, 10, 13, 16, 19)):
+            return None
+        if tuple(row[22:27]) != ("text", "text", "text", "text", "text"):
+            return None
+        # Full source lengths are diagnostic metadata. Summary and hint may be
+        # arbitrarily large in legacy databases, but only their SQL-capped
+        # prefixes are eligible to cross the Python boundary. Session identity,
+        # source type, and lineage remain exact because authorization depends on
+        # them and the SQL guard rejects their oversized forms.
+        projected_bytes = sum(
+            len(str(row[index]).encode("utf-8", errors="surrogatepass"))
+            for index in (1, 5, 10, 13, 19)
+        )
+        if projected_bytes > _CROSS_SESSION_ROW_MAX_BYTES:
+            return None
+        try:
+            source_ids = decode_source_ids(row[10])
+            node = SummaryNode(
+                node_id=int(row[0]),
+                session_id=str(row[1]),
+                depth=int(row[4]),
+                summary=str(row[5]),
+                token_count=int(row[8]),
+                source_token_count=int(row[9]),
+                source_ids=source_ids,
+                source_type=str(row[13]),
+                created_at=float(row[16]),
+                earliest_at=float(row[17]) if row[17] is not None else None,
+                latest_at=float(row[18]) if row[18] is not None else None,
+                expand_hint=str(row[19]),
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if rank_index is not None and len(row) > rank_index and row[rank_index] is not None:
+            node.search_rank = float(row[rank_index])
+        return node
+
+    def get_cross_session_candidate(
+        self, node_id: int, *, deadline: float
+    ) -> Optional[SummaryNode]:
+        """Load one explicit archive candidate without an unbounded text column."""
+        projection = self._cross_session_candidate_projection()
+        guard = self._cross_session_candidate_guard()
+        rows = self._bounded_cross_session_rows(
+            f"SELECT {projection} FROM summary_nodes WHERE node_id = ? AND {guard} LIMIT 1",
+            (int(node_id),),
+            deadline=deadline,
+        )
+        return self._cross_session_row_to_node(rows[0]) if rows else None
+
+    def search_cross_session_candidates(
+        self,
+        query: str,
+        *,
+        limit: int,
+        deadline: float,
+    ) -> List[SummaryNode]:
+        """Discover archive candidates through bounded FTS/LIKE SQL projections."""
+        safe_query = sanitize_fts5_query(query)
+        terms = extract_search_terms(safe_query)
+        phrases = extract_quoted_phrases(safe_query)
+        if not terms or time.monotonic() >= deadline:
+            return []
+        bounded_limit = max(1, int(limit))
+        candidate_cap = min(compute_search_candidate_cap(bounded_limit), 5_000)
+        projection = self._cross_session_candidate_projection("n")
+        guard = self._cross_session_candidate_guard("n")
+
+        if not requires_like_fallback(query):
+            order_by = _build_search_order_by(None, "COALESCE(n.latest_at, n.created_at)")
+            try:
+                rows = self._bounded_cross_session_rows(
+                    f"""SELECT {projection}, rank AS search_rank
+                        FROM nodes_fts fts
+                        JOIN summary_nodes n ON n.node_id = fts.rowid
+                        WHERE nodes_fts MATCH ? AND {guard}
+                        ORDER BY {order_by} LIMIT ?""",
+                    (safe_query, candidate_cap),
+                    deadline=deadline,
+                )
+                nodes = [
+                    node
+                    for row in rows
+                    if (node := self._cross_session_row_to_node(row, rank_index=27)) is not None
+                ]
+                for node in nodes:
+                    node.search_directness = compute_directness_score(node.summary, terms, phrases)
+                nodes.sort(key=lambda node: _fts_result_sort_key(node, None))
+                return nodes[:bounded_limit]
+            except sqlite3.Error as exc:
+                if time.monotonic() >= deadline:
+                    return []
+                logger.warning("Bounded FTS node discovery failed, falling back to LIKE: %s", exc)
+
+        like_clauses = ["n.summary LIKE ? ESCAPE '\\'" for _term in terms]
+        like_args = [f"%{escape_like(term)}%" for term in terms]
+        rows = self._bounded_cross_session_rows(
+            f"""SELECT {projection}
+                FROM summary_nodes n
+                WHERE ({' OR '.join(like_clauses)}) AND {guard}
+                LIMIT ?""",
+            [*like_args, candidate_cap],
+            deadline=deadline,
+        )
+        collapse_risky_repeats = contains_risky_fts_ascii(query)
+        nodes: list[SummaryNode] = []
+        for row in rows:
+            node = self._cross_session_row_to_node(row)
+            if node is None:
+                continue
+            score = sum(
+                min(count_term_matches(node.summary, term), 1)
+                if collapse_risky_repeats
+                else count_term_matches(node.summary, term)
+                for term in terms
+            )
+            if score <= 0:
+                continue
+            node.search_rank = -float(score)
+            node.search_directness = compute_directness_score(node.summary, terms, phrases)
+            nodes.append(node)
+        nodes.sort(key=lambda node: _fallback_result_sort_key(node, None))
+        return nodes[:bounded_limit]
 
     def get_session_nodes(self, session_id: str,
                           depth: int | None = None,
