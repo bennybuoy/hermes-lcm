@@ -31,6 +31,74 @@ _MAINTENANCE_MAX_EDGES = 40_000
 _MAINTENANCE_MAX_MESSAGES = 40_000
 _MAINTENANCE_MAX_FRONTIER_ITEMS = 10_000
 _MAINTENANCE_QUERY_BATCH = 400
+_MAINTENANCE_COPY_MAX_BYTES = 16 * 1024 * 1024
+_MAINTENANCE_COPY_MAX_TOKENS = 1_000_000
+_MAINTENANCE_COPY_MAX_FIELD_BYTES = 2 * 1024 * 1024
+_MAINTENANCE_COPY_MAX_NESTED_DEPTH = 32
+_MAINTENANCE_COPY_MAX_NESTED_ITEMS = 20_000
+
+
+def _validate_copy_nested_value(value: Any) -> None:
+    pending = [(value, 0)]
+    items = 0
+    while pending:
+        current, depth = pending.pop()
+        items += 1
+        if items > _MAINTENANCE_COPY_MAX_NESTED_ITEMS:
+            raise ValueError("maintenance copy nested-item bound exceeded")
+        if depth > _MAINTENANCE_COPY_MAX_NESTED_DEPTH:
+            raise ValueError("maintenance copy nested-depth bound exceeded")
+        if isinstance(current, dict):
+            pending.extend((key, depth + 1) for key in current)
+            pending.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, (list, tuple)):
+            pending.extend((item, depth + 1) for item in current)
+
+
+def _bounded_copy_message_row(
+    conn: sqlite3.Connection,
+    store_id: int,
+    message_columns: list[str],
+    budget: dict[str, int],
+) -> sqlite3.Row:
+    quoted = [f'"{column.replace(chr(34), chr(34) * 2)}"' for column in message_columns]
+    size_sql = ", ".join(
+        f"COALESCE(length(CAST({column} AS BLOB)), 0)" for column in quoted
+    )
+    sizes = conn.execute(
+        f"SELECT {size_sql} FROM messages WHERE store_id=?", (int(store_id),)
+    ).fetchone()
+    if sizes is None:
+        raise ValueError("copy source message disappeared from locked snapshot")
+    encoded_sizes = [int(value or 0) for value in sizes]
+    if any(value > _MAINTENANCE_COPY_MAX_FIELD_BYTES for value in encoded_sizes):
+        raise ValueError("maintenance copy field byte bound exceeded")
+    row_bytes = sum(encoded_sizes)
+    if budget["bytes"] + row_bytes > _MAINTENANCE_COPY_MAX_BYTES:
+        raise ValueError("maintenance copy shared byte budget exceeded")
+
+    message = conn.execute(
+        f"SELECT {','.join(quoted)} FROM messages WHERE store_id=?", (int(store_id),)
+    ).fetchone()
+    if message is None:
+        raise ValueError("copy source message disappeared from locked snapshot")
+    row_tokens = 0
+    for column, value in zip(message_columns, message):
+        if not isinstance(value, str):
+            continue
+        row_tokens += count_tokens(value)
+        if column in {"content", "tool_calls"} and value.lstrip().startswith(("{", "[")):
+            try:
+                nested = json.loads(value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                nested = None
+            if nested is not None:
+                _validate_copy_nested_value(nested)
+    if budget["tokens"] + row_tokens > _MAINTENANCE_COPY_MAX_TOKENS:
+        raise ValueError("maintenance copy shared token budget exceeded")
+    budget["bytes"] += row_bytes
+    budget["tokens"] += row_tokens
+    return message
 
 
 def _safe_database_path(db_path: str | Path) -> Path:
@@ -882,15 +950,7 @@ def apply_dag_maintenance(
             message_columns = [
                 description[1] for description in conn.execute("PRAGMA table_info(messages)")
             ]
-            source_messages: dict[int, sqlite3.Row] = {}
-            bounded_message_ids = list(closure_message_ids)
-            for offset in range(0, len(bounded_message_ids), _MAINTENANCE_QUERY_BATCH):
-                batch = bounded_message_ids[offset:offset + _MAINTENANCE_QUERY_BATCH]
-                placeholders = ",".join("?" for _ in batch)
-                for message in conn.execute(
-                    f"SELECT * FROM messages WHERE store_id IN ({placeholders})", batch
-                ).fetchall():
-                    source_messages[int(message[0])] = message
+            copy_budget = {"bytes": 0, "tokens": 0}
 
             def copy_node(source_node_id: int) -> int:
                 if source_node_id in node_remap:
@@ -901,9 +961,9 @@ def apply_dag_maintenance(
                     copied_sources = []
                     for store_id in sources:
                         if store_id not in message_remap:
-                            message = source_messages.get(store_id)
-                            if message is None:
-                                raise ValueError("copy source message disappeared from locked snapshot")
+                            message = _bounded_copy_message_row(
+                                conn, store_id, message_columns, copy_budget
+                            )
                             values = dict(zip(message_columns, message))
                             values.pop("store_id", None)
                             values["session_id"] = target_session_id

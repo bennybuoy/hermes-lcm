@@ -31,6 +31,7 @@ from .db_bootstrap import (
     configure_connection,
     run_versioned_migrations,
 )
+from .dag import decode_source_ids
 
 logger = logging.getLogger(__name__)
 
@@ -977,7 +978,7 @@ class FrontierStore:
             base_generation=row[3],
             source_end_store_id=row[4],
             source_identity_hash=row[5],
-            source_ids=json.loads(row[6]) if row[6] else [],
+            source_ids=decode_source_ids(row[6]),
             policy_fingerprint=row[7],
             route_fingerprint=row[8],
             state=row[9],
@@ -1005,7 +1006,29 @@ class FrontierStore:
             ).fetchone()
         if not row:
             return None
-        return self._row_to_batch(row)
+        try:
+            return self._row_to_batch(row)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            reason = f"invalid_source_ids:{exc}"
+            self.update_batch_state(int(row[0]), "rejected", failure_reason=reason)
+            return PreparedBatch(
+                batch_id=int(row[0]),
+                conversation_id=str(row[1]),
+                session_id=str(row[2]),
+                base_generation=int(row[3]),
+                source_end_store_id=int(row[4]),
+                source_identity_hash=str(row[5]),
+                source_ids=[],
+                policy_fingerprint=str(row[7]),
+                route_fingerprint=str(row[8]),
+                state="rejected",
+                expected_leaf_count=int(row[10]),
+                frontier_end_store_id=int(row[11]),
+                failure_reason=reason,
+                summary_payload=(row[13] if len(row) > 13 else "") or "",
+                payload_version=int(row[14]) if len(row) > 14 else 0,
+                resolved_policy_json=(row[15] if len(row) > 15 else "{}") or "{}",
+            )
 
     def get_batch_counts_by_state(self, conversation_id: str) -> dict[str, int]:
         with self._lock:
@@ -1043,7 +1066,15 @@ class FrontierStore:
             ).fetchone()
         if not row:
             return None
-        batch = self._row_to_batch(row)
+        try:
+            batch = self._row_to_batch(row)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.update_batch_state(
+                int(row[0]),
+                "rejected",
+                failure_reason=f"invalid_source_ids:{exc}",
+            )
+            return None
         if not batch.has_summary_payload:
             # Reject silently at the ready-lookup boundary so callers fall back
             # to foreground compaction instead of re-running the LLM.

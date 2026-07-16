@@ -26143,6 +26143,16 @@ class TestHandleExpandStoreId:
 class TestHandleLoadSession:
     """Ordered, paged raw transcript loading by explicit session_id."""
 
+    @staticmethod
+    def _call(engine, args):
+        session_id = str(args.get("session_id") or "")
+        kwargs = {}
+        if session_id and session_id != engine.current_session_id:
+            kwargs["cross_session_capability"] = engine.issue_cross_session_capability(
+                [session_id]
+            )
+        return engine.handle_tool_call("lcm_load_session", args, **kwargs)
+
     def _seed_old_session(self, engine):
         rows = [
             ("user", "first old-session message", "cli", 100.0),
@@ -26170,8 +26180,8 @@ class TestHandleLoadSession:
         store_ids = self._seed_old_session(engine)
 
         result = json.loads(
-            engine.handle_tool_call(
-                "lcm_load_session",
+            self._call(
+                engine,
                 {"session_id": "old-session", "limit": 2},
             )
         )
@@ -26194,8 +26204,8 @@ class TestHandleLoadSession:
         store_ids = self._seed_old_session(engine)
 
         result = json.loads(
-            engine.handle_tool_call(
-                "lcm_load_session",
+            self._call(
+                engine,
                 {"session_id": "old-session", "after_store_id": store_ids[1], "limit": 10},
             )
         )
@@ -26209,8 +26219,8 @@ class TestHandleLoadSession:
         store_ids = self._seed_old_session(engine)
 
         result = json.loads(
-            engine.handle_tool_call(
-                "lcm_load_session",
+            self._call(
+                engine,
                 {
                     "session_id": "old-session",
                     "roles": ["user", "tool"],
@@ -26236,8 +26246,8 @@ class TestHandleLoadSession:
         )
 
         result = json.loads(
-            engine.handle_tool_call(
-                "lcm_load_session",
+            self._call(
+                engine,
                 {"session_id": "large-session", "max_content_chars": 3},
             )
         )
@@ -26257,8 +26267,8 @@ class TestHandleLoadSession:
         )
 
         result = json.loads(
-            engine.handle_tool_call(
-                "lcm_load_session",
+            self._call(
+                engine,
                 {"session_id": "large-session", "max_content_chars": 50_000},
             )
         )
@@ -26274,40 +26284,40 @@ class TestHandleLoadSession:
         assert "error" in missing and "session_id" in missing["error"]
 
         bad_roles = json.loads(
-            engine.handle_tool_call(
-                "lcm_load_session",
+            self._call(
+                engine,
                 {"session_id": "old-session", "roles": "user"},
             )
         )
         assert "error" in bad_roles and "roles" in bad_roles["error"]
 
         bad_cursor = json.loads(
-            engine.handle_tool_call(
-                "lcm_load_session",
+            self._call(
+                engine,
                 {"session_id": "old-session", "after_store_id": "not-an-id"},
             )
         )
         assert "error" in bad_cursor and "after_store_id" in bad_cursor["error"]
 
         bad_limit = json.loads(
-            engine.handle_tool_call(
-                "lcm_load_session",
+            self._call(
+                engine,
                 {"session_id": "old-session", "limit": "not-a-limit"},
             )
         )
         assert "error" in bad_limit and "limit" in bad_limit["error"]
 
         bad_max_content_chars = json.loads(
-            engine.handle_tool_call(
-                "lcm_load_session",
+            self._call(
+                engine,
                 {"session_id": "old-session", "max_content_chars": "not-a-size"},
             )
         )
         assert "error" in bad_max_content_chars and "max_content_chars" in bad_max_content_chars["error"]
 
         bad_range = json.loads(
-            engine.handle_tool_call(
-                "lcm_load_session",
+            self._call(
+                engine,
                 {"session_id": "old-session", "time_from": 5, "time_to": 4},
             )
         )
@@ -26317,8 +26327,8 @@ class TestHandleLoadSession:
         self._seed_old_session(engine)
 
         result = json.loads(
-            engine.handle_tool_call(
-                "lcm_load_session",
+            self._call(
+                engine,
                 {"session_id": "missing-session", "limit": 5000},
             )
         )

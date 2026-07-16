@@ -20,6 +20,11 @@ from .tokens import count_messages_tokens, count_tokens
 
 logger = logging.getLogger(__name__)
 
+_FULL_SWEEP_QUERY_BATCH = 400
+_FULL_SWEEP_MAX_FRONTIER_ROWS = 10_000
+_FULL_SWEEP_MAX_MESSAGE_ROWS = 10_000
+_FULL_SWEEP_MAX_LOCKED_SERIALIZED_BYTES = 4 * 1024 * 1024
+
 
 @dataclass(eq=False)
 class _StagedNode:
@@ -113,21 +118,77 @@ class FullSweepMixin:
             previous_end = end
         return validated
 
-    def _delete_staged_nodes_after_failed_sweep(self, staged: list[_StagedNode]) -> bool:
-        deleted_all = True
-        for item in reversed(staged):
-            if item.node_id <= 0:
-                continue
-            try:
-                deleted_all = bool(self._dag.delete_node(item.node_id)) and deleted_all
-            except Exception:
-                deleted_all = False
-                logger.error(
-                    "LCM full sweep could not compensate DAG node %d",
-                    item.node_id,
-                    exc_info=True,
-                )
-        return deleted_all
+    @staticmethod
+    def _bounded_full_sweep_frontier_rows_no_commit(
+        conn,
+        conversation_id: str,
+        generation: int,
+        *,
+        deadline_at: float,
+        byte_budget: list[int],
+    ) -> list[tuple[str, int, int, int]]:
+        rows: list[tuple[str, int, int, int]] = []
+        last_ordinal = -1
+        while True:
+            if time.monotonic() >= deadline_at:
+                raise RuntimeError("full sweep locked frontier deadline exceeded")
+            remaining = _FULL_SWEEP_MAX_FRONTIER_ROWS - len(rows)
+            page_limit = min(_FULL_SWEEP_QUERY_BATCH, remaining + 1)
+            page = conn.execute(
+                """SELECT ordinal, kind, ref_id, source_start, source_end
+                   FROM lcm_frontier_items
+                   WHERE conversation_id=? AND generation=? AND ordinal>?
+                   ORDER BY ordinal LIMIT ?""",
+                (conversation_id, int(generation), last_ordinal, page_limit),
+            ).fetchall()
+            if not page:
+                return rows
+            for ordinal, kind, ref_id, start, end in page:
+                if len(rows) >= _FULL_SWEEP_MAX_FRONTIER_ROWS:
+                    raise RuntimeError("full sweep locked frontier row bound exceeded")
+                charge = len(str(kind).encode("utf-8", errors="replace")) + 48
+                byte_budget[0] += charge
+                if byte_budget[0] > _FULL_SWEEP_MAX_LOCKED_SERIALIZED_BYTES:
+                    raise RuntimeError("full sweep locked publication byte bound exceeded")
+                rows.append((str(kind), int(ref_id), int(start or 0), int(end or 0)))
+                last_ordinal = int(ordinal)
+            if len(page) < page_limit:
+                return rows
+
+    @staticmethod
+    def _bounded_full_sweep_message_tail_no_commit(
+        conn,
+        session_id: str,
+        source_end: int,
+        *,
+        deadline_at: float,
+        byte_budget: list[int],
+    ) -> list[dict[str, int]]:
+        rows: list[dict[str, int]] = []
+        last_store_id = int(source_end)
+        while True:
+            if time.monotonic() >= deadline_at:
+                raise RuntimeError("full sweep locked message deadline exceeded")
+            remaining = _FULL_SWEEP_MAX_MESSAGE_ROWS - len(rows)
+            page_limit = min(_FULL_SWEEP_QUERY_BATCH, remaining + 1)
+            page = conn.execute(
+                """SELECT store_id FROM messages
+                   WHERE session_id=? AND store_id>? ORDER BY store_id LIMIT ?""",
+                (session_id, last_store_id, page_limit),
+            ).fetchall()
+            if not page:
+                return rows
+            for (raw_store_id,) in page:
+                if len(rows) >= _FULL_SWEEP_MAX_MESSAGE_ROWS:
+                    raise RuntimeError("full sweep locked message row bound exceeded")
+                byte_budget[0] += 32
+                if byte_budget[0] > _FULL_SWEEP_MAX_LOCKED_SERIALIZED_BYTES:
+                    raise RuntimeError("full sweep locked publication byte bound exceeded")
+                store_id = int(raw_store_id)
+                rows.append({"store_id": store_id})
+                last_store_id = store_id
+            if len(page) < page_limit:
+                return rows
 
     def _compress_full_sweep(
         self,
@@ -411,7 +472,7 @@ class FullSweepMixin:
                     canonical_winner_observed = True
                     raise RuntimeError("full sweep frontier CAS mismatch")
                 canonical_coverage = self._canonical_message_source_ids_no_commit(
-                    publication_conn, session_id
+                    publication_conn, session_id, deadline_at=deadline_at
                 )
                 if canonical_coverage.intersection(covered_source_ids):
                     canonical_winner_observed = True
@@ -451,12 +512,14 @@ class FullSweepMixin:
                 _publication_boundary("after_nodes")
 
                 covered_start = min(covered_source_ids)
-                active_rows = publication_conn.execute(
-                    """SELECT kind, ref_id, source_start, source_end
-                       FROM lcm_frontier_items
-                       WHERE conversation_id=? AND generation=? ORDER BY ordinal""",
-                    (conversation_id, int(frontier["generation"])),
-                ).fetchall()
+                locked_byte_budget = [0]
+                active_rows = self._bounded_full_sweep_frontier_rows_no_commit(
+                    publication_conn,
+                    conversation_id,
+                    int(frontier["generation"]),
+                    deadline_at=deadline_at,
+                    byte_budget=locked_byte_budget,
+                )
                 carried_items: list[dict[str, Any]] = []
                 for kind, ref_id, start, end in active_rows:
                     start, end = int(start or 0), int(end or 0)
@@ -470,14 +533,13 @@ class FullSweepMixin:
                         "kind": str(kind), "ref_id": int(ref_id),
                         "source_start": start, "source_end": end,
                     })
-                stored_tail = [
-                    {"store_id": int(row[0])}
-                    for row in publication_conn.execute(
-                        """SELECT store_id FROM messages
-                           WHERE session_id=? AND store_id>? ORDER BY store_id""",
-                        (session_id, source_end),
-                    ).fetchall()
-                ]
+                stored_tail = self._bounded_full_sweep_message_tail_no_commit(
+                    publication_conn,
+                    session_id,
+                    source_end,
+                    deadline_at=deadline_at,
+                    byte_budget=locked_byte_budget,
+                )
                 frontier_items = self._full_sweep_frontier_items(
                     roots, stored_tail, carried_items
                 )
@@ -506,16 +568,20 @@ class FullSweepMixin:
                 publication_committed or canonical_winner_observed
             )
             if frontier_rolled_back:
-                self._delete_staged_nodes_after_failed_sweep(staged)
                 self._last_compacted_store_id = previous_frontier_store_id
                 self._ingest_cursor = len(messages)
                 self._ingest_cursor_needs_reconcile = False
                 self._last_compression_status = "failed"
-                self._last_compression_noop_reason = "full_sweep_publication_rolled_back"
+                rollback_reason = "deadline" if reason == "deadline" else "publication-rolled-back"
+                self._last_compression_noop_reason = (
+                    "full_sweep_deadline_before_publication"
+                    if rollback_reason == "deadline"
+                    else "full_sweep_publication_rolled_back"
+                )
                 self._full_sweep_status(
-                    reason="publication-rolled-back",
+                    reason=rollback_reason,
                     passes=passes,
-                    partial=False,
+                    partial=rollback_reason == "deadline",
                     publication_count=0,
                     leaf_count=leaf_count,
                     condensation_count=condensation_count,

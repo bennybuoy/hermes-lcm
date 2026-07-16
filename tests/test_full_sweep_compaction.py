@@ -7,6 +7,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -352,6 +353,117 @@ def test_full_sweep_rejects_source_rewrite_between_summary_and_publication(
         assert engine._dag.get_session_node_count("sweep-session") == 0
         assert engine._frontier.get_active_frontier("sweep-conversation")["generation"] == 1
         assert engine._last_full_sweep_status["publication_count"] == 0
+    finally:
+        engine.shutdown()
+
+
+def test_full_sweep_rollback_never_deletes_waiting_writer_reused_node_id(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    _stub_summaries(monkeypatch, engine)
+    writer_started = threading.Event()
+    writer_committed = threading.Event()
+    writer_result: dict[str, int] = {}
+    writer_thread: list[threading.Thread] = []
+    original_delete = engine._dag.delete_node
+
+    def waiting_writer():
+        conn = sqlite3.connect(str(engine._store.db_path), timeout=5.0)
+        try:
+            writer_started.set()
+            cur = conn.execute(
+                """INSERT INTO summary_nodes
+                   (session_id, depth, summary, token_count, source_token_count,
+                    source_ids, source_type, created_at)
+                   VALUES ('winner-session', 0, 'waiting writer winner', 1, 1,
+                           '[]', 'messages', 99)"""
+            )
+            conn.commit()
+            writer_result["node_id"] = int(cur.lastrowid)
+        finally:
+            conn.close()
+            writer_committed.set()
+
+    def fail_after_nodes(phase):
+        if phase == "after_nodes" and not writer_thread:
+            thread = threading.Thread(target=waiting_writer, name="waiting-writer")
+            writer_thread.append(thread)
+            thread.start()
+            assert writer_started.wait(timeout=2)
+            raise RuntimeError("force full-sweep rollback")
+
+    def expose_reused_id(node_id):
+        assert writer_committed.wait(timeout=5)
+        return original_delete(node_id)
+
+    monkeypatch.setattr(engine._dag, "delete_node", expose_reused_id)
+    engine._full_sweep_publish_failure_hook = fail_after_nodes
+    try:
+        engine.compress(_messages(10), current_tokens=1_900)
+        assert writer_thread
+        writer_thread[0].join(timeout=5)
+        assert not writer_thread[0].is_alive()
+        winner_id = writer_result["node_id"]
+        row = engine._dag.connection.execute(
+            "SELECT summary FROM summary_nodes WHERE node_id=?", (winner_id,)
+        ).fetchone()
+        assert row == ("waiting writer winner",)
+        assert engine._frontier.get_active_frontier("sweep-conversation")["generation"] == 1
+    finally:
+        engine._full_sweep_publish_failure_hook = None
+        if writer_thread:
+            writer_thread[0].join(timeout=5)
+        engine.shutdown()
+
+
+def test_full_sweep_aborts_losslessly_when_locked_tail_bounds_are_exceeded(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    _stub_summaries(monkeypatch, engine)
+    monkeypatch.setattr(sweep_module, "_FULL_SWEEP_MAX_MESSAGE_ROWS", 1, raising=False)
+    try:
+        original = _messages(10)
+        result = engine.compress(original, current_tokens=1_900)
+        assert engine._frontier.get_active_frontier("sweep-conversation")["generation"] == 1
+        assert engine._dag.get_session_nodes("sweep-session") == []
+        assert engine._last_full_sweep_status["reason"] == "publication-rolled-back"
+        assert [message["content"] for message in result] == [
+            message["content"] for message in original
+        ]
+    finally:
+        engine.shutdown()
+
+
+def test_full_sweep_aborts_losslessly_when_locked_frontier_bounds_are_exceeded(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    _stub_summaries(monkeypatch, engine)
+    legacy_id = engine._store.append(
+        "sweep-session", {"role": "user", "content": "prior frontier source"}
+    )
+    engine._frontier.set_frontier_items(
+        "sweep-conversation",
+        1,
+        [{
+            "kind": "message",
+            "ref_id": legacy_id,
+            "source_start": legacy_id,
+            "source_end": legacy_id,
+        }],
+    )
+    monkeypatch.setattr(sweep_module, "_FULL_SWEEP_MAX_FRONTIER_ROWS", 0)
+    try:
+        original = _messages(10)
+        result = engine.compress(original, current_tokens=1_900)
+        assert engine._frontier.get_active_frontier("sweep-conversation")["generation"] == 1
+        assert engine._dag.get_session_nodes("sweep-session") == []
+        assert engine._last_full_sweep_status["reason"] == "publication-rolled-back"
+        assert [message["content"] for message in result] == [
+            message["content"] for message in original
+        ]
     finally:
         engine.shutdown()
 

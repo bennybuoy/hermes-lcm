@@ -8,8 +8,11 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import threading
 
 import pytest
+
+import hermes_lcm.maintenance as maintenance_module
 
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
@@ -71,6 +74,39 @@ def _active(path, conversation_id):
     ).fetchall()
     conn.close()
     return row, items
+
+
+def _maintenance_state(path):
+    conn = sqlite3.connect(path)
+    try:
+        return {
+            "messages": conn.execute(
+                """SELECT store_id, session_id, conversation_id, role, content,
+                          COALESCE(tool_calls, '') FROM messages ORDER BY store_id"""
+            ).fetchall(),
+            "nodes": conn.execute(
+                """SELECT node_id, session_id, depth, summary, source_ids, source_type
+                   FROM summary_nodes ORDER BY node_id"""
+            ).fetchall(),
+            "frontiers": conn.execute(
+                """SELECT conversation_id, generation, session_id, source_end_store_id
+                   FROM lcm_active_frontiers ORDER BY conversation_id, generation"""
+            ).fetchall(),
+            "items": conn.execute(
+                """SELECT conversation_id, generation, ordinal, kind, ref_id,
+                          source_start, source_end FROM lcm_frontier_items
+                   ORDER BY conversation_id, generation, ordinal"""
+            ).fetchall(),
+            "batches": conn.execute(
+                "SELECT batch_id, conversation_id, state FROM lcm_prepared_batches ORDER BY batch_id"
+            ).fetchall(),
+            "lifecycle": conn.execute(
+                """SELECT conversation_id, current_session_id, current_frontier_store_id
+                   FROM lcm_lifecycle_state ORDER BY conversation_id"""
+            ).fetchall(),
+        }
+    finally:
+        conn.close()
 
 
 def test_rewrite_requires_confirmation_and_publishes_new_generation(tmp_path):
@@ -251,43 +287,56 @@ def test_maintenance_atomically_advances_lifecycle_and_settles_base_batch(tmp_pa
         conn.close()
 
 
-def test_concurrent_winner_between_plan_and_lock_aborts_before_backup(tmp_path):
+def test_concurrent_winner_during_locked_snapshot_serializes_and_rejects(tmp_path):
     path, parent, _ = _fixture(tmp_path)
+    attempting = threading.Event()
+    outcome: dict[str, str] = {}
+    competitors: list[threading.Thread] = []
 
-    def publish_winner(phase):
-        assert phase == "before_begin"
-        conn = sqlite3.connect(path)
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
-            """INSERT INTO lcm_active_frontiers
-               (conversation_id, generation, session_id, source_end_store_id,
-                policy_fingerprint, route_fingerprint, created_at, updated_at)
-               SELECT conversation_id, 2, session_id, source_end_store_id,
-                      policy_fingerprint, route_fingerprint, 2, 2
-               FROM lcm_active_frontiers
-               WHERE conversation_id='source-conv' AND generation=1"""
-        )
-        conn.execute(
-            """INSERT INTO lcm_frontier_items
-               (conversation_id, generation, ordinal, kind, ref_id, source_start, source_end)
-               SELECT conversation_id, 2, ordinal, kind, ref_id, source_start, source_end
-               FROM lcm_frontier_items
-               WHERE conversation_id='source-conv' AND generation=1"""
-        )
-        conn.commit()
-        conn.close()
+    def competing_publisher():
+        conn = sqlite3.connect(path, timeout=5.0)
+        try:
+            attempting.set()
+            conn.execute("BEGIN IMMEDIATE")
+            generation = conn.execute(
+                """SELECT generation FROM lcm_active_frontiers
+                   WHERE conversation_id='source-conv'
+                   ORDER BY generation DESC LIMIT 1"""
+            ).fetchone()[0]
+            if generation != 1:
+                conn.rollback()
+                outcome["state"] = "rejected"
+                return
+            raise AssertionError("competitor acquired the lock before maintenance committed")
+        finally:
+            conn.close()
 
-    with pytest.raises(ValueError, match="frontier changed after dry-run"):
-        apply_dag_maintenance(
-            path,
-            operation="dissolve",
-            conversation_id="source-conv",
-            node_id=parent,
-            confirmation="APPLY dissolve",
-            snapshot_hook=publish_winner,
-        )
+    def start_during_locked_snapshot(phase):
+        if phase != "after_snapshot_locked":
+            return
+        thread = threading.Thread(target=competing_publisher, name="maintenance-competitor")
+        competitors.append(thread)
+        thread.start()
+        assert attempting.wait(timeout=2)
+
+    result = apply_dag_maintenance(
+        path,
+        operation="dissolve",
+        conversation_id="source-conv",
+        node_id=parent,
+        confirmation="APPLY dissolve",
+        snapshot_hook=start_during_locked_snapshot,
+    )
+    assert result["new_generation"] == 2
+    assert competitors
+    competitors[0].join(timeout=5)
+    assert not competitors[0].is_alive()
+    assert outcome["state"] == "rejected"
     assert _active(path, "source-conv")[0][0] == 2
-    assert not (tmp_path / "lcm-maintenance-backups").exists()
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    conn.close()
 
 
 def test_maintenance_source_inventory_batches_message_validation_and_rejects_fanout(
@@ -351,23 +400,126 @@ def test_maintenance_frontier_rows_are_sql_limited_before_allocation(tmp_path):
     conn.close()
 
 
-@pytest.mark.parametrize(
-    ("phase", "expected_generation"),
-    [("after_frontier", 1), ("after_commit", 2)],
-)
-def test_maintenance_process_death_restarts_at_wholly_old_or_new_state(
-    tmp_path, phase, expected_generation
+def test_copy_subtree_shared_byte_budget_aborts_before_retaining_source_rows(
+    tmp_path, monkeypatch
 ):
     path, parent, _ = _fixture(tmp_path)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "UPDATE messages SET content=? WHERE session_id='source' AND store_id=1",
+        ("nested payload " + ("x" * 20_000),),
+    )
+    before = {
+        "messages": conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
+        "nodes": conn.execute("SELECT COUNT(*) FROM summary_nodes").fetchone()[0],
+        "frontiers": conn.execute("SELECT COUNT(*) FROM lcm_active_frontiers").fetchone()[0],
+        "items": conn.execute("SELECT COUNT(*) FROM lcm_frontier_items").fetchone()[0],
+    }
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(
+        maintenance_module, "_MAINTENANCE_COPY_MAX_BYTES", 1_024, raising=False
+    )
+    with pytest.raises(ValueError, match="copy.*byte.*budget"):
+        apply_dag_maintenance(
+            path,
+            operation="copy-subtree",
+            conversation_id="source-conv",
+            node_id=parent,
+            target_session_id="target",
+            target_conversation_id="target-conv",
+            confirmation="APPLY copy-subtree",
+        )
+    conn = sqlite3.connect(path)
+    after = {
+        "messages": conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
+        "nodes": conn.execute("SELECT COUNT(*) FROM summary_nodes").fetchone()[0],
+        "frontiers": conn.execute("SELECT COUNT(*) FROM lcm_active_frontiers").fetchone()[0],
+        "items": conn.execute("SELECT COUNT(*) FROM lcm_frontier_items").fetchone()[0],
+    }
+    conn.close()
+    assert after == before
+
+
+def test_copy_subtree_shared_token_budget_aborts_atomically(tmp_path, monkeypatch):
+    path, parent, _ = _fixture(tmp_path)
+    monkeypatch.setattr(maintenance_module, "_MAINTENANCE_COPY_MAX_TOKENS", 1)
+    with pytest.raises(ValueError, match="copy.*token.*budget"):
+        apply_dag_maintenance(
+            path,
+            operation="copy-subtree",
+            conversation_id="source-conv",
+            node_id=parent,
+            target_session_id="target",
+            target_conversation_id="target-conv",
+            confirmation="APPLY copy-subtree",
+        )
+    assert _active(path, "target-conv")[0][0] == 1
+    conn = sqlite3.connect(path)
+    assert conn.execute("SELECT COUNT(*) FROM messages WHERE session_id='target'").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM summary_nodes WHERE session_id='target'").fetchone()[0] == 0
+    conn.close()
+
+
+def test_copy_subtree_nested_tool_payload_depth_aborts_atomically(
+    tmp_path, monkeypatch
+):
+    path, parent, _ = _fixture(tmp_path)
+    nested: object = "leaf"
+    for _ in range(8):
+        nested = {"content": nested}
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "UPDATE messages SET tool_calls=? WHERE session_id='source' AND store_id=1",
+        (json.dumps(nested),),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(maintenance_module, "_MAINTENANCE_COPY_MAX_NESTED_DEPTH", 3)
+    with pytest.raises(ValueError, match="nested-depth"):
+        apply_dag_maintenance(
+            path,
+            operation="copy-subtree",
+            conversation_id="source-conv",
+            node_id=parent,
+            target_session_id="target",
+            target_conversation_id="target-conv",
+            confirmation="APPLY copy-subtree",
+        )
+    assert _active(path, "target-conv")[0][0] == 1
+
+
+@pytest.mark.parametrize("phase", ["after_frontier", "after_commit"])
+def test_maintenance_process_death_restarts_at_wholly_old_or_new_state(
+    tmp_path, phase
+):
+    path, parent, _ = _fixture(tmp_path)
+    engine = LCMEngine(config=LCMConfig(database_path=str(path)))
+    target = engine._frontier.get_active_frontier("target-conv")
+    assert target is not None
+    batch_id, _ = engine._frontier.create_batch_cas(
+        conversation_id="target-conv",
+        session_id="target",
+        base_generation=int(target["generation"]),
+        source_end_store_id=int(target["source_end_store_id"]),
+        source_identity_hash="maintenance-crash-batch",
+        source_ids=[int(target["source_end_store_id"])],
+        policy_fingerprint="",
+        route_fingerprint="",
+    )
+    assert batch_id > 0
+    engine.shutdown()
+    old_state = _maintenance_state(path)
     script = r'''
 import os, sys
 from hermes_lcm.maintenance import apply_dag_maintenance
 def crash(observed):
-    if observed == sys.argv[4]:
+    if observed == sys.argv[3]:
         os._exit(91)
 apply_dag_maintenance(
-    sys.argv[1], operation='dissolve', conversation_id='source-conv',
-    node_id=int(sys.argv[2]), confirmation='APPLY dissolve',
+    sys.argv[1], operation='copy-subtree', conversation_id='source-conv',
+    node_id=int(sys.argv[2]), confirmation='APPLY copy-subtree',
+    target_session_id='target', target_conversation_id='target-conv',
     publication_phase_hook=crash,
 )
 raise SystemExit('crash hook did not fire')
@@ -380,7 +532,7 @@ raise SystemExit('crash hook did not fire')
         [str(package_root), "/home/ben/hermes-agent-gil-pr"]
     )
     crashed = subprocess.run(
-        [sys.executable, "-c", script, str(path), str(parent), "unused", phase],
+        [sys.executable, "-c", script, str(path), str(parent), phase],
         env=env,
         text=True,
         capture_output=True,
@@ -388,15 +540,29 @@ raise SystemExit('crash hook did not fire')
         timeout=30,
     )
     assert crashed.returncode == 91, (crashed.stdout, crashed.stderr)
-    conn = sqlite3.connect(path)
-    active = conn.execute(
-        """SELECT generation, source_end_store_id FROM lcm_active_frontiers
-           WHERE conversation_id='source-conv' ORDER BY generation DESC LIMIT 1"""
-    ).fetchone()
-    lifecycle = conn.execute(
-        """SELECT current_frontier_store_id FROM lcm_lifecycle_state
-           WHERE conversation_id='source-conv'"""
-    ).fetchone()
-    conn.close()
-    assert active[0] == expected_generation
-    assert lifecycle[0] == (active[1] if expected_generation == 2 else 0)
+    backups = list((tmp_path / "lcm-maintenance-backups").glob("*.sqlite3"))
+    assert len(backups) == 1
+    assert _maintenance_state(backups[0]) == old_state
+
+    recovered = _maintenance_state(path)
+    if phase == "after_frontier":
+        assert recovered == old_state
+    else:
+        assert len(recovered["messages"]) == len(old_state["messages"]) + 2
+        assert len(recovered["nodes"]) == len(old_state["nodes"]) + 3
+        assert len(recovered["frontiers"]) == len(old_state["frontiers"]) + 1
+        target_frontier = [
+            row for row in recovered["frontiers"] if row[0] == "target-conv"
+        ][-1]
+        assert target_frontier[1] == 2
+        target_items = [
+            row for row in recovered["items"]
+            if row[0] == "target-conv" and row[1] == 2
+        ]
+        assert {row[3] for row in target_items} == {"message", "node"}
+        assert recovered["batches"] == [(batch_id, "target-conv", "superseded")]
+        assert ("target-conv", "target", target_frontier[3]) in recovered["lifecycle"]
+        conn = sqlite3.connect(path)
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        conn.close()

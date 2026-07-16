@@ -156,8 +156,10 @@ _SENSITIVE_PATTERN_CATALOG: dict[str, re.Pattern[str]] = {
         re.IGNORECASE,
     ),
     "password_assignment": re.compile(
-        r"(?P<prefix>\b(?:password|passwd|pwd|passphrase)\b\s*[\"']?\s*[:=]\s*)"
-        r"(?:(?P<quote>[\"'])(?P<secret_quoted>[^\r\n\]\}]{6,}?)(?P=quote)|"
+        r"(?P<prefix>\b(?:password|passwd|pwd|passphrase)\b\s*(?:\\?[\"'])?\s*[:=]\s*)"
+        r"(?:(?P<escaped_quote>\\[\"'])(?P<secret_escaped_quoted>[^\r\n\]\}]{6,}?)(?P=escaped_quote)|"
+        r"(?P<escaped_unterminated_quote>\\[\"'])(?P<secret_escaped_unterminated>[^\r\n\]\}]{6,})|"
+        r"(?P<quote>[\"'])(?P<secret_quoted>[^\r\n\]\}]{6,}?)(?P=quote)|"
         r"(?P<unterminated_quote>[\"'])(?P<secret_unterminated>[^\r\n\]\}]{6,})|"
         r"(?P<secret_unquoted>[^\s,\"'\]}]{6,}))",
         re.IGNORECASE,
@@ -747,6 +749,8 @@ def _redact_match(pattern_name: str, match: re.Match[str]) -> str:
     secret_group = None
     for candidate in (
         "secret",
+        "secret_escaped_quoted",
+        "secret_escaped_unterminated",
         "secret_quoted",
         "secret_unterminated",
         "secret_unquoted",

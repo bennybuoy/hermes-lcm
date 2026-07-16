@@ -30,6 +30,7 @@ from .dag import (
     MAX_SOURCE_IDS_JSON_CHARS,
     MAX_SOURCE_IDS_PER_NODE,
     build_nodes_fts_spec,
+    decode_source_ids,
 )
 from .db_bootstrap import check_external_content_fts_integrity, inspect_lcm_schema_health
 from .extraction import sanitize_pre_compaction_content
@@ -304,23 +305,30 @@ def _search_externalized_payloads(
             "max_files": max_files,
             "max_payload_chars": max_payload_chars,
         }
-    def _candidate_paths():
-        if ref:
-            yield root / ref
-            return
-        with os.scandir(root) as entries:
-            for entry in entries:
-                if entry.name.endswith(".json"):
-                    yield root / entry.name
-
     regex_deadline = time.monotonic() + _LCM_GREP_REGEX_OPERATION_DEADLINE_SECONDS
     regex_timeouts = 0
     candidates_seen = 0
-    for path in _candidate_paths():
-        if candidates_seen >= max_files:
+    paths: list[Path] = []
+    if ref:
+        candidates_seen = 1
+        paths.append(root / ref)
+    else:
+        exhausted = False
+        with os.scandir(root) as entries:
+            iterator = iter(entries)
+            while candidates_seen < max_files:
+                try:
+                    entry = next(iterator)
+                except StopIteration:
+                    exhausted = True
+                    break
+                candidates_seen += 1
+                if entry.name.endswith(".json"):
+                    paths.append(root / entry.name)
+        if not exhausted and candidates_seen >= max_files:
             scan_truncated = True
-            break
-        candidates_seen += 1
+
+    for path_index, path in enumerate(paths):
         if bytes_scanned >= _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES:
             scan_truncated = True
             break
@@ -428,10 +436,11 @@ def _search_externalized_payloads(
             "_sort_directness": 0.0,
         })
         if len(hits) >= limit:
-            scan_truncated = scan_truncated or len(paths) > files_scanned
+            scan_truncated = scan_truncated or path_index + 1 < len(paths)
             break
     return hits, diagnostics, {
         "files_scanned": files_scanned,
+        "entries_scanned": candidates_seen,
         "bytes_scanned": bytes_scanned,
         "matches": len(hits),
         "scan_truncated": scan_truncated,
@@ -543,10 +552,17 @@ _LCM_LOAD_SESSION_DEFAULT_LIMIT = 100
 _LCM_LOAD_SESSION_HARD_LIMIT_CAP = 200
 _LCM_LOAD_SESSION_DEFAULT_MAX_CONTENT_CHARS = 4000
 _LCM_LOAD_SESSION_HARD_MAX_CONTENT_CHARS = 20_000
+_LCM_LOAD_SESSION_MAX_NESTED_DEPTH = 12
+_LCM_LOAD_SESSION_MAX_NESTED_ITEMS = 256
+_LCM_LOAD_SESSION_MAX_ROW_SERIALIZED_BYTES = 64 * 1024
+_LCM_LOAD_SESSION_MAX_SERIALIZED_BYTES = 2 * 1024 * 1024
 _LCM_INSPECT_DEFAULT_LIMIT = 20
 _LCM_INSPECT_HARD_LIMIT_CAP = 200
 _LCM_INSPECT_REF_SCAN_MESSAGE_LIMIT = 10_000
 _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES = 16_384
+_LCM_INSPECT_LINEAGE_MAX_ROWS = 10_000
+_LCM_INSPECT_LINEAGE_MAX_EDGES = 40_000
+_LCM_INSPECT_LINEAGE_DEADLINE_SECONDS = 0.25
 
 
 def _slice_content_for_response(
@@ -2138,9 +2154,13 @@ def _parse_load_session_roles(value: Any) -> tuple[list[str], str | None]:
 
 
 def _slice_loaded_content(content: Any, max_content_chars: int) -> dict[str, Any]:
-    text = content or ""
-    sliced = text[:max_content_chars]
-    has_more = len(sliced) < len(text)
+    text = str(content or "")
+    sliced, has_more = _bounded_cross_session_text(
+        text,
+        None,
+        max_tokens=max(1, max_content_chars * 2),
+        max_chars=max_content_chars,
+    )
     return {
         "content": sliced,
         "content_chars": len(text),
@@ -2150,14 +2170,91 @@ def _slice_loaded_content(content: Any, max_content_chars: int) -> dict[str, Any
     }
 
 
+def _bounded_loaded_nested_value(
+    value: Any,
+    *,
+    char_budget: list[int],
+    item_budget: list[int],
+    depth: int = 0,
+) -> tuple[Any, bool]:
+    """Mandatory-redact and bound every nested value in a loaded row."""
+    if depth > _LCM_LOAD_SESSION_MAX_NESTED_DEPTH or item_budget[0] <= 0:
+        return "[LCM nested value truncated]", True
+    item_budget[0] -= 1
+    if isinstance(value, str):
+        allowed = max(0, char_budget[0])
+        if allowed <= 0:
+            return "[LCM string truncated]", True
+        bounded, truncated = _bounded_cross_session_text(
+            value,
+            None,
+            max_tokens=max(1, allowed * 2),
+            max_chars=allowed,
+        )
+        char_budget[0] = max(0, char_budget[0] - len(bounded))
+        return bounded, truncated
+    if isinstance(value, dict):
+        result: dict[Any, Any] = {}
+        truncated = False
+        for index, (key, item) in enumerate(value.items()):
+            if index >= _LCM_LOAD_SESSION_MAX_NESTED_ITEMS or item_budget[0] <= 0:
+                truncated = True
+                break
+            safe_key, key_truncated = _bounded_loaded_nested_value(
+                key if isinstance(key, str) else str(key),
+                char_budget=char_budget,
+                item_budget=item_budget,
+                depth=depth + 1,
+            )
+            safe_item, item_truncated = _bounded_loaded_nested_value(
+                item,
+                char_budget=char_budget,
+                item_budget=item_budget,
+                depth=depth + 1,
+            )
+            result[str(safe_key)] = safe_item
+            truncated = truncated or key_truncated or item_truncated
+        return result, truncated
+    if isinstance(value, (list, tuple)):
+        result = []
+        truncated = False
+        for index, item in enumerate(value):
+            if index >= _LCM_LOAD_SESSION_MAX_NESTED_ITEMS or item_budget[0] <= 0:
+                truncated = True
+                break
+            safe_item, item_truncated = _bounded_loaded_nested_value(
+                item,
+                char_budget=char_budget,
+                item_budget=item_budget,
+                depth=depth + 1,
+            )
+            result.append(safe_item)
+            truncated = truncated or item_truncated
+        return result, truncated
+    if value is None or isinstance(value, (bool, int, float)):
+        return value, False
+    return _bounded_loaded_nested_value(
+        str(value), char_budget=char_budget, item_budget=item_budget, depth=depth + 1
+    )
+
+
 def _serialize_loaded_message(engine: "LCMEngine", row: dict[str, Any], max_content_chars: int) -> dict[str, Any]:
     stored_session_id = row.get("session_id", "")
     content_slice = _slice_loaded_content(row.get("content", "") or "", max_content_chars)
+    safe_session_id, _ = _bounded_cross_session_text(
+        stored_session_id, None, max_tokens=512, max_chars=512
+    )
+    safe_source, _ = _bounded_cross_session_text(
+        row.get("source") or "", None, max_tokens=512, max_chars=512
+    )
+    safe_role, _ = _bounded_cross_session_text(
+        row.get("role") or "", None, max_tokens=128, max_chars=128
+    )
     item: dict[str, Any] = {
         "store_id": row.get("store_id"),
-        "session_id": stored_session_id,
-        "source": row.get("source") or "",
-        "role": row.get("role"),
+        "session_id": safe_session_id,
+        "source": safe_source,
+        "role": safe_role,
         "timestamp": row.get("timestamp", 0),
         "content": content_slice["content"],
         "content_chars": content_slice["content_chars"],
@@ -2166,12 +2263,34 @@ def _serialize_loaded_message(engine: "LCMEngine", row: dict[str, Any], max_cont
         "next_content_offset": content_slice["next_content_offset"],
         "from_current_session": bool(engine.current_session_id) and stored_session_id == engine.current_session_id,
     }
+    nested_truncated = False
+    char_budget = [max(1, _LCM_LOAD_SESSION_MAX_ROW_SERIALIZED_BYTES // 2)]
+    item_budget = [_LCM_LOAD_SESSION_MAX_NESTED_ITEMS]
     if row.get("tool_call_id"):
-        item["tool_call_id"] = row.get("tool_call_id")
+        item["tool_call_id"], changed = _bounded_loaded_nested_value(
+            row.get("tool_call_id"), char_budget=char_budget, item_budget=item_budget
+        )
+        nested_truncated = nested_truncated or changed
     if row.get("tool_calls"):
-        item["tool_calls"] = row.get("tool_calls")
+        item["tool_calls"], changed = _bounded_loaded_nested_value(
+            row.get("tool_calls"), char_budget=char_budget, item_budget=item_budget
+        )
+        nested_truncated = nested_truncated or changed
     if row.get("tool_name"):
-        item["tool_name"] = row.get("tool_name")
+        item["tool_name"], changed = _bounded_loaded_nested_value(
+            row.get("tool_name"), char_budget=char_budget, item_budget=item_budget
+        )
+        nested_truncated = nested_truncated or changed
+    encoded_size = len(json.dumps(item, ensure_ascii=False, default=str).encode("utf-8"))
+    if encoded_size > _LCM_LOAD_SESSION_MAX_ROW_SERIALIZED_BYTES:
+        item.pop("tool_calls", None)
+        item["tool_calls_truncated"] = True
+        nested_truncated = True
+        encoded_size = len(json.dumps(item, ensure_ascii=False, default=str).encode("utf-8"))
+    item["serialized_truncated"] = bool(
+        nested_truncated or content_slice["content_truncated"]
+    )
+    item["serialized_bytes"] = encoded_size
     return item
 
 
@@ -2184,6 +2303,14 @@ def lcm_load_session(args: Dict[str, Any], **kwargs) -> str:
     session_id = str(args.get("session_id") or "").strip()
     if not session_id:
         return json.dumps({"error": "session_id is required"})
+    if session_id != engine.current_session_id:
+        allowed_session_ids = engine._authorized_cross_session_ids(
+            kwargs.get("cross_session_capability")
+        )
+        if allowed_session_ids is None or session_id not in allowed_session_ids:
+            return json.dumps({
+                "error": "cross-session load requires a trusted host capability"
+            })
 
     raw_limit_arg = args.get("limit", _LCM_LOAD_SESSION_DEFAULT_LIMIT)
     parsed_limit, limit_error = _parse_strict_int(raw_limit_arg, "limit")
@@ -2240,16 +2367,42 @@ def lcm_load_session(args: Dict[str, Any], **kwargs) -> str:
     has_more = len(rows) > limit
     next_cursor = page_rows[-1]["store_id"] if has_more and page_rows else None
 
+    serialized_messages: list[dict[str, Any]] = []
+    shared_messages_bytes = 0
+    shared_budget_exhausted = False
+    response_reserve = min(
+        16_384, max(1_024, _LCM_LOAD_SESSION_MAX_SERIALIZED_BYTES // 4)
+    )
+    message_byte_limit = max(
+        0, _LCM_LOAD_SESSION_MAX_SERIALIZED_BYTES - response_reserve
+    )
+    for row in page_rows:
+        item = _serialize_loaded_message(engine, row, max_content_chars)
+        item_bytes = len(json.dumps(item, ensure_ascii=False, default=str).encode("utf-8"))
+        if shared_messages_bytes + item_bytes > message_byte_limit:
+            shared_budget_exhausted = True
+            has_more = True
+            break
+        serialized_messages.append(item)
+        shared_messages_bytes += item_bytes
+
+    if has_more:
+        next_cursor = (
+            serialized_messages[-1]["store_id"] if serialized_messages else after_store_id
+        )
+
     response: dict[str, Any] = {
         "session_id": session_id,
         "limit": limit,
         "max_content_chars": max_content_chars,
         "after_store_id": after_store_id,
         "total_messages": total_messages,
-        "returned_messages": len(page_rows),
-        "messages": [_serialize_loaded_message(engine, row, max_content_chars) for row in page_rows],
+        "returned_messages": len(serialized_messages),
+        "messages": serialized_messages,
         "next_cursor": next_cursor,
         "has_more": has_more,
+        "serialized_byte_limit": _LCM_LOAD_SESSION_MAX_SERIALIZED_BYTES,
+        "serialized_budget_exhausted": shared_budget_exhausted,
     }
     if roles:
         response["roles"] = roles
@@ -2261,6 +2414,14 @@ def lcm_load_session(args: Dict[str, Any], **kwargs) -> str:
         response["limit_clamped_from"] = requested_limit
     if requested_max_content_chars > _LCM_LOAD_SESSION_HARD_MAX_CONTENT_CHARS:
         response["max_content_chars_clamped_from"] = requested_max_content_chars
+    response["serialized_bytes"] = 0
+    for _ in range(3):
+        serialized_bytes = len(
+            json.dumps(response, ensure_ascii=False, default=str).encode("utf-8")
+        )
+        if serialized_bytes == response["serialized_bytes"]:
+            break
+        response["serialized_bytes"] = serialized_bytes
     return json.dumps(response)
 
 
@@ -3566,24 +3727,41 @@ def _inspect_lifecycle_state(engine: "LCMEngine", session_id: str, conversation_
 
 def _inspect_highest_compacted_source_store_id(engine: "LCMEngine", session_id: str) -> int:
     highest = 0
-    rows = engine._dag.connection.execute(
-        """
-        SELECT source_ids
-        FROM summary_nodes
-        WHERE session_id = ? AND source_type = 'messages'
-        """,
-        (session_id,),
-    ).fetchall()
-    for (raw_source_ids,) in rows:
-        try:
-            source_ids = json.loads(raw_source_ids or "[]")
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
-        for source_id in source_ids:
+    edges = 0
+    deadline = time.monotonic() + _LCM_INSPECT_LINEAGE_DEADLINE_SECONDS
+    rows_seen = 0
+    last_node_id = 0
+    while rows_seen < _LCM_INSPECT_LINEAGE_MAX_ROWS:
+        if time.monotonic() >= deadline:
+            break
+        page_limit = min(400, _LCM_INSPECT_LINEAGE_MAX_ROWS - rows_seen)
+        rows = engine._dag.connection.execute(
+            """SELECT node_id, source_ids FROM summary_nodes
+               WHERE session_id = ? AND source_type = 'messages' AND node_id > ?
+               ORDER BY node_id LIMIT ?""",
+            (session_id, last_node_id, page_limit),
+        ).fetchall()
+        if not rows:
+            break
+        for node_id, raw_source_ids in rows:
+            if time.monotonic() >= deadline:
+                return highest
+            rows_seen += 1
+            last_node_id = int(node_id)
             try:
-                highest = max(highest, int(source_id))
-            except (TypeError, ValueError, OverflowError):
+                source_ids = decode_source_ids(raw_source_ids or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
                 continue
+            if edges + len(source_ids) > _LCM_INSPECT_LINEAGE_MAX_EDGES:
+                return highest
+            edges += len(source_ids)
+            for source_id in source_ids:
+                try:
+                    highest = max(highest, int(source_id))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+        if len(rows) < page_limit:
+            break
     return highest
 
 

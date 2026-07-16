@@ -160,6 +160,10 @@ _AUTO_FOCUS_MAX_CHARS = 700
 _PROMPT_AWARE_MAX_TERMS = 64
 _PROMPT_AWARE_MAX_SUMMARIES = 512
 _PROMPT_AWARE_MAX_PROMPT_CHARS = 20_000
+_CANONICAL_LINEAGE_QUERY_BATCH = 400
+_CANONICAL_LINEAGE_MAX_ROWS = 10_000
+_CANONICAL_LINEAGE_MAX_EDGES = 40_000
+_CANONICAL_LINEAGE_MAX_BYTES = 4 * 1024 * 1024
 
 _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
 _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
@@ -3938,7 +3942,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         handler = handlers.get(name)
         if handler:
             handler_kwargs = {"engine": self}
-            if name in {"lcm_grep", "lcm_expand", "lcm_expand_query"} and kwargs.get("cross_session_capability") is not None:
+            if name in {"lcm_grep", "lcm_load_session", "lcm_expand", "lcm_expand_query"} and kwargs.get("cross_session_capability") is not None:
                 handler_kwargs["cross_session_capability"] = kwargs["cross_session_capability"]
             return handler(args, **handler_kwargs)
         return json.dumps({"error": f"Unknown LCM tool: {name}"})
@@ -6518,26 +6522,47 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
     def _canonical_message_source_ids_no_commit(
         conn: sqlite3.Connection,
         session_id: str,
+        *,
+        deadline_at: float | None = None,
     ) -> set[int]:
         """Return canonical raw lineage visible on ``conn``'s transaction."""
         covered: set[int] = set()
-        rows = conn.execute(
-            """
-            SELECT source_ids FROM summary_nodes
-            WHERE session_id = ? AND source_type = 'messages'
-            """,
-            (session_id,),
-        ).fetchall()
-        for row in rows:
-            try:
-                source_values = decode_source_ids(row[0] or "[]")
-            except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                raise RuntimeError("canonical DAG contains unbounded source lineage") from exc
-            for source_id in source_values:
+        last_node_id = 0
+        rows_seen = 0
+        edges_seen = 0
+        bytes_seen = 0
+        while True:
+            if deadline_at is not None and time.monotonic() >= deadline_at:
+                raise RuntimeError("canonical DAG lineage deadline exceeded")
+            remaining = _CANONICAL_LINEAGE_MAX_ROWS - rows_seen
+            page_limit = min(_CANONICAL_LINEAGE_QUERY_BATCH, remaining + 1)
+            rows = conn.execute(
+                """SELECT node_id, source_ids FROM summary_nodes
+                   WHERE session_id = ? AND source_type = 'messages' AND node_id > ?
+                   ORDER BY node_id LIMIT ?""",
+                (session_id, last_node_id, page_limit),
+            ).fetchall()
+            if not rows:
+                return covered
+            for node_id, raw_source_ids in rows:
+                if rows_seen >= _CANONICAL_LINEAGE_MAX_ROWS:
+                    raise RuntimeError("canonical DAG lineage row bound exceeded")
+                raw_source_ids = raw_source_ids or "[]"
+                bytes_seen += len(str(raw_source_ids).encode("utf-8", errors="replace"))
+                if bytes_seen > _CANONICAL_LINEAGE_MAX_BYTES:
+                    raise RuntimeError("canonical DAG lineage byte bound exceeded")
                 try:
-                    covered.add(int(source_id))
-                except (TypeError, ValueError):
-                    continue
+                    source_values = decode_source_ids(raw_source_ids)
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise RuntimeError("canonical DAG contains unbounded source lineage") from exc
+                edges_seen += len(source_values)
+                if edges_seen > _CANONICAL_LINEAGE_MAX_EDGES:
+                    raise RuntimeError("canonical DAG lineage edge bound exceeded")
+                covered.update(int(source_id) for source_id in source_values)
+                rows_seen += 1
+                last_node_id = int(node_id)
+            if len(rows) < page_limit:
+                return covered
         return covered
 
     @staticmethod

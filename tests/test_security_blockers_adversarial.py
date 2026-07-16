@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 
 import pytest
 
@@ -49,6 +50,26 @@ def test_unterminated_quoted_password_is_redacted_before_any_truncation(tmp_path
         engine.shutdown()
 
 
+def test_escaped_quoted_password_assignments_are_redacted_in_linear_time(tmp_path):
+    engine = _engine(tmp_path)
+    engine._config.sensitive_patterns_enabled = True
+    engine._config.sensitive_patterns = ["password_assignment"]
+    try:
+        secrets = ("escaped-assignment-secret", "escaped-json-secret")
+        value = (
+            'prefix password=\\"escaped-assignment-secret and '
+            '\\"password\\":\\"escaped-json-secret suffix'
+        )
+        started = time.monotonic()
+        redacted = redact_sensitive_text((value + "\n") * 2_000, engine._config)
+        elapsed = time.monotonic() - started
+        assert elapsed < 1.0
+        assert all(secret not in redacted for secret in secrets)
+        assert redacted.count("LCM sensitive redaction") >= 2
+    finally:
+        engine.shutdown()
+
+
 def test_cross_session_high_fanout_is_rejected_before_json_list_decode(
     tmp_path, monkeypatch
 ):
@@ -86,6 +107,89 @@ def test_cross_session_high_fanout_is_rejected_before_json_list_decode(
         ))
         assert result.get("authorization_truncated") is True or "error" in result
     finally:
+        engine.shutdown()
+
+
+def test_prepared_batch_lineage_rejects_before_oversized_json_decode(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    source_id = engine._store.append(
+        "current", {"role": "user", "content": "prepared source"}
+    )
+    engine._frontier.ensure_frontier("conversation", "current")
+    active = engine._frontier.get_active_frontier("conversation")
+    assert active is not None
+    batch_id, _ = engine._frontier.create_batch_cas(
+        conversation_id="conversation",
+        session_id="current",
+        base_generation=int(active["generation"]),
+        source_end_store_id=source_id,
+        source_identity_hash="identity",
+        source_ids=[source_id],
+        policy_fingerprint="",
+        route_fingerprint="",
+    )
+    assert batch_id > 0
+    raw = "[" + ",".join(str(index) for index in range(20_000)) + "]"
+    engine._frontier._conn.execute(
+        "UPDATE lcm_prepared_batches SET source_ids=?, state='ready' WHERE batch_id=?",
+        (raw, batch_id),
+    )
+    engine._frontier._conn.commit()
+    original_loads = tools_module.json.loads
+
+    def guarded_loads(value, *args, **kwargs):
+        if value == raw:
+            raise AssertionError("oversized prepared-batch lineage was decoded")
+        return original_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(tools_module.json, "loads", guarded_loads)
+    import hermes_lcm.frontier as frontier_module
+    monkeypatch.setattr(frontier_module.json, "loads", guarded_loads)
+    try:
+        batch = engine._frontier.get_batch(batch_id)
+        assert batch is not None
+        assert batch.state == "rejected"
+        assert batch.source_ids == []
+        assert "source_ids" in batch.failure_reason
+        assert engine._frontier.get_ready_batch("conversation") is None
+    finally:
+        engine.shutdown()
+
+
+def test_inspection_lineage_is_sql_row_edge_and_deadline_bounded(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    raw = "[" + ",".join(str(index) for index in range(20_000)) + "]"
+    conn = engine._dag.connection
+    assert conn is not None
+    conn.execute(
+        """INSERT INTO summary_nodes
+           (session_id, depth, summary, token_count, source_token_count,
+            source_ids, source_type, created_at)
+           VALUES ('current', 0, 'poisoned lineage', 1, 1, ?, 'messages', 1)""",
+        (raw,),
+    )
+    conn.commit()
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    original_loads = tools_module.json.loads
+
+    def guarded_loads(value, *args, **kwargs):
+        if value == raw:
+            raise AssertionError("oversized inspection lineage was decoded")
+        return original_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(tools_module.json, "loads", guarded_loads)
+    try:
+        assert tools_module._inspect_highest_compacted_source_store_id(
+            engine, "current"
+        ) == 0
+        assert any("LIMIT" in statement.upper() for statement in statements)
+    finally:
+        conn.set_trace_callback(None)
         engine.shutdown()
 
 
@@ -155,6 +259,95 @@ def test_cross_session_grep_and_store_expand_require_host_capability(tmp_path):
         engine.shutdown()
 
 
+def test_load_session_requires_capability_and_bounds_redacts_nested_rows(tmp_path):
+    engine = _engine(tmp_path)
+    current_id = engine._store.append(
+        "current", {"role": "user", "content": "current transcript remains usable"}
+    )
+    foreign_id = engine._store.append(
+        "foreign", {"role": "assistant", "content": "placeholder"}
+    )
+    poisoned_tool_calls = json.dumps([
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "legacy",
+                "arguments": '\\"password\\":\\"tool-call-secret ' + ("x" * 50_000),
+            },
+        }
+    ])
+    engine._store._conn.execute(
+        "UPDATE messages SET content=?, tool_calls=? WHERE store_id=?",
+        ('password=\\"content-secret', poisoned_tool_calls, foreign_id),
+    )
+    engine._store._conn.commit()
+    try:
+        denied = json.loads(engine.handle_tool_call(
+            "lcm_load_session", {"session_id": "foreign"}
+        ))
+        assert "trusted host capability" in denied["error"]
+
+        current = json.loads(engine.handle_tool_call(
+            "lcm_load_session", {"session_id": "current"}
+        ))
+        assert current["messages"][0]["store_id"] == current_id
+        assert "remains usable" in current["messages"][0]["content"]
+
+        allowed = json.loads(engine.handle_tool_call(
+            "lcm_load_session",
+            {"session_id": "foreign", "max_content_chars": 20_000},
+            cross_session_capability=engine.issue_cross_session_capability(["foreign"]),
+        ))
+        encoded = json.dumps(allowed, sort_keys=True)
+        assert "content-secret" not in encoded
+        assert "tool-call-secret" not in encoded
+        assert "LCM sensitive redaction" in encoded
+        assert allowed["messages"][0]["serialized_truncated"] is True
+        assert allowed["serialized_bytes"] <= allowed["serialized_byte_limit"]
+    finally:
+        engine.shutdown()
+
+
+def test_load_session_shared_serialized_budget_stops_without_skipping_cursor(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    store_ids = [
+        engine._store.append(
+            "current",
+            {"role": "user", "content": f"row-{index} " + ("x" * 1_000)},
+        )
+        for index in range(20)
+    ]
+    monkeypatch.setattr(
+        tools_module, "_LCM_LOAD_SESSION_MAX_SERIALIZED_BYTES", 20_000
+    )
+    monkeypatch.setattr(
+        tools_module, "_LCM_LOAD_SESSION_MAX_ROW_SERIALIZED_BYTES", 2_000
+    )
+    try:
+        page = json.loads(engine.handle_tool_call(
+            "lcm_load_session", {"session_id": "current", "limit": 20}
+        ))
+        assert page["serialized_budget_exhausted"] is True
+        assert 0 < page["returned_messages"] < len(store_ids)
+        assert page["serialized_bytes"] <= page["serialized_byte_limit"]
+        assert page["next_cursor"] == page["messages"][-1]["store_id"]
+
+        next_page = json.loads(engine.handle_tool_call(
+            "lcm_load_session",
+            {
+                "session_id": "current",
+                "limit": 1,
+                "after_store_id": page["next_cursor"],
+            },
+        ))
+        assert next_page["messages"][0]["store_id"] == store_ids[page["returned_messages"]]
+    finally:
+        engine.shutdown()
+
+
 def test_externalized_enumeration_does_not_glob_or_sort_the_whole_directory(
     tmp_path, monkeypatch
 ):
@@ -177,6 +370,51 @@ def test_externalized_enumeration_does_not_glob_or_sort_the_whole_directory(
             engine=engine,
         ))
         assert result["scan"]["files_scanned"] <= 3
+        assert result["scan"]["scan_truncated"] is True
+    finally:
+        engine.shutdown()
+
+
+def test_externalized_scandir_counts_non_json_entries_at_the_hard_cap(
+    tmp_path, monkeypatch
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    engine = _engine(tmp_path, large_output_externalization_path=str(payload_dir))
+    seen = {"count": 0}
+
+    class _Entry:
+        def __init__(self, name):
+            self.name = name
+
+    class _Scandir:
+        def __init__(self):
+            self._names = iter([*(f"junk-{index}.txt" for index in range(20)), "hit.json"])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            seen["count"] += 1
+            if seen["count"] > 3:
+                raise AssertionError("scandir advanced beyond the hard entry cap")
+            return _Entry(next(self._names))
+
+    monkeypatch.setattr(tools_module.os, "scandir", lambda _root: _Scandir())
+    try:
+        result = json.loads(tools_module.lcm_grep(
+            {"query": "needle", "content_scope": "externalized", "max_files": 3},
+            engine=engine,
+        ))
+        assert seen["count"] == 3
+        assert result["scan"]["entries_scanned"] == 3
+        assert result["scan"]["files_scanned"] == 0
         assert result["scan"]["scan_truncated"] is True
     finally:
         engine.shutdown()
