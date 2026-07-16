@@ -468,6 +468,68 @@ def test_full_sweep_aborts_losslessly_when_locked_frontier_bounds_are_exceeded(
         engine.shutdown()
 
 
+def test_full_sweep_aborts_losslessly_on_shared_locked_byte_budget(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    _stub_summaries(monkeypatch, engine)
+    phases: list[str] = []
+    engine._full_sweep_publish_crash_hook = phases.append
+    monkeypatch.setattr(
+        sweep_module, "_FULL_SWEEP_MAX_LOCKED_SERIALIZED_BYTES", 500
+    )
+    try:
+        original = _messages(10)
+        result = engine.compress(original, current_tokens=1_900)
+        assert engine._frontier.get_active_frontier("sweep-conversation")["generation"] == 1
+        assert engine._dag.get_session_nodes("sweep-session") == []
+        assert engine._last_full_sweep_status["reason"] == "publication-rolled-back"
+        assert "after_nodes" not in phases
+        assert [message["content"] for message in result] == [
+            message["content"] for message in original
+        ]
+    finally:
+        engine.shutdown()
+
+
+def test_full_sweep_aborts_losslessly_on_locked_deadline(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    _stub_summaries(monkeypatch, engine)
+    expired = {"value": False}
+    real_monotonic = time.monotonic
+
+    def controlled_monotonic():
+        value = real_monotonic()
+        return value + 1_000.0 if expired["value"] else value
+
+    monkeypatch.setattr(sweep_module.time, "monotonic", controlled_monotonic)
+    original_canonical = engine._canonical_message_source_ids_no_commit
+
+    def expire_after_canonical(*args, **kwargs):
+        result = original_canonical(*args, **kwargs)
+        expired["value"] = True
+        return result
+
+    monkeypatch.setattr(
+        engine, "_canonical_message_source_ids_no_commit", expire_after_canonical
+    )
+    phases: list[str] = []
+    engine._full_sweep_publish_crash_hook = phases.append
+    try:
+        original = _messages(10)
+        result = engine.compress(original, current_tokens=1_900)
+        assert engine._frontier.get_active_frontier("sweep-conversation")["generation"] == 1
+        assert engine._dag.get_session_nodes("sweep-session") == []
+        assert engine._last_full_sweep_status["reason"] == "publication-rolled-back"
+        assert "after_nodes" not in phases
+        assert [message["content"] for message in result] == [
+            message["content"] for message in original
+        ]
+    finally:
+        engine._full_sweep_publish_crash_hook = None
+        engine.shutdown()
+
+
 @pytest.mark.parametrize(
     ("phase", "expected_generation"),
     [("after_nodes", 1), ("after_commit", 2)],

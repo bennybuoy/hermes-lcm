@@ -31,13 +31,17 @@ from .db_bootstrap import (
     configure_connection,
     run_versioned_migrations,
 )
-from .dag import decode_source_ids
+from .dag import MAX_SOURCE_IDS_JSON_CHARS, decode_source_ids
 
 logger = logging.getLogger(__name__)
 
 # payload_version >= PREPARED_PAYLOAD_VERSION means prepare stored a full
 # summary payload and promote must not re-run the summarizer.
 PREPARED_PAYLOAD_VERSION = 2
+_PENDING_BATCH_QUERY_PAGE = 200
+_PENDING_BATCH_MAX_ROWS = 2_000
+_PENDING_BATCH_MAX_SERIALIZED_BYTES = 2 * 1024 * 1024
+_PENDING_BATCH_DEADLINE_SECONDS = 0.5
 
 
 @dataclass
@@ -811,22 +815,93 @@ class FrontierStore:
             return int(cur.rowcount or 0) > 0
 
     def list_pending_batches(self, conversation_id: str) -> list[PreparedBatch]:
+        """Enumerate pending metadata with bounded keyset pages.
+
+        Summary payload and resolved-policy JSON are intentionally omitted:
+        pending-admission logic does not consume them. ``source_ids`` is
+        length-guarded inside SQLite before a bounded value can reach Python.
+        """
+        batches: list[PreparedBatch] = []
+        deadline_at = time.monotonic() + max(0.0, _PENDING_BATCH_DEADLINE_SECONDS)
+        serialized_bytes = 0
+        rows_seen = 0
+        last_source_end: int | None = None
+        last_batch_id: int | None = None
         with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT batch_id, conversation_id, session_id, base_generation,
-                       source_end_store_id, source_identity_hash, source_ids,
-                       policy_fingerprint, route_fingerprint, state,
-                       expected_leaf_count, frontier_end_store_id, failure_reason,
-                       COALESCE(summary_payload, ''), COALESCE(payload_version, 0),
-                       COALESCE(resolved_policy_json, '{}')
-                FROM lcm_prepared_batches
-                WHERE conversation_id = ? AND state IN ('preparing', 'ready')
-                ORDER BY source_end_store_id DESC, batch_id DESC
-                """,
-                (conversation_id,),
-            ).fetchall()
-        return [self._row_to_batch(row) for row in rows]
+            owns_transaction = not self._conn.in_transaction
+            while True:
+                if time.monotonic() >= deadline_at:
+                    raise RuntimeError("pending batch enumeration deadline exceeded")
+                remaining = _PENDING_BATCH_MAX_ROWS - rows_seen
+                page_limit = min(_PENDING_BATCH_QUERY_PAGE, remaining + 1)
+                rows = self._conn.execute(
+                    """SELECT batch_id, conversation_id, session_id, base_generation,
+                              source_end_store_id, source_identity_hash,
+                              CASE WHEN COALESCE(length(CAST(source_ids AS BLOB)), 0) <= ?
+                                   THEN CAST(source_ids AS TEXT) ELSE NULL END,
+                              policy_fingerprint, route_fingerprint, state,
+                              expected_leaf_count, frontier_end_store_id, failure_reason,
+                              '', 0, '{}',
+                              COALESCE(length(CAST(source_ids AS BLOB)), 0)
+                       FROM lcm_prepared_batches
+                       WHERE conversation_id = ?
+                         AND state IN ('preparing', 'ready')
+                         AND (
+                           ? IS NULL OR source_end_store_id < ? OR
+                           (source_end_store_id = ? AND batch_id < ?)
+                         )
+                       ORDER BY source_end_store_id DESC, batch_id DESC
+                       LIMIT ?""",
+                    (
+                        MAX_SOURCE_IDS_JSON_CHARS,
+                        conversation_id,
+                        last_source_end,
+                        last_source_end,
+                        last_source_end,
+                        last_batch_id,
+                        page_limit,
+                    ),
+                ).fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    if rows_seen >= _PENDING_BATCH_MAX_ROWS:
+                        raise RuntimeError("pending batch enumeration row bound exceeded")
+                    rows_seen += 1
+                    source_bytes = int(row[16] or 0)
+                    scalar_bytes = sum(
+                        len(str(value or "").encode("utf-8", errors="replace"))
+                        for value in (*row[1:6], *row[7:13])
+                    )
+                    serialized_bytes += source_bytes + scalar_bytes
+                    if serialized_bytes > _PENDING_BATCH_MAX_SERIALIZED_BYTES:
+                        raise RuntimeError(
+                            "pending batch enumeration serialized byte bound exceeded"
+                        )
+                    if row[6] is None or source_bytes > MAX_SOURCE_IDS_JSON_CHARS:
+                        self.update_batch_state_no_commit(
+                            self._conn,
+                            int(row[0]),
+                            "rejected",
+                            failure_reason="invalid_source_ids:encoded-size hard cap exceeded",
+                        )
+                    else:
+                        try:
+                            batches.append(self._row_to_batch(row[:16]))
+                        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                            self.update_batch_state_no_commit(
+                                self._conn,
+                                int(row[0]),
+                                "rejected",
+                                failure_reason=f"invalid_source_ids:{exc}",
+                            )
+                    last_source_end = int(row[4])
+                    last_batch_id = int(row[0])
+                if len(rows) < page_limit:
+                    break
+            if owns_transaction and self._conn.in_transaction:
+                self._conn.commit()
+        return batches
 
     def cleanup_pending_batches(
         self,

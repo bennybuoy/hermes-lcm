@@ -556,12 +556,17 @@ _LCM_LOAD_SESSION_MAX_NESTED_DEPTH = 12
 _LCM_LOAD_SESSION_MAX_NESTED_ITEMS = 256
 _LCM_LOAD_SESSION_MAX_ROW_SERIALIZED_BYTES = 64 * 1024
 _LCM_LOAD_SESSION_MAX_SERIALIZED_BYTES = 2 * 1024 * 1024
+_LCM_LOAD_SESSION_MAX_ROLES = 32
+_LCM_LOAD_SESSION_MAX_ROLE_CHARS = 128
+_LCM_LOAD_SESSION_MAX_SESSION_ID_CHARS = 512
 _LCM_INSPECT_DEFAULT_LIMIT = 20
 _LCM_INSPECT_HARD_LIMIT_CAP = 200
 _LCM_INSPECT_REF_SCAN_MESSAGE_LIMIT = 10_000
 _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES = 16_384
 _LCM_INSPECT_LINEAGE_MAX_ROWS = 10_000
 _LCM_INSPECT_LINEAGE_MAX_EDGES = 40_000
+_LCM_INSPECT_LINEAGE_MAX_BYTES = 4 * 1024 * 1024
+_LCM_INSPECT_LINEAGE_MAX_DEPTH = 64
 _LCM_INSPECT_LINEAGE_DEADLINE_SECONDS = 0.25
 
 
@@ -2141,15 +2146,23 @@ def _parse_load_session_roles(value: Any) -> tuple[list[str], str | None]:
         return [], None
     if not isinstance(value, list):
         return [], "roles must be an array of strings"
+    if len(value) > _LCM_LOAD_SESSION_MAX_ROLES:
+        return [], "roles count exceeds hard cap"
     roles: list[str] = []
     seen: set[str] = set()
     for item in value:
-        role = str(item or "").strip()
+        if not isinstance(item, str):
+            return [], "roles must contain only strings"
+        role = item.strip()
         if not role:
             return [], "roles must contain only non-empty strings"
+        if len(role) > _LCM_LOAD_SESSION_MAX_ROLE_CHARS:
+            return [], "role string exceeds hard character cap"
         if role not in seen:
             roles.append(role)
             seen.add(role)
+            if len(roles) > _LCM_LOAD_SESSION_MAX_ROLES:
+                return [], "roles count exceeds hard cap"
     return roles, None
 
 
@@ -2276,6 +2289,12 @@ def _serialize_loaded_message(engine: "LCMEngine", row: dict[str, Any], max_cont
             row.get("tool_calls"), char_budget=char_budget, item_budget=item_budget
         )
         nested_truncated = nested_truncated or changed
+    elif row.get("tool_calls_encoded_too_large"):
+        item["tool_calls_truncated"] = True
+        item["tool_calls_encoded_bytes"] = int(
+            row.get("tool_calls_encoded_bytes") or 0
+        )
+        nested_truncated = True
     if row.get("tool_name"):
         item["tool_name"], changed = _bounded_loaded_nested_value(
             row.get("tool_name"), char_budget=char_budget, item_budget=item_budget
@@ -2303,6 +2322,8 @@ def lcm_load_session(args: Dict[str, Any], **kwargs) -> str:
     session_id = str(args.get("session_id") or "").strip()
     if not session_id:
         return json.dumps({"error": "session_id is required"})
+    if len(session_id) > _LCM_LOAD_SESSION_MAX_SESSION_ID_CHARS:
+        return json.dumps({"error": "session_id exceeds hard character cap"})
     if session_id != engine.current_session_id:
         allowed_session_ids = engine._authorized_cross_session_ids(
             kwargs.get("cross_session_capability")
@@ -2415,14 +2436,38 @@ def lcm_load_session(args: Dict[str, Any], **kwargs) -> str:
     if requested_max_content_chars > _LCM_LOAD_SESSION_HARD_MAX_CONTENT_CHARS:
         response["max_content_chars_clamped_from"] = requested_max_content_chars
     response["serialized_bytes"] = 0
-    for _ in range(3):
-        serialized_bytes = len(
-            json.dumps(response, ensure_ascii=False, default=str).encode("utf-8")
+    while True:
+        for _ in range(8):
+            encoded = json.dumps(
+                response, ensure_ascii=False, default=str, separators=(",", ":")
+            )
+            serialized_bytes = len(encoded.encode("utf-8"))
+            if serialized_bytes == response["serialized_bytes"]:
+                break
+            response["serialized_bytes"] = serialized_bytes
+        encoded = json.dumps(
+            response, ensure_ascii=False, default=str, separators=(",", ":")
         )
-        if serialized_bytes == response["serialized_bytes"]:
-            break
-        response["serialized_bytes"] = serialized_bytes
-    return json.dumps(response)
+        if len(encoded.encode("utf-8")) <= _LCM_LOAD_SESSION_MAX_SERIALIZED_BYTES:
+            return encoded
+        if response["messages"]:
+            response["messages"].pop()
+            response["returned_messages"] = len(response["messages"])
+            response["has_more"] = True
+            response["serialized_budget_exhausted"] = True
+            response["next_cursor"] = (
+                response["messages"][-1]["store_id"]
+                if response["messages"] else after_store_id
+            )
+            response["serialized_bytes"] = 0
+            continue
+        return json.dumps(
+            {
+                "error": "load-session response metadata exceeds serialized hard cap",
+                "serialized_byte_limit": _LCM_LOAD_SESSION_MAX_SERIALIZED_BYTES,
+            },
+            separators=(",", ":"),
+        )
 
 
 def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
@@ -3728,6 +3773,7 @@ def _inspect_lifecycle_state(engine: "LCMEngine", session_id: str, conversation_
 def _inspect_highest_compacted_source_store_id(engine: "LCMEngine", session_id: str) -> int:
     highest = 0
     edges = 0
+    encoded_bytes = 0
     deadline = time.monotonic() + _LCM_INSPECT_LINEAGE_DEADLINE_SECONDS
     rows_seen = 0
     last_node_id = 0
@@ -3736,18 +3782,39 @@ def _inspect_highest_compacted_source_store_id(engine: "LCMEngine", session_id: 
             break
         page_limit = min(400, _LCM_INSPECT_LINEAGE_MAX_ROWS - rows_seen)
         rows = engine._dag.connection.execute(
-            """SELECT node_id, source_ids FROM summary_nodes
+            """SELECT node_id, depth,
+                      COALESCE(length(CAST(source_ids AS BLOB)), 0),
+                      CASE
+                        WHEN COALESCE(length(CAST(source_ids AS BLOB)), 0) <= ?
+                        THEN CAST(source_ids AS TEXT) ELSE NULL
+                      END
+               FROM summary_nodes
                WHERE session_id = ? AND source_type = 'messages' AND node_id > ?
                ORDER BY node_id LIMIT ?""",
-            (session_id, last_node_id, page_limit),
+            (
+                min(MAX_SOURCE_IDS_JSON_CHARS, _LCM_INSPECT_LINEAGE_MAX_BYTES),
+                session_id,
+                last_node_id,
+                page_limit,
+            ),
         ).fetchall()
         if not rows:
             break
-        for node_id, raw_source_ids in rows:
+        for node_id, depth, raw_bytes, raw_source_ids in rows:
             if time.monotonic() >= deadline:
                 return highest
             rows_seen += 1
             last_node_id = int(node_id)
+            if int(depth or 0) > _LCM_INSPECT_LINEAGE_MAX_DEPTH:
+                return highest
+            raw_bytes = int(raw_bytes or 0)
+            encoded_bytes += raw_bytes
+            if (
+                raw_source_ids is None
+                or raw_bytes > MAX_SOURCE_IDS_JSON_CHARS
+                or encoded_bytes > _LCM_INSPECT_LINEAGE_MAX_BYTES
+            ):
+                return highest
             try:
                 source_ids = decode_source_ids(raw_source_ids or "[]")
             except (TypeError, ValueError, json.JSONDecodeError):

@@ -143,6 +143,7 @@ LCM_LOAD_SESSION = {
         "properties": {
             "session_id": {
                 "type": "string",
+                "maxLength": 512,
                 "description": "Explicit LCM session id to load. Required; no implicit current/all fallback is applied.",
             },
             "limit": {
@@ -171,7 +172,8 @@ LCM_LOAD_SESSION = {
             },
             "roles": {
                 "type": "array",
-                "items": {"type": "string"},
+                "maxItems": 32,
+                "items": {"type": "string", "minLength": 1, "maxLength": 128},
                 "description": "Optional role filter, for example ['user', 'assistant', 'tool', 'system'].",
             },
             "time_from": {

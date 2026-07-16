@@ -57,6 +57,7 @@ _MESSAGE_SELECT_COLUMNS = (
     "tool_calls, tool_name, timestamp, token_estimate, pinned, conversation_id"
 )
 _UNKNOWN_SOURCE = "unknown"
+_LOAD_SESSION_MAX_TOOL_CALLS_ENCODED_BYTES = 64 * 1024
 
 
 def _legacy_blank_source_clause(column: str) -> str:
@@ -586,12 +587,28 @@ class MessageStore:
         where.append("store_id > ?")
         args.extend([after_store_id, limit])
         rows = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+            f"""SELECT store_id, session_id, source, role, content, tool_call_id,
+                       CASE
+                         WHEN COALESCE(length(CAST(tool_calls AS BLOB)), 0) <= ?
+                         THEN tool_calls ELSE NULL
+                       END,
+                       tool_name, timestamp, token_estimate, pinned, conversation_id,
+                       COALESCE(length(CAST(tool_calls AS BLOB)), 0)
+                FROM messages
                WHERE {' AND '.join(where)}
                ORDER BY store_id LIMIT ?""",
-            args,
+            [_LOAD_SESSION_MAX_TOOL_CALLS_ENCODED_BYTES, *args],
         ).fetchall()
-        return [self._row_to_dict(r) for r in rows]
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = self._row_to_dict(row[:12])
+            encoded_bytes = int(row[12] or 0)
+            item["tool_calls_encoded_bytes"] = encoded_bytes
+            item["tool_calls_encoded_too_large"] = (
+                encoded_bytes > _LOAD_SESSION_MAX_TOOL_CALLS_ENCODED_BYTES
+            )
+            result.append(item)
+        return result
 
     def get_session_messages(self, session_id: str,
                              limit: int = 10000) -> List[Dict[str, Any]]:

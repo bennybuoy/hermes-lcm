@@ -24,6 +24,10 @@ _FULL_SWEEP_QUERY_BATCH = 400
 _FULL_SWEEP_MAX_FRONTIER_ROWS = 10_000
 _FULL_SWEEP_MAX_MESSAGE_ROWS = 10_000
 _FULL_SWEEP_MAX_LOCKED_SERIALIZED_BYTES = 4 * 1024 * 1024
+_FULL_SWEEP_MAX_LOCKED_ROWS = 50_000
+_FULL_SWEEP_MAX_CANONICAL_ROWS = 10_000
+_FULL_SWEEP_MAX_CANONICAL_EDGES = 40_000
+_FULL_SWEEP_MAX_CANONICAL_DEPTH = 64
 
 
 @dataclass(eq=False)
@@ -43,6 +47,25 @@ class _StagedNode:
 
 class FullSweepMixin:
     """Engine mixin implementing issue #8's private-candidate sweep."""
+
+    @staticmethod
+    def _charge_full_sweep_locked_read(
+        read_budget: dict[str, float | int],
+        *,
+        rows: int,
+        serialized_bytes: int,
+        label: str,
+    ) -> None:
+        if time.monotonic() >= float(read_budget["deadline_at"]):
+            raise RuntimeError(f"{label} deadline exceeded")
+        next_rows = int(read_budget["rows"]) + int(rows)
+        if next_rows > int(read_budget["max_rows"]):
+            raise RuntimeError(f"{label} row bound exceeded")
+        next_bytes = int(read_budget["bytes"]) + max(0, int(serialized_bytes))
+        if next_bytes > int(read_budget["max_bytes"]):
+            raise RuntimeError(f"{label} serialized byte bound exceeded")
+        read_budget["rows"] = next_rows
+        read_budget["bytes"] = next_bytes
 
     def _full_sweep_status(
         self,
@@ -125,7 +148,7 @@ class FullSweepMixin:
         generation: int,
         *,
         deadline_at: float,
-        byte_budget: list[int],
+        read_budget: dict[str, float | int],
     ) -> list[tuple[str, int, int, int]]:
         rows: list[tuple[str, int, int, int]] = []
         last_ordinal = -1
@@ -147,9 +170,12 @@ class FullSweepMixin:
                 if len(rows) >= _FULL_SWEEP_MAX_FRONTIER_ROWS:
                     raise RuntimeError("full sweep locked frontier row bound exceeded")
                 charge = len(str(kind).encode("utf-8", errors="replace")) + 48
-                byte_budget[0] += charge
-                if byte_budget[0] > _FULL_SWEEP_MAX_LOCKED_SERIALIZED_BYTES:
-                    raise RuntimeError("full sweep locked publication byte bound exceeded")
+                FullSweepMixin._charge_full_sweep_locked_read(
+                    read_budget,
+                    rows=1,
+                    serialized_bytes=charge,
+                    label="full sweep locked frontier",
+                )
                 rows.append((str(kind), int(ref_id), int(start or 0), int(end or 0)))
                 last_ordinal = int(ordinal)
             if len(page) < page_limit:
@@ -162,7 +188,7 @@ class FullSweepMixin:
         source_end: int,
         *,
         deadline_at: float,
-        byte_budget: list[int],
+        read_budget: dict[str, float | int],
     ) -> list[dict[str, int]]:
         rows: list[dict[str, int]] = []
         last_store_id = int(source_end)
@@ -181,9 +207,12 @@ class FullSweepMixin:
             for (raw_store_id,) in page:
                 if len(rows) >= _FULL_SWEEP_MAX_MESSAGE_ROWS:
                     raise RuntimeError("full sweep locked message row bound exceeded")
-                byte_budget[0] += 32
-                if byte_budget[0] > _FULL_SWEEP_MAX_LOCKED_SERIALIZED_BYTES:
-                    raise RuntimeError("full sweep locked publication byte bound exceeded")
+                FullSweepMixin._charge_full_sweep_locked_read(
+                    read_budget,
+                    rows=1,
+                    serialized_bytes=32,
+                    label="full sweep locked message",
+                )
                 store_id = int(raw_store_id)
                 rows.append({"store_id": store_id})
                 last_store_id = store_id
@@ -458,6 +487,13 @@ class FullSweepMixin:
         try:
             with self._frontier.publication_transaction() as publication_conn:
                 _publication_boundary("after_begin")
+                locked_read_budget: dict[str, float | int] = {
+                    "rows": 0,
+                    "bytes": 0,
+                    "max_rows": int(_FULL_SWEEP_MAX_LOCKED_ROWS),
+                    "max_bytes": int(_FULL_SWEEP_MAX_LOCKED_SERIALIZED_BYTES),
+                    "deadline_at": float(deadline_at),
+                }
                 locked_frontier = publication_conn.execute(
                     """SELECT generation, session_id, source_end_store_id
                        FROM lcm_active_frontiers WHERE conversation_id=?
@@ -472,17 +508,31 @@ class FullSweepMixin:
                     canonical_winner_observed = True
                     raise RuntimeError("full sweep frontier CAS mismatch")
                 canonical_coverage = self._canonical_message_source_ids_no_commit(
-                    publication_conn, session_id, deadline_at=deadline_at
+                    publication_conn,
+                    session_id,
+                    deadline_at=deadline_at,
+                    max_rows=_FULL_SWEEP_MAX_CANONICAL_ROWS,
+                    max_edges=_FULL_SWEEP_MAX_CANONICAL_EDGES,
+                    max_depth=_FULL_SWEEP_MAX_CANONICAL_DEPTH,
+                    max_bytes=_FULL_SWEEP_MAX_LOCKED_SERIALIZED_BYTES,
+                    read_budget=locked_read_budget,
                 )
                 if canonical_coverage.intersection(covered_source_ids):
                     canonical_winner_observed = True
                     raise RuntimeError("full sweep canonical source overlap")
                 if not self._exact_source_rows_exist_no_commit(
-                    publication_conn, session_id, covered_source_ids
+                    publication_conn,
+                    session_id,
+                    covered_source_ids,
+                    deadline_at=deadline_at,
+                    read_budget=locked_read_budget,
                 ):
                     raise RuntimeError("full sweep source rows changed before publication")
-                locked_identity = self._source_content_identity_hash_no_commit(
-                    publication_conn, session_id, covered_source_ids
+                locked_identity = self._bounded_source_content_identity_hash_no_commit(
+                    publication_conn,
+                    session_id,
+                    covered_source_ids,
+                    read_budget=locked_read_budget,
                 )
                 if locked_identity != expected_source_identity:
                     raise RuntimeError("full sweep source identity mismatch")
@@ -512,13 +562,12 @@ class FullSweepMixin:
                 _publication_boundary("after_nodes")
 
                 covered_start = min(covered_source_ids)
-                locked_byte_budget = [0]
                 active_rows = self._bounded_full_sweep_frontier_rows_no_commit(
                     publication_conn,
                     conversation_id,
                     int(frontier["generation"]),
                     deadline_at=deadline_at,
-                    byte_budget=locked_byte_budget,
+                    read_budget=locked_read_budget,
                 )
                 carried_items: list[dict[str, Any]] = []
                 for kind, ref_id, start, end in active_rows:
@@ -538,7 +587,7 @@ class FullSweepMixin:
                     session_id,
                     source_end,
                     deadline_at=deadline_at,
-                    byte_budget=locked_byte_budget,
+                    read_budget=locked_read_budget,
                 )
                 frontier_items = self._full_sweep_frontier_items(
                     roots, stored_tail, carried_items

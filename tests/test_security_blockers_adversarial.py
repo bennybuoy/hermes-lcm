@@ -11,6 +11,8 @@ import pytest
 
 import hermes_lcm.engine as engine_module
 import hermes_lcm.config as config_module
+import hermes_lcm.frontier as frontier_module
+import hermes_lcm.store as store_module
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
@@ -50,22 +52,34 @@ def test_unterminated_quoted_password_is_redacted_before_any_truncation(tmp_path
         engine.shutdown()
 
 
-def test_escaped_quoted_password_assignments_are_redacted_in_linear_time(tmp_path):
+def test_escaped_assignment_password_is_redacted_in_linear_time(tmp_path):
     engine = _engine(tmp_path)
     engine._config.sensitive_patterns_enabled = True
     engine._config.sensitive_patterns = ["password_assignment"]
     try:
-        secrets = ("escaped-assignment-secret", "escaped-json-secret")
-        value = (
-            'prefix password=\\"escaped-assignment-secret and '
-            '\\"password\\":\\"escaped-json-secret suffix'
-        )
+        value = 'prefix password=\\"escaped-assignment-secret suffix'
         started = time.monotonic()
         redacted = redact_sensitive_text((value + "\n") * 2_000, engine._config)
         elapsed = time.monotonic() - started
         assert elapsed < 1.0
-        assert all(secret not in redacted for secret in secrets)
-        assert redacted.count("LCM sensitive redaction") >= 2
+        assert "escaped-assignment-secret" not in redacted
+        assert "LCM sensitive redaction" in redacted
+    finally:
+        engine.shutdown()
+
+
+def test_escaped_json_password_is_independently_redacted_in_linear_time(tmp_path):
+    engine = _engine(tmp_path)
+    engine._config.sensitive_patterns_enabled = True
+    engine._config.sensitive_patterns = ["password_assignment"]
+    try:
+        value = 'prefix \\"password\\":\\"escaped-json-secret\\" suffix'
+        started = time.monotonic()
+        redacted = redact_sensitive_text((value + "\n") * 2_000, engine._config)
+        elapsed = time.monotonic() - started
+        assert elapsed < 1.0
+        assert "escaped-json-secret" not in redacted
+        assert "LCM sensitive redaction" in redacted
     finally:
         engine.shutdown()
 
@@ -190,6 +204,376 @@ def test_inspection_lineage_is_sql_row_edge_and_deadline_bounded(
         assert any("LIMIT" in statement.upper() for statement in statements)
     finally:
         conn.set_trace_callback(None)
+        engine.shutdown()
+
+
+def test_inspection_lineage_aggregate_row_cap_stops_before_later_rows(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    conn = engine._dag.connection
+    assert conn is not None
+    for source_id in (11, 99):
+        conn.execute(
+            """INSERT INTO summary_nodes
+               (session_id, depth, summary, token_count, source_token_count,
+                source_ids, source_type, created_at)
+               VALUES ('current', 0, ?, 1, 1, ?, 'messages', 1)""",
+            (f"row-{source_id}", json.dumps([source_id])),
+        )
+    conn.commit()
+    monkeypatch.setattr(tools_module, "_LCM_INSPECT_LINEAGE_MAX_ROWS", 1)
+    try:
+        assert tools_module._inspect_highest_compacted_source_store_id(
+            engine, "current"
+        ) == 11
+    finally:
+        engine.shutdown()
+
+
+def test_inspection_lineage_aggregate_edge_cap_stops_before_later_edges(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    conn = engine._dag.connection
+    assert conn is not None
+    for raw in ("[11,12]", "[99]"):
+        conn.execute(
+            """INSERT INTO summary_nodes
+               (session_id, depth, summary, token_count, source_token_count,
+                source_ids, source_type, created_at)
+               VALUES ('current', 0, 'edge row', 1, 1, ?, 'messages', 1)""",
+            (raw,),
+        )
+    conn.commit()
+    monkeypatch.setattr(tools_module, "_LCM_INSPECT_LINEAGE_MAX_EDGES", 2)
+    try:
+        assert tools_module._inspect_highest_compacted_source_store_id(
+            engine, "current"
+        ) == 12
+    finally:
+        engine.shutdown()
+
+
+def test_inspection_lineage_deadline_stops_before_decode(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    conn = engine._dag.connection
+    assert conn is not None
+    conn.execute(
+        """INSERT INTO summary_nodes
+           (session_id, depth, summary, token_count, source_token_count,
+            source_ids, source_type, created_at)
+           VALUES ('current', 0, 'deadline row', 1, 1, '[99]', 'messages', 1)"""
+    )
+    conn.commit()
+    ticks = iter((0.0, 0.0, 1.0))
+    monkeypatch.setattr(tools_module.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(
+        tools_module,
+        "decode_source_ids",
+        lambda _raw: (_ for _ in ()).throw(AssertionError("decoded after deadline")),
+    )
+    try:
+        assert tools_module._inspect_highest_compacted_source_store_id(
+            engine, "current"
+        ) == 0
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("limit_kind", ["rows", "edges", "bytes", "deadline"])
+def test_foreground_publication_canonical_limits_abort_without_partial_truth(
+    tmp_path, monkeypatch, limit_kind
+):
+    engine = _engine(tmp_path)
+    first = engine._store.append(
+        "current", {"role": "user", "content": "canonical one"}
+    )
+    second = engine._store.append(
+        "current", {"role": "assistant", "content": "canonical two"}
+    )
+    candidate_id = engine._store.append(
+        "current", {"role": "user", "content": "candidate"}
+    )
+    for source_id in (first, second):
+        engine._dag.add_node(SummaryNode(
+            session_id="current",
+            depth=0,
+            summary=f"existing-{source_id}",
+            token_count=1,
+            source_token_count=1,
+            source_ids=[source_id],
+            source_type="messages",
+            created_at=1.0,
+        ))
+    engine._frontier.ensure_frontier("conversation", "current")
+    if limit_kind == "rows":
+        monkeypatch.setattr(engine_module, "_CANONICAL_LINEAGE_MAX_ROWS", 1)
+    elif limit_kind == "edges":
+        monkeypatch.setattr(engine_module, "_CANONICAL_LINEAGE_MAX_EDGES", 1)
+    elif limit_kind == "bytes":
+        monkeypatch.setattr(engine_module, "_CANONICAL_LINEAGE_MAX_BYTES", 4)
+    else:
+        monkeypatch.setattr(engine_module, "_PUBLICATION_LOCKED_DEADLINE_SECONDS", 0.0)
+    before_nodes = len(engine._dag.get_session_nodes("current"))
+    try:
+        with pytest.raises(RuntimeError, match="lineage|deadline"):
+            engine._publish_foreground_leaf(
+                node=SummaryNode(
+                    session_id="current",
+                    depth=0,
+                    summary="must roll back",
+                    token_count=1,
+                    source_token_count=1,
+                    source_ids=[candidate_id],
+                    source_type="messages",
+                    created_at=2.0,
+                ),
+                source_end_store_id=candidate_id,
+                covered_source_ids=[candidate_id],
+            )
+        assert len(engine._dag.get_session_nodes("current")) == before_nodes
+        assert engine._frontier.get_active_frontier("conversation")["generation"] == 1
+    finally:
+        engine.shutdown()
+
+
+def test_pending_batch_enumeration_pages_and_omits_unbounded_payload_columns(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    engine._frontier.ensure_frontier("conversation", "current")
+    active = engine._frontier.get_active_frontier("conversation")
+    assert active is not None
+    for source_end in range(1, 6):
+        batch_id, _ = engine._frontier.create_batch_cas(
+            conversation_id="conversation",
+            session_id="current",
+            base_generation=int(active["generation"]),
+            source_end_store_id=source_end,
+            source_identity_hash=f"hash-{source_end}",
+            source_ids=[source_end],
+            policy_fingerprint="policy",
+            route_fingerprint="route",
+        )
+        assert batch_id > 0
+        engine._frontier._conn.execute(
+            """UPDATE lcm_prepared_batches
+               SET summary_payload=?, resolved_policy_json=? WHERE batch_id=?""",
+            ("payload-secret-" + "x" * 20_000, "policy-secret-" + "y" * 20_000, batch_id),
+        )
+        engine._frontier._conn.commit()
+    statements: list[str] = []
+    engine._frontier._conn.set_trace_callback(statements.append)
+    monkeypatch.setattr(frontier_module, "_PENDING_BATCH_QUERY_PAGE", 2)
+    try:
+        batches = engine._frontier.list_pending_batches("conversation")
+        assert [batch.source_end_store_id for batch in batches] == [5, 4, 3, 2, 1]
+        assert all(batch.summary_payload == "" for batch in batches)
+        selects = [
+            statement for statement in statements
+            if "FROM lcm_prepared_batches" in statement
+            and statement.lstrip().upper().startswith("SELECT")
+        ]
+        assert len(selects) >= 3
+        assert all("LIMIT" in statement.upper() for statement in selects)
+        assert all("COALESCE(summary_payload" not in statement for statement in selects)
+        assert all("COALESCE(resolved_policy_json" not in statement for statement in selects)
+    finally:
+        engine._frontier._conn.set_trace_callback(None)
+        engine.shutdown()
+
+
+def test_load_session_rejects_oversized_roles_before_storage_read(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(
+        engine._store,
+        "count_session_load_messages",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("storage read")),
+    )
+    try:
+        too_many = [f"role-{index}" for index in range(
+            tools_module._LCM_LOAD_SESSION_MAX_ROLES + 1
+        )]
+        result = json.loads(engine.handle_tool_call(
+            "lcm_load_session", {"session_id": "current", "roles": too_many}
+        ))
+        assert "roles count" in result["error"]
+        too_long = "r" * (tools_module._LCM_LOAD_SESSION_MAX_ROLE_CHARS + 1)
+        result = json.loads(engine.handle_tool_call(
+            "lcm_load_session", {"session_id": "current", "roles": [too_long]}
+        ))
+        assert "role string" in result["error"]
+    finally:
+        engine.shutdown()
+
+
+def test_load_session_oversized_tool_calls_is_guarded_before_json_decode(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    store_id = engine._store.append(
+        "current", {"role": "assistant", "content": "safe", "tool_calls": [{"id": "ok"}]}
+    )
+    raw = json.dumps([{"arguments": "x" * 80_000}])
+    engine._store._conn.execute(
+        "UPDATE messages SET tool_calls=? WHERE store_id=?", (raw, store_id)
+    )
+    engine._store._conn.commit()
+    original_loads = store_module.json.loads
+
+    def guarded_loads(value, *args, **kwargs):
+        if value == raw:
+            raise AssertionError("oversized tool_calls decoded")
+        return original_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(store_module.json, "loads", guarded_loads)
+    try:
+        response_text = engine.handle_tool_call(
+            "lcm_load_session", {"session_id": "current"}
+        )
+        assert len(response_text.encode("utf-8")) <= tools_module._LCM_LOAD_SESSION_MAX_SERIALIZED_BYTES
+        response = json.loads(response_text)
+        assert response["messages"][0]["tool_calls_truncated"] is True
+        assert "tool_calls" not in response["messages"][0]
+        assert response["serialized_bytes"] <= response["serialized_byte_limit"]
+    finally:
+        engine.shutdown()
+
+
+def test_foreground_publication_pages_locked_frontier_and_tail(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    store_ids = [
+        engine._store.append(
+            "current", {"role": "user", "content": f"message-{index}"}
+        )
+        for index in range(5)
+    ]
+    node_ids = []
+    for source_id in store_ids[:2]:
+        node_ids.append(engine._dag.add_node(SummaryNode(
+            session_id="current",
+            depth=0,
+            summary=f"existing-{source_id}",
+            token_count=1,
+            source_token_count=1,
+            source_ids=[source_id],
+            source_type="messages",
+            created_at=1.0,
+        )))
+    engine._frontier.ensure_frontier(
+        "conversation", "current", source_end_store_id=store_ids[1]
+    )
+    engine._frontier.set_frontier_items(
+        "conversation",
+        1,
+        [
+            {
+                "kind": "node",
+                "ref_id": node_id,
+                "source_start": source_id,
+                "source_end": source_id,
+            }
+            for node_id, source_id in zip(node_ids, store_ids[:2])
+        ],
+    )
+    statements: list[str] = []
+    engine._frontier._conn.set_trace_callback(statements.append)
+    monkeypatch.setattr(engine_module, "_PUBLICATION_LOCKED_QUERY_BATCH", 1)
+    try:
+        result = engine._publish_foreground_leaf(
+            node=SummaryNode(
+                session_id="current",
+                depth=0,
+                summary="paged candidate",
+                token_count=1,
+                source_token_count=1,
+                source_ids=[store_ids[2]],
+                source_type="messages",
+                created_at=2.0,
+            ),
+            source_end_store_id=store_ids[2],
+            covered_source_ids=[store_ids[2]],
+        )
+        assert result["published"] is True
+        frontier_selects = [
+            statement for statement in statements
+            if "FROM lcm_frontier_items AS i" in statement
+        ]
+        tail_selects = [
+            statement for statement in statements
+            if "FROM messages" in statement
+            and "store_id >" in statement
+            and "ORDER BY store_id" in statement
+        ]
+        assert len(frontier_selects) >= 2
+        assert len(tail_selects) >= 2
+        assert all("LIMIT" in statement.upper() for statement in frontier_selects + tail_selects)
+    finally:
+        engine._frontier._conn.set_trace_callback(None)
+        engine.shutdown()
+
+
+def test_rollover_publication_pages_locked_frontier(tmp_path, monkeypatch):
+    engine = _engine(tmp_path, new_session_retain_depth=-1)
+    store_ids = [
+        engine._store.append(
+            "current", {"role": "user", "content": f"rollover-{index}"}
+        )
+        for index in range(3)
+    ]
+    node_ids = [
+        engine._dag.add_node(SummaryNode(
+            session_id="current",
+            depth=0,
+            summary=f"rollover-node-{source_id}",
+            token_count=1,
+            source_token_count=1,
+            source_ids=[source_id],
+            source_type="messages",
+            created_at=1.0,
+        ))
+        for source_id in store_ids
+    ]
+    engine._frontier.ensure_frontier(
+        "conversation", "current", source_end_store_id=store_ids[-1]
+    )
+    engine._frontier.set_frontier_items(
+        "conversation",
+        1,
+        [
+            {
+                "kind": "node",
+                "ref_id": node_id,
+                "source_start": source_id,
+                "source_end": source_id,
+            }
+            for node_id, source_id in zip(node_ids, store_ids)
+        ],
+    )
+    statements: list[str] = []
+    engine._frontier._conn.set_trace_callback(statements.append)
+    monkeypatch.setattr(engine_module, "_PUBLICATION_LOCKED_QUERY_BATCH", 1)
+    try:
+        moved = engine._publish_rollover_state(
+            "conversation",
+            "current",
+            "next",
+            carry_over_context=True,
+            final_tail=[],
+        )
+        assert moved == 3
+        selects = [
+            statement for statement in statements
+            if "FROM lcm_frontier_items AS i" in statement
+        ]
+        assert len(selects) >= 3
+        assert all("LIMIT" in statement.upper() for statement in selects)
+        active = engine._frontier.get_active_frontier("conversation")
+        assert active["generation"] == 2
+        assert active["session_id"] == "next"
+    finally:
+        engine._frontier._conn.set_trace_callback(None)
         engine.shutdown()
 
 

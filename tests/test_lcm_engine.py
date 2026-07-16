@@ -11456,15 +11456,20 @@ class TestEngineCompress:
         engine.context_length = 200000
         engine.threshold_tokens = int(200000 * config.context_threshold)
 
+        earlier_source_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "Historical source for earlier leaf"},
+            token_estimate=80,
+        )
         engine._dag.add_node(SummaryNode(
             session_id="test-session",
             depth=0,
             summary="Earlier leaf",
             token_count=40,
             source_token_count=80,
-            source_ids=[1],
+            source_ids=[earlier_source_id],
             source_type="messages",
-            created_at=time.time() - 10,
+            created_at=time.time(),
             expand_hint="earlier leaf",
         ))
 
@@ -11510,15 +11515,20 @@ class TestEngineCompress:
         engine.context_length = 1000
         engine.threshold_tokens = int(1000 * config.context_threshold)
 
+        earlier_source_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "Historical source for earlier leaf"},
+            token_estimate=80,
+        )
         engine._dag.add_node(SummaryNode(
             session_id="test-session",
             depth=0,
             summary="Earlier leaf",
             token_count=40,
             source_token_count=80,
-            source_ids=[1],
+            source_ids=[earlier_source_id],
             source_type="messages",
-            created_at=time.time() - 10,
+            created_at=time.time(),
             expand_hint="earlier leaf",
         ))
 
@@ -11562,15 +11572,20 @@ class TestEngineCompress:
         engine.threshold_tokens = int(200000 * config.context_threshold)
 
         for i in range(3):
+            source_id = engine._store.append(
+                "test-session",
+                {"role": "user", "content": f"Historical source for earlier leaf {i}"},
+                token_estimate=80,
+            )
             engine._dag.add_node(SummaryNode(
                 session_id="test-session",
                 depth=0,
                 summary=f"Earlier leaf {i}",
                 token_count=40,
                 source_token_count=80,
-                source_ids=[i + 1],
+                source_ids=[source_id],
                 source_type="messages",
-                created_at=time.time() - (10 + i),
+                created_at=time.time(),
                 expand_hint=f"earlier leaf {i}",
             ))
 
@@ -11615,15 +11630,20 @@ class TestEngineCompress:
         engine.context_length = 200000
         engine.threshold_tokens = int(200000 * config.context_threshold)
 
+        earlier_source_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "Historical source for earlier leaf"},
+            token_estimate=80,
+        )
         engine._dag.add_node(SummaryNode(
             session_id="test-session",
             depth=0,
             summary="Earlier leaf",
             token_count=40,
             source_token_count=80,
-            source_ids=[1],
+            source_ids=[earlier_source_id],
             source_type="messages",
-            created_at=time.time() - 10,
+            created_at=time.time(),
             expand_hint="earlier leaf",
         ))
 

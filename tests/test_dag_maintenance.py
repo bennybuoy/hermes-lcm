@@ -17,6 +17,7 @@ import hermes_lcm.maintenance as maintenance_module
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
+from hermes_lcm.frontier import FrontierStore
 from hermes_lcm.lcm_cli import main as cli_main
 from hermes_lcm.maintenance import (
     _MAINTENANCE_MAX_FRONTIER_ITEMS,
@@ -288,28 +289,39 @@ def test_maintenance_atomically_advances_lifecycle_and_settles_base_batch(tmp_pa
 
 
 def test_concurrent_winner_during_locked_snapshot_serializes_and_rejects(tmp_path):
-    path, parent, _ = _fixture(tmp_path)
+    path, parent, leaf_ids = _fixture(tmp_path)
     attempting = threading.Event()
+    acquired = threading.Event()
+    finished = threading.Event()
     outcome: dict[str, str] = {}
     competitors: list[threading.Thread] = []
+    competitor_store = FrontierStore(str(path))
 
     def competing_publisher():
-        conn = sqlite3.connect(path, timeout=5.0)
         try:
             attempting.set()
-            conn.execute("BEGIN IMMEDIATE")
-            generation = conn.execute(
-                """SELECT generation FROM lcm_active_frontiers
-                   WHERE conversation_id='source-conv'
-                   ORDER BY generation DESC LIMIT 1"""
-            ).fetchone()[0]
-            if generation != 1:
-                conn.rollback()
-                outcome["state"] = "rejected"
-                return
-            raise AssertionError("competitor acquired the lock before maintenance committed")
+            with competitor_store.publication_transaction() as conn:
+                acquired.set()
+                generation = competitor_store.publish_generation_state_no_commit(
+                    conn,
+                    conversation_id="source-conv",
+                    session_id="source",
+                    source_end_store_id=2,
+                    policy_fingerprint="",
+                    route_fingerprint="",
+                    base_generation=1,
+                    items=[{
+                        "kind": "node",
+                        "ref_id": parent,
+                        "source_start": 1,
+                        "source_end": 2,
+                    }],
+                    batch_reason="competing_test_publication",
+                )
+                outcome["generation"] = str(generation)
+                outcome["state"] = "published" if generation else "rejected"
         finally:
-            conn.close()
+            finished.set()
 
     def start_during_locked_snapshot(phase):
         if phase != "after_snapshot_locked":
@@ -318,6 +330,13 @@ def test_concurrent_winner_during_locked_snapshot_serializes_and_rejects(tmp_pat
         competitors.append(thread)
         thread.start()
         assert attempting.wait(timeout=2)
+        assert not acquired.wait(timeout=0.05)
+        probe = sqlite3.connect(path, timeout=0.0)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                probe.execute("BEGIN IMMEDIATE")
+        finally:
+            probe.close()
 
     result = apply_dag_maintenance(
         path,
@@ -331,12 +350,23 @@ def test_concurrent_winner_during_locked_snapshot_serializes_and_rejects(tmp_pat
     assert competitors
     competitors[0].join(timeout=5)
     assert not competitors[0].is_alive()
+    assert acquired.is_set() and finished.is_set()
     assert outcome["state"] == "rejected"
-    assert _active(path, "source-conv")[0][0] == 2
+    assert outcome["generation"] == "0"
+    active, items = _active(path, "source-conv")
+    assert active[0] == 2
+    assert {item[1] for item in items if item[0] == "node"} == set(leaf_ids)
     conn = sqlite3.connect(path)
-    assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
-    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
-    conn.close()
+    try:
+        assert conn.execute(
+            """SELECT MAX(generation) FROM lcm_active_frontiers
+               WHERE conversation_id='source-conv'"""
+        ).fetchone()[0] == 2
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        conn.close()
+        competitor_store.close()
 
 
 def test_maintenance_source_inventory_batches_message_validation_and_rejects_fanout(
