@@ -585,7 +585,53 @@ def is_externalized_placeholder(text: str) -> bool:
     return bool(_EXTERNALIZED_REF_RE.fullmatch(stripped))
 
 
-def load_externalized_payload(ref: str, *, config, hermes_home: str = "") -> Dict[str, Any] | None:
+def _preflight_bounded_externalized_json(
+    raw: str,
+    *,
+    deadline_at: float | None,
+    max_depth: int,
+    max_items: int,
+) -> None:
+    depth = 0
+    items = 0
+    in_string = False
+    escaped = False
+    for index, character in enumerate(raw):
+        if index % 4096 == 0 and deadline_at is not None and time.monotonic() >= deadline_at:
+            raise RuntimeError("externalized payload deadline exceeded")
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            items += 1
+            if depth > max_depth:
+                raise RuntimeError("externalized payload nested-depth bound exceeded")
+        elif character in "]}":
+            depth = max(0, depth - 1)
+        elif character in ",:":
+            items += 1
+        if items > max_items:
+            raise RuntimeError("externalized payload nested-item bound exceeded")
+
+
+def load_externalized_payload(
+    ref: str,
+    *,
+    config,
+    hermes_home: str = "",
+    read_budget: dict[str, float | int] | None = None,
+    budget_label: str = "externalized payload",
+    max_nested_depth: int = 32,
+    max_nested_items: int = 20_000,
+) -> Dict[str, Any] | None:
     if not ref or Path(ref).name != ref:
         return None
     storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
@@ -595,7 +641,37 @@ def load_externalized_payload(ref: str, *, config, hermes_home: str = "") -> Dic
     if not path.exists() or not path.is_file():
         return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        deadline_at = (
+            float(read_budget["deadline_at"]) if read_budget is not None else None
+        )
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            raise RuntimeError(f"{budget_label} deadline exceeded")
+        encoded_size = int(path.stat().st_size)
+        if read_budget is not None:
+            remaining = int(read_budget["max_bytes"]) - int(read_budget["bytes"])
+            if encoded_size > remaining:
+                raise RuntimeError(f"{budget_label} serialized byte bound exceeded")
+        with path.open("rb") as handle:
+            raw_bytes = handle.read(encoded_size + 1)
+        if len(raw_bytes) != encoded_size:
+            raise RuntimeError(f"{budget_label} payload changed during bounded read")
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            raise RuntimeError(f"{budget_label} deadline exceeded")
+        raw = raw_bytes.decode("utf-8")
+        if read_budget is not None:
+            _preflight_bounded_externalized_json(
+                raw,
+                deadline_at=deadline_at,
+                max_depth=max_nested_depth,
+                max_items=max_nested_items,
+            )
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            return None
+        if read_budget is not None:
+            if deadline_at is not None and time.monotonic() >= deadline_at:
+                raise RuntimeError(f"{budget_label} deadline exceeded")
+            read_budget["bytes"] = int(read_budget["bytes"]) + encoded_size
     except (OSError, json.JSONDecodeError):
         return None
     summary = _externalized_summary(path, payload)

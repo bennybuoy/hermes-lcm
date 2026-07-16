@@ -40,6 +40,74 @@ _MAINTENANCE_LINEAGE_MAX_BYTES = 4 * 1024 * 1024
 _MAINTENANCE_LINEAGE_DEADLINE_SECONDS = 2.0
 _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES = 8 * 1024
 
+_MAINTENANCE_NODE_COLUMNS = (
+    "node_id", "session_id", "depth", "summary", "token_count",
+    "source_token_count", "source_ids", "source_type", "created_at",
+    "earliest_at", "latest_at", "expand_hint",
+)
+_MAINTENANCE_NODE_TEXT_COLUMNS = (
+    "session_id", "summary", "source_ids", "source_type", "expand_hint",
+)
+_MAINTENANCE_NODE_TEXT_LIMITS = (
+    _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
+    _MAINTENANCE_COPY_MAX_FIELD_BYTES,
+    MAX_SOURCE_IDS_JSON_CHARS,
+    _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
+    _MAINTENANCE_COPY_MAX_FIELD_BYTES,
+)
+_MAINTENANCE_MESSAGE_COLUMNS = (
+    "store_id", "session_id", "source", "role", "content", "tool_call_id",
+    "tool_calls", "tool_name", "timestamp", "token_estimate", "pinned",
+    "conversation_id",
+)
+_MAINTENANCE_MESSAGE_TEXT_COLUMNS = {
+    "session_id", "source", "role", "content", "tool_call_id", "tool_calls",
+    "tool_name", "conversation_id",
+}
+
+
+def _new_maintenance_copy_budget() -> dict[str, float | int]:
+    return {
+        "bytes": 0,
+        "tokens": 0,
+        "deadline_at": time.monotonic()
+        + max(0.0, float(_MAINTENANCE_LINEAGE_DEADLINE_SECONDS)),
+    }
+
+
+def _check_copy_deadline(budget: dict[str, float | int]) -> None:
+    if time.monotonic() >= float(budget["deadline_at"]):
+        raise ValueError("maintenance copy deadline exceeded")
+
+
+def _charge_copy_budget(
+    budget: dict[str, float | int], *, encoded_bytes: int, tokens: int = 0
+) -> None:
+    _check_copy_deadline(budget)
+    next_bytes = int(budget["bytes"]) + max(0, int(encoded_bytes))
+    if next_bytes > _MAINTENANCE_COPY_MAX_BYTES:
+        raise ValueError("maintenance copy shared byte budget exceeded")
+    next_tokens = int(budget["tokens"]) + max(0, int(tokens))
+    if next_tokens > _MAINTENANCE_COPY_MAX_TOKENS:
+        raise ValueError("maintenance copy shared token budget exceeded")
+    budget["bytes"] = next_bytes
+    budget["tokens"] = next_tokens
+
+
+def _preflight_copy_token_budget(
+    budget: dict[str, float | int], *, encoded_bytes: int
+) -> None:
+    """Reject before fetching text when even its byte count cannot fit tokens.
+
+    A tokenizer cannot emit more tokens than the number of UTF-8 bytes fed to
+    it.  Using that as a conservative upper bound lets maintenance prove the
+    shared token cap before SQLite returns summaries, hints, IDs, or messages.
+    The exact token count is still charged after the bounded fetch.
+    """
+    _check_copy_deadline(budget)
+    if int(budget["tokens"]) + max(0, int(encoded_bytes)) > _MAINTENANCE_COPY_MAX_TOKENS:
+        raise ValueError("maintenance copy shared token budget exceeded")
+
 
 def _validate_copy_nested_value(value: Any) -> None:
     pending = [(value, 0)]
@@ -62,12 +130,18 @@ def _bounded_copy_message_row(
     conn: sqlite3.Connection,
     store_id: int,
     message_columns: list[str],
-    budget: dict[str, int],
+    budget: dict[str, float | int],
 ) -> sqlite3.Row:
+    _check_copy_deadline(budget)
+    if tuple(message_columns) != _MAINTENANCE_MESSAGE_COLUMNS:
+        raise ValueError("maintenance copy encountered unsupported message schema")
     quoted = [f'"{column.replace(chr(34), chr(34) * 2)}"' for column in message_columns]
-    size_sql = ", ".join(
-        f"COALESCE(length(CAST({column} AS BLOB)), 0)" for column in quoted
-    )
+    text_lengths = {
+        column: f"COALESCE(length(CAST(\"{column}\" AS BLOB)), 0)"
+        for column in _MAINTENANCE_MESSAGE_TEXT_COLUMNS
+    }
+    size_sql = ", ".join(text_lengths[column] for column in message_columns
+                         if column in text_lengths)
     sizes = conn.execute(
         f"SELECT {size_sql} FROM messages WHERE store_id=?", (int(store_id),)
     ).fetchone()
@@ -77,14 +151,46 @@ def _bounded_copy_message_row(
     if any(value > _MAINTENANCE_COPY_MAX_FIELD_BYTES for value in encoded_sizes):
         raise ValueError("maintenance copy field byte bound exceeded")
     row_bytes = sum(encoded_sizes)
-    if budget["bytes"] + row_bytes > _MAINTENANCE_COPY_MAX_BYTES:
-        raise ValueError("maintenance copy shared byte budget exceeded")
-
+    _preflight_copy_token_budget(budget, encoded_bytes=row_bytes)
+    _charge_copy_budget(budget, encoded_bytes=row_bytes)
+    bounded_columns: list[str] = []
+    for column in message_columns:
+        quoted_column = f'"{column}"'
+        if column in _MAINTENANCE_MESSAGE_TEXT_COLUMNS:
+            bounded_columns.append(
+                f"CASE WHEN {quoted_column} IS NULL THEN NULL ELSE "
+                f"substr(CAST({quoted_column} AS TEXT), "
+                f"1, {_MAINTENANCE_COPY_MAX_FIELD_BYTES + 1}) END"
+            )
+        elif column in {"store_id", "token_estimate", "pinned"}:
+            bounded_columns.append(
+                f"CASE WHEN typeof({quoted_column}) = 'integer' THEN {quoted_column} END"
+            )
+        elif column == "timestamp":
+            bounded_columns.append(
+                f"CASE WHEN typeof({quoted_column}) IN ('integer', 'real') THEN {quoted_column} END"
+            )
+        else:  # pragma: no cover - schema tuple above is exhaustive
+            raise ValueError("maintenance copy encountered unsupported message column")
     message = conn.execute(
-        f"SELECT {','.join(quoted)} FROM messages WHERE store_id=?", (int(store_id),)
+        f"SELECT {','.join(bounded_columns)} FROM messages WHERE store_id=?",
+        (int(store_id),),
     ).fetchone()
     if message is None:
         raise ValueError("copy source message disappeared from locked snapshot")
+    if any(
+        message[index] is None
+        for index, column in enumerate(message_columns)
+        if column not in _MAINTENANCE_MESSAGE_TEXT_COLUMNS
+    ):
+        raise ValueError("maintenance copy invalid message scalar type")
+    actual_text_sizes = [
+        len(str(message[index] or "").encode("utf-8", errors="replace"))
+        for index, column in enumerate(message_columns)
+        if column in _MAINTENANCE_MESSAGE_TEXT_COLUMNS
+    ]
+    if actual_text_sizes != encoded_sizes:
+        raise ValueError("maintenance copy field byte bound exceeded")
     row_tokens = 0
     for column, value in zip(message_columns, message):
         if not isinstance(value, str):
@@ -97,10 +203,7 @@ def _bounded_copy_message_row(
                 nested = None
             if nested is not None:
                 _validate_copy_nested_value(nested)
-    if budget["tokens"] + row_tokens > _MAINTENANCE_COPY_MAX_TOKENS:
-        raise ValueError("maintenance copy shared token budget exceeded")
-    budget["bytes"] += row_bytes
-    budget["tokens"] += row_tokens
+    _charge_copy_budget(budget, encoded_bytes=0, tokens=row_tokens)
     return message
 
 
@@ -436,11 +539,121 @@ def verify_restore_proof(backup_path: str | Path) -> dict[str, Any]:
     }
 
 
-def _node_row(conn: sqlite3.Connection, node_id: int) -> sqlite3.Row:
-    row = conn.execute("SELECT * FROM summary_nodes WHERE node_id=?", (int(node_id),)).fetchone()
+def _node_row(
+    conn: sqlite3.Connection,
+    node_id: int,
+    *,
+    budget: dict[str, float | int] | None = None,
+) -> sqlite3.Row:
+    """Read one node through explicit, byte-capped columns.
+
+    Copy operations pass one shared budget for every node and message. Other
+    maintenance operations still use a bounded one-row budget rather than
+    falling back to SELECT *.
+    """
+    active_budget = budget if budget is not None else _new_maintenance_copy_budget()
+    _check_copy_deadline(active_budget)
+    length_exprs = [
+        f"COALESCE(length(CAST({column} AS BLOB)), 0)"
+        for column in _MAINTENANCE_NODE_TEXT_COLUMNS
+    ]
+    metadata = conn.execute(
+        f"""SELECT
+                   CASE WHEN typeof(node_id) = 'integer' THEN node_id END,
+                   CASE WHEN typeof(depth) = 'integer' THEN depth END,
+                   CASE WHEN typeof(token_count) = 'integer' THEN token_count END,
+                   CASE WHEN typeof(source_token_count) = 'integer' THEN source_token_count END,
+                   CASE WHEN typeof(created_at) IN ('integer', 'real') THEN created_at END,
+                   CASE WHEN typeof(earliest_at) IN ('integer', 'real', 'null') THEN earliest_at ELSE 'invalid' END,
+                   CASE WHEN typeof(latest_at) IN ('integer', 'real', 'null') THEN latest_at ELSE 'invalid' END,
+                   {', '.join(length_exprs)}
+            FROM summary_nodes WHERE node_id=? LIMIT 1""",
+        (int(node_id),),
+    ).fetchone()
+    if metadata is None:
+        raise ValueError(f"summary node {node_id} not found")
+    if any(value is None for value in metadata[:5]) or any(
+        value == "invalid" for value in metadata[5:7]
+    ):
+        raise ValueError("maintenance copy invalid node scalar type")
+    encoded_sizes = [int(value or 0) for value in metadata[7:12]]
+    if any(
+        size > limit
+        for size, limit in zip(encoded_sizes, _MAINTENANCE_NODE_TEXT_LIMITS)
+    ):
+        raise ValueError("maintenance copy field byte bound exceeded")
+    _preflight_copy_token_budget(
+        active_budget,
+        encoded_bytes=sum(
+            encoded_sizes[_MAINTENANCE_NODE_TEXT_COLUMNS.index(column)]
+            for column in ("summary", "source_ids", "expand_hint")
+        ),
+    )
+    _charge_copy_budget(active_budget, encoded_bytes=sum(encoded_sizes))
+    bounded_text = {
+        column: (
+            f"CASE WHEN {column} IS NULL THEN NULL ELSE "
+            f"substr(CAST({column} AS TEXT), 1, {limit + 1}) END"
+        )
+        for column, limit in zip(
+            _MAINTENANCE_NODE_TEXT_COLUMNS, _MAINTENANCE_NODE_TEXT_LIMITS
+        )
+    }
+    select_columns: list[str] = []
+    for column in _MAINTENANCE_NODE_COLUMNS:
+        if column in bounded_text:
+            select_columns.append(bounded_text[column])
+        elif column in {"node_id", "depth", "token_count", "source_token_count"}:
+            select_columns.append(
+                f"CASE WHEN typeof({column}) = 'integer' THEN {column} END"
+            )
+        elif column in {"created_at", "earliest_at", "latest_at"}:
+            select_columns.append(
+                f"CASE WHEN typeof({column}) IN ('integer', 'real', 'null') THEN {column} END"
+            )
+    row = conn.execute(
+        f"SELECT {', '.join(select_columns)} FROM summary_nodes WHERE node_id=? LIMIT 1",
+        (int(node_id),),
+    ).fetchone()
     if row is None:
         raise ValueError(f"summary node {node_id} not found")
+    actual_sizes = [
+        len(str(row[_MAINTENANCE_NODE_COLUMNS.index(column)] or "").encode(
+            "utf-8", errors="replace"
+        ))
+        for column in _MAINTENANCE_NODE_TEXT_COLUMNS
+    ]
+    if actual_sizes != encoded_sizes:
+        raise ValueError("maintenance copy field byte bound exceeded")
+    row_tokens = sum(
+        count_tokens(str(row[_MAINTENANCE_NODE_COLUMNS.index(column)] or ""))
+        for column in ("summary", "source_ids", "expand_hint")
+    )
+    _charge_copy_budget(active_budget, encoded_bytes=0, tokens=row_tokens)
     return row
+
+
+def _node_session_id(conn: sqlite3.Connection, node_id: int) -> str:
+    length_expr = "COALESCE(length(CAST(session_id AS BLOB)), 0)"
+    row = conn.execute(
+        f"""SELECT CASE
+                      WHEN typeof(session_id) = 'text' AND {length_expr} <= ?
+                      THEN substr(session_id, 1, ?)
+                      ELSE NULL
+                   END,
+                   {length_expr}
+            FROM summary_nodes WHERE node_id=? LIMIT 1""",
+        (
+            _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
+            _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES + 1,
+            int(node_id),
+        ),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"summary node {node_id} not found")
+    if row[0] is None or int(row[1] or 0) > _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES:
+        raise ValueError("DAG lineage byte bound exceeded")
+    return str(row[0])
 
 
 def _json_ids(raw: Any) -> list[int]:
@@ -477,8 +690,7 @@ def _source_inventory(
     limit: int = 10_000,
 ) -> tuple[set[int], set[int]]:
     """Return the exact node/message closure beneath ``node_id``."""
-    root = _node_row(conn, node_id)
-    root_session_id = str(root[1])
+    root_session_id = _node_session_id(conn, node_id)
     pending = [int(node_id)]
     nodes: set[int] = set()
     messages: set[int] = set()
@@ -609,12 +821,24 @@ def _source_inventory(
     for offset in range(0, len(message_ids), _MAINTENANCE_QUERY_BATCH):
         batch = message_ids[offset:offset + _MAINTENANCE_QUERY_BATCH]
         placeholders = ",".join("?" for _ in batch)
+        session_length = "COALESCE(length(CAST(session_id AS BLOB)), 0)"
         rows = conn.execute(
-            f"SELECT store_id, session_id FROM messages WHERE store_id IN ({placeholders})",
-            batch,
+            f"""SELECT store_id,
+                       CASE WHEN typeof(session_id) = 'text' AND {session_length} <= ?
+                            THEN substr(session_id, 1, ?) ELSE NULL END,
+                       {session_length}
+                FROM messages WHERE store_id IN ({placeholders})""",
+            (
+                _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
+                _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES + 1,
+                *batch,
+            ),
         ).fetchall()
         if {int(row[0]) for row in rows} != set(batch) or any(
-            str(row[1]) != root_session_id for row in rows
+            row[1] is None
+            or int(row[2] or 0) > _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES
+            or str(row[1]) != root_session_id
+            for row in rows
         ):
             raise ValueError("DAG has missing/cross-session message sources")
     return nodes, messages
@@ -664,7 +888,10 @@ def plan_dag_maintenance(
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only=ON")
     try:
-        row = _node_row(conn, node_id)
+        node_budget = (
+            _new_maintenance_copy_budget() if operation == "copy-subtree" else None
+        )
+        row = _node_row(conn, node_id, budget=node_budget)
         source_start, source_end = _source_bounds(conn, node_id)
         frontier = _active_frontier(conn, conversation_id)
         if str(row[1]) != str(frontier[2]):
@@ -745,7 +972,9 @@ def plan_dag_maintenance(
             for target_item in target_items:
                 if target_item["kind"] != "node":
                     continue
-                target_root = _node_row(conn, int(target_item["ref_id"]))
+                target_root = _node_row(
+                    conn, int(target_item["ref_id"]), budget=node_budget
+                )
                 if (
                     int(target_root[2]) == int(row[2])
                     and str(target_root[3]) == str(row[3])
@@ -758,7 +987,14 @@ def plan_dag_maintenance(
             message_rows_added = len(closure_messages)
             frontier_item_rows_added = len(target_items) + 1
             storage_token_delta = sum(
-                int(_node_row(conn, closure_id)[4] or 0)
+                int(
+                    (
+                        row
+                        if int(closure_id) == int(node_id)
+                        else _node_row(conn, closure_id, budget=node_budget)
+                    )[4]
+                    or 0
+                )
                 for closure_id in closure_nodes
             )
             token_delta = int(row[4] or 0)
@@ -942,7 +1178,10 @@ def apply_dag_maintenance(
         if callable(snapshot_hook):
             snapshot_hook("before_begin")
         conn.execute("BEGIN IMMEDIATE")
-        root = _node_row(conn, node_id)
+        copy_budget = (
+            _new_maintenance_copy_budget() if operation == "copy-subtree" else None
+        )
+        root = _node_row(conn, node_id, budget=copy_budget)
         frontier = _active_frontier(conn, conversation_id)
         if int(frontier[1]) != int(plan["base_generation"]):
             raise ValueError("frontier changed after dry-run")
@@ -1020,15 +1259,16 @@ def apply_dag_maintenance(
             message_remap: dict[int, int] = {}
             node_remap: dict[int, int] = {}
             _closure_nodes, closure_message_ids = _source_inventory(conn, int(node_id))
-            message_columns = [
-                description[1] for description in conn.execute("PRAGMA table_info(messages)")
-            ]
-            copy_budget = {"bytes": 0, "tokens": 0}
+            message_columns = list(_MAINTENANCE_MESSAGE_COLUMNS)
+            assert copy_budget is not None
+            preloaded_rows = {int(node_id): root}
 
             def copy_node(source_node_id: int) -> int:
                 if source_node_id in node_remap:
                     return node_remap[source_node_id]
-                row = _node_row(conn, source_node_id)
+                row = preloaded_rows.pop(source_node_id, None)
+                if row is None:
+                    row = _node_row(conn, source_node_id, budget=copy_budget)
                 sources = _json_ids(row[6])
                 if row[7] == "messages":
                     copied_sources = []

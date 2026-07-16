@@ -58,6 +58,17 @@ _MESSAGE_SELECT_COLUMNS = (
 )
 _UNKNOWN_SOURCE = "unknown"
 _LOAD_SESSION_MAX_TOOL_CALLS_ENCODED_BYTES = 64 * 1024
+_LOAD_SESSION_MAX_SCALAR_TEXT_BYTES = 8 * 1024
+_LOAD_SESSION_MAX_SESSION_TEXT_BYTES = 2 * 1024
+_LOAD_SESSION_MAX_ROLE_TEXT_BYTES = 512
+_LOAD_SESSION_MAX_ROW_MATERIALIZED_BYTES = 96 * 1024
+_LOAD_SESSION_MAX_PAGE_MATERIALIZED_BYTES = 2 * 1024 * 1024
+
+
+class SessionLoadPage(list[dict[str, Any]]):
+    """List-compatible bounded page with aggregate exhaustion metadata."""
+
+    budget_exhausted: bool = False
 
 
 def _legacy_blank_source_clause(column: str) -> str:
@@ -572,6 +583,9 @@ class MessageStore:
         roles: list[str] | None = None,
         time_from: float | None = None,
         time_to: float | None = None,
+        max_content_chars: int = 20_000,
+        max_serialized_bytes: int = _LOAD_SESSION_MAX_PAGE_MATERIALIZED_BYTES,
+        max_row_serialized_bytes: int = _LOAD_SESSION_MAX_ROW_MATERIALIZED_BYTES,
     ) -> List[Dict[str, Any]]:
         """Load one ordered raw-message page for a session.
 
@@ -585,29 +599,149 @@ class MessageStore:
             time_to=time_to,
         )
         where.append("store_id > ?")
-        args.extend([after_store_id, limit])
-        rows = self._conn.execute(
-            f"""SELECT store_id, session_id, source, role, content, tool_call_id,
-                       CASE
-                         WHEN COALESCE(length(CAST(tool_calls AS BLOB)), 0) <= ?
-                         THEN tool_calls ELSE NULL
-                       END,
-                       tool_name, timestamp, token_estimate, pinned, conversation_id,
-                       COALESCE(length(CAST(tool_calls AS BLOB)), 0)
-                FROM messages
-               WHERE {' AND '.join(where)}
-               ORDER BY store_id LIMIT ?""",
-            [_LOAD_SESSION_MAX_TOOL_CALLS_ENCODED_BYTES, *args],
-        ).fetchall()
-        result: list[dict[str, Any]] = []
-        for row in rows:
+        args.append(after_store_id)
+        result = SessionLoadPage()
+        materialized_bytes = 0
+        last_store_id = int(after_store_id)
+        text_columns = (
+            "session_id", "source", "role", "content", "tool_call_id",
+            "tool_calls", "tool_name", "conversation_id",
+        )
+        text_limits = (
+            _LOAD_SESSION_MAX_SESSION_TEXT_BYTES,
+            _LOAD_SESSION_MAX_SCALAR_TEXT_BYTES,
+            _LOAD_SESSION_MAX_ROLE_TEXT_BYTES,
+            max(1, int(max_content_chars)) * 4,
+            _LOAD_SESSION_MAX_SCALAR_TEXT_BYTES,
+            _LOAD_SESSION_MAX_TOOL_CALLS_ENCODED_BYTES,
+            _LOAD_SESSION_MAX_SCALAR_TEXT_BYTES,
+            _LOAD_SESSION_MAX_SESSION_TEXT_BYTES,
+        )
+        length_exprs = [
+            f"COALESCE(length(CAST({column} AS BLOB)), 0)" for column in text_columns
+        ]
+        char_length_exprs = [
+            f"COALESCE(length(CAST({column} AS TEXT)), 0)" for column in text_columns
+        ]
+        while len(result) < int(limit):
+            metadata_where = [*where[:-1], "store_id > ?"]
+            metadata_args = [*args[:-1], last_store_id]
+            metadata = self._conn.execute(
+                f"""SELECT
+                           CASE WHEN typeof(store_id) = 'integer' THEN store_id END,
+                           CASE WHEN typeof(timestamp) IN ('integer', 'real') THEN timestamp END,
+                           CASE WHEN typeof(token_estimate) = 'integer' THEN token_estimate END,
+                           CASE WHEN typeof(pinned) = 'integer' THEN pinned END,
+                           {', '.join(length_exprs)},
+                           {', '.join(char_length_exprs)},
+                           {', '.join(f"typeof({column}) IN ('text', 'null')" for column in text_columns)}
+                    FROM messages WHERE {' AND '.join(metadata_where)}
+                    ORDER BY store_id LIMIT 1""",
+                metadata_args,
+            ).fetchone()
+            if metadata is None:
+                break
+            if any(value is None for value in metadata[:4]) or not all(
+                bool(value) for value in metadata[20:28]
+            ):
+                raise ValueError("invalid stored message scalar type")
+            store_id = int(metadata[0])
+            encoded_lengths = [int(value or 0) for value in metadata[4:12]]
+            char_lengths = [int(value or 0) for value in metadata[12:20]]
+            invalid_scalar_text = any(
+                length > limit_value
+                for index, (length, limit_value) in enumerate(zip(encoded_lengths, text_limits))
+                if text_columns[index] not in {"content", "tool_calls"}
+            )
+            if invalid_scalar_text:
+                raise ValueError("invalid stored message scalar text bound")
+            bounded_lengths = [
+                min(length, limit_value)
+                for length, limit_value in zip(encoded_lengths, text_limits)
+            ]
+            tool_calls_omitted = (
+                encoded_lengths[5] > _LOAD_SESSION_MAX_TOOL_CALLS_ENCODED_BYTES
+            )
+            if tool_calls_omitted:
+                bounded_lengths[5] = 0
+            row_upper_bound = sum(bounded_lengths) + 128
+            if row_upper_bound > int(max_row_serialized_bytes):
+                # A JSON tool_calls value cannot be safely substring-truncated.
+                # Omit it before reserving the rest of the per-row budget.
+                fixed_without_content = row_upper_bound - bounded_lengths[3]
+                if (
+                    bounded_lengths[5]
+                    and fixed_without_content > int(max_row_serialized_bytes)
+                ):
+                    row_upper_bound -= bounded_lengths[5]
+                    bounded_lengths[5] = 0
+                    tool_calls_omitted = True
+                # Content is intentionally sliceable; reserve the remaining
+                # row cap for it after all non-content scalar fields.
+                fixed = row_upper_bound - bounded_lengths[3]
+                bounded_lengths[3] = max(0, int(max_row_serialized_bytes) - fixed)
+                row_upper_bound = fixed + bounded_lengths[3]
+            if row_upper_bound > int(max_row_serialized_bytes):
+                result.budget_exhausted = True
+                break
+            if materialized_bytes + row_upper_bound > int(max_serialized_bytes):
+                result.budget_exhausted = True
+                break
+            content_char_cap = min(
+                max(1, int(max_content_chars)),
+                (
+                    char_lengths[3]
+                    if bounded_lengths[3] >= encoded_lengths[3]
+                    else max(0, bounded_lengths[3] // 4)
+                ),
+            )
+            bounded_sql: dict[str, str] = {}
+            for index, column in enumerate(text_columns):
+                if column == "tool_calls" and tool_calls_omitted:
+                    bounded_sql[column] = "NULL"
+                    continue
+                char_cap = content_char_cap if column == "content" else char_lengths[index]
+                length_guard = ""
+                if column != "content":
+                    length_guard = f" AND {length_exprs[index]} <= {text_limits[index]}"
+                bounded_sql[column] = (
+                    f"CASE WHEN {column} IS NULL THEN NULL ELSE "
+                    f"CASE WHEN typeof({column}) = 'text'{length_guard} THEN "
+                    f"substr(CAST({column} AS TEXT), 1, {int(char_cap)}) "
+                    "ELSE NULL END END"
+                )
+            row = self._conn.execute(
+                f"""SELECT
+                           CASE WHEN typeof(store_id) = 'integer' THEN store_id END,
+                           {bounded_sql['session_id']}, {bounded_sql['source']},
+                           {bounded_sql['role']}, {bounded_sql['content']},
+                           {bounded_sql['tool_call_id']}, {bounded_sql['tool_calls']},
+                           {bounded_sql['tool_name']},
+                           CASE WHEN typeof(timestamp) IN ('integer', 'real') THEN timestamp END,
+                           CASE WHEN typeof(token_estimate) = 'integer' THEN token_estimate END,
+                           CASE WHEN typeof(pinned) = 'integer' THEN pinned END,
+                           {bounded_sql['conversation_id']},
+                           {', '.join(length_exprs)},
+                           {', '.join(f"typeof({column}) IN ('text', 'null')" for column in text_columns)}
+                    FROM messages WHERE store_id=? LIMIT 1""",
+                (store_id,),
+            ).fetchone()
+            if row is None or any(row[index] is None for index in (0, 8, 9, 10)):
+                raise ValueError("invalid stored message scalar type")
+            if [int(value or 0) for value in row[12:20]] != encoded_lengths or not all(
+                bool(value) for value in row[20:28]
+            ):
+                raise ValueError("stored message changed during bounded load")
             item = self._row_to_dict(row[:12])
-            encoded_bytes = int(row[12] or 0)
+            item["content_chars"] = char_lengths[3]
+            encoded_bytes = encoded_lengths[5]
             item["tool_calls_encoded_bytes"] = encoded_bytes
             item["tool_calls_encoded_too_large"] = (
-                encoded_bytes > _LOAD_SESSION_MAX_TOOL_CALLS_ENCODED_BYTES
+                tool_calls_omitted
             )
             result.append(item)
+            materialized_bytes += row_upper_bound
+            last_store_id = store_id
         return result
 
     def get_session_messages(self, session_id: str,

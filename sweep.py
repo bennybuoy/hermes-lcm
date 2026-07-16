@@ -39,6 +39,7 @@ class _StagedNode:
     source_token_count: int
     raw_source_ids: list[int]
     message_source_ids: list[int] = field(default_factory=list)
+    raw_messages_by_id: list[tuple[int, dict[str, Any]]] = field(default_factory=list)
     child_sources: list["_StagedNode"] = field(default_factory=list)
     created_at: float = 0.0
     earliest_at: float | None = None
@@ -100,6 +101,13 @@ class FullSweepMixin:
         carried_items: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = [dict(item) for item in (carried_items or [])]
+        carried_raw_ids = {
+            int(item["ref_id"])
+            for item in items
+            if item.get("kind") == "message"
+            and int(item.get("source_start") or 0) == int(item.get("ref_id") or 0)
+            and int(item.get("source_end") or 0) == int(item.get("ref_id") or 0)
+        }
         for root in roots:
             source_ids = sorted({int(source_id) for source_id in root.raw_source_ids if source_id})
             if not source_ids or root.node_id <= 0:
@@ -114,7 +122,7 @@ class FullSweepMixin:
             )
         for row in stored_tail:
             store_id = int(row.get("store_id") or 0)
-            if store_id <= 0:
+            if store_id <= 0 or store_id in carried_raw_ids:
                 continue
             items.append(
                 {
@@ -137,7 +145,9 @@ class FullSweepMixin:
             start = int(item["source_start"])
             end = int(item["source_end"])
             if start <= previous_end or end < start:
-                continue
+                raise RuntimeError(
+                    "full sweep candidate range overlap would drop a frontier item"
+                )
             validated.append(item)
             previous_end = end
         return validated
@@ -306,10 +316,16 @@ class FullSweepMixin:
             if not compacted or len(compacted) > len(selected):
                 reason, partial = "no-progress", bool(staged)
                 break
-            source_ids = sorted(dict.fromkeys(self._get_store_ids_for_messages(compacted)))
+            mapped_source_ids = self._get_store_ids_for_messages(compacted)
+            source_ids = sorted(dict.fromkeys(mapped_source_ids))
             actual_source_tokens = count_messages_tokens(compacted)
             summary_tokens = count_tokens(summary)
-            if not source_ids or summary_tokens >= actual_source_tokens:
+            if (
+                not source_ids
+                or len(mapped_source_ids) != len(compacted)
+                or len(source_ids) != len(mapped_source_ids)
+                or summary_tokens >= actual_source_tokens
+            ):
                 reason, partial = "no-progress", bool(staged)
                 break
             earliest_at, latest_at = self._store.get_time_bounds(source_ids)
@@ -320,6 +336,7 @@ class FullSweepMixin:
                 source_token_count=actual_source_tokens,
                 raw_source_ids=source_ids,
                 message_source_ids=source_ids,
+                raw_messages_by_id=list(zip(mapped_source_ids, compacted)),
                 created_at=time.time(),
                 earliest_at=earliest_at,
                 latest_at=latest_at,
@@ -391,6 +408,16 @@ class FullSweepMixin:
             raw_ids = sorted(
                 {source_id for node in selected_group for source_id in node.raw_source_ids}
             )
+            raw_pairs = sorted(
+                [
+                    pair
+                    for child in selected_group
+                    for pair in child.raw_messages_by_id
+                ],
+                key=lambda pair: pair[0],
+            )
+            if len({source_id for source_id, _message in raw_pairs}) != len(raw_pairs):
+                raise RuntimeError("full sweep staged lineage overlaps")
             parent = _StagedNode(
                 depth=selected_group[0].depth + 1,
                 summary=summary,
@@ -398,6 +425,7 @@ class FullSweepMixin:
                 source_token_count=source_tokens,
                 raw_source_ids=raw_ids,
                 child_sources=list(selected_group),
+                raw_messages_by_id=raw_pairs,
                 created_at=time.time(),
                 earliest_at=min(
                     (node.earliest_at for node in selected_group if node.earliest_at is not None),
@@ -460,12 +488,18 @@ class FullSweepMixin:
             {source_id for root in roots for source_id in root.raw_source_ids}
         )
         source_end = max(covered_source_ids)
-        source_message_map = self._get_store_id_map_for_messages(working_messages)
-        summarized_messages = [
-            message
-            for message in working_messages
-            if int(source_message_map.get(id(message)) or 0) in covered_source_ids
+        summarized_pairs = [
+            (int(source_id), message)
+            for root in roots
+            for source_id, message in root.raw_messages_by_id
         ]
+        summarized_by_id = dict(summarized_pairs)
+        if (
+            len(summarized_by_id) != len(summarized_pairs)
+            or set(summarized_by_id) != set(covered_source_ids)
+        ):
+            raise RuntimeError("full sweep summarized source mapping is incomplete")
+        summarized_messages = [summarized_by_id[source_id] for source_id in covered_source_ids]
         expected_source_identity = self._foreground_source_identity_for_messages(
             summarized_messages,
             covered_source_ids,
@@ -575,8 +609,21 @@ class FullSweepMixin:
                 carried_items: list[dict[str, Any]] = []
                 for kind, ref_id, start, end in active_rows:
                     start, end = int(start or 0), int(end or 0)
-                    if start <= 0 or end < start or not (end < covered_start or start > source_end):
-                        continue
+                    if start <= 0 or end < start:
+                        raise RuntimeError("full sweep active frontier contains invalid range")
+                    if kind not in {"node", "message"}:
+                        raise RuntimeError("full sweep active frontier has invalid item kind")
+                    if kind == "message":
+                        if start != int(ref_id) or end != int(ref_id):
+                            raise RuntimeError("full sweep message frontier range is invalid")
+                        if int(ref_id) in covered_source_ids:
+                            # Exact raw lineage is intentionally replaced by
+                            # the newly staged summary nodes.
+                            continue
+                    if not (end < covered_start or start > source_end):
+                        raise RuntimeError(
+                            "full sweep candidate declared range overlap would lose canonical coverage"
+                        )
                     if kind == "node" and publication_conn.execute(
                         "SELECT 1 FROM summary_nodes WHERE node_id=?", (int(ref_id),)
                     ).fetchone() is None:

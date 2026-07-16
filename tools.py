@@ -2254,6 +2254,14 @@ def _bounded_loaded_nested_value(
 def _serialize_loaded_message(engine: "LCMEngine", row: dict[str, Any], max_content_chars: int) -> dict[str, Any]:
     stored_session_id = row.get("session_id", "")
     content_slice = _slice_loaded_content(row.get("content", "") or "", max_content_chars)
+    stored_content_chars = row.get("content_chars")
+    if isinstance(stored_content_chars, int) and stored_content_chars >= 0:
+        returned_chars = len(content_slice["content"])
+        content_slice["content_chars"] = stored_content_chars
+        content_slice["content_truncated"] = stored_content_chars > returned_chars
+        content_slice["next_content_offset"] = (
+            returned_chars if stored_content_chars > returned_chars else 0
+        )
     safe_session_id, _ = _bounded_cross_session_text(
         stored_session_id, None, max_tokens=512, max_chars=512
     )
@@ -2376,21 +2384,28 @@ def lcm_load_session(args: Dict[str, Any], **kwargs) -> str:
         time_from=time_from,
         time_to=time_to,
     )
-    rows = engine._store.load_session_page(
-        session_id,
-        after_store_id=after_store_id,
-        limit=limit + 1,
-        roles=roles or None,
-        time_from=time_from,
-        time_to=time_to,
-    )
+    try:
+        rows = engine._store.load_session_page(
+            session_id,
+            after_store_id=after_store_id,
+            limit=limit + 1,
+            roles=roles or None,
+            time_from=time_from,
+            time_to=time_to,
+            max_content_chars=max_content_chars,
+            max_serialized_bytes=_LCM_LOAD_SESSION_MAX_SERIALIZED_BYTES,
+            max_row_serialized_bytes=_LCM_LOAD_SESSION_MAX_ROW_SERIALIZED_BYTES,
+        )
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
     page_rows = rows[:limit]
-    has_more = len(rows) > limit
+    storage_budget_exhausted = bool(getattr(rows, "budget_exhausted", False))
+    has_more = len(rows) > limit or storage_budget_exhausted
     next_cursor = page_rows[-1]["store_id"] if has_more and page_rows else None
 
     serialized_messages: list[dict[str, Any]] = []
     shared_messages_bytes = 0
-    shared_budget_exhausted = False
+    shared_budget_exhausted = storage_budget_exhausted
     response_reserve = min(
         16_384, max(1_024, _LCM_LOAD_SESSION_MAX_SERIALIZED_BYTES // 4)
     )

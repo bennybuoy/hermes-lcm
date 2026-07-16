@@ -2733,15 +2733,25 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         prefix_count = self._session_end_store_prefix_count(session_id, messages)
         return prefix_count is not None and prefix_count > 0
 
-    def _session_end_prefix_compare_value(self, value: Any, *, session_id: str) -> Any:
+    def _session_end_prefix_compare_value(
+        self,
+        value: Any,
+        *,
+        session_id: str,
+        read_budget: dict[str, float | int] | None = None,
+    ) -> Any:
         if isinstance(value, dict):
             return {
-                key: self._session_end_prefix_compare_value(child, session_id=session_id)
+                key: self._session_end_prefix_compare_value(
+                    child, session_id=session_id, read_budget=read_budget
+                )
                 for key, child in value.items()
             }
         if isinstance(value, list):
             return [
-                self._session_end_prefix_compare_value(child, session_id=session_id)
+                self._session_end_prefix_compare_value(
+                    child, session_id=session_id, read_budget=read_budget
+                )
                 for child in value
             ]
         if not isinstance(value, str):
@@ -2764,6 +2774,10 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 ingest_refs[0],
                 config=self._config,
                 hermes_home=self._hermes_home,
+                read_budget=read_budget,
+                budget_label="rollover prefix",
+                max_nested_depth=_PUBLICATION_LOCKED_MAX_NESTED_DEPTH,
+                max_nested_items=_PUBLICATION_LOCKED_MAX_NESTED_ITEMS,
             )
             if payload is not None:
                 payload_session_id = str(payload.get("session_id") or "")
@@ -2778,6 +2792,10 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 ref or "",
                 config=self._config,
                 hermes_home=self._hermes_home,
+                read_budget=read_budget,
+                budget_label="rollover prefix",
+                max_nested_depth=_PUBLICATION_LOCKED_MAX_NESTED_DEPTH,
+                max_nested_items=_PUBLICATION_LOCKED_MAX_NESTED_ITEMS,
             )
             if payload is not None:
                 payload_session_id = str(payload.get("session_id") or "")
@@ -2792,10 +2810,12 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         message: Dict[str, Any],
         *,
         session_id: str,
+        read_budget: dict[str, float | int] | None = None,
     ) -> str:
         content = self._session_end_prefix_compare_value(
             (message or {}).get("content"),
             session_id=session_id,
+            read_budget=read_budget,
         )
         content = redact_sensitive_value(
             content,
@@ -2809,10 +2829,12 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         message: Dict[str, Any],
         *,
         session_id: str,
+        read_budget: dict[str, float | int] | None = None,
     ) -> str:
         tool_calls = self._session_end_prefix_compare_value(
             (message or {}).get("tool_calls"),
             session_id=session_id,
+            read_budget=read_budget,
         )
         tool_calls = redact_sensitive_value(
             tool_calls,
@@ -2834,13 +2856,18 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         message: Dict[str, Any],
         *,
         session_id: str,
+        read_budget: dict[str, float | int] | None = None,
     ) -> tuple[str, str, str, str, str]:
         return (
             str((message or {}).get("role") or ""),
-            self._session_end_prefix_compare_content(message, session_id=session_id),
+            self._session_end_prefix_compare_content(
+                message, session_id=session_id, read_budget=read_budget
+            ),
             str((message or {}).get("tool_call_id") or ""),
             str((message or {}).get("tool_name") or ""),
-            self._session_end_prefix_compare_tool_calls(message, session_id=session_id),
+            self._session_end_prefix_compare_tool_calls(
+                message, session_id=session_id, read_budget=read_budget
+            ),
         )
 
     @staticmethod
@@ -2896,6 +2923,33 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             elif isinstance(current, (list, tuple)):
                 pending.extend((item, depth + 1) for item in current)
 
+    @classmethod
+    def _bounded_rollover_active_encoded_bytes(
+        cls,
+        value: Any,
+        *,
+        read_budget: dict[str, float | int],
+        remaining_bytes: int | None = None,
+    ) -> int:
+        """Count JSON bytes incrementally before redaction or placeholder IO."""
+        cls._guard_rollover_nested_representation(value, read_budget=read_budget)
+        remaining = int(read_budget["max_bytes"]) - int(read_budget["bytes"])
+        if remaining_bytes is not None:
+            remaining = min(remaining, max(0, int(remaining_bytes)))
+        encoded_bytes = 0
+        encoder = json.JSONEncoder(
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        for index, chunk in enumerate(encoder.iterencode(value)):
+            if index % 64 == 0 and time.monotonic() >= float(read_budget["deadline_at"]):
+                raise RuntimeError("rollover prefix deadline exceeded")
+            encoded_bytes += len(chunk.encode("utf-8", errors="replace"))
+            if encoded_bytes > remaining:
+                raise RuntimeError("rollover prefix serialized byte bound exceeded")
+        return encoded_bytes
+
     def _session_end_store_prefix_count(
         self,
         session_id: str,
@@ -2948,7 +3002,8 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 )
                 bounded = [
                     f"CASE WHEN {guard} THEN "
-                    f"substr(CAST(COALESCE({field}, '') AS TEXT), 1, {field_limit + 1}) "
+                    f"CASE WHEN {field} IS NULL THEN NULL ELSE "
+                    f"substr(CAST({field} AS TEXT), 1, {field_limit + 1}) END "
                     "ELSE NULL END"
                     for field in fields
                 ]
@@ -2982,7 +3037,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     row_bytes = sum(row_lengths)
                     if row_bytes > row_payload_cap or any(
                         length > field_limit for length in row_lengths
-                    ) or any(row[index] is None for index in range(1, 6)):
+                    ):
                         raise RuntimeError("rollover prefix serialized byte bound exceeded")
                     self._charge_locked_publication_read(
                         read_budget,
@@ -2992,11 +3047,29 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     )
                     stored_msg = dict(zip(fields, row[1:6]))
                     msg = messages[compared]
+                    # Charge every active field in its original encoded form
+                    # before normalization, redaction, or externalized
+                    # placeholder expansion can shrink or replace it.
+                    active_bytes = 0
+                    for field in fields:
+                        active_bytes += self._bounded_rollover_active_encoded_bytes(
+                            msg.get(field),
+                            read_budget=read_budget,
+                            remaining_bytes=(
+                                int(read_budget["max_bytes"])
+                                - int(read_budget["bytes"])
+                                - 32
+                                - active_bytes
+                            ),
+                        )
+                    self._charge_locked_publication_read(
+                        read_budget,
+                        rows=0,
+                        serialized_bytes=active_bytes + 32,
+                        label="rollover prefix",
+                    )
                     for candidate in (
-                        msg.get("content"),
-                        msg.get("tool_calls"),
-                        stored_msg.get("content"),
-                        stored_msg.get("tool_calls"),
+                        stored_msg.get("content"), stored_msg.get("tool_calls")
                     ):
                         self._guard_rollover_nested_representation(
                             candidate,
@@ -3005,10 +3078,12 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     message_identity = self._session_end_prefix_compare_identity(
                         msg,
                         session_id=session_id,
+                        read_budget=read_budget,
                     )
                     stored_identity = self._session_end_prefix_compare_identity(
                         stored_msg,
                         session_id=session_id,
+                        read_budget=read_budget,
                     )
                     if time.monotonic() >= float(read_budget["deadline_at"]):
                         raise RuntimeError("rollover prefix deadline exceeded")
@@ -6916,20 +6991,24 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
     ) -> str:
         """Capture DB identity only while it still matches summarized messages."""
         wanted = [int(value) for value in source_ids]
-        id_map = self._get_store_id_map_for_messages(list(messages))
-        message_by_store_id = {
-            int(id_map[id(message)]): message
-            for message in messages
-            if id(message) in id_map
-        }
+        if len(messages) != len(wanted) or len(set(wanted)) != len(wanted):
+            return ""
+        # Callers supply the exact summarized IDs in the same stable order as
+        # the summarized messages. Re-scanning the session here would allocate
+        # complete payload rows before the bounded identity reader runs.
+        message_by_store_id = dict(zip(wanted, messages))
         if set(message_by_store_id) != set(wanted):
             return ""
-        stored_by_id = self._store.get_batch(wanted)
-        for source_id in wanted:
+        mismatch = False
+        validated_source_ids: set[int] = set()
+
+        def validate_stored_row(source_id: int, stored: dict[str, Any]) -> None:
+            nonlocal mismatch
+            validated_source_ids.add(source_id)
             active = message_by_store_id[source_id]
-            stored = stored_by_id.get(source_id)
-            if stored is None or str(stored.get("session_id") or "") != self._session_id:
-                return ""
+            if str(stored.get("session_id") or "") != self._session_id:
+                mismatch = True
+                return
             active_semantics = self._canonical_summarizer_message_identity(
                 role=active.get("role"),
                 content=active.get("content"),
@@ -6943,7 +7022,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 tool_calls=stored.get("tool_calls"),
             )
             if active_semantics == stored_semantics:
-                continue
+                return
             # Externalization/cleanup can intentionally make the durable form
             # differ while retaining an equivalent replay identity.
             active_identity = self._message_replay_identity(active)
@@ -6953,31 +7032,22 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 cleanup_identity is None
                 or self._active_cleanup_replay_identity(stored_identity) != cleanup_identity
             ):
-                return ""
-        # Hash the exact rows just validated against the summarized in-memory
-        # messages. A second SELECT here would reopen a race where a rewrite
-        # could become the newly "expected" identity before publication.
-        h = hashlib.sha256()
-        for source_id in wanted:
-            stored = stored_by_id[source_id]
-            semantic_identity = self._canonical_summarizer_message_identity(
-                role=stored.get("role"),
-                content=stored.get("content"),
-                tool_call_id=stored.get("tool_call_id"),
-                tool_calls=stored.get("tool_calls"),
-            )
-            h.update(
-                json.dumps(
-                    [
-                        source_id,
-                        str(stored.get("session_id") or ""),
-                        *semantic_identity,
-                    ],
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            )
-        return h.hexdigest()
+                mismatch = True
+
+        # The hash and active-message comparison consume the same bounded,
+        # incremental SQL rows.  No unrestricted MessageStore.get_batch()
+        # allocation occurs, and there is no second optimistic read that could
+        # silently replace the expected identity after validation.
+        identity = compute_source_identity_hash(
+            self._store._conn,
+            self._session_id,
+            wanted,
+            read_budget=self._new_locked_publication_read_budget(),
+            digest_chars=None,
+            role_default="unknown",
+            row_validator=validate_stored_row,
+        )
+        return "" if mismatch or validated_source_ids != set(wanted) else identity
 
     def _publish_foreground_leaf(
         self,
@@ -8121,7 +8191,14 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         read_budget: dict[str, float | int],
     ) -> list[dict[str, Any]]:
         """Build a frontier layout from the caller's locked SQLite snapshot."""
+        covered_set = {int(source_id) for source_id in covered_source_ids}
+        if not covered_set or any(source_id <= 0 for source_id in covered_set):
+            raise RuntimeError("foreground candidate has invalid source coverage")
+        covered_start = min(covered_set)
+        covered_end = max(covered_set)
+        end_id = int(frontier_end_store_id or 0)
         items: list[dict[str, Any]] = []
+        active_raw_ids: set[int] = set()
         active = conn.execute(
             """
             SELECT generation, session_id FROM lcm_active_frontiers
@@ -8141,17 +8218,49 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 read_budget=read_budget,
             )
             for _ordinal, kind, raw_ref_id, raw_start, raw_end, node_session in rows:
-                if kind != "node":
-                    continue
+                if kind not in {"node", "message"}:
+                    raise RuntimeError("foreground frontier contains invalid item kind")
                 ref_id = int(raw_ref_id or 0)
                 start = int(raw_start or 0)
                 end = int(raw_end or 0)
                 if start <= 0 or end < start:
+                    raise RuntimeError("foreground frontier contains invalid range")
+                if kind == "message":
+                    if start != ref_id or end != ref_id:
+                        raise RuntimeError("foreground message frontier range is invalid")
+                    if ref_id in covered_set:
+                        # Exact raw-message lineage is intentionally replaced by
+                        # the new canonical node.
+                        continue
+                    if not (
+                        end < covered_start
+                        or start > covered_end
+                    ):
+                        raise RuntimeError(
+                            "foreground candidate declared range overlap would lose raw coverage"
+                        )
+                    # Preserve exact disjoint raw lineage. The tail scan below
+                    # may rediscover the same row; that exact duplicate is the
+                    # only safe case to coalesce.
+                    active_raw_ids.add(ref_id)
+                    items.append(
+                        {
+                            "kind": "message",
+                            "ref_id": ref_id,
+                            "source_start": ref_id,
+                            "source_end": ref_id,
+                        }
+                    )
                     continue
-                if any(start <= source_id <= end for source_id in covered_source_ids):
-                    continue
+                if not (
+                    end < covered_start
+                    or start > covered_end
+                ):
+                    raise RuntimeError(
+                        "foreground candidate declared range overlap would lose canonical coverage"
+                    )
                 if node_session != session_id:
-                    continue
+                    raise RuntimeError("foreground frontier node crosses session boundary")
                 items.append(
                     {
                         "kind": "node",
@@ -8160,17 +8269,15 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                         "source_end": end,
                     }
                 )
-        if covered_source_ids and node_id != 0:
+        if node_id != 0:
             items.append(
                 {
                     "kind": "node",
                     "ref_id": int(node_id),
-                    "source_start": int(min(covered_source_ids)),
-                    "source_end": int(max(covered_source_ids)),
+                    "source_start": covered_start,
+                    "source_end": covered_end,
                 }
             )
-        end_id = int(frontier_end_store_id or 0)
-        covered_set = {int(source_id) for source_id in covered_source_ids}
         rows = self._bounded_message_tail_ids_no_commit(
             conn,
             session_id,
@@ -8178,7 +8285,11 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             read_budget=read_budget,
         )
         for store_id in rows:
-            if store_id <= 0 or store_id in covered_set:
+            if (
+                store_id <= 0
+                or store_id in covered_set
+                or store_id in active_raw_ids
+            ):
                 continue
             items.append(
                 {
@@ -8202,7 +8313,9 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             start = int(item.get("source_start") or 0)
             end = int(item.get("source_end") or 0)
             if start <= previous_end or end < start:
-                continue
+                raise RuntimeError(
+                    "foreground candidate range overlap would drop a frontier item"
+                )
             validated.append(item)
             previous_end = end
         return validated

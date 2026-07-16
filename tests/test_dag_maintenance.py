@@ -439,9 +439,12 @@ def test_maintenance_source_inventory_batches_message_validation_and_rejects_fan
     assert len(nodes) == 3 and messages == {1, 2}
     message_selects = [
         statement for statement in statements
-        if statement.lstrip().upper().startswith("SELECT STORE_ID, SESSION_ID FROM MESSAGES")
+        if statement.lstrip().upper().startswith("SELECT STORE_ID,")
+        and "FROM MESSAGES" in statement.upper()
     ]
     assert len(message_selects) == 1
+    assert "SUBSTR" in message_selects[0].upper()
+    assert "LENGTH(CAST(SESSION_ID AS BLOB))" in message_selects[0].upper()
 
     raw = "[" + ",".join(str(index) for index in range(7_000)) + "]"
     conn.execute("UPDATE summary_nodes SET source_ids=? WHERE node_id=?", (raw, parent))

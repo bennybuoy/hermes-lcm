@@ -215,6 +215,12 @@ class StressRun:
                 handler_kwargs["cross_session_capability"] = (
                     engine.issue_cross_session_capability([str(row[0])])
                 )
+        elif name == "lcm_load_session":
+            target_session_id = str(args.get("session_id") or "").strip()
+            if target_session_id and target_session_id != engine.current_session_id:
+                handler_kwargs["cross_session_capability"] = (
+                    engine.issue_cross_session_capability([target_session_id])
+                )
         raw = engine.handle_tool_call(
             name,
             args,

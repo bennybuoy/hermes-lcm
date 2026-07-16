@@ -23,7 +23,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 from .db_bootstrap import (
     ensure_frontier_tables,
@@ -841,7 +841,6 @@ class FrontierStore:
         deadline_at = time.monotonic() + max(0.0, _PENDING_BATCH_DEADLINE_SECONDS)
         serialized_bytes = 0
         rows_seen = 0
-        last_source_end: int | None = None
         last_batch_id: int | None = None
         with self._lock:
             owns_transaction = not self._conn.in_transaction
@@ -889,17 +888,22 @@ class FrontierStore:
                     _PENDING_BATCH_STATE_MAX_BYTES,
                     _PENDING_BATCH_SCALAR_MAX_BYTES,
                 ]
+                text_column_names = (
+                    "conversation_id", "session_id", "source_identity_hash",
+                    "source_ids", "policy_fingerprint", "route_fingerprint",
+                    "state", "failure_reason",
+                )
                 guard_sql = " AND ".join(
                     [f"({total_length_sql}) <= ?"]
                     + [f"{expr} <= ?" for expr in text_lengths]
+                    + [
+                        f"typeof({column}) IN ('text', 'null')"
+                        for column in text_column_names
+                    ]
                 )
                 bounded_columns = []
                 for column, limit in zip(
-                    (
-                        "conversation_id", "session_id", "source_identity_hash",
-                        "source_ids", "policy_fingerprint", "route_fingerprint",
-                        "state", "failure_reason",
-                    ),
+                    text_column_names,
                     scalar_limits,
                 ):
                     bounded_columns.append(
@@ -910,29 +914,28 @@ class FrontierStore:
                 guard_params = (row_byte_cap, *scalar_limits)
                 repeated_guard_params = guard_params * len(bounded_columns)
                 rows = self._conn.execute(
-                    f"""SELECT batch_id, {bounded_columns[0]}, {bounded_columns[1]},
-                              base_generation, source_end_store_id,
+                    f"""SELECT CASE WHEN typeof(batch_id) = 'integer' THEN batch_id END,
+                              {bounded_columns[0]}, {bounded_columns[1]},
+                              CASE WHEN typeof(base_generation) = 'integer' THEN base_generation END,
+                              CASE WHEN typeof(source_end_store_id) = 'integer' THEN source_end_store_id END,
                               {bounded_columns[2]}, {bounded_columns[3]},
                               {bounded_columns[4]}, {bounded_columns[5]},
-                              {bounded_columns[6]}, expected_leaf_count,
-                              frontier_end_store_id, {bounded_columns[7]},
+                              {bounded_columns[6]},
+                              CASE WHEN typeof(expected_leaf_count) = 'integer' THEN expected_leaf_count END,
+                              CASE WHEN typeof(frontier_end_store_id) = 'integer' THEN frontier_end_store_id END,
+                              {bounded_columns[7]},
                               '', 0, '{{}}',
                               {', '.join(text_lengths)}
                        FROM lcm_prepared_batches
                        WHERE conversation_id = ?
                          AND state IN ('preparing', 'ready')
-                         AND (
-                           ? IS NULL OR source_end_store_id < ? OR
-                           (source_end_store_id = ? AND batch_id < ?)
-                         )
-                       ORDER BY source_end_store_id DESC, batch_id DESC
+                         AND (? IS NULL OR batch_id < ?)
+                       ORDER BY batch_id DESC
                        LIMIT ?""",
                     (
                         *repeated_guard_params,
                         conversation_id,
-                        last_source_end,
-                        last_source_end,
-                        last_source_end,
+                        last_batch_id,
                         last_batch_id,
                         page_limit,
                     ),
@@ -962,10 +965,24 @@ class FrontierStore:
                         raise RuntimeError(
                             "pending batch enumeration serialized byte bound exceeded"
                         )
-                    if invalid_column or any(row[index] is None for index in (1, 2, 5, 6, 7, 8, 9, 12)):
+                    invalid_scalar = any(
+                        row[index] is None for index in (0, 3, 4, 10, 11)
+                    )
+                    safe_batch_id = int(row[0]) if row[0] is not None else 0
+                    if invalid_scalar:
+                        # batch_id is an INTEGER PRIMARY KEY in supported
+                        # schemas; the zero fallback is defensive only.
+                        if safe_batch_id:
+                            self.update_batch_state_no_commit(
+                                self._conn,
+                                safe_batch_id,
+                                "rejected",
+                                failure_reason="invalid_pending_metadata:invalid scalar type",
+                            )
+                    elif invalid_column or any(row[index] is None for index in (1, 2, 5, 6, 7, 8, 9, 12)):
                         self.update_batch_state_no_commit(
                             self._conn,
-                            int(row[0]),
+                            safe_batch_id,
                             "rejected",
                             failure_reason="invalid_pending_metadata:encoded-size hard cap exceeded",
                         )
@@ -979,8 +996,7 @@ class FrontierStore:
                                 "rejected",
                                 failure_reason=f"invalid_source_ids:{exc}",
                             )
-                    last_source_end = int(row[4])
-                    last_batch_id = int(row[0])
+                    last_batch_id = safe_batch_id
                 if len(rows) < page_limit:
                     break
             if owns_transaction and self._conn.in_transaction:
@@ -1176,10 +1192,19 @@ class FrontierStore:
                 f"COALESCE(length(CAST({column} AS BLOB)), 0)"
                 for column in text_columns
             ]
+            type_exprs = [
+                f"typeof({column}) IN ('text', 'null')" for column in text_columns
+            ]
             metadata = self._conn.execute(
-                f"""SELECT batch_id, base_generation, source_end_store_id,
-                           expected_leaf_count, frontier_end_store_id,
-                           COALESCE(payload_version, 0), {', '.join(length_exprs)}
+                f"""SELECT CASE WHEN typeof(batch_id) = 'integer' THEN batch_id END,
+                           CASE WHEN typeof(base_generation) = 'integer' THEN base_generation END,
+                           CASE WHEN typeof(source_end_store_id) = 'integer' THEN source_end_store_id END,
+                           CASE WHEN typeof(expected_leaf_count) = 'integer' THEN expected_leaf_count END,
+                           CASE WHEN typeof(frontier_end_store_id) = 'integer' THEN frontier_end_store_id END,
+                           CASE WHEN typeof(payload_version) IN ('integer', 'null')
+                                THEN COALESCE(payload_version, 0) END,
+                           {', '.join(length_exprs)},
+                           {', '.join(type_exprs)}
                     FROM lcm_prepared_batches WHERE batch_id = ? LIMIT 1""",
                 (batch_id,),
             ).fetchone()
@@ -1187,8 +1212,13 @@ class FrontierStore:
                 return None
             if time.monotonic() >= deadline_at:
                 raise RuntimeError("prepared batch load deadline exceeded")
+            invalid_scalar = any(value is None for value in metadata[:6]) or not all(
+                bool(value) for value in metadata[16:26]
+            )
             encoded_lengths = [int(value or 0) for value in metadata[6:16]]
             invalid = (
+                invalid_scalar
+                or
                 sum(encoded_lengths) > _BATCH_LOAD_MAX_SERIALIZED_BYTES
                 or any(
                     length > limit
@@ -1196,7 +1226,11 @@ class FrontierStore:
                 )
             )
             if invalid:
-                reason = "invalid_batch_payload:encoded-size hard cap exceeded"
+                reason = (
+                    "invalid_batch_payload:invalid scalar type"
+                    if invalid_scalar
+                    else "invalid_batch_payload:encoded-size hard cap exceeded"
+                )
                 self.update_batch_state_no_commit(
                     self._conn,
                     int(batch_id),
@@ -1222,15 +1256,24 @@ class FrontierStore:
                     payload_version=int(metadata[5] or 0),
                 )
             bounded = [
-                f"substr(CAST(COALESCE({column}, '') AS TEXT), 1, {limit + 1})"
+                f"CASE WHEN typeof({column}) IN ('text', 'null') THEN "
+                f"substr(CAST(COALESCE({column}, '') AS TEXT), 1, {limit + 1}) "
+                "ELSE NULL END"
                 for column, limit in zip(text_columns, text_limits)
             ]
             row = self._conn.execute(
-                f"""SELECT batch_id, {bounded[0]}, {bounded[1]}, base_generation,
-                           source_end_store_id, {bounded[2]}, {bounded[3]},
+                f"""SELECT CASE WHEN typeof(batch_id) = 'integer' THEN batch_id END,
+                           {bounded[0]}, {bounded[1]},
+                           CASE WHEN typeof(base_generation) = 'integer' THEN base_generation END,
+                           CASE WHEN typeof(source_end_store_id) = 'integer' THEN source_end_store_id END,
+                           {bounded[2]}, {bounded[3]},
                            {bounded[4]}, {bounded[5]}, {bounded[6]},
-                           expected_leaf_count, frontier_end_store_id, {bounded[7]},
-                           {bounded[8]}, COALESCE(payload_version, 0), {bounded[9]}
+                           CASE WHEN typeof(expected_leaf_count) = 'integer' THEN expected_leaf_count END,
+                           CASE WHEN typeof(frontier_end_store_id) = 'integer' THEN frontier_end_store_id END,
+                           {bounded[7]}, {bounded[8]},
+                           CASE WHEN typeof(payload_version) IN ('integer', 'null')
+                                THEN COALESCE(payload_version, 0) END,
+                           {bounded[9]}
                     FROM lcm_prepared_batches WHERE batch_id = ? LIMIT 1""",
                 (batch_id,),
             ).fetchone()
@@ -1298,12 +1341,7 @@ class FrontierStore:
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT batch_id, conversation_id, session_id, base_generation,
-                       source_end_store_id, source_identity_hash, source_ids,
-                       policy_fingerprint, route_fingerprint, state,
-                       expected_leaf_count, frontier_end_store_id, failure_reason,
-                       COALESCE(summary_payload, ''), COALESCE(payload_version, 0),
-                       COALESCE(resolved_policy_json, '{}')
+                SELECT CASE WHEN typeof(batch_id) = 'integer' THEN batch_id END
                 FROM lcm_prepared_batches
                 WHERE conversation_id = ? AND state = 'ready'
                 ORDER BY batch_id DESC
@@ -1313,14 +1351,10 @@ class FrontierStore:
             ).fetchone()
         if not row:
             return None
-        try:
-            batch = self._row_to_batch(row)
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            self.update_batch_state(
-                int(row[0]),
-                "rejected",
-                failure_reason=f"invalid_source_ids:{exc}",
-            )
+        if row[0] is None:
+            return None
+        batch = self.get_batch(int(row[0]))
+        if batch is None or batch.state != "ready":
             return None
         if not batch.has_summary_payload:
             # Reject silently at the ready-lookup boundary so callers fall back
@@ -1617,6 +1651,7 @@ def compute_source_identity_hash(
     read_budget: dict[str, float | int],
     digest_chars: int | None = 32,
     role_default: str = "",
+    row_validator: Callable[[int, dict[str, Any]], None] | None = None,
 ) -> str:
     """Incrementally hash semantic source identity under a caller-owned budget.
 
@@ -1634,35 +1669,72 @@ def compute_source_identity_hash(
         int(read_budget.get("max_column_bytes", _SOURCE_IDENTITY_MAX_COLUMN_BYTES)),
     )
     columns = ("session_id", "role", "content", "tool_call_id", "tool_calls")
-    for offset in range(0, len(normalized_ids), _SOURCE_IDENTITY_QUERY_PAGE):
+    offset = 0
+    while offset < len(normalized_ids):
         if time.monotonic() >= float(read_budget["deadline_at"]):
             raise RuntimeError("source identity deadline exceeded")
         remaining_rows = int(read_budget["max_rows"]) - int(read_budget["rows"])
         if remaining_rows <= 0:
             raise RuntimeError("source identity row bound exceeded")
+        remaining_bytes = int(read_budget["max_bytes"]) - int(read_budget["bytes"])
+        if remaining_bytes <= 64 + (2 * len(columns)):
+            raise RuntimeError("source identity serialized byte bound exceeded")
+        # Size the metadata page from the aggregate bytes still available.  A
+        # worst-case row can consume the entire remainder, so this deliberately
+        # collapses to one row for large field caps.  That prevents SQLite from
+        # applying json_quote to a count-sized page of attacker-controlled text.
+        max_row_charge = min(
+            remaining_bytes,
+            (len(columns) * max_column_bytes * 6) + 64,
+        )
+        byte_sized_rows = max(1, remaining_bytes // max(1, max_row_charge))
+        page_count = min(
+            _SOURCE_IDENTITY_QUERY_PAGE,
+            remaining_rows + 1,
+            byte_sized_rows,
+            len(normalized_ids) - offset,
+        )
         page_ids = normalized_ids[
-            offset:offset + min(_SOURCE_IDENTITY_QUERY_PAGE, remaining_rows + 1)
+            offset:offset + page_count
         ]
         placeholders = ",".join("?" for _ in page_ids)
+        page_byte_allowance = remaining_bytes // max(1, page_count)
+        # json_quote can amplify one input byte to a six-byte JSON escape.
+        # Cap the raw row from the per-page aggregate allowance so even the
+        # expensive SQL expression cannot construct an over-budget result.
+        row_raw_cap = min(
+            max_column_bytes * len(columns),
+            max(0, (page_byte_allowance - 64 - (2 * len(columns))) // 6),
+        )
+        length_exprs = [
+            f"COALESCE(length(CAST({column} AS BLOB)), 0)" for column in columns
+        ]
+        type_guards = [f"typeof({column}) IN ('text', 'null')" for column in columns]
+        row_guard = " AND ".join(
+            [f"({' + '.join(length_exprs)}) <= ?"]
+            + [f"{length_expr} <= ?" for length_expr in length_exprs]
+            + type_guards
+        )
         metadata_exprs = []
-        for column in columns:
-            length_expr = f"COALESCE(length(CAST({column} AS BLOB)), 0)"
+        for column, length_expr in zip(columns, length_exprs):
             metadata_exprs.extend((
-                length_expr,
-                f"CASE WHEN {length_expr} <= ? THEN "
-                f"COALESCE(length(CAST(json_quote(CAST({column} AS TEXT)) AS BLOB)), 4) "
+                f"CASE WHEN {row_guard} THEN {length_expr} ELSE NULL END",
+                f"CASE WHEN {row_guard} THEN "
+                f"COALESCE(length(CAST(json_quote(substr(CAST(COALESCE({column}, '') AS TEXT), "
+                f"1, {max_column_bytes + 1})) AS BLOB)), 4) "
                 "ELSE NULL END",
             ))
+        guard_params = (row_raw_cap, *(max_column_bytes for _ in columns))
         metadata = conn.execute(
             f"""SELECT store_id, {', '.join(metadata_exprs)}
                 FROM messages
                 WHERE session_id = ? AND store_id IN ({placeholders})
                 ORDER BY store_id LIMIT ?""",
             (
-                *(max_column_bytes for _ in columns),
+                *(guard_params * (len(columns) * 2)),
                 session_id,
                 *page_ids,
-                len(page_ids) + 1,
+                page_count,
             ),
         ).fetchall()
         if time.monotonic() >= float(read_budget["deadline_at"]):
@@ -1671,12 +1743,17 @@ def compute_source_identity_hash(
         for source_id in page_ids:
             meta = metadata_by_id.get(source_id)
             if meta is None:
+                _charge_source_identity_budget(
+                    read_budget,
+                    rows=1,
+                    serialized_bytes=32,
+                )
                 h.update(f"{source_id}|missing".encode())
                 continue
             raw_lengths = [int(meta[index] or 0) for index in range(1, 11, 2)]
             quoted_lengths = [meta[index] for index in range(2, 11, 2)]
-            if any(length > max_column_bytes for length in raw_lengths) or any(
-                length is None for length in quoted_lengths
+            if any(meta[index] is None for index in range(1, 11)) or any(
+                length > max_column_bytes for length in raw_lengths
             ):
                 raise RuntimeError("source identity column byte bound exceeded")
             serialized_upper_bound = (
@@ -1728,6 +1805,24 @@ def compute_source_identity_hash(
             tool_calls = _canonical_identity_tool_calls(
                 row[5], read_budget=read_budget
             )
+            if row_validator is not None:
+                validator_tool_calls: Any = row[5]
+                if isinstance(validator_tool_calls, str) and validator_tool_calls:
+                    try:
+                        validator_tool_calls = json.loads(validator_tool_calls)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        pass
+                row_validator(
+                    source_id,
+                    {
+                        "store_id": int(row[0]),
+                        "session_id": str(row[1] or ""),
+                        "role": str(row[2] or role_default),
+                        "content": content,
+                        "tool_call_id": str(row[4] or ""),
+                        "tool_calls": validator_tool_calls,
+                    },
+                )
             encoded = json.dumps(
                 [
                     int(row[0]),
@@ -1743,6 +1838,7 @@ def compute_source_identity_hash(
             if len(encoded) > serialized_upper_bound:
                 raise RuntimeError("source identity serialized byte bound exceeded")
             h.update(encoded)
+        offset += len(page_ids)
     digest = h.hexdigest()
     return digest if digest_chars is None else digest[:int(digest_chars)]
 
