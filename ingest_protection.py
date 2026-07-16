@@ -17,11 +17,13 @@ import os
 import re
 import stat
 import tempfile
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List
 
 from .externalize import (
+    _charge_externalized_read_budget,
     externalize_ingest_payload,
     extract_externalized_ref,
     extract_externalized_refs,
@@ -530,7 +532,12 @@ def _stat_generation_metadata(stats: os.stat_result) -> dict[str, int]:
     }
 
 
-def _read_regular_file_no_symlink(path: Path) -> tuple[str, dict[str, int]] | None:
+def _read_regular_file_no_symlink(
+    path: Path,
+    *,
+    read_budget: dict[str, float | int] | None = None,
+    budget_label: str = "persisted-output file",
+) -> tuple[str, dict[str, int]] | None:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -538,21 +545,37 @@ def _read_regular_file_no_symlink(path: Path) -> tuple[str, dict[str, int]] | No
         flags |= os.O_NONBLOCK
     fd: int | None = None
     try:
+        if read_budget is not None:
+            _charge_externalized_read_budget(
+                read_budget, files=1, budget_label=budget_label
+            )
         lstat_result = os.lstat(str(path))
         if not stat.S_ISREG(lstat_result.st_mode):
             return None
-        if lstat_result.st_size > _MAX_RECOVERED_PERSISTED_OUTPUT_BYTES:
+        if read_budget is None and lstat_result.st_size > _MAX_RECOVERED_PERSISTED_OUTPUT_BYTES:
             return None
+        if read_budget is not None:
+            _charge_externalized_read_budget(
+                read_budget,
+                encoded_bytes=int(lstat_result.st_size),
+                budget_label=budget_label,
+            )
         fd = os.open(str(path), flags)
         stats_before = os.fstat(fd)
         if not stat.S_ISREG(stats_before.st_mode):
             return None
-        if stats_before.st_size > _MAX_RECOVERED_PERSISTED_OUTPUT_BYTES:
+        if read_budget is None and stats_before.st_size > _MAX_RECOVERED_PERSISTED_OUTPUT_BYTES:
             return None
+        if int(stats_before.st_size) != int(lstat_result.st_size):
+            raise RuntimeError(f"{budget_label} changed during bounded preflight")
         with os.fdopen(fd, "rb") as handle:
             fd = None
-            raw = handle.read()
+            raw = handle.read(int(stats_before.st_size) + 1)
             stats_after = os.fstat(handle.fileno())
+        if len(raw) != int(stats_before.st_size):
+            raise RuntimeError(f"{budget_label} changed during bounded read")
+        if read_budget is not None and time.monotonic() >= float(read_budget["deadline_at"]):
+            raise RuntimeError(f"{budget_label} deadline exceeded")
         if _stat_generation_metadata(stats_before) != _stat_generation_metadata(stats_after):
             return None
         return raw.decode("utf-8"), _stat_generation_metadata(stats_after)
@@ -566,7 +589,14 @@ def _read_regular_file_no_symlink(path: Path) -> tuple[str, dict[str, int]] | No
                 pass
 
 
-def recover_hermes_persisted_output_with_file_stat(text: str | None) -> tuple[str, dict[str, int]] | None:
+def recover_hermes_persisted_output_with_file_stat(
+    text: str | None,
+    *,
+    read_budget: dict[str, float | int] | None = None,
+    budget_label: str = "persisted-output file",
+    max_nested_depth: int = 32,
+    max_nested_items: int = 20_000,
+) -> tuple[str, dict[str, int]] | None:
     """Recover Hermes host `<persisted-output>` content when the backing file is safe.
 
     Recovery is intentionally conservative: the marker must include Hermes'
@@ -588,7 +618,13 @@ def recover_hermes_persisted_output_with_file_stat(text: str | None) -> tuple[st
     safe_path = _safe_temp_hermes_results_file(path)
     if safe_path is None:
         return None
-    recovered_with_stat = _read_regular_file_no_symlink(safe_path)
+    if max_nested_depth <= 0 or max_nested_items <= 0:
+        raise RuntimeError(f"{budget_label} nesting bound exceeded")
+    recovered_with_stat = _read_regular_file_no_symlink(
+        safe_path,
+        read_budget=read_budget,
+        budget_label=budget_label,
+    )
     if recovered_with_stat is None:
         return None
     recovered, file_stat = recovered_with_stat

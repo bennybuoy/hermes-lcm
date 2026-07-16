@@ -2378,12 +2378,6 @@ def lcm_load_session(args: Dict[str, Any], **kwargs) -> str:
     if time_from is not None and time_to is not None and time_to < time_from:
         return json.dumps({"error": "time_to must be greater than or equal to time_from"})
 
-    total_messages = engine._store.count_session_load_messages(
-        session_id,
-        roles=roles or None,
-        time_from=time_from,
-        time_to=time_to,
-    )
     try:
         rows = engine._store.load_session_page(
             session_id,
@@ -2393,11 +2387,13 @@ def lcm_load_session(args: Dict[str, Any], **kwargs) -> str:
             time_from=time_from,
             time_to=time_to,
             max_content_chars=max_content_chars,
+            content_lookahead_chars=_MANDATORY_REDACTION_LOOKAHEAD_CHARS,
             max_serialized_bytes=_LCM_LOAD_SESSION_MAX_SERIALIZED_BYTES,
             max_row_serialized_bytes=_LCM_LOAD_SESSION_MAX_ROW_SERIALIZED_BYTES,
         )
     except ValueError as exc:
         return json.dumps({"error": str(exc)})
+    total_messages = int(getattr(rows, "total_messages", 0))
     page_rows = rows[:limit]
     storage_budget_exhausted = bool(getattr(rows, "budget_exhausted", False))
     has_more = len(rows) > limit or storage_budget_exhausted

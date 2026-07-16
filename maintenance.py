@@ -77,6 +77,67 @@ def _new_maintenance_copy_budget() -> dict[str, float | int]:
     }
 
 
+def _new_maintenance_lineage_budget() -> dict[str, Any]:
+    """One shared closure budget and memo table for a maintenance operation."""
+    return {
+        "rows": 0,
+        "bytes": 0,
+        "nodes": 0,
+        "edges": 0,
+        "messages": 0,
+        "message_rows": 0,
+        "deadline_at": time.monotonic()
+        + max(0.0, float(_MAINTENANCE_LINEAGE_DEADLINE_SECONDS)),
+        "node_rows": {},
+        "root_sessions": {},
+        "charged_message_ids": set(),
+        "validated_messages": {},
+        "inventory_cache": {},
+        "bounds_cache": {},
+    }
+
+
+def _check_lineage_deadline(budget: dict[str, Any]) -> None:
+    if time.monotonic() >= float(budget["deadline_at"]):
+        raise ValueError("DAG lineage deadline exceeded")
+
+
+def _charge_lineage_budget(
+    budget: dict[str, Any],
+    *,
+    rows: int = 0,
+    encoded_bytes: int = 0,
+    nodes: int = 0,
+    edges: int = 0,
+    messages: int = 0,
+    message_rows: int = 0,
+) -> None:
+    _check_lineage_deadline(budget)
+    next_rows = int(budget["rows"]) + max(0, int(rows))
+    if next_rows > _MAINTENANCE_MAX_NODES + _MAINTENANCE_MAX_MESSAGES:
+        raise ValueError("DAG lineage row bound exceeded")
+    next_bytes = int(budget["bytes"]) + max(0, int(encoded_bytes))
+    if next_bytes > _MAINTENANCE_LINEAGE_MAX_BYTES:
+        raise ValueError("DAG lineage byte bound exceeded")
+    next_nodes = int(budget["nodes"]) + max(0, int(nodes))
+    if next_nodes > _MAINTENANCE_MAX_NODES:
+        raise ValueError("DAG source-closure bound exceeded")
+    next_edges = int(budget["edges"]) + max(0, int(edges))
+    if next_edges > _MAINTENANCE_MAX_EDGES:
+        raise ValueError("DAG source-edge bound exceeded")
+    next_messages = int(budget["messages"]) + max(0, int(messages))
+    if next_messages > _MAINTENANCE_MAX_MESSAGES:
+        raise ValueError("DAG source-message bound exceeded")
+    budget["rows"] = next_rows
+    budget["bytes"] = next_bytes
+    budget["nodes"] = next_nodes
+    budget["edges"] = next_edges
+    budget["messages"] = next_messages
+    budget["message_rows"] = int(budget["message_rows"]) + max(
+        0, int(message_rows)
+    )
+
+
 def _check_copy_deadline(budget: dict[str, float | int]) -> None:
     if time.monotonic() >= float(budget["deadline_at"]):
         raise ValueError("maintenance copy deadline exceeded")
@@ -652,8 +713,37 @@ def _node_row(
     return row
 
 
-def _node_session_id(conn: sqlite3.Connection, node_id: int) -> str:
+def _node_session_id(
+    conn: sqlite3.Connection,
+    node_id: int,
+    *,
+    lineage_budget: dict[str, Any] | None = None,
+) -> str:
+    if lineage_budget is not None:
+        _check_lineage_deadline(lineage_budget)
+        cached = lineage_budget["root_sessions"].get(int(node_id))
+        if cached is not None:
+            return str(cached)
+        cached_row = lineage_budget["node_rows"].get(int(node_id))
+        if cached_row is not None:
+            session_id = str(cached_row[1])
+            lineage_budget["root_sessions"][int(node_id)] = session_id
+            return session_id
     length_expr = "COALESCE(length(CAST(session_id AS BLOB)), 0)"
+    if lineage_budget is not None:
+        metadata = conn.execute(
+            f"""SELECT {length_expr}, typeof(session_id)
+                FROM summary_nodes WHERE node_id=? LIMIT 1""",
+            (int(node_id),),
+        ).fetchone()
+        if metadata is None:
+            raise ValueError(f"summary node {node_id} not found")
+        encoded_bytes = int(metadata[0] or 0)
+        if metadata[1] != "text" or encoded_bytes > _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES:
+            raise ValueError("DAG lineage byte bound exceeded")
+        _charge_lineage_budget(
+            lineage_budget, rows=1, encoded_bytes=encoded_bytes + 16
+        )
     row = conn.execute(
         f"""SELECT CASE
                       WHEN typeof(session_id) = 'text' AND {length_expr} <= ?
@@ -672,7 +762,11 @@ def _node_session_id(conn: sqlite3.Connection, node_id: int) -> str:
         raise ValueError(f"summary node {node_id} not found")
     if row[0] is None or int(row[1] or 0) > _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES:
         raise ValueError("DAG lineage byte bound exceeded")
-    return str(row[0])
+    session_id = str(row[0])
+    if lineage_budget is not None:
+        _check_lineage_deadline(lineage_budget)
+        lineage_budget["root_sessions"][int(node_id)] = session_id
+    return session_id
 
 
 def _node_depth(
@@ -715,11 +809,26 @@ def _json_ids(raw: Any) -> list[int]:
     return [int(item) for item in value]
 
 
-def _source_bounds(conn: sqlite3.Connection, node_id: int, *, limit: int = _MAINTENANCE_MAX_NODES) -> tuple[int, int]:
-    _nodes, source_ids = _source_inventory(conn, node_id, limit=limit)
+def _source_bounds(
+    conn: sqlite3.Connection,
+    node_id: int,
+    *,
+    limit: int = _MAINTENANCE_MAX_NODES,
+    lineage_budget: dict[str, Any] | None = None,
+) -> tuple[int, int]:
+    budget = lineage_budget or _new_maintenance_lineage_budget()
+    cached = budget["bounds_cache"].get(int(node_id))
+    if cached is not None:
+        _check_lineage_deadline(budget)
+        return cached
+    _nodes, source_ids = _source_inventory(
+        conn, node_id, limit=limit, lineage_budget=budget
+    )
     if not source_ids:
         raise ValueError(f"node {node_id} has no raw source closure")
-    return min(source_ids), max(source_ids)
+    bounds = (min(source_ids), max(source_ids))
+    budget["bounds_cache"][int(node_id)] = bounds
+    return bounds
 
 
 def _source_inventory(
@@ -727,23 +836,27 @@ def _source_inventory(
     node_id: int,
     *,
     limit: int = 10_000,
+    lineage_budget: dict[str, Any] | None = None,
 ) -> tuple[set[int], set[int]]:
     """Return the exact node/message closure beneath ``node_id``."""
-    root_session_id = _node_session_id(conn, node_id)
+    budget = lineage_budget or _new_maintenance_lineage_budget()
+    cache_key = (int(node_id), int(limit))
+    cached_inventory = budget["inventory_cache"].get(cache_key)
+    if cached_inventory is not None:
+        _check_lineage_deadline(budget)
+        return set(cached_inventory[0]), set(cached_inventory[1])
+    root_session_id = _node_session_id(
+        conn, node_id, lineage_budget=budget
+    )
     pending = [int(node_id)]
     nodes: set[int] = set()
     messages: set[int] = set()
     adjacency: dict[int, list[int]] = {}
-    edges = 0
-    lineage_bytes = 0
-    deadline_at = time.monotonic() + max(
-        0.0, float(_MAINTENANCE_LINEAGE_DEADLINE_SECONDS)
-    )
+    node_rows: dict[int, tuple[Any, ...]] = budget["node_rows"]
     while pending:
-        if time.monotonic() >= deadline_at:
-            raise ValueError("DAG lineage deadline exceeded")
-        remaining_bytes = _MAINTENANCE_LINEAGE_MAX_BYTES - lineage_bytes
-        if remaining_bytes < 0:
+        _check_lineage_deadline(budget)
+        remaining_bytes = _MAINTENANCE_LINEAGE_MAX_BYTES - int(budget["bytes"])
+        if remaining_bytes <= 0:
             raise ValueError("DAG lineage byte bound exceeded")
         max_row_bytes = (
             MAX_SOURCE_IDS_JSON_CHARS
@@ -765,7 +878,7 @@ def _source_inventory(
             continue
         if len(nodes) + len(batch) > limit:
             raise ValueError("DAG source-closure bound exceeded")
-        placeholders = ",".join("?" for _ in batch)
+        uncached = [candidate for candidate in batch if candidate not in node_rows]
         session_length = "COALESCE(length(CAST(session_id AS BLOB)), 0)"
         source_length = "COALESCE(length(CAST(source_ids AS BLOB)), 0)"
         type_length = "COALESCE(length(CAST(source_type AS BLOB)), 0)"
@@ -774,8 +887,11 @@ def _source_inventory(
             f"{total_length} <= ? AND {session_length} <= ? "
             f"AND {source_length} <= ? AND {type_length} <= ?"
         )
-        rows = conn.execute(
-            f"""SELECT node_id,
+        rows: list[sqlite3.Row] = []
+        if uncached:
+            placeholders = ",".join("?" for _ in uncached)
+            rows = conn.execute(
+                f"""SELECT node_id,
                        CASE WHEN {guard} THEN
                             substr(CAST(session_id AS TEXT), 1, ?)
                             ELSE NULL END,
@@ -787,50 +903,56 @@ def _source_inventory(
                             substr(CAST(source_type AS TEXT), 1, ?)
                             ELSE NULL END,
                        {session_length}, {source_length}, {type_length}
-                FROM summary_nodes WHERE node_id IN ({placeholders})""",
-            (
-                row_byte_cap,
-                _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
-                MAX_SOURCE_IDS_JSON_CHARS,
-                _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
-                _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES + 1,
-                row_byte_cap,
-                _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
-                MAX_SOURCE_IDS_JSON_CHARS,
-                _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
-                MAX_SOURCE_IDS_JSON_CHARS + 1,
-                row_byte_cap,
-                _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
-                MAX_SOURCE_IDS_JSON_CHARS,
-                _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
-                _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES + 1,
-                *batch,
-            ),
-        ).fetchall()
-        if time.monotonic() >= deadline_at:
-            raise ValueError("DAG lineage deadline exceeded")
+                    FROM summary_nodes WHERE node_id IN ({placeholders})""",
+                (
+                    row_byte_cap,
+                    _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
+                    MAX_SOURCE_IDS_JSON_CHARS,
+                    _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
+                    _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES + 1,
+                    row_byte_cap,
+                    _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
+                    MAX_SOURCE_IDS_JSON_CHARS,
+                    _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
+                    MAX_SOURCE_IDS_JSON_CHARS + 1,
+                    row_byte_cap,
+                    _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
+                    MAX_SOURCE_IDS_JSON_CHARS,
+                    _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES,
+                    _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES + 1,
+                    *uncached,
+                ),
+            ).fetchall()
+        _check_lineage_deadline(budget)
         by_id = {int(row[0]): row for row in rows}
-        if set(batch) != set(by_id):
+        if set(uncached) != set(by_id):
             raise ValueError("DAG source closure references a missing node")
-        for current_id in batch:
-            row = by_id[current_id]
-            if time.monotonic() >= deadline_at:
-                raise ValueError("DAG lineage deadline exceeded")
+        for current_id, row in by_id.items():
             row_bytes = sum(int(value or 0) for value in row[8:11])
-            if row_bytes > row_byte_cap or any(
-                row[index] is None for index in (1, 6, 7)
-            ):
+            if row_bytes > row_byte_cap or any(row[index] is None for index in (1, 6, 7)):
                 raise ValueError("DAG lineage byte bound exceeded")
-            lineage_bytes += row_bytes
-            if lineage_bytes > _MAINTENANCE_LINEAGE_MAX_BYTES:
-                raise ValueError("DAG lineage byte bound exceeded")
+            ids = _json_ids(row[6])
+            charged_message_ids: set[int] = budget["charged_message_ids"]
+            new_message_ids = (
+                set(ids) - charged_message_ids if row[7] == "messages" else set()
+            )
+            _charge_lineage_budget(
+                budget,
+                rows=1,
+                encoded_bytes=row_bytes,
+                nodes=1,
+                edges=len(ids),
+                messages=len(new_message_ids),
+            )
+            charged_message_ids.update(new_message_ids)
+            node_rows[current_id] = tuple(row)
+        for current_id in batch:
+            _check_lineage_deadline(budget)
+            row = node_rows[current_id]
             if str(row[1]) != root_session_id:
                 raise ValueError(f"node {current_id} crosses session boundary")
             nodes.add(current_id)
             ids = _json_ids(row[6])
-            edges += len(ids)
-            if edges > _MAINTENANCE_MAX_EDGES:
-                raise ValueError("DAG source-edge bound exceeded")
             if row[7] == "messages":
                 messages.update(ids)
                 if len(messages) > _MAINTENANCE_MAX_MESSAGES:
@@ -846,9 +968,11 @@ def _source_inventory(
             indegree[child_id] += 1
     ready = [current_id for current_id, degree in indegree.items() if degree == 0]
     visited = 0
+    topological: list[int] = []
     while ready:
         current_id = ready.pop()
         visited += 1
+        topological.append(current_id)
         for child_id in adjacency.get(current_id, []):
             indegree[child_id] -= 1
             if indegree[child_id] == 0:
@@ -856,11 +980,40 @@ def _source_inventory(
     if visited != len(nodes):
         raise ValueError("cycle detected in DAG source closure")
 
-    message_ids = list(messages)
-    for offset in range(0, len(message_ids), _MAINTENANCE_QUERY_BATCH):
-        batch = message_ids[offset:offset + _MAINTENANCE_QUERY_BATCH]
+    validated_messages: dict[int, str] = budget["validated_messages"]
+    message_ids = sorted(messages)
+    uncached_message_ids = [
+        store_id for store_id in message_ids if store_id not in validated_messages
+    ]
+    for offset in range(0, len(uncached_message_ids), _MAINTENANCE_QUERY_BATCH):
+        _check_lineage_deadline(budget)
+        batch = uncached_message_ids[offset:offset + _MAINTENANCE_QUERY_BATCH]
         placeholders = ",".join("?" for _ in batch)
         session_length = "COALESCE(length(CAST(session_id AS BLOB)), 0)"
+        metadata = conn.execute(
+            f"""WITH message_lengths AS (
+                       SELECT store_id, {session_length} AS session_bytes,
+                              typeof(session_id) AS session_type
+                       FROM messages WHERE store_id IN ({placeholders})
+                   )
+                   SELECT store_id, session_bytes, session_type
+                   FROM message_lengths""",
+            batch,
+        ).fetchall()
+        if {int(row[0]) for row in metadata} != set(batch):
+            raise ValueError("DAG has missing/cross-session message sources")
+        metadata_by_id = {int(row[0]): row for row in metadata}
+        for store_id in batch:
+            row = metadata_by_id[store_id]
+            encoded_bytes = int(row[1] or 0)
+            if row[2] != "text" or encoded_bytes > _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES:
+                raise ValueError("DAG lineage byte bound exceeded")
+            _charge_lineage_budget(
+                budget,
+                rows=1,
+                encoded_bytes=encoded_bytes + 16,
+                message_rows=1,
+            )
         rows = conn.execute(
             f"""SELECT store_id,
                        CASE WHEN typeof(session_id) = 'text' AND {session_length} <= ?
@@ -873,13 +1026,33 @@ def _source_inventory(
                 *batch,
             ),
         ).fetchall()
-        if {int(row[0]) for row in rows} != set(batch) or any(
-            row[1] is None
-            or int(row[2] or 0) > _MAINTENANCE_LINEAGE_SCALAR_MAX_BYTES
-            or str(row[1]) != root_session_id
-            for row in rows
-        ):
+        _check_lineage_deadline(budget)
+        if {int(row[0]) for row in rows} != set(batch):
             raise ValueError("DAG has missing/cross-session message sources")
+        for row in rows:
+            store_id = int(row[0])
+            expected_bytes = int(metadata_by_id[store_id][1] or 0)
+            if row[1] is None or int(row[2] or 0) != expected_bytes:
+                raise ValueError("DAG has missing/cross-session message sources")
+            validated_messages[store_id] = str(row[1])
+    if any(validated_messages.get(store_id) != root_session_id for store_id in messages):
+        raise ValueError("DAG has missing/cross-session message sources")
+
+    bounds_cache: dict[int, tuple[int, int]] = budget["bounds_cache"]
+    for current_id in reversed(topological):
+        row = node_rows[current_id]
+        ids = _json_ids(row[6])
+        if row[7] == "messages":
+            if ids:
+                bounds_cache[current_id] = (min(ids), max(ids))
+        else:
+            child_bounds = [bounds_cache[child_id] for child_id in ids]
+            if child_bounds:
+                bounds_cache[current_id] = (
+                    min(value[0] for value in child_bounds),
+                    max(value[1] for value in child_bounds),
+                )
+    budget["inventory_cache"][cache_key] = (frozenset(nodes), frozenset(messages))
     return nodes, messages
 
 
@@ -930,8 +1103,11 @@ def plan_dag_maintenance(
     conn.execute("PRAGMA query_only=ON")
     try:
         node_budget = _new_maintenance_copy_budget()
+        lineage_budget = _new_maintenance_lineage_budget()
         row = _node_row(conn, node_id, budget=node_budget)
-        source_start, source_end = _source_bounds(conn, node_id)
+        source_start, source_end = _source_bounds(
+            conn, node_id, lineage_budget=lineage_budget
+        )
         frontier = _active_frontier(conn, conversation_id)
         if str(row[1]) != str(frontier[2]):
             raise ValueError("maintenance root does not belong to the active conversation session")
@@ -955,7 +1131,9 @@ def plan_dag_maintenance(
             mapping = {int(key): str(value) for key, value in (rewrites or {}).items()}
             if int(node_id) not in mapping:
                 raise ValueError("rewrite-subtree requires a replacement for the root node")
-            closure_nodes, _ = _source_inventory(conn, node_id)
+            closure_nodes, _ = _source_inventory(
+                conn, node_id, lineage_budget=lineage_budget
+            )
             if not set(mapping).issubset(closure_nodes):
                 raise ValueError("rewrite set is outside the selected subtree")
             parents: dict[int, set[int]] = {}
@@ -1024,7 +1202,9 @@ def plan_dag_maintenance(
                     and str(target_root[7]) == str(row[7])
                 ):
                     raise ValueError("equivalent copied subtree is already active in the target")
-            closure_nodes, closure_messages = _source_inventory(conn, node_id)
+            closure_nodes, closure_messages = _source_inventory(
+                conn, node_id, lineage_budget=lineage_budget
+            )
             affected = sorted(closure_nodes)
             node_rows_added = len(closure_nodes)
             message_rows_added = len(closure_messages)
@@ -1232,6 +1412,7 @@ def apply_dag_maintenance(
         # read connection can take a consistent SQLite backup while no writer
         # can change the mutation snapshot validated above.
         backup = create_verified_backup(db_path)
+        lineage_budget = _new_maintenance_lineage_budget()
         old_items = [
             dict(row) for row in _frontier_rows(
                 conn, conversation_id, int(frontier[1])
@@ -1285,7 +1466,9 @@ def apply_dag_maintenance(
                 if item["kind"] == "node" and int(item["ref_id"]) == int(node_id):
                     found = True
                     for child_id in child_ids:
-                        child_start, child_end = _source_bounds(conn, child_id)
+                        child_start, child_end = _source_bounds(
+                            conn, child_id, lineage_budget=lineage_budget
+                        )
                         replacement.append({
                             "kind": "node",
                             "ref_id": child_id,
@@ -1307,7 +1490,9 @@ def apply_dag_maintenance(
         elif operation == "copy-subtree":
             message_remap: dict[int, int] = {}
             node_remap: dict[int, int] = {}
-            _closure_nodes, closure_message_ids = _source_inventory(conn, int(node_id))
+            _closure_nodes, closure_message_ids = _source_inventory(
+                conn, int(node_id), lineage_budget=lineage_budget
+            )
             message_columns = list(_MAINTENANCE_MESSAGE_COLUMNS)
             preloaded_rows = {int(node_id): root}
 
@@ -1357,7 +1542,9 @@ def apply_dag_maintenance(
                     conn, target_conversation_id, int(target_frontier[1])
                 )
             ]
-            start, end = _source_bounds(conn, copied_root)
+            start, end = _source_bounds(
+                conn, copied_root, lineage_budget=lineage_budget
+            )
             target_items.append({"kind": "node", "ref_id": copied_root, "source_start": start, "source_end": end})
             target_items.sort(key=lambda item: (int(item["source_start"]), int(item["source_end"])))
             generation = _publish_items(
@@ -1372,7 +1559,7 @@ def apply_dag_maintenance(
             raise ValueError("unknown maintenance operation")
 
         for created_id in created_node_ids:
-            _source_bounds(conn, created_id)
+            _source_bounds(conn, created_id, lineage_budget=lineage_budget)
         foreign = conn.execute("PRAGMA foreign_key_check").fetchall()
         quick = conn.execute("PRAGMA quick_check").fetchone()[0]
         if foreign or quick != "ok":

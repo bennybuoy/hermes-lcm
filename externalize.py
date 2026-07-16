@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import stat
 import time
 from pathlib import Path
 from typing import Any, Dict
@@ -30,6 +31,32 @@ def _placeholder_metadata(value: Any) -> str:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _charge_externalized_read_budget(
+    read_budget: dict[str, float | int],
+    *,
+    files: int = 0,
+    encoded_bytes: int = 0,
+    budget_label: str,
+) -> None:
+    """Reserve shared publication capacity before filesystem work."""
+    if time.monotonic() >= float(read_budget["deadline_at"]):
+        raise RuntimeError(f"{budget_label} deadline exceeded")
+    current_files = int(read_budget.setdefault("files", 0))
+    max_files = int(
+        read_budget.setdefault(
+            "max_files", read_budget.get("max_rows", 0)
+        )
+    )
+    next_files = current_files + max(0, int(files))
+    if next_files > max_files:
+        raise RuntimeError(f"{budget_label} file-count bound exceeded")
+    next_bytes = int(read_budget["bytes"]) + max(0, int(encoded_bytes))
+    if next_bytes > int(read_budget["max_bytes"]):
+        raise RuntimeError(f"{budget_label} serialized byte bound exceeded")
+    read_budget["files"] = next_files
+    read_budget["bytes"] = next_bytes
 
 
 def _tool_call_stub(tool_call_id: str) -> str:
@@ -638,19 +665,28 @@ def load_externalized_payload(
     if not storage_dir.exists() or not storage_dir.is_dir():
         return None
     path = storage_dir / ref
-    if not path.exists() or not path.is_file():
-        return None
     try:
         deadline_at = (
             float(read_budget["deadline_at"]) if read_budget is not None else None
         )
         if deadline_at is not None and time.monotonic() >= deadline_at:
             raise RuntimeError(f"{budget_label} deadline exceeded")
-        encoded_size = int(path.stat().st_size)
         if read_budget is not None:
-            remaining = int(read_budget["max_bytes"]) - int(read_budget["bytes"])
-            if encoded_size > remaining:
-                raise RuntimeError(f"{budget_label} serialized byte bound exceeded")
+            _charge_externalized_read_budget(
+                read_budget,
+                files=1,
+                budget_label=budget_label,
+            )
+        file_stat = path.stat()
+        if not stat.S_ISREG(file_stat.st_mode) or path.is_symlink():
+            return None
+        encoded_size = int(file_stat.st_size)
+        if read_budget is not None:
+            _charge_externalized_read_budget(
+                read_budget,
+                encoded_bytes=encoded_size,
+                budget_label=budget_label,
+            )
         with path.open("rb") as handle:
             raw_bytes = handle.read(encoded_size + 1)
         if len(raw_bytes) != encoded_size:
@@ -668,10 +704,6 @@ def load_externalized_payload(
         payload = json.loads(raw)
         if not isinstance(payload, dict):
             return None
-        if read_budget is not None:
-            if deadline_at is not None and time.monotonic() >= deadline_at:
-                raise RuntimeError(f"{budget_label} deadline exceeded")
-            read_budget["bytes"] = int(read_budget["bytes"]) + encoded_size
     except (OSError, json.JSONDecodeError):
         return None
     summary = _externalized_summary(path, payload)
@@ -679,7 +711,16 @@ def load_externalized_payload(
     return summary
 
 
-def externalized_tool_result_has_persisted_output_marker(ref: str, *, config, hermes_home: str = "") -> bool:
+def externalized_tool_result_has_persisted_output_marker(
+    ref: str,
+    *,
+    config,
+    hermes_home: str = "",
+    read_budget: dict[str, float | int] | None = None,
+    budget_label: str = "externalized persisted-output marker",
+    max_nested_depth: int = 32,
+    max_nested_items: int = 20_000,
+) -> bool:
     if not ref or Path(ref).name != ref:
         return False
     storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
@@ -687,7 +728,36 @@ def externalized_tool_result_has_persisted_output_marker(ref: str, *, config, he
         return False
     path = storage_dir / ref
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        deadline_at = (
+            float(read_budget["deadline_at"]) if read_budget is not None else None
+        )
+        if read_budget is not None:
+            _charge_externalized_read_budget(
+                read_budget, files=1, budget_label=budget_label
+            )
+        file_stat = path.stat()
+        if not stat.S_ISREG(file_stat.st_mode) or path.is_symlink():
+            return False
+        encoded_size = int(file_stat.st_size)
+        if read_budget is not None:
+            _charge_externalized_read_budget(
+                read_budget,
+                encoded_bytes=encoded_size,
+                budget_label=budget_label,
+            )
+        with path.open("rb") as handle:
+            raw_bytes = handle.read(encoded_size + 1)
+        if len(raw_bytes) != encoded_size:
+            raise RuntimeError(f"{budget_label} payload changed during bounded read")
+        raw = raw_bytes.decode("utf-8")
+        if read_budget is not None:
+            _preflight_bounded_externalized_json(
+                raw,
+                deadline_at=deadline_at,
+                max_depth=max_nested_depth,
+                max_items=max_nested_items,
+            )
+        payload = json.loads(raw)
     except (OSError, json.JSONDecodeError):
         return False
     if payload.get("kind", "tool_result") != "tool_result":
@@ -795,6 +865,10 @@ def find_externalized_tool_result_content_for_call(
     persisted_output_file_ctime_ns: int | None = None,
     config,
     hermes_home: str = "",
+    read_budget: dict[str, float | int] | None = None,
+    budget_label: str = "persisted-output durable payload",
+    max_nested_depth: int = 32,
+    max_nested_items: int = 20_000,
 ) -> str | None:
     """Return durable externalized tool-result content for a matching marker.
 
@@ -811,64 +885,108 @@ def find_externalized_tool_result_content_for_call(
     storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
     if not storage_dir.exists() or not storage_dir.is_dir():
         return None
-    for path in sorted(storage_dir.glob("*.json")):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if payload.get("kind", "tool_result") != "tool_result":
-            continue
-        if (payload.get("tool_call_id") or "") != tool_call_id:
-            continue
-        if session_id and (payload.get("session_id") or "") != session_id:
-            continue
-        payload_role = payload.get("role") or ""
-        if payload_role and payload_role != "tool":
-            continue
-        content = payload.get("content")
-        if not isinstance(content, str):
-            continue
-        if (
-            expected_chars is not None
-            or persisted_output_source_path
-            or persisted_output_preview_sha256
-            or require_persisted_output_file_not_newer
-        ):
-            marker_matches = False
-            for marker in _persisted_output_marker_entries(payload, include_legacy_preview_prefix=True):
-                if expected_chars is not None and marker.get("expected_chars") != expected_chars:
-                    continue
-                if persisted_output_source_path and marker.get("source_path") != persisted_output_source_path:
-                    continue
-                if require_missing_file_generation_metadata and (
-                    marker.get("file_size") is not None
-                    or marker.get("file_mtime_ns") is not None
-                    or marker.get("file_ctime_ns") is not None
-                ):
-                    continue
-                if persisted_output_file_size is not None and marker.get("file_size") != persisted_output_file_size:
-                    continue
-                if persisted_output_file_mtime_ns is not None and marker.get("file_mtime_ns") != persisted_output_file_mtime_ns:
-                    continue
-                if persisted_output_file_ctime_ns is not None and marker.get("file_ctime_ns") != persisted_output_file_ctime_ns:
-                    continue
-                if (
-                    persisted_output_preview_sha256
-                    and not _persisted_output_marker_matches_preview_digest(
-                        marker,
-                        persisted_output_preview_sha256,
-                        config=config,
-                        allow_redacted_preview_match=allow_redacted_preview_match,
+    try:
+        entries = os.scandir(storage_dir)
+    except OSError:
+        return None
+    with entries:
+        for entry in entries:
+            try:
+                if read_budget is not None:
+                    _charge_externalized_read_budget(
+                        read_budget, files=1, budget_label=budget_label
                     )
+                if (
+                    not entry.name.endswith(".json")
+                    or not entry.is_file(follow_symlinks=False)
                 ):
                     continue
-                if require_persisted_output_file_not_newer and not _marker_file_not_newer_than_payload(marker, payload):
+                entry_stat = entry.stat(follow_symlinks=False)
+                if not stat.S_ISREG(entry_stat.st_mode):
                     continue
-                marker_matches = True
-                break
-            if not marker_matches:
+                encoded_size = int(entry_stat.st_size)
+                if read_budget is not None:
+                    _charge_externalized_read_budget(
+                        read_budget,
+                        encoded_bytes=encoded_size,
+                        budget_label=budget_label,
+                    )
+                path = Path(entry.path)
+                with path.open("rb") as handle:
+                    raw_bytes = handle.read(encoded_size + 1)
+                if len(raw_bytes) != encoded_size:
+                    raise RuntimeError(
+                        f"{budget_label} payload changed during bounded read"
+                    )
+                raw = raw_bytes.decode("utf-8")
+                if read_budget is not None:
+                    _preflight_bounded_externalized_json(
+                        raw,
+                        deadline_at=float(read_budget["deadline_at"]),
+                        max_depth=max_nested_depth,
+                        max_items=max_nested_items,
+                    )
+                payload = json.loads(raw)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 continue
-        return content
+            if payload.get("kind", "tool_result") != "tool_result":
+                continue
+            if (payload.get("tool_call_id") or "") != tool_call_id:
+                continue
+            if session_id and (payload.get("session_id") or "") != session_id:
+                continue
+            payload_role = payload.get("role") or ""
+            if payload_role and payload_role != "tool":
+                continue
+            content = payload.get("content")
+            if not isinstance(content, str):
+                continue
+            if (
+                expected_chars is not None
+                or persisted_output_source_path
+                or persisted_output_preview_sha256
+                or require_persisted_output_file_not_newer
+            ):
+                marker_matches = False
+                for marker in _persisted_output_marker_entries(
+                    payload, include_legacy_preview_prefix=True
+                ):
+                    if expected_chars is not None and marker.get("expected_chars") != expected_chars:
+                        continue
+                    if persisted_output_source_path and marker.get("source_path") != persisted_output_source_path:
+                        continue
+                    if require_missing_file_generation_metadata and (
+                        marker.get("file_size") is not None
+                        or marker.get("file_mtime_ns") is not None
+                        or marker.get("file_ctime_ns") is not None
+                    ):
+                        continue
+                    if persisted_output_file_size is not None and marker.get("file_size") != persisted_output_file_size:
+                        continue
+                    if persisted_output_file_mtime_ns is not None and marker.get("file_mtime_ns") != persisted_output_file_mtime_ns:
+                        continue
+                    if persisted_output_file_ctime_ns is not None and marker.get("file_ctime_ns") != persisted_output_file_ctime_ns:
+                        continue
+                    if (
+                        persisted_output_preview_sha256
+                        and not _persisted_output_marker_matches_preview_digest(
+                            marker,
+                            persisted_output_preview_sha256,
+                            config=config,
+                            allow_redacted_preview_match=allow_redacted_preview_match,
+                        )
+                    ):
+                        continue
+                    if (
+                        require_persisted_output_file_not_newer
+                        and not _marker_file_not_newer_than_payload(marker, payload)
+                    ):
+                        continue
+                    marker_matches = True
+                    break
+                if not marker_matches:
+                    continue
+            return content
     return None
 
 

@@ -92,7 +92,12 @@ class ReconcileMixin:
         except (TypeError, ValueError):
             return str(tool_calls)
 
-    def _has_durable_persisted_output_replay_identity(self, msg: Dict[str, Any]) -> bool:
+    def _has_durable_persisted_output_replay_identity(
+        self,
+        msg: Dict[str, Any],
+        *,
+        read_budget: dict[str, float | int] | None = None,
+    ) -> bool:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
         if role != "tool" or not _is_hermes_persisted_output_marker(content):
@@ -106,7 +111,13 @@ class ReconcileMixin:
             or not persisted_output_preview_sha256
         ):
             return False
-        recovered_with_stat = recover_hermes_persisted_output_with_file_stat(content)
+        recovered_with_stat = recover_hermes_persisted_output_with_file_stat(
+            content,
+            read_budget=read_budget,
+            budget_label="source reconciliation persisted-output file",
+            max_nested_depth=_RECONCILIATION_MAX_NESTED_DEPTH,
+            max_nested_items=_RECONCILIATION_MAX_NESTED_ITEMS,
+        )
         if recovered_with_stat is None:
             return False
         require_live_file_freshness = True
@@ -120,6 +131,10 @@ class ReconcileMixin:
             allow_redacted_preview_match=allow_redacted_preview_match,
             config=self._config,
             hermes_home=self._hermes_home,
+            read_budget=read_budget,
+            budget_label="source reconciliation durable payload",
+            max_nested_depth=_RECONCILIATION_MAX_NESTED_DEPTH,
+            max_nested_items=_RECONCILIATION_MAX_NESTED_ITEMS,
         )
         if durable_content is None:
             return False
@@ -147,7 +162,17 @@ class ReconcileMixin:
             persisted_output_source_path = _persisted_output_saved_path(content)
             persisted_output_preview_sha256, allow_redacted_preview_match = self._persisted_output_marker_replay_proof(content)
             durable_content = None
-            recovered_with_stat = recover_hermes_persisted_output_with_file_stat(content) if not stored_row else None
+            recovered_with_stat = (
+                recover_hermes_persisted_output_with_file_stat(
+                    content,
+                    read_budget=read_budget,
+                    budget_label="source reconciliation persisted-output file",
+                    max_nested_depth=_RECONCILIATION_MAX_NESTED_DEPTH,
+                    max_nested_items=_RECONCILIATION_MAX_NESTED_ITEMS,
+                )
+                if not stored_row
+                else None
+            )
             recovered_content = recovered_with_stat[0] if recovered_with_stat is not None else None
             recovered_identity_content = None
             if recovered_content is not None:
@@ -193,6 +218,10 @@ class ReconcileMixin:
                     allow_redacted_preview_match=allow_redacted_preview_match,
                     config=self._config,
                     hermes_home=self._hermes_home,
+                    read_budget=read_budget,
+                    budget_label="source reconciliation durable payload",
+                    max_nested_depth=_RECONCILIATION_MAX_NESTED_DEPTH,
+                    max_nested_items=_RECONCILIATION_MAX_NESTED_ITEMS,
                 )
             if durable_content is not None and (
                 recovered_content is None or self._recovered_content_matches_durable_identity(recovered_content, durable_content)
@@ -208,6 +237,10 @@ class ReconcileMixin:
                     allow_redacted_preview_match=allow_redacted_preview_match,
                     config=self._config,
                     hermes_home=self._hermes_home,
+                    read_budget=read_budget,
+                    budget_label="source reconciliation durable payload",
+                    max_nested_depth=_RECONCILIATION_MAX_NESTED_DEPTH,
+                    max_nested_items=_RECONCILIATION_MAX_NESTED_ITEMS,
                 )
                 if (
                     stale_durable_content is not None
@@ -283,7 +316,12 @@ class ReconcileMixin:
         )
         return (role, stripped, tool_call_id, tool_calls)
 
-    def _stored_row_has_durable_persisted_output_marker(self, row: Dict[str, Any]) -> bool:
+    def _stored_row_has_durable_persisted_output_marker(
+        self,
+        row: Dict[str, Any],
+        *,
+        read_budget: dict[str, float | int] | None = None,
+    ) -> bool:
         if str(row.get("role") or "") != "tool":
             return False
         content = normalize_content_value(row.get("content")) or ""
@@ -294,6 +332,10 @@ class ReconcileMixin:
             ref,
             config=self._config,
             hermes_home=self._hermes_home,
+            read_budget=read_budget,
+            budget_label="source reconciliation persisted-output marker",
+            max_nested_depth=_RECONCILIATION_MAX_NESTED_DEPTH,
+            max_nested_items=_RECONCILIATION_MAX_NESTED_ITEMS,
         )
 
     @staticmethod
@@ -309,6 +351,10 @@ class ReconcileMixin:
         candidate_prefix: list[tuple[str, str, str, str]],
         stored_tail: list[tuple[str, str, str, str]],
         stored_tail_rows: list[Dict[str, Any]] | None,
+        *,
+        read_budget: dict[str, float | int] | None = None,
+        durable_cache: dict[int, bool] | None = None,
+        stored_marker_cache: dict[int, bool] | None = None,
     ) -> bool:
         if not stored_tail_rows or len(candidate_prefix) != len(stored_tail) or len(candidate_messages) != len(candidate_prefix):
             return False
@@ -326,12 +372,29 @@ class ReconcileMixin:
                 str(candidate_msg.get("role") or "") == "tool"
                 and _is_hermes_persisted_output_marker(candidate_content)
             )
-            stored_is_persisted_output = self._stored_row_has_durable_persisted_output_marker(stored_row)
+            stored_key = int(stored_row.get("store_id") or id(stored_row))
+            if stored_marker_cache is not None and stored_key in stored_marker_cache:
+                stored_is_persisted_output = stored_marker_cache[stored_key]
+            else:
+                stored_is_persisted_output = self._stored_row_has_durable_persisted_output_marker(
+                    stored_row, read_budget=read_budget
+                )
+                if stored_marker_cache is not None:
+                    stored_marker_cache[stored_key] = stored_is_persisted_output
+            candidate_key = id(candidate_msg)
+            if durable_cache is not None and candidate_key in durable_cache:
+                candidate_is_durable = durable_cache[candidate_key]
+            else:
+                candidate_is_durable = self._has_durable_persisted_output_replay_identity(
+                    candidate_msg, read_budget=read_budget
+                )
+                if durable_cache is not None:
+                    durable_cache[candidate_key] = candidate_is_durable
             if candidate_is_persisted_marker or stored_is_persisted_output:
                 if (
                     not candidate_is_persisted_marker
                     or not stored_is_persisted_output
-                    or not self._has_durable_persisted_output_replay_identity(candidate_msg)
+                    or not candidate_is_durable
                 ):
                     return False
                 saw_persisted_output = True
@@ -442,7 +505,53 @@ class ReconcileMixin:
         allow_empty_prefix: bool,
         session_count: int,
         raw_session_count: int,
+        read_budget: dict[str, float | int] | None = None,
+        active_identities: dict[int, tuple[str, str, str, str]] | None = None,
     ) -> int | None:
+        budget = read_budget or self._new_locked_publication_read_budget()
+        identity_by_message_id = active_identities or {}
+        for msg in messages:
+            message_id = id(msg)
+            if message_id in identity_by_message_id:
+                continue
+            self._charge_reconciliation_active_message(msg, read_budget=budget)
+            identity_by_message_id[message_id] = self._message_replay_identity(
+                msg, read_budget=budget
+            )
+
+        def identity_for(msg: Dict[str, Any]) -> tuple[str, str, str, str]:
+            return identity_by_message_id[id(msg)]
+
+        persisted_recovery_cache: dict[int, bool] = {}
+        durable_replay_cache: dict[int, bool] = {}
+        stored_marker_cache: dict[int, bool] = {}
+
+        def persisted_marker_is_recoverable(msg: Dict[str, Any]) -> bool:
+            message_id = id(msg)
+            if message_id not in persisted_recovery_cache:
+                content = normalize_content_value(msg.get("content")) or ""
+                persisted_recovery_cache[message_id] = (
+                    recover_hermes_persisted_output_with_file_stat(
+                        content,
+                        read_budget=budget,
+                        budget_label="source reconciliation persisted-output proof",
+                        max_nested_depth=_RECONCILIATION_MAX_NESTED_DEPTH,
+                        max_nested_items=_RECONCILIATION_MAX_NESTED_ITEMS,
+                    )
+                    is not None
+                )
+            return persisted_recovery_cache[message_id]
+
+        def has_durable_replay(msg: Dict[str, Any]) -> bool:
+            message_id = id(msg)
+            if message_id not in durable_replay_cache:
+                durable_replay_cache[message_id] = (
+                    self._has_durable_persisted_output_replay_identity(
+                        msg, read_budget=budget
+                    )
+                )
+            return durable_replay_cache[message_id]
+
         sanitized_replay_tail = self._stored_tail_for_sanitized_active_replay(stored_tail)
         effective_session_count = len(sanitized_replay_tail)
         sanitized_tail_collapsed = len(sanitized_replay_tail) < len(stored_tail)
@@ -469,7 +578,7 @@ class ReconcileMixin:
                 and not (
                     self._compiled_ignore_message_patterns
                     and self._is_quarantined_assistant_replay_identity(
-                        self._message_replay_identity(msg)
+                        identity_for(msg)
                     )
                     and self._matches_ignore_message_patterns(msg, stored_row=True)
                 )
@@ -479,7 +588,7 @@ class ReconcileMixin:
                 self._is_replayed_context_scaffold_message(msg) for msg in candidate_messages
             )
             candidate_has_quarantined_replay_evidence = any(
-                self._is_quarantined_assistant_replay_identity(self._message_replay_identity(msg))
+                self._is_quarantined_assistant_replay_identity(identity_for(msg))
                 for msg in candidate_messages
             )
             candidate_identity_messages = (
@@ -488,11 +597,11 @@ class ReconcileMixin:
                 else candidate_visible_messages
             )
             candidate_visible_prefix = [
-                self._message_replay_identity(msg)
+                identity_for(msg)
                 for msg in candidate_visible_messages
             ]
             candidate_prefix = [
-                self._message_replay_identity(msg)
+                identity_for(msg)
                 for msg in candidate_identity_messages
             ]
             if not candidate_prefix:
@@ -524,10 +633,7 @@ class ReconcileMixin:
             early_candidate_has_unrecoverable_persisted_marker = any(
                 str(msg.get("role") or "") == "tool"
                 and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
-                and recover_hermes_persisted_output_with_file_stat(
-                    normalize_content_value(msg.get("content")) or ""
-                )
-                is None
+                and not persisted_marker_is_recoverable(msg)
                 for msg in candidate_identity_messages
             )
             if (matches_visible_sanitized_tail or matches_visible_raw_tail) and not early_candidate_has_unrecoverable_persisted_marker:
@@ -542,14 +648,14 @@ class ReconcileMixin:
                 candidate_prefix,
                 stored_tail,
                 stored_tail_rows,
+                read_budget=budget,
+                durable_cache=durable_replay_cache,
+                stored_marker_cache=stored_marker_cache,
             )
             candidate_has_unrecoverable_persisted_marker = any(
                 str(msg.get("role") or "") == "tool"
                 and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
-                and recover_hermes_persisted_output_with_file_stat(
-                    normalize_content_value(msg.get("content")) or ""
-                )
-                is None
+                and not persisted_marker_is_recoverable(msg)
                 for msg in candidate_identity_messages
             )
             matches_inline_generation_cleanup_tail = False
@@ -602,7 +708,7 @@ class ReconcileMixin:
                 or (
                     self._compiled_ignore_message_patterns
                     and self._is_quarantined_assistant_replay_identity(
-                        self._message_replay_identity(msg)
+                        identity_for(msg)
                     )
                     and self._matches_ignore_message_patterns(msg, stored_row=True)
                 )
@@ -641,7 +747,7 @@ class ReconcileMixin:
                 and any(
                     str(msg.get("role") or "") == "tool"
                     and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
-                    and self._has_durable_persisted_output_replay_identity(msg)
+                    and has_durable_replay(msg)
                     for msg in candidate_messages
                 )
             )
@@ -767,9 +873,15 @@ class ReconcileMixin:
     def _effective_replay_identities(
         self,
         messages: List[Dict[str, Any]],
+        *,
+        active_identities: dict[int, tuple[str, str, str, str]] | None = None,
     ) -> list[tuple[str, str, str, str]]:
         return [
-            self._message_replay_identity(msg)
+            (
+                active_identities[id(msg)]
+                if active_identities is not None
+                else self._message_replay_identity(msg)
+            )
             for msg in messages
             if not self._is_replayed_context_scaffold_message(msg)
             and not self._matches_ignore_message_patterns(msg)
@@ -842,6 +954,28 @@ class ReconcileMixin:
                     return cursor
             return 0
 
+        read_budget = self._new_locked_publication_read_budget()
+        active_identities: dict[int, tuple[str, str, str, str]] = {}
+        for msg in messages:
+            self._charge_reconciliation_active_message(
+                msg, read_budget=read_budget
+            )
+            active_identities[id(msg)] = self._message_replay_identity(
+                msg, read_budget=read_budget
+            )
+        stored_identity_cache: dict[int, tuple[str, str, str, str]] = {}
+
+        def stored_identity(row: Dict[str, Any]) -> tuple[str, str, str, str]:
+            store_id = int(row.get("store_id") or 0)
+            if store_id not in stored_identity_cache:
+                self._charge_reconciliation_active_message(
+                    row, read_budget=read_budget
+                )
+                stored_identity_cache[store_id] = self._message_replay_identity(
+                    row, stored_row=True, read_budget=read_budget
+                )
+            return stored_identity_cache[store_id]
+
         tail_limit = min(max(len(messages) * 4, 64), session_count)
         stored_rows = self._store.get_session_tail(self._session_id, limit=tail_limit)
         if not stored_rows:
@@ -852,7 +986,7 @@ class ReconcileMixin:
             if not self._matches_ignore_message_patterns(row, stored_row=True)
         ]
         stored_tail = [
-            self._message_replay_identity(row, stored_row=True)
+            stored_identity(row)
             for row in stored_tail_rows
         ]
         cursor = self._find_reconciled_cursor_for_store_tail(
@@ -862,11 +996,15 @@ class ReconcileMixin:
             allow_empty_prefix=True,
             session_count=len(stored_tail),
             raw_session_count=session_count,
+            read_budget=read_budget,
+            active_identities=active_identities,
         )
         if cursor is not None and cursor > 0:
             reason = (
                 "skipped scaffold-only prefix"
-                if not self._effective_replay_identities(messages[:cursor])
+                if not self._effective_replay_identities(
+                    messages[:cursor], active_identities=active_identities
+                )
                 else "replayed durable tail"
             )
             self._record_ingest_reconciliation(
@@ -876,7 +1014,11 @@ class ReconcileMixin:
                 incoming=len(messages),
                 session_count=session_count,
                 stored_tail_count=len(stored_tail),
-                effective_incoming=len(self._effective_replay_identities(messages)),
+                effective_incoming=len(
+                    self._effective_replay_identities(
+                        messages, active_identities=active_identities
+                    )
+                ),
             )
             logger.debug(
                 "LCM reconciled ingest cursor after existing-session bind: session=%s cursor=%d incoming=%d stored_tail=%d session_count=%d reason=%s",
@@ -889,12 +1031,14 @@ class ReconcileMixin:
             )
             return cursor
 
-        incoming_identities = self._effective_replay_identities(messages)
+        incoming_identities = self._effective_replay_identities(
+            messages, active_identities=active_identities
+        )
         stored_head_rows = self._store.get_session_messages(
             self._session_id,
             limit=tail_limit,
         )
-        stored_head = [self._message_replay_identity(row, stored_row=True) for row in stored_head_rows]
+        stored_head = [stored_identity(row) for row in stored_head_rows]
         # Stale-snapshot proof uses the raw durable prefix.  Ignore-message
         # filters may suppress noisy rows for tail reconciliation, but filtered
         # history alone must not create replay evidence for skipping a batch.
@@ -902,7 +1046,11 @@ class ReconcileMixin:
             str(msg.get("role") or "") == "tool"
             and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
             and recover_hermes_persisted_output_with_file_stat(
-                normalize_content_value(msg.get("content")) or ""
+                normalize_content_value(msg.get("content")) or "",
+                read_budget=read_budget,
+                budget_label="source reconciliation stale-snapshot proof",
+                max_nested_depth=_RECONCILIATION_MAX_NESTED_DEPTH,
+                max_nested_items=_RECONCILIATION_MAX_NESTED_ITEMS,
             )
             is None
             for msg in messages
@@ -1195,9 +1343,23 @@ class ReconcileMixin:
         """
         read_budget = self._new_locked_publication_read_budget()
         active_identity_counts: dict[tuple[Any, ...], int] = {}
+        active_identities: dict[int, tuple[Any, ...]] = {}
+        active_cleanup_identities: dict[int, tuple[Any, ...] | None] = {}
+        active_raw_identities: dict[int, tuple[str, str, str, str] | None] = {}
         for msg in messages:
             self._charge_reconciliation_active_message(msg, read_budget=read_budget)
             identity = self._message_replay_identity(msg, read_budget=read_budget)
+            message_id = id(msg)
+            active_identities[message_id] = identity
+            active_cleanup_identities[message_id] = self._active_cleanup_replay_identity(identity)
+            msg_content = normalize_content_value(msg.get("content")) or ""
+            raw_identity = None
+            if (
+                msg.get("store_id") is None
+                and self._content_has_externalized_placeholder_ref(msg_content)
+            ):
+                raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
+            active_raw_identities[message_id] = raw_identity
             active_identity_counts[identity] = active_identity_counts.get(identity, 0) + 1
         (
             candidate_store_ids,
@@ -1208,8 +1370,6 @@ class ReconcileMixin:
             stored_cleanup_identity_counts,
         ) = self._bounded_reconciliation_candidates(read_budget=read_budget)
 
-        def stored_raw_placeholder_identity(probe_idx: int) -> tuple[str, str, str, str]:
-            return stored_raw_placeholder_identities[probe_idx]
         active_surplus_skips: dict[tuple[Any, ...], int] = {}
         generated_surplus_skip_message_ids: set[int] = set()
         generated_placeholder_message_ids = getattr(
@@ -1217,7 +1377,16 @@ class ReconcileMixin:
             "_generated_ignored_active_replay_placeholder_message_ids",
             set(),
         )
+        generated_by_identity: dict[tuple[Any, ...], list[int]] = {}
+        for msg in messages:
+            message_id = id(msg)
+            if message_id in generated_placeholder_message_ids:
+                generated_by_identity.setdefault(
+                    active_identities[message_id], []
+                ).append(message_id)
         for identity, active_count in active_identity_counts.items():
+            if time.monotonic() >= float(read_budget["deadline_at"]):
+                raise RuntimeError("source reconciliation deadline exceeded")
             wanted_cleanup_identity = self._active_cleanup_replay_identity(identity)
             stored_exact = stored_identity_counts.get(identity, 0)
             stored_cleanup = 0
@@ -1226,144 +1395,94 @@ class ReconcileMixin:
             stored_available = max(stored_exact, stored_cleanup)
             if active_count > stored_available:
                 surplus_count = active_count - stored_available
-                for msg in messages:
-                    if surplus_count <= 0:
-                        break
-                    if id(msg) not in generated_placeholder_message_ids:
-                        continue
-                    if self._message_replay_identity(msg) != identity:
-                        continue
-                    generated_surplus_skip_message_ids.add(id(msg))
-                    surplus_count -= 1
+                generated_ids = generated_by_identity.get(identity, [])
+                generated_surplus_skip_message_ids.update(
+                    generated_ids[:surplus_count]
+                )
+                surplus_count -= min(surplus_count, len(generated_ids))
                 if surplus_count > 0:
                     active_surplus_skips[identity] = surplus_count
 
         placeholder_identity_counts: dict[tuple[str, str, str, str], int] = {}
         for msg in messages:
-            msg_content = normalize_content_value(msg.get("content")) or ""
-            if msg.get("store_id") is None and self._content_has_externalized_placeholder_ref(msg_content):
-                raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
+            raw_identity = active_raw_identities[id(msg)]
+            if raw_identity is not None:
                 placeholder_identity_counts[raw_identity] = placeholder_identity_counts.get(raw_identity, 0) + 1
         self._current_compress_placeholder_identity_counts = placeholder_identity_counts
 
-        def find_raw_placeholder_match_index(
-            raw_identity: tuple[str, str, str, str],
-            start_idx: int,
+        exact_positions: dict[tuple[Any, ...], list[int]] = {}
+        cleanup_positions: dict[tuple[Any, ...], list[int]] = {}
+        raw_positions: dict[tuple[str, str, str, str], list[int]] = {}
+        for index, identity in enumerate(stored_identities):
+            exact_positions.setdefault(identity, []).append(index)
+            cleanup = stored_cleanup_identities[index]
+            if cleanup is not None:
+                cleanup_positions.setdefault(cleanup, []).append(index)
+            raw_positions.setdefault(
+                stored_raw_placeholder_identities[index], []
+            ).append(index)
+
+        position_offsets: dict[tuple[str, tuple[Any, ...]], int] = {}
+
+        def first_at_or_after(
+            kind: str,
+            identity: tuple[Any, ...],
+            positions: list[int] | None,
+            start: int,
         ) -> int | None:
-            probe_idx = start_idx
-            while probe_idx < len(candidate_store_ids):
-                if stored_raw_placeholder_identity(probe_idx) == raw_identity:
-                    return probe_idx
-                probe_idx += 1
-            return None
+            if not positions:
+                return None
+            key = (kind, identity)
+            offset = position_offsets.get(key, 0)
+            while offset < len(positions) and positions[offset] < start:
+                offset += 1
+            position_offsets[key] = offset
+            return positions[offset] if offset < len(positions) else None
 
-        def find_message_match_index(msg: Dict[str, Any], start_idx: int) -> int | None:
-            msg_content = normalize_content_value(msg.get("content")) or ""
-            if msg.get("store_id") is None and self._content_has_externalized_placeholder_ref(msg_content):
-                raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
-                raw_match_idx = find_raw_placeholder_match_index(raw_identity, start_idx)
-                if raw_match_idx is not None:
-                    return raw_match_idx
-
-            message_identity = self._message_replay_identity(msg)
-            wanted_cleanup_identity = self._active_cleanup_replay_identity(message_identity)
-            probe_idx = start_idx
-            while probe_idx < len(candidate_store_ids):
-                stored_identity = stored_identities[probe_idx]
-                if stored_identity == message_identity:
-                    return probe_idx
-                if (
-                    wanted_cleanup_identity is not None
-                    and stored_cleanup_identities[probe_idx] == wanted_cleanup_identity
-                ):
-                    return probe_idx
-                probe_idx += 1
-            return None
-
-        def matched_remaining_message_ids(
-            message_start_idx: int,
-            start_store_idx: int,
-            surplus_skips: dict[tuple[Any, ...], int],
-        ) -> set[int]:
-            matched_message_ids: set[int] = set()
-            local_surplus_skips = dict(surplus_skips)
-            probe_idx = start_store_idx
-            for remaining_msg in messages[message_start_idx:]:
-                msg_content = normalize_content_value(remaining_msg.get("content")) or ""
-                if (
-                    remaining_msg.get("store_id") is None
-                    and self._content_has_externalized_placeholder_ref(msg_content)
-                ):
-                    raw_identity = self._raw_externalized_placeholder_replay_identity(remaining_msg)
-                    raw_match_idx = find_raw_placeholder_match_index(raw_identity, probe_idx)
-                    if raw_match_idx is not None:
-                        matched_message_ids.add(id(remaining_msg))
-                        probe_idx = raw_match_idx + 1
-                        continue
-                message_identity = self._message_replay_identity(remaining_msg)
-                if id(remaining_msg) in generated_surplus_skip_message_ids:
-                    continue
-                surplus = local_surplus_skips.get(message_identity, 0)
-                if surplus > 0:
-                    local_surplus_skips[message_identity] = surplus - 1
-                    continue
-                match_idx = find_message_match_index(remaining_msg, probe_idx)
-                if match_idx is None:
-                    continue
-                matched_message_ids.add(id(remaining_msg))
-                probe_idx = match_idx + 1
-            return matched_message_ids
+        def find_identity_match_index(message_id: int, start: int) -> int | None:
+            identity = active_identities[message_id]
+            exact = first_at_or_after(
+                "exact", identity, exact_positions.get(identity), start
+            )
+            cleanup_identity = active_cleanup_identities[message_id]
+            cleanup = (
+                first_at_or_after(
+                    "cleanup",
+                    cleanup_identity,
+                    cleanup_positions.get(cleanup_identity),
+                    start,
+                )
+                if cleanup_identity is not None
+                else None
+            )
+            candidates = [value for value in (exact, cleanup) if value is not None]
+            return min(candidates) if candidates else None
 
         ids_by_message_id: dict[int, int] = {}
         store_idx = 0
-        for msg_idx, msg in enumerate(messages):
-            msg_content = normalize_content_value(msg.get("content")) or ""
-            if msg.get("store_id") is None and self._content_has_externalized_placeholder_ref(msg_content):
-                raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
-                if placeholder_identity_counts.get(raw_identity, 0) > 1:
-                    match_idx = find_raw_placeholder_match_index(raw_identity, store_idx)
-                    if match_idx is not None:
-                        ids_by_message_id[id(msg)] = candidate_store_ids[match_idx]
-                        store_idx = match_idx + 1
-                else:
-                    # Prefer a later duplicate only when it does not orphan
-                    # later active messages that still need monotonic mapping.
-                    first_match_idx = find_raw_placeholder_match_index(raw_identity, store_idx)
-                    if first_match_idx is not None:
-                        baseline_suffix_ids = matched_remaining_message_ids(
-                            msg_idx + 1,
-                            first_match_idx + 1,
-                            active_surplus_skips,
-                        )
-                    else:
-                        baseline_suffix_ids = set()
-                    probe_idx = len(candidate_store_ids) - 1
-                    while first_match_idx is not None and probe_idx >= first_match_idx:
-                        if stored_raw_placeholder_identity(probe_idx) == raw_identity:
-                            candidate_suffix_ids = matched_remaining_message_ids(
-                                msg_idx + 1,
-                                probe_idx + 1,
-                                active_surplus_skips,
-                            )
-                            if not baseline_suffix_ids.issubset(candidate_suffix_ids):
-                                probe_idx -= 1
-                                continue
-                            ids_by_message_id[id(msg)] = candidate_store_ids[probe_idx]
-                            store_idx = probe_idx + 1
-                            break
-                        probe_idx -= 1
-                if id(msg) in ids_by_message_id:
+        for msg in messages:
+            if time.monotonic() >= float(read_budget["deadline_at"]):
+                raise RuntimeError("source reconciliation deadline exceeded")
+            message_id = id(msg)
+            raw_identity = active_raw_identities[message_id]
+            if raw_identity is not None:
+                raw_match_idx = first_at_or_after(
+                    "raw", raw_identity, raw_positions.get(raw_identity), store_idx
+                )
+                if raw_match_idx is not None:
+                    ids_by_message_id[message_id] = candidate_store_ids[raw_match_idx]
+                    store_idx = raw_match_idx + 1
                     continue
-            message_identity = self._message_replay_identity(msg)
-            if id(msg) in generated_surplus_skip_message_ids:
+            message_identity = active_identities[message_id]
+            if message_id in generated_surplus_skip_message_ids:
                 continue
             surplus = active_surplus_skips.get(message_identity, 0)
             if surplus > 0:
                 active_surplus_skips[message_identity] = surplus - 1
                 continue
-            match_idx = find_message_match_index(msg, store_idx)
+            match_idx = find_identity_match_index(message_id, store_idx)
             if match_idx is not None:
-                ids_by_message_id[id(msg)] = candidate_store_ids[match_idx]
+                ids_by_message_id[message_id] = candidate_store_ids[match_idx]
                 store_idx = match_idx + 1
 
         return ids_by_message_id

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import tempfile
 
 import pytest
 
@@ -40,6 +41,26 @@ def _engine(tmp_path, **overrides) -> LCMEngine:
         "current", conversation_id="conversation", platform="test", context_length=10_000
     )
     return engine
+
+
+def _persisted_output_marker(
+    tmp_path, monkeypatch, content: str, name: str = "result.txt"
+) -> str:
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    result_dir = tmp_path / "hermes-results"
+    result_dir.mkdir(exist_ok=True)
+    result_path = result_dir / name
+    result_path.write_text(content, encoding="utf-8")
+    preview = content[:30]
+    return (
+        "<persisted-output>\n"
+        f"This tool result was too large ({len(content):,} characters, 1.0 KB).\n"
+        f"Full output saved to: {result_path}\n"
+        "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+        "Preview (first 30 chars):\n"
+        f"{preview}\n...\n"
+        "</persisted-output>"
+    )
 
 
 def test_foreground_identity_uses_incremental_bounded_sql_not_get_batch(
@@ -259,6 +280,99 @@ def test_source_mapper_preflights_shared_nested_and_deadline_budget(
         engine.shutdown()
 
 
+def test_source_mapper_computes_each_active_identity_once_with_shared_budget(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    messages = [
+        {"role": "user", "content": f"generated-placeholder-{index}"}
+        for index in range(40)
+    ]
+    engine._generated_ignored_active_replay_placeholder_message_ids = {
+        id(message) for message in messages
+    }
+    calls: dict[int, int] = {}
+    original = engine._message_replay_identity
+
+    def counted(message, *args, **kwargs):
+        if message in messages:
+            assert kwargs.get("read_budget") is not None
+            calls[id(message)] = calls.get(id(message), 0) + 1
+        return original(message, *args, **kwargs)
+
+    monkeypatch.setattr(engine, "_message_replay_identity", counted)
+    try:
+        engine._get_store_ids_for_messages(messages)
+        assert calls == {id(message): 1 for message in messages}
+    finally:
+        engine.shutdown()
+
+
+def test_restart_reconciliation_computes_each_identity_once_under_one_budget(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    messages = [
+        {"role": "system", "content": "bounded restart"},
+        {"role": "user", "content": "restart question"},
+        {"role": "assistant", "content": "restart answer"},
+    ]
+    engine._store._append_protected_batch(
+        "current", messages, [1, 1, 1], conversation_id="conversation"
+    )
+    active_ids = {id(message) for message in messages}
+    active_calls: dict[int, int] = {}
+    stored_calls: dict[int, int] = {}
+    budget_ids: set[int] = set()
+    original = engine._message_replay_identity
+
+    def counted(message, *args, **kwargs):
+        budget = kwargs.get("read_budget")
+        assert budget is not None
+        budget_ids.add(id(budget))
+        if id(message) in active_ids:
+            active_calls[id(message)] = active_calls.get(id(message), 0) + 1
+        elif kwargs.get("stored_row"):
+            store_id = int(message["store_id"])
+            stored_calls[store_id] = stored_calls.get(store_id, 0) + 1
+        return original(message, *args, **kwargs)
+
+    monkeypatch.setattr(engine, "_message_replay_identity", counted)
+    try:
+        assert engine._reconcile_ingest_cursor_from_store(messages) == len(messages)
+        assert active_calls == {id(message): 1 for message in messages}
+        assert stored_calls == {1: 1, 2: 1, 3: 1}
+        assert len(budget_ids) == 1
+    finally:
+        engine.shutdown()
+
+
+def test_source_mapper_persisted_output_recovery_uses_shared_byte_budget(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path, large_output_externalization_enabled=True)
+    marker = _persisted_output_marker(tmp_path, monkeypatch, "P" * 8_000)
+    message = {"role": "tool", "tool_call_id": "bounded", "content": marker}
+    monkeypatch.setattr(
+        engine,
+        "_new_locked_publication_read_budget",
+        lambda: {
+            "rows": 0,
+            "bytes": 0,
+            "files": 0,
+            "max_rows": 10,
+            "max_bytes": 2_048,
+            "max_files": 10,
+            "deadline_at": 1e30,
+        },
+    )
+    try:
+        with pytest.raises(RuntimeError, match="byte bound"):
+            engine._get_store_ids_for_messages([message])
+    finally:
+        engine.shutdown()
+
+
 def _ready_batch(engine: LCMEngine) -> int:
     engine._frontier.ensure_frontier("conversation", "current")
     active = engine._frontier.get_active_frontier("conversation")
@@ -275,6 +389,59 @@ def _ready_batch(engine: LCMEngine) -> int:
     )
     assert batch_id > 0
     return batch_id
+
+
+def test_maintenance_lineage_budget_charges_and_memoizes_message_validation(
+    tmp_path
+):
+    path, parent, _children = maintenance_fixture(tmp_path)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    budget = maintenance_module._new_maintenance_lineage_budget()
+    try:
+        first = _source_inventory(conn, parent, lineage_budget=budget)
+        first_usage = (budget["rows"], budget["bytes"])
+        second = _source_inventory(conn, parent, lineage_budget=budget)
+        assert second == first
+        assert (budget["rows"], budget["bytes"]) == first_usage
+        assert int(budget["message_rows"]) == 2
+        message_payload_reads = [
+            statement for statement in statements
+            if "FROM messages" in statement
+            and "SUBSTR" in statement.upper()
+            and statement.lstrip().upper().startswith("SELECT")
+        ]
+        assert len(message_payload_reads) == 1
+    finally:
+        conn.close()
+
+
+def test_maintenance_plan_threads_one_lineage_budget_through_all_closures(
+    tmp_path, monkeypatch
+):
+    path, parent, _children = maintenance_fixture(tmp_path)
+    seen_budgets: list[object] = []
+    original = maintenance_module._source_inventory
+
+    def recorded(*args, **kwargs):
+        budget = kwargs.get("lineage_budget")
+        assert budget is not None
+        seen_budgets.append(budget)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(maintenance_module, "_source_inventory", recorded)
+    plan = plan_dag_maintenance(
+        path,
+        operation="rewrite-subtree",
+        conversation_id="source-conv",
+        node_id=parent,
+        rewrites={parent: "bounded rewrite"},
+    )
+    assert plan["dry_run"] is True
+    assert len(seen_budgets) >= 2
+    assert len({id(budget) for budget in seen_budgets}) == 1
 
 
 def test_valid_oversized_ready_row_is_rejected_directly_before_payload_decode(
@@ -700,6 +867,76 @@ def test_rollover_matched_prefix_preflights_huge_unmatched_suffix_and_rolls_back
         engine.shutdown()
 
 
+def test_rollover_unmatched_persisted_output_expansion_aborts_losslessly(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    marker = _persisted_output_marker(
+        tmp_path, monkeypatch, "rollover-secret-" + ("R" * 12_000), "rollover.txt"
+    )
+    message = {"role": "tool", "tool_call_id": "rollover", "content": marker}
+    before_frontier = engine._frontier.get_active_frontier("conversation")
+    monkeypatch.setattr(
+        engine_module, "_PUBLICATION_LOCKED_MAX_SERIALIZED_BYTES", 2_048
+    )
+    try:
+        with pytest.raises(RuntimeError, match="byte bound"):
+            engine.rollover_session(
+                "current", "next", previous_messages=[message]
+            )
+        assert engine.current_session_id == "current"
+        assert engine._store.get_session_count("current") == 0
+        assert engine._frontier.get_active_frontier("conversation") == before_frontier
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("payload_state", ["oversized", "missing"])
+def test_rollover_unmatched_externalized_marker_resolves_with_shared_budget(
+    tmp_path, monkeypatch, payload_state
+):
+    engine = _engine(tmp_path)
+    ref = f"unmatched-{payload_state}.json"
+    if payload_state == "oversized":
+        payload_dir = externalize_module.get_large_output_storage_dir(
+            engine._config, hermes_home=engine._hermes_home, create=True
+        )
+        (payload_dir / ref).write_text(
+            json.dumps({
+                "kind": "tool_result",
+                "session_id": "current",
+                "role": "tool",
+                "tool_call_id": "externalized-rollover",
+                "content": "E" * 12_000,
+            }),
+            encoding="utf-8",
+        )
+    placeholder = (
+        "[Externalized tool output: tool_call_id=externalized-rollover; "
+        f"chars=12000; ref={ref}]"
+    )
+    message = {
+        "role": "tool",
+        "tool_call_id": "externalized-rollover",
+        "content": placeholder,
+    }
+    before_frontier = engine._frontier.get_active_frontier("conversation")
+    monkeypatch.setattr(
+        engine_module, "_PUBLICATION_LOCKED_MAX_SERIALIZED_BYTES", 2_048
+    )
+    try:
+        expected = "byte bound" if payload_state == "oversized" else "could not be resolved"
+        with pytest.raises(RuntimeError, match=expected):
+            engine.rollover_session(
+                "current", "next", previous_messages=[message]
+            )
+        assert engine.current_session_id == "current"
+        assert engine._store.get_session_count("current") == 0
+        assert engine._frontier.get_active_frontier("conversation") == before_frontier
+    finally:
+        engine.shutdown()
+
+
 def test_load_session_sql_substrings_valid_oversized_content_before_python(
     tmp_path
 ):
@@ -729,6 +966,71 @@ def test_load_session_sql_substrings_valid_oversized_content_before_python(
                    for statement in selects)
     finally:
         engine._store._conn.set_trace_callback(None)
+        engine.shutdown()
+
+
+def test_load_session_redacts_secret_spanning_requested_content_boundary(tmp_path):
+    engine = _engine(tmp_path)
+    max_chars = 128
+    secret = "github_pat_" + ("A" * 40)
+    content = ("x" * (max_chars - 10)) + " " + secret + " visible-tail"
+    engine._store.append("current", {"role": "user", "content": content})
+    try:
+        response = json.loads(engine.handle_tool_call(
+            "lcm_load_session",
+            {
+                "session_id": "current",
+                "limit": 1,
+                "max_content_chars": max_chars,
+            },
+        ))
+        returned = response["messages"][0]["content"]
+        assert secret not in returned
+        assert "github_pat" not in returned
+        assert "LCM sens" in returned
+        assert len(returned) <= max_chars
+    finally:
+        engine.shutdown()
+
+
+def test_load_session_count_and_page_share_snapshot_during_concurrent_insert(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    engine._store.append("current", {"role": "user", "content": "snapshot-one"})
+    original = engine._store._load_session_page_locked
+    raced = {"value": False}
+
+    def insert_between_count_and_page(*args, **kwargs):
+        if not raced["value"]:
+            raced["value"] = True
+            writer = sqlite3.connect(engine._store.db_path, timeout=2.0)
+            try:
+                writer.execute(
+                    """INSERT INTO messages
+                       (session_id, source, role, content, timestamp, token_estimate,
+                        pinned, conversation_id)
+                       VALUES ('current', 'test', 'user', 'snapshot-two', 0, 1, 0,
+                               'conversation')"""
+                )
+                writer.commit()
+            finally:
+                writer.close()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        engine._store, "_load_session_page_locked", insert_between_count_and_page
+    )
+    try:
+        response = json.loads(engine.handle_tool_call(
+            "lcm_load_session", {"session_id": "current", "limit": 10}
+        ))
+        assert raced["value"] is True
+        assert response["total_messages"] == response["returned_messages"] == 1
+        assert response["messages"][0]["content"] == "snapshot-one"
+        assert response["has_more"] is False
+        assert response["next_cursor"] is None
+    finally:
         engine.shutdown()
 
 

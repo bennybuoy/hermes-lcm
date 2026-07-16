@@ -69,6 +69,7 @@ class SessionLoadPage(list[dict[str, Any]]):
     """List-compatible bounded page with aggregate exhaustion metadata."""
 
     budget_exhausted: bool = False
+    total_messages: int = 0
 
 
 def _legacy_blank_source_clause(column: str) -> str:
@@ -584,6 +585,7 @@ class MessageStore:
         time_from: float | None = None,
         time_to: float | None = None,
         max_content_chars: int = 20_000,
+        content_lookahead_chars: int = 0,
         max_serialized_bytes: int = _LOAD_SESSION_MAX_PAGE_MATERIALIZED_BYTES,
         max_row_serialized_bytes: int = _LOAD_SESSION_MAX_ROW_MATERIALIZED_BYTES,
     ) -> List[Dict[str, Any]]:
@@ -598,6 +600,18 @@ class MessageStore:
         with self._write_lock:
             self._conn.execute(f"SAVEPOINT {savepoint}")
             try:
+                count_where, count_args = self._session_load_where(
+                    session_id,
+                    roles=roles,
+                    time_from=time_from,
+                    time_to=time_to,
+                )
+                total_messages = int(
+                    self._conn.execute(
+                        f"SELECT COUNT(*) FROM messages WHERE {' AND '.join(count_where)}",
+                        count_args,
+                    ).fetchone()[0]
+                )
                 result = self._load_session_page_locked(
                     session_id,
                     after_store_id=after_store_id,
@@ -606,9 +620,11 @@ class MessageStore:
                     time_from=time_from,
                     time_to=time_to,
                     max_content_chars=max_content_chars,
+                    content_lookahead_chars=content_lookahead_chars,
                     max_serialized_bytes=max_serialized_bytes,
                     max_row_serialized_bytes=max_row_serialized_bytes,
                 )
+                result.total_messages = total_messages
                 self._conn.execute(f"RELEASE {savepoint}")
                 return result
             except Exception:
@@ -626,6 +642,7 @@ class MessageStore:
         time_from: float | None = None,
         time_to: float | None = None,
         max_content_chars: int = 20_000,
+        content_lookahead_chars: int = 0,
         max_serialized_bytes: int = _LOAD_SESSION_MAX_PAGE_MATERIALIZED_BYTES,
         max_row_serialized_bytes: int = _LOAD_SESSION_MAX_ROW_MATERIALIZED_BYTES,
     ) -> List[Dict[str, Any]]:
@@ -649,11 +666,14 @@ class MessageStore:
             "session_id", "source", "role", "content", "tool_call_id",
             "tool_calls", "tool_name", "conversation_id",
         )
+        content_scan_chars = max(1, int(max_content_chars)) + max(
+            0, int(content_lookahead_chars)
+        )
         text_limits = (
             _LOAD_SESSION_MAX_SESSION_TEXT_BYTES,
             _LOAD_SESSION_MAX_SCALAR_TEXT_BYTES,
             _LOAD_SESSION_MAX_ROLE_TEXT_BYTES,
-            max(1, int(max_content_chars)) * 4,
+            content_scan_chars * 4,
             _LOAD_SESSION_MAX_SCALAR_TEXT_BYTES,
             _LOAD_SESSION_MAX_TOOL_CALLS_ENCODED_BYTES,
             _LOAD_SESSION_MAX_SCALAR_TEXT_BYTES,
@@ -730,7 +750,7 @@ class MessageStore:
                 result.budget_exhausted = True
                 break
             content_char_cap = min(
-                max(1, int(max_content_chars)),
+                content_scan_chars,
                 (
                     char_lengths[3]
                     if bounded_lengths[3] >= encoded_lengths[3]

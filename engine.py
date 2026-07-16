@@ -3989,6 +3989,8 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         # compares.  Charge every unmatched host row against that same budget
         # before normalization, redaction, placeholder recovery, tokenization,
         # or the writer transaction can materialize it.
+        resolved_suffix: list[Dict[str, Any]] = []
+        resolver_cache: dict[tuple[str, str], str] = {}
         for message in suffix:
             encoded_bytes = self._bounded_rollover_active_encoded_bytes(
                 message,
@@ -4005,8 +4007,74 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 serialized_bytes=encoded_bytes + 32,
                 label="rollover final tail",
             )
+            resolved = dict(message)
+            content = normalize_content_value(resolved.get("content")) or ""
+            stripped = content.strip()
+            ref = None
+            ingest_refs = extract_ingest_externalized_refs(stripped)
+            if (
+                len(ingest_refs) == 1
+                and stripped.startswith("[Externalized LCM ingest payload:")
+                and stripped.endswith("]")
+            ):
+                ref = ingest_refs[0]
+            elif is_externalized_placeholder(stripped):
+                ref = extract_externalized_ref(stripped)
+            if ref:
+                cache_key = ("externalized", ref)
+                resolved_content = resolver_cache.get(cache_key)
+                if resolved_content is None:
+                    payload = load_externalized_payload(
+                        ref,
+                        config=self._config,
+                        hermes_home=self._hermes_home,
+                        read_budget=read_budget,
+                        budget_label="rollover final tail externalized payload",
+                        max_nested_depth=_PUBLICATION_LOCKED_MAX_NESTED_DEPTH,
+                        max_nested_items=_PUBLICATION_LOCKED_MAX_NESTED_ITEMS,
+                    )
+                    if payload is None:
+                        raise RuntimeError(
+                            "rollover final tail externalized payload could not be resolved"
+                        )
+                    payload_session_id = str(payload.get("session_id") or "")
+                    if payload_session_id and payload_session_id != old_session_id:
+                        raise RuntimeError(
+                            "rollover final tail externalized payload crosses session boundary"
+                        )
+                    payload_content = payload.get("content")
+                    if not isinstance(payload_content, str):
+                        raise RuntimeError(
+                            "rollover final tail externalized payload has invalid content"
+                        )
+                    resolved_content = payload_content
+                    resolver_cache[cache_key] = resolved_content
+                content = resolved_content
+            if (
+                str(resolved.get("role") or "") == "tool"
+                and _is_hermes_persisted_output_marker(content)
+            ):
+                cache_key = ("persisted-output", content)
+                recovered = resolver_cache.get(cache_key)
+                if recovered is None:
+                    recovered_with_stat = recover_hermes_persisted_output_with_file_stat(
+                        content,
+                        read_budget=read_budget,
+                        budget_label="rollover final tail persisted-output file",
+                        max_nested_depth=_PUBLICATION_LOCKED_MAX_NESTED_DEPTH,
+                        max_nested_items=_PUBLICATION_LOCKED_MAX_NESTED_ITEMS,
+                    )
+                    if recovered_with_stat is None:
+                        raise RuntimeError(
+                            "rollover final tail persisted-output file could not be resolved"
+                        )
+                    recovered = recovered_with_stat[0]
+                    resolver_cache[cache_key] = recovered
+                content = recovered
+            resolved["content"] = content
+            resolved_suffix.append(resolved)
         protected = protect_messages_for_ingest(
-            suffix,
+            resolved_suffix,
             session_id=old_session_id,
             config=self._config,
             hermes_home=self._hermes_home,
@@ -6783,8 +6851,10 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         return {
             "rows": 0,
             "bytes": 0,
+            "files": 0,
             "max_rows": int(_PUBLICATION_LOCKED_MAX_ROWS),
             "max_bytes": int(_PUBLICATION_LOCKED_MAX_SERIALIZED_BYTES),
+            "max_files": int(_PUBLICATION_LOCKED_MAX_ROWS),
             "deadline_at": time.monotonic()
             + max(0.0, float(_PUBLICATION_LOCKED_DEADLINE_SECONDS)),
         }
