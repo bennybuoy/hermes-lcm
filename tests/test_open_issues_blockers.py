@@ -1337,7 +1337,7 @@ def test_externalized_marker_state_is_private_exact_and_cleaned(
             engine=engine,
         ))
         assert first["scan"]["continuations_pending"] == 1
-        state_files = list(state_dir.glob("*.sqlite3"))
+        state_files = list(state_dir.rglob("markers-*.sqlite3"))
         assert len(state_files) == 1
         assert not state_files[0].is_relative_to(payload_dir)
         assert state_files[0].resolve() != (tmp_path / "open-issues.db").resolve()
@@ -1368,12 +1368,12 @@ def test_externalized_marker_state_is_private_exact_and_cleaned(
         assert duplicate["results"] == []
         assert duplicate["diagnostics"] == [{"ref": ref, "error": "invalid_payload"}]
         assert not old_state.exists()
-        assert list(state_dir.glob("*.sqlite3")) == []
+        assert list(state_dir.rglob("markers-*.sqlite3")) == []
     finally:
         engine.shutdown()
 
 
-def test_externalized_marker_state_reaps_crash_orphans_and_shutdown_files(
+def test_externalized_marker_state_preserves_unprovable_files_and_cleans_own_state(
     tmp_path, monkeypatch
 ):
     state_dir = tmp_path / "marker-state"
@@ -1382,8 +1382,8 @@ def test_externalized_marker_state_reaps_crash_orphans_and_shutdown_files(
     stale.write_bytes(b"crashed")
     stale_journal = state_dir / "markers-dead-process.sqlite3-journal"
     stale_journal.write_bytes(b"partial")
-    fresh_dead = state_dir / "markers-99999999-fresh.sqlite3"
-    fresh_dead.write_bytes(b"fresh-crash")
+    unprovable = state_dir / "markers-99999999-fresh.sqlite3"
+    unprovable.write_bytes(b"unprovable-owner")
     old = time.time() - tools_module._EXTERNALIZED_MARKER_STATE_TTL_SECONDS - 2
     os.utime(stale, (old, old))
     os.utime(stale_journal, (old, old))
@@ -1394,15 +1394,17 @@ def test_externalized_marker_state_reaps_crash_orphans_and_shutdown_files(
     state = tools_module._ExternalizedMarkerIdentityStore()
     live = state.path
     assert live.exists()
-    assert not stale.exists()
-    assert not stale_journal.exists()
-    assert not fresh_dead.exists()
+    # Legacy/malformed files have no strong owner identity and lease. They are
+    # not proof of death, so the safe reaper leaves them alone.
+    assert stale.exists()
+    assert stale_journal.exists()
+    assert unprovable.exists()
     state.close()
     assert not live.exists()
-    assert list(state_dir.iterdir()) == []
+    assert stale.exists() and stale_journal.exists() and unprovable.exists()
 
 
-def test_externalized_marker_state_directory_enforces_count_bound(
+def test_externalized_marker_state_count_pressure_never_deletes_unprovable_owners(
     tmp_path, monkeypatch
 ):
     state_dir = tmp_path / "marker-state"
@@ -1420,10 +1422,10 @@ def test_externalized_marker_state_directory_enforces_count_bound(
 
     state = tools_module._ExternalizedMarkerIdentityStore()
     try:
-        assert len(list(state_dir.glob("*.sqlite3"))) <= (
-            tools_module._EXTERNALIZED_MARKER_STATE_MAX_ORPHANS
+        assert len(list(state_dir.glob("*.sqlite3"))) == (
+            tools_module._EXTERNALIZED_MARKER_STATE_MAX_ORPHANS + 8
         )
-        assert oldest is not None and not oldest.exists()
+        assert oldest is not None and oldest.exists()
     finally:
         state.close()
 

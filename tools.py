@@ -5,13 +5,13 @@ from __future__ import annotations
 import codecs
 import bisect
 import hashlib
-import heapq
 import json
 import logging
 import math
 import multiprocessing
 import os
 import re
+import secrets
 import sqlite3
 import stat
 import sys
@@ -818,16 +818,321 @@ _EXTERNALIZED_PERSISTED_OUTPUT_MARKER_KEYS = frozenset({
     "redacted_preview_sha256", "file_size", "file_mtime_ns", "file_ctime_ns",
 })
 
-_EXTERNALIZED_MARKER_STATE_ROOT = (
-    Path(tempfile.gettempdir())
-    / f"hermes-lcm-marker-state-{getattr(os, 'getuid', lambda: 0)()}"
-)
+_EXTERNALIZED_MARKER_STATE_ROOT: Path | None = None
 _EXTERNALIZED_MARKER_STATE_TTL_SECONDS = 10 * 60.0
 _EXTERNALIZED_MARKER_STATE_MAX_ORPHANS = 64
-_EXTERNALIZED_MARKER_STATE_BATCH_ITEMS = 512
-_EXTERNALIZED_MARKER_STATE_BATCH_BYTES = 128 * 1024
-_EXTERNALIZED_MARKER_STATE_CACHE_BYTES = 256 * 1024
+_EXTERNALIZED_MARKER_STATE_BATCH_ITEMS = 128
+_EXTERNALIZED_MARKER_STATE_BATCH_BYTES = 32 * 1024
+_EXTERNALIZED_MARKER_STATE_CACHE_BYTES = 64 * 1024
 _EXTERNALIZED_MARKER_STATE_GUARD = threading.Lock()
+_EXTERNALIZED_PRIVATE_STATE_SCANDIR = os.scandir
+
+
+class _ExternalizedStateUnavailable(OSError):
+    """Private continuation state cannot be created safely on this host."""
+
+
+def _externalized_process_start_identity(pid: int) -> str | None:
+    """Return Linux's non-recycled process start tick for ``pid`` when known."""
+    try:
+        raw = Path(f"/proc/{int(pid)}/stat").read_text(encoding="ascii")
+    except (OSError, ValueError):
+        return None
+    closing = raw.rfind(")")
+    if closing < 0:
+        return None
+    fields = raw[closing + 2:].split()
+    # The tail starts at field 3 (state); process starttime is field 22.
+    if len(fields) <= 19 or not fields[19].isdigit():
+        return None
+    return fields[19]
+
+
+def _externalized_owner_identity(name: str) -> tuple[int, str] | None:
+    match = re.fullmatch(r"owner-([0-9]+)-([0-9]+)-([0-9a-f]{32})", name)
+    if match is None:
+        return None
+    return int(match.group(1)), match.group(2)
+
+
+def _externalized_owner_provably_dead(name: str) -> bool:
+    identity = _externalized_owner_identity(name)
+    if identity is None:
+        return False
+    pid, recorded_start = identity
+    observed_start = _externalized_process_start_identity(pid)
+    if observed_start is not None:
+        return observed_start != recorded_start
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (OSError, PermissionError):
+        return False
+    return False
+
+
+def _externalized_try_lock_lease(path: Path) -> int | None:
+    """Acquire an orphan lease without following a hostile replacement."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Windows degrades without reaping
+        return None
+    flags = os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(descriptor)
+        return None
+    return descriptor
+
+
+def _externalized_lock_new_lease(path: Path) -> int:
+    try:
+        import fcntl
+    except ImportError as exc:  # pragma: no cover - no safe lease primitive
+        raise _ExternalizedStateUnavailable("file leases are unavailable") from exc
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _externalized_state_root_candidates() -> tuple[Path, ...]:
+    override = _EXTERNALIZED_MARKER_STATE_ROOT
+    if override is not None:
+        return (Path(override),)
+    bases: list[Path] = []
+    try:
+        bases.append(Path(tempfile.gettempdir()))
+    except (OSError, RuntimeError, FileNotFoundError):
+        pass
+    cache_home = os.environ.get("XDG_CACHE_HOME", "").strip()
+    if cache_home:
+        bases.append(Path(cache_home))
+    try:
+        bases.append(Path.home() / ".cache")
+    except (OSError, RuntimeError):
+        pass
+    suffix = f"hermes-lcm-private-state-{getattr(os, 'getuid', lambda: 0)()}"
+    unique: list[Path] = []
+    for base in bases:
+        candidate = base / suffix
+        if candidate not in unique:
+            unique.append(candidate)
+    return tuple(unique)
+
+
+def _externalized_reap_dead_owners(root: Path) -> None:
+    """Delete only owners proven dead *and* proven to have released the lease."""
+    try:
+        entries = _EXTERNALIZED_PRIVATE_STATE_SCANDIR(root)
+    except OSError:
+        return
+    with entries:
+        for entry in entries:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            if not _externalized_owner_provably_dead(entry.name):
+                # TTL and global-count pressure are intentionally irrelevant
+                # to a live or unprovable foreign owner.
+                continue
+            owner_dir = root / entry.name
+            lease_descriptor = _externalized_try_lock_lease(
+                owner_dir / "owner.lease"
+            )
+            if lease_descriptor is None:
+                continue
+            try:
+                _externalized_remove_private_tree(owner_dir)
+            except OSError:
+                logger.debug(
+                    "LCM could not reap dead private-state owner %s",
+                    owner_dir,
+                    exc_info=True,
+                )
+            finally:
+                os.close(lease_descriptor)
+
+
+def _externalized_remove_private_tree(path: Path) -> None:
+    """Remove one validated private owner without ambient ``os.scandir``."""
+    with _EXTERNALIZED_PRIVATE_STATE_SCANDIR(path) as entries:
+        for entry in entries:
+            child = path / entry.name
+            if entry.is_dir(follow_symlinks=False):
+                _externalized_remove_private_tree(child)
+            else:
+                child.unlink(missing_ok=True)
+    path.rmdir()
+
+
+def _prepare_externalized_marker_state_root() -> Path:
+    """Resolve and prepare the private root lazily, never during import."""
+    with _EXTERNALIZED_MARKER_STATE_GUARD:
+        last_error: BaseException | None = None
+        for root in _externalized_state_root_candidates():
+            try:
+                root.mkdir(mode=0o700, parents=True, exist_ok=True)
+                root_stat = root.lstat()
+                if not stat.S_ISDIR(root_stat.st_mode) or root.is_symlink():
+                    raise OSError("unsafe externalized private-state root")
+                getuid = getattr(os, "getuid", None)
+                if callable(getuid) and root_stat.st_uid != getuid():
+                    raise PermissionError("private-state root owner mismatch")
+                root.chmod(0o700)
+                _externalized_reap_dead_owners(root)
+                return root
+            except (OSError, RuntimeError) as exc:
+                last_error = exc
+        raise _ExternalizedStateUnavailable(
+            "no writable private temp/cache state root"
+        ) from last_error
+
+
+class _ExternalizedPrivateRuntimeState:
+    """Per-engine private disk owner, shutdown fence, and checkout registry."""
+
+    __slots__ = (
+        "lock", "closed", "generation", "active_checkouts", "owner_dir",
+        "lease_descriptor", "scheduler_connection",
+    )
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.closed = False
+        self.generation = 0
+        self.active_checkouts: dict[
+            int, tuple["_ExternalizedPayloadContinuation", int]
+        ] = {}
+        self.owner_dir: Path | None = None
+        self.lease_descriptor: int | None = None
+        self.scheduler_connection: sqlite3.Connection | None = None
+
+    def ensure_owner_dir(self) -> Path:
+        with self.lock:
+            if self.closed:
+                raise _ExternalizedStateUnavailable("private state is closed")
+            if self.owner_dir is not None:
+                return self.owner_dir
+            root = _prepare_externalized_marker_state_root()
+            # Linux start ticks disambiguate PID reuse. Other platforms retain
+            # the random 128-bit nonce plus held lease and conservatively reap
+            # only after the PID itself is certainly absent.
+            start = _externalized_process_start_identity(os.getpid()) or "0"
+            owner_dir = root / (
+                f"owner-{os.getpid()}-{start}-{secrets.token_hex(16)}"
+            )
+            owner_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
+            try:
+                lease_descriptor = _externalized_lock_new_lease(
+                    owner_dir / "owner.lease"
+                )
+            except BaseException:
+                try:
+                    _externalized_remove_private_tree(owner_dir)
+                except OSError:
+                    pass
+                raise
+            self.owner_dir = owner_dir
+            self.lease_descriptor = lease_descriptor
+            return owner_dir
+
+    def register_checkout(
+        self, continuation: "_ExternalizedPayloadContinuation"
+    ) -> int | None:
+        with self.lock:
+            if self.closed:
+                continuation.close()
+                return None
+            identity = id(continuation)
+            current = self.active_checkouts.get(identity)
+            count = current[1] + 1 if current is not None else 1
+            self.active_checkouts[identity] = (continuation, count)
+            return self.generation
+
+    def return_checkout(
+        self,
+        continuation: "_ExternalizedPayloadContinuation",
+        generation: int | None,
+    ) -> None:
+        close_owner = False
+        with self.lock:
+            identity = id(continuation)
+            current = self.active_checkouts.get(identity)
+            if current is not None:
+                if current[1] <= 1:
+                    self.active_checkouts.pop(identity, None)
+                else:
+                    self.active_checkouts[identity] = (
+                        current[0], current[1] - 1
+                    )
+            if self.closed or generation != self.generation:
+                continuation.close()
+            close_owner = self.closed and not self.active_checkouts
+        if close_owner:
+            self._close_owner()
+
+    def accepts_generation(self, generation: int | None) -> bool:
+        with self.lock:
+            return not self.closed and generation == self.generation
+
+    def close_for_shutdown(self) -> None:
+        scheduler: sqlite3.Connection | None
+        close_owner: bool
+        with self.lock:
+            if not self.closed:
+                self.closed = True
+                self.generation += 1
+            scheduler = self.scheduler_connection
+            self.scheduler_connection = None
+            close_owner = not self.active_checkouts
+        if scheduler is not None:
+            scheduler.close()
+        if close_owner:
+            self._close_owner()
+
+    def _close_owner(self) -> None:
+        with self.lock:
+            owner_dir = self.owner_dir
+            lease_descriptor = self.lease_descriptor
+            self.owner_dir = None
+            self.lease_descriptor = None
+        if owner_dir is not None:
+            try:
+                _externalized_remove_private_tree(owner_dir)
+            except OSError:
+                logger.debug(
+                    "LCM could not remove private-state owner %s",
+                    owner_dir,
+                    exc_info=True,
+                )
+        if lease_descriptor is not None:
+            try:
+                os.close(lease_descriptor)
+            except OSError:
+                pass
+
+
+def _externalized_runtime_state(engine: "LCMEngine") -> _ExternalizedPrivateRuntimeState:
+    with _EXTERNALIZED_CONTINUATION_STATE_GUARD:
+        state = getattr(engine, "_externalized_grep_runtime_state", None)
+        if not isinstance(state, _ExternalizedPrivateRuntimeState):
+            state = _ExternalizedPrivateRuntimeState()
+            setattr(engine, "_externalized_grep_runtime_state", state)
+    return state
 
 
 def _unlink_externalized_marker_state(path: Path) -> None:
@@ -848,78 +1153,6 @@ def _unlink_externalized_marker_state(path: Path) -> None:
             )
 
 
-def _externalized_marker_state_owner_alive(name: str) -> bool:
-    """Return false only when a parseable temp-state owner is certainly dead."""
-    try:
-        owner_pid = int(name.split("-", 2)[1])
-    except (IndexError, ValueError):
-        return True
-    if owner_pid == os.getpid():
-        return True
-    try:
-        os.kill(owner_pid, 0)
-    except ProcessLookupError:
-        return False
-    except (OSError, PermissionError):
-        return True
-    return True
-
-
-def _prepare_externalized_marker_state_root() -> Path:
-    """Create the private temp root and reap stale/crashed process state."""
-    root = Path(_EXTERNALIZED_MARKER_STATE_ROOT)
-    with _EXTERNALIZED_MARKER_STATE_GUARD:
-        try:
-            root.mkdir(mode=0o700, parents=True, exist_ok=False)
-        except FileExistsError:
-            pass
-        root_stat = root.lstat()
-        if not stat.S_ISDIR(root_stat.st_mode) or root.is_symlink():
-            raise OSError("unsafe externalized marker-state root")
-        getuid = getattr(os, "getuid", None)
-        if callable(getuid) and root_stat.st_uid != getuid():
-            raise PermissionError("externalized marker-state root owner mismatch")
-        try:
-            root.chmod(0o700)
-        except OSError:
-            pass
-        now = time.time()
-        candidates: list[tuple[float, str, Path]] = []
-        try:
-            entries = os.scandir(root)
-        except OSError:
-            entries = None
-        if entries is not None:
-            with entries:
-                for entry in entries:
-                    if not (
-                        entry.name.startswith("markers-")
-                        and entry.name.endswith(".sqlite3")
-                    ):
-                        continue
-                    path = root / entry.name
-                    if not _externalized_marker_state_owner_alive(entry.name):
-                        _unlink_externalized_marker_state(path)
-                        continue
-                    try:
-                        modified = entry.stat().st_mtime
-                    except OSError:
-                        _unlink_externalized_marker_state(path)
-                        continue
-                    if now - modified > _EXTERNALIZED_MARKER_STATE_TTL_SECONDS:
-                        _unlink_externalized_marker_state(path)
-                        continue
-                    heapq.heappush(candidates, (modified, entry.name, path))
-                    # Reserve one slot for the state file this preparation
-                    # immediately creates, keeping the directory at the cap.
-                    if len(candidates) >= _EXTERNALIZED_MARKER_STATE_MAX_ORPHANS:
-                        _oldest_modified, _oldest_name, oldest = heapq.heappop(
-                            candidates
-                        )
-                        _unlink_externalized_marker_state(oldest)
-    return root
-
-
 def _externalized_marker_identity_bytes(identity: tuple[Any, ...]) -> bytes:
     """Return the exact canonical marker identity stored in the UNIQUE index."""
     return json.dumps(
@@ -935,12 +1168,20 @@ class _ExternalizedMarkerIdentityStore:
     __slots__ = (
         "path", "connection", "pending", "pending_set", "pending_bytes",
         "deadline", "deadline_error", "closed", "stat_identity",
+        "runtime_state", "owns_runtime_state",
     )
 
-    def __init__(self, *, stat_identity: tuple[int, ...] = ()):
-        root = _prepare_externalized_marker_state_root()
+    def __init__(
+        self,
+        *,
+        stat_identity: tuple[int, ...] = (),
+        runtime_state: _ExternalizedPrivateRuntimeState | None = None,
+    ):
+        self.runtime_state = runtime_state or _ExternalizedPrivateRuntimeState()
+        self.owns_runtime_state = runtime_state is None
+        root = self.runtime_state.ensure_owner_dir()
         descriptor, raw_path = tempfile.mkstemp(
-            prefix=f"markers-{os.getpid()}-",
+            prefix="markers-",
             suffix=".sqlite3",
             dir=root,
         )
@@ -963,6 +1204,7 @@ class _ExternalizedMarkerIdentityStore:
                 str(self.path),
                 timeout=0.05,
                 check_same_thread=False,
+                cached_statements=4,
             )
             # The index is disposable continuation state, never authoritative
             # data. Avoid durable-journal I/O; process death reaps/culls it.
@@ -970,6 +1212,7 @@ class _ExternalizedMarkerIdentityStore:
             self.connection.execute("PRAGMA synchronous=OFF")
             self.connection.execute("PRAGMA temp_store=FILE")
             self.connection.execute("PRAGMA mmap_size=0")
+            self.connection.execute("PRAGMA cache_spill=OFF")
             self.connection.execute(
                 f"PRAGMA cache_size=-{_EXTERNALIZED_MARKER_STATE_CACHE_BYTES // 1024}"
             )
@@ -1046,12 +1289,13 @@ class _ExternalizedMarkerIdentityStore:
             self.pending_set.clear()
             self.pending_bytes = 0
             _unlink_externalized_marker_state(self.path)
+            if self.owns_runtime_state:
+                self.runtime_state.close_for_shutdown()
 
     def retained_bytes(self) -> int:
-        return (
-            _externalized_python_retained_bytes(self)
-            + _EXTERNALIZED_MARKER_STATE_CACHE_BYTES
-        )
+        # Native SQLite allocation is verified by subprocess RSS regressions;
+        # do not present a pager target as if it were measured native memory.
+        return _externalized_python_retained_bytes(self)
 
     def __del__(self):  # pragma: no cover - best-effort interpreter cleanup
         try:
@@ -1077,13 +1321,19 @@ class _ExternalizedSuffixBudgetExceeded(Exception):
 class _ExternalizedSuffixOperationBudget:
     """Shared diagnostic/CPU accounting bounded by the operation byte cap."""
 
-    __slots__ = ("max_markers", "markers")
+    __slots__ = ("max_markers", "markers", "runtime_state")
 
-    def __init__(self, max_markers: int | None = None):
+    def __init__(
+        self,
+        max_markers: int | None = None,
+        *,
+        runtime_state: _ExternalizedPrivateRuntimeState | None = None,
+    ):
         self.max_markers = (
             None if max_markers is None else max(0, int(max_markers))
         )
         self.markers = 0
+        self.runtime_state = runtime_state
 
     def charge(self, count: int = 1) -> None:
         count = max(0, int(count))
@@ -1646,7 +1896,8 @@ class _ExternalizedSuffixParser:
                 self.operation_budget.charge()
                 if self.marker_store is None:
                     self.marker_store = _ExternalizedMarkerIdentityStore(
-                        stat_identity=self.stat_identity
+                        stat_identity=self.stat_identity,
+                        runtime_state=self.operation_budget.runtime_state,
                     )
                     self.marker_store.configure_deadline(
                         self.deadline, self.deadline_error
@@ -2064,27 +2315,272 @@ _EXTERNALIZED_CONTINUATION_TTL_SECONDS = 5 * 60.0
 _EXTERNALIZED_CONTINUATION_STATE_GUARD = threading.Lock()
 _EXTERNALIZED_SCHEDULER_MAX_QUERIES = 8
 _EXTERNALIZED_SCHEDULER_TTL_SECONDS = 5 * 60.0
+_EXTERNALIZED_SCHEDULER_FAIRNESS_SECONDS = 15.0
+_EXTERNALIZED_SCHEDULER_MAX_DISK_QUERIES = 128
+_EXTERNALIZED_SCHEDULER_MAX_BYTES = 1024 * 1024
 
 
 class _ExternalizedDiscoveryScheduler:
     """Bounded deterministic cursor for one root and no-ref search shape."""
 
     __slots__ = (
-        "root_identity", "refs", "cursor", "active_ref", "cached_at",
+        "key", "root_identity", "listing_identity", "refs", "cursor",
+        "active_ref", "cached_at", "updated_wall", "blocked",
     )
 
     def __init__(
         self,
         *,
+        key: str = "",
         root_identity: tuple[int, ...],
         refs: tuple[str, ...],
         cached_at: float,
+        listing_identity: str = "",
+        cursor: int = 0,
+        active_ref: str | None = None,
+        updated_wall: float | None = None,
     ):
+        self.key = key
         self.root_identity = root_identity
+        self.listing_identity = listing_identity
         self.refs = refs
-        self.cursor = 0
-        self.active_ref: str | None = None
+        self.cursor = max(0, min(int(cursor), len(refs)))
+        self.active_ref = active_ref if active_ref in refs else None
         self.cached_at = cached_at
+        self.updated_wall = time.time() if updated_wall is None else updated_wall
+        self.blocked = False
+
+
+def _externalized_scheduler_listing_identity(refs: tuple[str, ...]) -> str:
+    digest = hashlib.sha256()
+    for ref in refs:
+        digest.update(ref.encode("utf-8", errors="surrogatepass"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _externalized_scheduler_connection(
+    runtime: _ExternalizedPrivateRuntimeState,
+) -> sqlite3.Connection | None:
+    """Open the disposable scheduler DB, degrading to memory when unavailable."""
+    with runtime.lock:
+        if runtime.closed:
+            return None
+        if runtime.scheduler_connection is not None:
+            return runtime.scheduler_connection
+        try:
+            owner_dir = runtime.ensure_owner_dir()
+            path = owner_dir / "scheduler.sqlite3"
+            connection = sqlite3.connect(
+                str(path),
+                timeout=0.05,
+                check_same_thread=False,
+                cached_statements=4,
+            )
+            connection.execute("PRAGMA page_size=4096")
+            connection.execute("PRAGMA auto_vacuum=FULL")
+            connection.execute("PRAGMA journal_mode=OFF")
+            connection.execute("PRAGMA synchronous=OFF")
+            connection.execute("PRAGMA temp_store=FILE")
+            connection.execute("PRAGMA mmap_size=0")
+            connection.execute("PRAGMA cache_spill=OFF")
+            connection.execute("PRAGMA cache_size=-64")
+            connection.execute(
+                f"PRAGMA max_page_count={_EXTERNALIZED_SCHEDULER_MAX_BYTES // 4096}"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS scheduler_cursors ("
+                "shape_key TEXT PRIMARY KEY, root_identity TEXT NOT NULL, "
+                "listing_identity TEXT NOT NULL, cursor INTEGER NOT NULL, "
+                "active_ref TEXT, updated_wall REAL NOT NULL) WITHOUT ROWID"
+            )
+            connection.commit()
+        except (OSError, sqlite3.Error, _ExternalizedStateUnavailable):
+            try:
+                connection.close()  # type: ignore[possibly-undefined]
+            except (NameError, sqlite3.Error):
+                pass
+            logger.debug(
+                "LCM scheduler private disk state is unavailable",
+                exc_info=True,
+            )
+            return None
+        runtime.scheduler_connection = connection
+        return connection
+
+
+def _externalized_scheduler_cleanup_disk_locked(
+    connection: sqlite3.Connection,
+    *,
+    protected_keys: frozenset[str],
+) -> None:
+    cutoff = time.time() - _EXTERNALIZED_SCHEDULER_TTL_SECONDS
+    if protected_keys:
+        placeholders = ",".join("?" for _ in protected_keys)
+        connection.execute(
+            "DELETE FROM scheduler_cursors WHERE updated_wall < ? "
+            f"AND shape_key NOT IN ({placeholders})",
+            (cutoff, *sorted(protected_keys)),
+        )
+    else:
+        connection.execute(
+            "DELETE FROM scheduler_cursors WHERE updated_wall < ?", (cutoff,)
+        )
+    connection.commit()
+
+
+def _externalized_scheduler_persist_locked(
+    runtime: _ExternalizedPrivateRuntimeState,
+    state: _ExternalizedDiscoveryScheduler,
+    *,
+    protected_keys: frozenset[str],
+) -> None:
+    connection = _externalized_scheduler_connection(runtime)
+    if connection is None:
+        return
+    try:
+        _externalized_scheduler_cleanup_disk_locked(
+            connection, protected_keys=protected_keys
+        )
+        exists = connection.execute(
+            "SELECT 1 FROM scheduler_cursors WHERE shape_key = ?", (state.key,)
+        ).fetchone()
+        if exists is None:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM scheduler_cursors"
+            ).fetchone()[0]
+            # Never evict a non-expired/live shape to make room. A new shape
+            # beyond the cap simply uses the already-bounded memory scheduler.
+            if int(count) >= _EXTERNALIZED_SCHEDULER_MAX_DISK_QUERIES:
+                return
+        state.updated_wall = time.time()
+        connection.execute(
+            "INSERT INTO scheduler_cursors("
+            "shape_key, root_identity, listing_identity, cursor, active_ref, updated_wall"
+            ") VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(shape_key) DO UPDATE SET "
+            "root_identity=excluded.root_identity, "
+            "listing_identity=excluded.listing_identity, cursor=excluded.cursor, "
+            "active_ref=excluded.active_ref, updated_wall=excluded.updated_wall",
+            (
+                state.key,
+                json.dumps(state.root_identity, separators=(",", ":")),
+                state.listing_identity,
+                state.cursor,
+                state.active_ref,
+                state.updated_wall,
+            ),
+        )
+        connection.commit()
+    except sqlite3.Error:
+        logger.debug("LCM could not persist scheduler cursor", exc_info=True)
+
+
+def _externalized_scheduler_load_locked(
+    runtime: _ExternalizedPrivateRuntimeState,
+    *,
+    key: str,
+    root_identity: tuple[int, ...],
+    listing_identity: str,
+    refs: tuple[str, ...],
+    now: float,
+) -> _ExternalizedDiscoveryScheduler | None:
+    connection = _externalized_scheduler_connection(runtime)
+    if connection is None:
+        return None
+    try:
+        row = connection.execute(
+            "SELECT root_identity, listing_identity, cursor, active_ref, updated_wall "
+            "FROM scheduler_cursors WHERE shape_key = ?",
+            (key,),
+        ).fetchone()
+    except sqlite3.Error:
+        logger.debug("LCM could not load scheduler cursor", exc_info=True)
+        return None
+    if row is None:
+        return None
+    try:
+        stored_root = tuple(int(item) for item in json.loads(row[0]))
+        updated_wall = float(row[4])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        stored_root != root_identity
+        or str(row[1]) != listing_identity
+        or time.time() - updated_wall > _EXTERNALIZED_SCHEDULER_TTL_SECONDS
+    ):
+        try:
+            connection.execute(
+                "DELETE FROM scheduler_cursors WHERE shape_key = ?", (key,)
+            )
+            connection.commit()
+        except sqlite3.Error:
+            pass
+        return None
+    return _ExternalizedDiscoveryScheduler(
+        key=key,
+        root_identity=root_identity,
+        listing_identity=listing_identity,
+        refs=refs,
+        cursor=int(row[2]),
+        active_ref=row[3] if isinstance(row[3], str) else None,
+        cached_at=now,
+        updated_wall=updated_wall,
+    )
+
+
+def _externalized_scheduler_min_live_cursor_locked(
+    runtime: _ExternalizedPrivateRuntimeState,
+    state: _ExternalizedDiscoveryScheduler,
+) -> tuple[int, int]:
+    connection = _externalized_scheduler_connection(runtime)
+    if connection is None:
+        return state.cursor, 1
+    try:
+        row = connection.execute(
+            "SELECT MIN(cursor), COUNT(*) FROM scheduler_cursors "
+            "WHERE root_identity = ? AND listing_identity = ? AND updated_wall >= ?",
+            (
+                json.dumps(state.root_identity, separators=(",", ":")),
+                state.listing_identity,
+                time.time() - _EXTERNALIZED_SCHEDULER_FAIRNESS_SECONDS,
+            ),
+        ).fetchone()
+    except sqlite3.Error:
+        return state.cursor, 1
+    if row is None or row[0] is None:
+        return state.cursor, 1
+    return int(row[0]), int(row[1])
+
+
+def _externalized_scheduler_ref_still_live_locked(
+    engine: "LCMEngine",
+    state: _ExternalizedDiscoveryScheduler,
+    ref: str,
+) -> bool:
+    runtime = _externalized_runtime_state(engine)
+    connection = _externalized_scheduler_connection(runtime)
+    if connection is None:
+        return False
+    try:
+        ref_index = state.refs.index(ref)
+    except ValueError:
+        return False
+    try:
+        row = connection.execute(
+            "SELECT 1 FROM scheduler_cursors WHERE root_identity = ? "
+            "AND listing_identity = ? AND updated_wall >= ? "
+            "AND (cursor <= ? OR active_ref = ?) LIMIT 1",
+            (
+                json.dumps(state.root_identity, separators=(",", ":")),
+                state.listing_identity,
+                time.time() - _EXTERNALIZED_SCHEDULER_FAIRNESS_SECONDS,
+                ref_index,
+                ref,
+            ),
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    return row is not None
 
 
 def _externalized_python_retained_bytes(
@@ -2121,25 +2617,6 @@ def _externalized_python_retained_bytes(
     if hasattr(value, "__dict__"):
         size += _externalized_python_retained_bytes(vars(value), seen)
     return size
-
-
-def _externalized_marker_native_cache_bytes(value: Any) -> int:
-    stores: list[_ExternalizedMarkerIdentityStore] = []
-    if isinstance(value, _ExternalizedSuffixParser):
-        if value.marker_store is not None:
-            stores.append(value.marker_store)
-    elif isinstance(value, _ExternalizedContentContinuation):
-        if value.suffix_parser.marker_store is not None:
-            stores.append(value.suffix_parser.marker_store)
-    elif isinstance(value, _ExternalizedPayloadContinuation):
-        if value.prefix_parser.marker_store is not None:
-            stores.append(value.prefix_parser.marker_store)
-        if (
-            value.content_state is not None
-            and value.content_state.suffix_parser.marker_store is not None
-        ):
-            stores.append(value.content_state.suffix_parser.marker_store)
-    return len({id(store) for store in stores}) * _EXTERNALIZED_MARKER_STATE_CACHE_BYTES
 
 
 class _ExternalizedContentContinuation:
@@ -2290,10 +2767,7 @@ class _ExternalizedContentContinuation:
         return "".join(self.pieces)
 
     def retained_bytes(self) -> int:
-        return (
-            _externalized_python_retained_bytes(self)
-            + _externalized_marker_native_cache_bytes(self)
-        )
+        return _externalized_python_retained_bytes(self)
 
     def close(self) -> None:
         self.suffix_parser.close()
@@ -2488,10 +2962,7 @@ class _ExternalizedPayloadContinuation:
         return True
 
     def retained_bytes(self) -> int:
-        return (
-            _externalized_python_retained_bytes(self)
-            + _externalized_marker_native_cache_bytes(self)
-        )
+        return _externalized_python_retained_bytes(self)
 
     def close(self) -> None:
         self.prefix_parser.close()
@@ -2502,18 +2973,13 @@ class _ExternalizedPayloadContinuation:
 def _externalized_continuation_cache(
     engine: "LCMEngine",
 ) -> dict[str, _ExternalizedPayloadContinuation]:
+    runtime = _externalized_runtime_state(engine)
     with _EXTERNALIZED_CONTINUATION_STATE_GUARD:
         cache = getattr(engine, "_externalized_grep_continuations", None)
         if not isinstance(cache, dict):
             cache = {}
             setattr(engine, "_externalized_grep_continuations", cache)
-        lock = getattr(engine, "_externalized_grep_continuations_lock", None)
-        if not hasattr(lock, "acquire") or not hasattr(lock, "release"):
-            setattr(
-                engine,
-                "_externalized_grep_continuations_lock",
-                threading.RLock(),
-            )
+        setattr(engine, "_externalized_grep_continuations_lock", runtime.lock)
     return cache
 
 
@@ -2599,6 +3065,7 @@ def _checkout_externalized_scheduler(
     refs: tuple[str, ...],
 ) -> _ExternalizedDiscoveryScheduler:
     cache = _externalized_scheduler_cache(engine)
+    runtime = _externalized_runtime_state(engine)
     with _externalized_continuation_lock(engine):
         now = time.monotonic()
         for stale_key in [
@@ -2609,22 +3076,47 @@ def _checkout_externalized_scheduler(
         ]:
             cache.pop(stale_key, None)
         state = cache.get(key)
+        listing_identity = _externalized_scheduler_listing_identity(refs)
         if not (
             isinstance(state, _ExternalizedDiscoveryScheduler)
             and state.root_identity == root_identity
             and state.refs == refs
+            and state.listing_identity == listing_identity
         ):
-            state = _ExternalizedDiscoveryScheduler(
+            state = _externalized_scheduler_load_locked(
+                runtime,
+                key=key,
                 root_identity=root_identity,
+                listing_identity=listing_identity,
                 refs=refs,
-                cached_at=now,
+                now=now,
             )
+            if state is None:
+                state = _ExternalizedDiscoveryScheduler(
+                    key=key,
+                    root_identity=root_identity,
+                    listing_identity=listing_identity,
+                    refs=refs,
+                    cached_at=now,
+                )
             cache.pop(key, None)
             cache[key] = state
         elif state.cursor >= len(state.refs) and state.active_ref is None:
             # A fully acknowledged sweep starts a fresh deterministic cycle.
             state.cursor = 0
         state.cached_at = now
+        _externalized_scheduler_persist_locked(
+            runtime,
+            state,
+            protected_keys=frozenset(cache),
+        )
+        minimum_live_cursor, live_shape_count = (
+            _externalized_scheduler_min_live_cursor_locked(runtime, state)
+        )
+        state.blocked = (
+            live_shape_count > _EXTERNALIZED_CONTINUATION_MAX_FILES
+            and state.cursor > minimum_live_cursor
+        )
         while len(cache) > _EXTERNALIZED_SCHEDULER_MAX_QUERIES:
             cache.pop(next(iter(cache)), None)
         return state
@@ -2637,10 +3129,17 @@ def _externalized_scheduler_mark_active(
     ref: str,
 ) -> None:
     cache = _externalized_scheduler_cache(engine)
+    runtime = _externalized_runtime_state(engine)
     with _externalized_continuation_lock(engine):
-        if cache.get(key) is state:
-            state.active_ref = ref
-            state.cached_at = time.monotonic()
+        if runtime.closed or state.key != key or ref not in state.refs:
+            return
+        state.active_ref = ref
+        state.cached_at = time.monotonic()
+        _externalized_scheduler_persist_locked(
+            runtime,
+            state,
+            protected_keys=frozenset(cache) | {key},
+        )
 
 
 def _externalized_scheduler_advance(
@@ -2650,8 +3149,9 @@ def _externalized_scheduler_advance(
     ref: str,
 ) -> None:
     cache = _externalized_scheduler_cache(engine)
+    runtime = _externalized_runtime_state(engine)
     with _externalized_continuation_lock(engine):
-        if cache.get(key) is not state:
+        if runtime.closed or state.key != key:
             return
         try:
             index = state.refs.index(ref, state.cursor)
@@ -2661,6 +3161,11 @@ def _externalized_scheduler_advance(
         if state.active_ref == ref:
             state.active_ref = None
         state.cached_at = time.monotonic()
+        _externalized_scheduler_persist_locked(
+            runtime,
+            state,
+            protected_keys=frozenset(cache) | {key},
+        )
 
 
 def _prune_externalized_continuations_locked(
@@ -2729,9 +3234,18 @@ def _store_externalized_continuation(
     engine: "LCMEngine",
     key: str,
     continuation: _ExternalizedPayloadContinuation,
-) -> None:
+    *,
+    expected_generation: int | None = None,
+) -> bool:
     cache = _externalized_continuation_cache(engine)
+    runtime = _externalized_runtime_state(engine)
     with _externalized_continuation_lock(engine):
+        if runtime.closed or (
+            expected_generation is not None
+            and expected_generation != runtime.generation
+        ):
+            continuation.close()
+            return False
         now = time.monotonic()
         _prune_externalized_continuations_locked(cache, now=now)
         existing = cache.get(key)
@@ -2763,6 +3277,7 @@ def _store_externalized_continuation(
             evicted = cache.pop(next(iter(cache)))
             if isinstance(evicted, _ExternalizedPayloadContinuation):
                 evicted.close()
+        return True
 
 
 def _delete_externalized_continuation(
@@ -2823,6 +3338,7 @@ def _externalized_continuation_stats(
 
 def _cleanup_externalized_runtime_state(engine: "LCMEngine") -> None:
     """Release private parser files and bounded discovery state on shutdown."""
+    runtime = _externalized_runtime_state(engine)
     cache = getattr(engine, "_externalized_grep_continuations", None)
     if not isinstance(cache, dict):
         cache = {}
@@ -2831,7 +3347,12 @@ def _cleanup_externalized_runtime_state(engine: "LCMEngine") -> None:
         context = lock
     else:
         context = _externalized_continuation_lock(engine)
+    scheduler_connection: sqlite3.Connection | None = None
+    close_owner = False
     with context:
+        if not runtime.closed:
+            runtime.closed = True
+            runtime.generation += 1
         for continuation in tuple(cache.values()):
             if isinstance(continuation, _ExternalizedPayloadContinuation):
                 continuation.close()
@@ -2839,6 +3360,13 @@ def _cleanup_externalized_runtime_state(engine: "LCMEngine") -> None:
         schedulers = getattr(engine, "_externalized_grep_schedulers", None)
         if isinstance(schedulers, dict):
             schedulers.clear()
+        scheduler_connection = runtime.scheduler_connection
+        runtime.scheduler_connection = None
+        close_owner = not runtime.active_checkouts
+    if scheduler_connection is not None:
+        scheduler_connection.close()
+    if close_owner:
+        runtime._close_owner()
 
 
 class _ExternalizedContinuationCompletion:
@@ -2872,15 +3400,23 @@ class _ExternalizedContinuationCompletion:
             and self.scheduler is not None
             and self.scheduler_ref is not None
         ):
-            _delete_externalized_continuation(
-                self.engine, self.key, self.continuation
-            )
             _externalized_scheduler_advance(
                 self.engine,
                 self.scheduler_key,
                 self.scheduler,
                 self.scheduler_ref,
             )
+            with _externalized_continuation_lock(self.engine):
+                if _externalized_scheduler_ref_still_live_locked(
+                    self.engine, self.scheduler, self.scheduler_ref
+                ):
+                    _touch_externalized_continuation(
+                        self.engine, self.key, self.continuation
+                    )
+                else:
+                    _delete_externalized_continuation(
+                        self.engine, self.key, self.continuation
+                    )
         else:
             _touch_externalized_continuation(
                 self.engine, self.key, self.continuation
@@ -2908,6 +3444,7 @@ def _search_externalized_payloads(
         _ExternalizedContinuationCompletion
     ] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, Any]]:
+    runtime_state = _externalized_runtime_state(engine)
     diagnostics: list[dict[str, str]] = []
     hits: list[dict[str, Any]] = []
     files_scanned = 0
@@ -2923,7 +3460,8 @@ def _search_externalized_payloads(
     # so CPU/allocation per call stays bounded without imposing a lifetime
     # marker-count limit on historical writer output.
     suffix_operation_budget = _ExternalizedSuffixOperationBudget(
-        max_markers=effective_total_bytes + 1
+        max_markers=effective_total_bytes + 1,
+        runtime_state=runtime_state,
     )
     try:
         root = get_large_output_storage_dir(
@@ -3026,7 +3564,8 @@ def _search_externalized_payloads(
                 start_index = scheduler.refs.index(scheduler.active_ref)
             except ValueError:
                 scheduler.active_ref = None
-        paths.extend(root / item for item in scheduler.refs[start_index:])
+        if not scheduler.blocked:
+            paths.extend(root / item for item in scheduler.refs[start_index:])
 
     for path_index, path in enumerate(paths):
         if deadline is not None and time.monotonic() >= deadline:
@@ -3062,6 +3601,8 @@ def _search_externalized_payloads(
         continuation_key = str(resolved)
         continuation: _ExternalizedPayloadContinuation | None = None
         completion: _ExternalizedContinuationCompletion | None = None
+        checkout_generation: int | None = None
+        checkout_registered = False
         try:
             with resolved.open("rb") as raw_handle:
                 opened_stat = os.fstat(raw_handle.fileno())
@@ -3094,6 +3635,12 @@ def _search_externalized_payloads(
                         max_payload_chars=max_payload_chars,
                         operation_budget=suffix_operation_budget,
                     )
+                checkout_generation = runtime_state.register_checkout(continuation)
+                if checkout_generation is None:
+                    raise _ExternalizedStateUnavailable(
+                        "externalized runtime state is closed"
+                    )
+                checkout_registered = True
                 completed = continuation.resume(
                     raw_handle,
                     file_size=int(opened_stat.st_size),
@@ -3108,6 +3655,7 @@ def _search_externalized_payloads(
                             engine,
                             continuation_key,
                             continuation,
+                            expected_generation=checkout_generation,
                         )
                     payload_session_id = continuation.prefix_parser.fields.get(
                         "session_id"
@@ -3189,6 +3737,7 @@ def _search_externalized_payloads(
                     engine,
                     continuation_key,
                     continuation,
+                    expected_generation=checkout_generation,
                 )
                 completion = _ExternalizedContinuationCompletion(
                     engine,
@@ -3205,6 +3754,7 @@ def _search_externalized_payloads(
                     engine,
                     continuation_key,
                     continuation,
+                    expected_generation=checkout_generation,
                 )
             diagnostics.append({
                 "ref": path.name,
@@ -3249,6 +3799,11 @@ def _search_externalized_payloads(
                     engine, scheduler_key, scheduler, path.name
                 )
             continue
+        finally:
+            if checkout_registered and continuation is not None:
+                runtime_state.return_checkout(
+                    continuation, checkout_generation
+                )
         files_scanned += 1
         if regex_mode:
             remaining_regex_time = regex_deadline - time.monotonic()
