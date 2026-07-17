@@ -31,7 +31,7 @@ class SQLiteStartupBusyError(RuntimeError):
     """Raised when bounded SQLite startup lock waiting is exhausted."""
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 SQLITE_STARTUP_BACKOFF_INITIAL_SECONDS = 0.01
 SQLITE_STARTUP_BACKOFF_MAX_SECONDS = 0.25
@@ -285,6 +285,8 @@ def ensure_lifecycle_state_table(conn: sqlite3.Connection) -> None:
             last_maintenance_attempt_at REAL,
             last_rollover_at REAL,
             last_reset_at REAL,
+            rollover_carry_over_context INTEGER
+                CHECK (rollover_carry_over_context IN (0, 1)),
             updated_at REAL NOT NULL DEFAULT (strftime('%s','now'))
         )
         """
@@ -325,6 +327,11 @@ def ensure_lifecycle_state_columns(conn: sqlite3.Connection) -> None:
     add_column_if_missing(
         conn, columns, "last_reset_at",
         "ALTER TABLE lcm_lifecycle_state ADD COLUMN last_reset_at REAL",
+    )
+    add_column_if_missing(
+        conn, columns, "rollover_carry_over_context",
+        "ALTER TABLE lcm_lifecycle_state ADD COLUMN rollover_carry_over_context INTEGER "
+        "CHECK (rollover_carry_over_context IN (0, 1))",
     )
 
 
@@ -1177,9 +1184,13 @@ def run_versioned_migrations(
             mark_migration_step_complete(conn, "v9_content_scan_checkpoints")
             current_version = 9
 
+        if current_version < 10:
+            mark_migration_step_complete(conn, "v10_rollover_carry_policy")
+            current_version = 10
+
         # Startup FTS inspection, repair, rebuild, and trigger installation are
         # part of the same cross-connection writer transaction as schema
-        # migration.  A concurrent opener therefore cannot observe v9, release
+        # migration.  A concurrent opener therefore cannot observe v10, release
         # the migration lock, and race this connection's drop/create sequence.
         for spec in fts_specs:
             repair_external_content_fts(

@@ -14,6 +14,7 @@ import re
 import sqlite3
 import threading
 import time
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -3129,6 +3130,131 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             return None
 
     @staticmethod
+    def _ordered_unmatched_retained_indices(
+        host_identities: Sequence[Any],
+        durable_identities: Sequence[Any],
+    ) -> list[int]:
+        """Return host occurrences not represented by one ordered durable match.
+
+        Durable occurrence positions are queued once, then consumed while the
+        host sequence is scanned from left to right.  This recognizes shared
+        suffixes after divergent branches, preserves repeated-value
+        multiplicity, and stays O(host + durable) in time and space.
+        """
+        positions: dict[Any, deque[int]] = defaultdict(deque)
+        for durable_index, identity in enumerate(durable_identities):
+            positions[identity].append(durable_index)
+
+        unmatched: list[int] = []
+        last_position = -1
+        for host_index, identity in enumerate(host_identities):
+            candidates = positions.get(identity)
+            if candidates is not None:
+                while candidates and candidates[0] <= last_position:
+                    candidates.popleft()
+            if candidates:
+                last_position = candidates.popleft()
+            else:
+                unmatched.append(host_index)
+        return unmatched
+
+    def _session_end_store_retained_identities(
+        self,
+        session_id: str,
+        *,
+        conversation_id: str,
+        read_budget: dict[str, float | int],
+        conn: sqlite3.Connection,
+    ) -> list[tuple[str, str, str, str, str]]:
+        """Read one bounded, ignore-normalized durable retained sequence."""
+        identities: list[tuple[str, str, str, str, str]] = []
+        last_store_id = 0
+        fields = ("role", "content", "tool_call_id", "tool_name", "tool_calls")
+        field_limit = min(
+            _PUBLICATION_LOCKED_MAX_FIELD_BYTES,
+            int(read_budget["max_bytes"]),
+        )
+        while True:
+            if time.monotonic() >= float(read_budget["deadline_at"]):
+                raise RuntimeError("rollover sequence deadline exceeded")
+            remaining_rows = int(read_budget["max_rows"]) - int(read_budget["rows"])
+            remaining_bytes = int(read_budget["max_bytes"]) - int(read_budget["bytes"])
+            if remaining_rows <= 0:
+                raise RuntimeError("rollover sequence row bound exceeded")
+            if remaining_bytes <= 64:
+                raise RuntimeError("rollover sequence serialized byte bound exceeded")
+            max_row_bytes = min(
+                int(read_budget["max_bytes"]),
+                (len(fields) * field_limit) + 64,
+            )
+            byte_sized_rows = max(1, remaining_bytes // max(1, max_row_bytes))
+            page_limit = min(
+                _PUBLICATION_LOCKED_QUERY_BATCH,
+                remaining_rows + 1,
+                byte_sized_rows,
+            )
+            row_payload_cap = max(0, remaining_bytes // max(1, page_limit) - 64)
+            lengths = [f"COALESCE(length(CAST({field} AS BLOB)), 0)" for field in fields]
+            total_length = " + ".join(lengths)
+            guard = " AND ".join(
+                [f"({total_length}) <= ?"]
+                + [f"{length} <= ?" for length in lengths]
+            )
+            bounded = [
+                f"CASE WHEN {guard} THEN "
+                f"CASE WHEN {field} IS NULL THEN NULL ELSE "
+                f"substr(CAST({field} AS TEXT), 1, {field_limit + 1}) END "
+                "ELSE NULL END"
+                for field in fields
+            ]
+            guard_params = (row_payload_cap, *(field_limit for _ in fields))
+            rows = conn.execute(
+                f"""SELECT store_id, {', '.join(bounded)}, {', '.join(lengths)}
+                    FROM messages
+                    WHERE session_id = ? AND conversation_id = ? AND store_id > ?
+                    ORDER BY store_id LIMIT ?""",
+                [
+                    *(guard_params * len(fields)),
+                    session_id,
+                    conversation_id,
+                    last_store_id,
+                    page_limit,
+                ],
+            ).fetchall()
+            if not rows:
+                return identities
+            for row in rows:
+                row_lengths = [int(value or 0) for value in row[6:11]]
+                row_bytes = sum(row_lengths)
+                if row_bytes > row_payload_cap or any(
+                    length > field_limit for length in row_lengths
+                ):
+                    raise RuntimeError("rollover sequence serialized byte bound exceeded")
+                self._charge_locked_publication_read(
+                    read_budget,
+                    rows=1,
+                    serialized_bytes=row_bytes + 64,
+                    label="rollover sequence",
+                )
+                last_store_id = int(row[0])
+                stored_message = dict(zip(fields, row[1:6]))
+                if self._matches_ignore_message_patterns(
+                    stored_message,
+                    stored_row=True,
+                    read_budget=read_budget,
+                ):
+                    continue
+                identities.append(
+                    self._session_end_prefix_compare_identity(
+                        stored_message,
+                        session_id=session_id,
+                        read_budget=read_budget,
+                    )
+                )
+            if len(rows) < page_limit:
+                return identities
+
+    @staticmethod
     def _lcm_bypass_message_fingerprint(message: Dict[str, Any]) -> str:
         tool_calls = message.get("tool_calls")
         if tool_calls is None or tool_calls == [] or tool_calls == {}:
@@ -3291,7 +3417,9 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         if not session_id or not messages:
             return []
         kept: list[tuple[int, Dict[str, Any]]] = []
-        for host_index, msg in enumerate(messages[int(prefix_count):], start=int(prefix_count)):
+        # Reconcile the complete retained sequence below.  A host index is not
+        # durable evidence because ignored rows legitimately leave gaps.
+        for host_index, msg in enumerate(messages):
             if self._matches_ignore_message_patterns(msg):
                 self._ignored_message_count += 1
                 excerpt = (text_content_for_pattern_matching(msg.get("content")) or "")[:80].replace("\n", " ")
@@ -3317,79 +3445,92 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             for (host_index, _message), protected in zip(kept, protected_messages)
         ]
         appended_ids: list[int] = []
-        with self._frontier.publication_transaction() as conn:
-            self._rollover_publication_boundary("after_begin")
-            read_budget = self._new_locked_publication_read_budget()
-            lifecycle = conn.execute(
-                """SELECT current_session_id, last_finalized_session_id,
-                          current_frontier_store_id, last_finalized_frontier_store_id
-                   FROM lcm_lifecycle_state WHERE conversation_id = ?""",
-                (conversation_id,),
-            ).fetchone()
-            active = conn.execute(
-                """SELECT generation, session_id, source_end_store_id,
-                          policy_fingerprint, route_fingerprint
-                   FROM lcm_active_frontiers WHERE conversation_id = ?
-                   ORDER BY generation DESC LIMIT 1""",
-                (conversation_id,),
-            ).fetchone()
-            current_session_id = str(lifecycle[0] or "") if lifecycle else ""
-            finalized_session_id = str(lifecycle[1] or "") if lifecycle else ""
-            active_session_id = str(active[1] or "") if active else ""
-            extends_rollover = bool(
-                lifecycle is not None
-                and active is not None
-                and current_session_id
-                and current_session_id != session_id
-                and finalized_session_id == session_id
-                and active_session_id == current_session_id
-            )
-            finalizes_current = bool(
-                lifecycle is not None and current_session_id == session_id
-            )
-            extends_finalized = bool(
-                lifecycle is not None
-                and not current_session_id
-                and finalized_session_id == session_id
-            )
-            if not (extends_rollover or finalizes_current or extends_finalized):
-                raise RuntimeError(
-                    "late session-end rejected after durable lifecycle ownership changed"
+        with _temporary_sqlite_busy_timeout(
+            [getattr(self._frontier, "_conn", None)],
+            _SESSION_END_BUSY_TIMEOUT_MS,
+        ):
+            with self._frontier.publication_transaction() as conn:
+                self._rollover_publication_boundary("after_begin")
+                read_budget = self._new_locked_publication_read_budget()
+                lifecycle = conn.execute(
+                    """SELECT current_session_id, last_finalized_session_id,
+                              current_frontier_store_id, last_finalized_frontier_store_id,
+                              rollover_carry_over_context
+                       FROM lcm_lifecycle_state WHERE conversation_id = ?""",
+                    (conversation_id,),
+                ).fetchone()
+                active = conn.execute(
+                    """SELECT generation, session_id, source_end_store_id,
+                              policy_fingerprint, route_fingerprint
+                       FROM lcm_active_frontiers WHERE conversation_id = ?
+                       ORDER BY generation DESC LIMIT 1""",
+                    (conversation_id,),
+                ).fetchone()
+                current_session_id = str(lifecycle[0] or "") if lifecycle else ""
+                finalized_session_id = str(lifecycle[1] or "") if lifecycle else ""
+                active_session_id = str(active[1] or "") if active else ""
+                extends_rollover = bool(
+                    lifecycle is not None
+                    and active is not None
+                    and current_session_id
+                    and current_session_id != session_id
+                    and finalized_session_id == session_id
+                    and active_session_id == current_session_id
                 )
+                finalizes_current = bool(
+                    lifecycle is not None and current_session_id == session_id
+                )
+                extends_finalized = bool(
+                    lifecycle is not None
+                    and not current_session_id
+                    and finalized_session_id == session_id
+                )
+                if not (extends_rollover or finalizes_current or extends_finalized):
+                    raise RuntimeError(
+                        "late session-end rejected after durable lifecycle ownership changed"
+                    )
+                if (
+                    extends_rollover
+                    and lifecycle[4] is not None
+                    and not bool(lifecycle[4])
+                ):
+                    raise RuntimeError(
+                        "late session-end rejected by rollover carry-over policy"
+                    )
 
-            appended_ids = self._revalidate_and_append_old_session_tail_no_commit(
-                conn,
-                conversation_id=conversation_id,
-                old_session_id=session_id,
-                previous_messages=messages,
-                prepared_tail=prepared_tail,
-                source=source,
-                read_budget=read_budget,
-            )
-            self._rollover_publication_boundary("after_revalidation")
-            self._rollover_publication_boundary("after_tail_ingest")
-
-            if extends_rollover:
-                self._extend_completed_rollover_no_commit(
+                appended_ids = self._revalidate_and_append_old_session_tail_no_commit(
                     conn,
                     conversation_id=conversation_id,
                     old_session_id=session_id,
-                    winner_session_id=current_session_id,
-                    active=active,
+                    previous_messages=messages,
+                    prepared_tail=prepared_tail,
+                    source=source,
                     read_budget=read_budget,
-                    batch_reason="late_finalized_session_suffix",
                 )
-            elif finalizes_current:
-                frontier_store_id = int(lifecycle[2] or 0)
-                if active is not None and active_session_id == session_id:
-                    frontier_store_id = max(frontier_store_id, int(active[2] or 0))
-                self._lifecycle.finalize_session_no_commit(
-                    conn,
-                    conversation_id,
-                    session_id=session_id,
-                    frontier_store_id=frontier_store_id,
-                )
-                self._rollover_publication_boundary("after_lifecycle")
+                self._rollover_publication_boundary("after_revalidation")
+                self._rollover_publication_boundary("after_tail_ingest")
+
+                if extends_rollover:
+                    self._extend_completed_rollover_no_commit(
+                        conn,
+                        conversation_id=conversation_id,
+                        old_session_id=session_id,
+                        winner_session_id=current_session_id,
+                        active=active,
+                        read_budget=read_budget,
+                        batch_reason="late_finalized_session_suffix",
+                    )
+                elif finalizes_current:
+                    frontier_store_id = int(lifecycle[2] or 0)
+                    if active is not None and active_session_id == session_id:
+                        frontier_store_id = max(frontier_store_id, int(active[2] or 0))
+                    self._lifecycle.finalize_session_no_commit(
+                        conn,
+                        conversation_id,
+                        session_id=session_id,
+                        frontier_store_id=frontier_store_id,
+                    )
+                    self._rollover_publication_boundary("after_lifecycle")
 
         self._rollover_publication_boundary("after_commit")
         return appended_ids
@@ -3937,11 +4078,9 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         source_end_store_id: int,
         include_existing: bool,
         read_budget: dict[str, float | int],
-        preserve_existing_raw: bool = True,
     ) -> tuple[list[dict[str, Any]], int, list[int]]:
         """Clone one immutable frontier and close it over durable old raw tail."""
         items: list[dict[str, Any]] = []
-        canonical_tip_end = int(source_end_store_id or 0)
         if include_existing and generation > 0:
             rows = self._bounded_frontier_rows_no_commit(
                 conn,
@@ -3950,7 +4089,6 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 read_budget=read_budget,
             )
             for _ordinal, kind, ref_id, source_start, source_end, node_session in rows:
-                canonical_tip_end = max(canonical_tip_end, int(source_end or 0))
                 if kind not in {"node", "message"}:
                     raise RuntimeError("rollover frontier contains invalid item kind")
                 if source_start <= 0 or source_end < source_start:
@@ -3966,8 +4104,6 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     ref_id == source_start == source_end
                 ):
                     raise RuntimeError("rollover raw frontier range is invalid")
-                if kind == "message" and not preserve_existing_raw:
-                    continue
                 items.append(
                     {
                         "kind": kind,
@@ -3977,19 +4113,46 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     }
                 )
 
-        existing_item_end = max(
-            (int(item["source_end"]) for item in items),
-            default=0,
+        items.sort(
+            key=lambda item: (
+                int(item["source_start"]),
+                0 if item["kind"] == "node" else 1,
+                int(item["ref_id"]),
+            )
         )
+        previous_end = 0
+        for item in items:
+            start = int(item["source_start"])
+            end = int(item["source_end"])
+            if start <= previous_end or end < start:
+                raise RuntimeError("rollover frontier source closure overlaps")
+            previous_end = end
+
+        # Scan the full bounded old-session sequence, not merely rows after the
+        # old source tip.  That preserves existing raw items and restores raw
+        # descendants of any summary pruned in this same transaction, so the
+        # next source boundary can never jump across an uncovered durable row.
         durable_raw_ids = self._bounded_message_tail_ids_no_commit(
             conn,
             old_session_id,
-            max(canonical_tip_end, existing_item_end),
+            0,
             read_budget=read_budget,
             conversation_id=conversation_id,
         )
         added_raw_ids: list[int] = []
+        coverage_index = 0
         for store_id in durable_raw_ids:
+            while (
+                coverage_index < len(items)
+                and int(items[coverage_index]["source_end"]) < store_id
+            ):
+                coverage_index += 1
+            if (
+                coverage_index < len(items)
+                and int(items[coverage_index]["source_start"]) <= store_id
+                <= int(items[coverage_index]["source_end"])
+            ):
+                continue
             items.append(
                 {
                     "kind": "message",
@@ -4015,14 +4178,9 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             if start <= previous_end or end < start:
                 raise RuntimeError("rollover frontier source closure overlaps")
             previous_end = end
-        new_source_end = (
-            max(
-                int(source_end_store_id or 0),
-                existing_item_end,
-                max(added_raw_ids, default=0),
-            )
-            if ordered
-            else 0
+        new_source_end = max(
+            (int(item["source_end"]) for item in ordered),
+            default=0,
         )
         return ordered, new_source_end, added_raw_ids
 
@@ -4037,13 +4195,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         source: str,
         read_budget: dict[str, float | int],
     ) -> list[int]:
-        """Append only the host prefix portion not represented durably yet.
-
-        A durable log may contain a competing branch between the shared host
-        prefix and this caller's suffix.  Ordered-subsequence coverage makes
-        retries of either branch idempotent without treating the other branch
-        as this caller's data.
-        """
+        """Append only retained host occurrences not represented durably."""
         tail_entries: list[tuple[int, Dict[str, Any], int]] = []
         legacy_prefix = len(previous_messages) - len(prepared_tail)
         for offset, entry in enumerate(prepared_tail):
@@ -4056,24 +4208,48 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 raise RuntimeError("invalid prepared old-session tail entry")
             tail_entries.append((int(host_index), message, int(token_estimate)))
 
-        durable_coverage = 0
-        if previous_messages:
-            durable_coverage = self._session_end_store_prefix_count(
-                old_session_id,
-                list(previous_messages),
-                conversation_id=conversation_id,
-                raise_on_read_error=True,
+        retained_entries = [
+            entry
+            for entry in tail_entries
+            if not self._matches_ignore_message_patterns(entry[1])
+        ]
+        durable_identities = self._session_end_store_retained_identities(
+            old_session_id,
+            conversation_id=conversation_id,
+            read_budget=read_budget,
+            conn=conn,
+        )
+        host_identities: list[tuple[str, str, str, str, str]] = []
+        for _host_index, message, _estimate in retained_entries:
+            encoded_bytes = self._bounded_rollover_active_encoded_bytes(
+                message,
                 read_budget=read_budget,
-                conn=conn,
-                allow_durable_interleaving=True,
+                remaining_bytes=(
+                    int(read_budget["max_bytes"])
+                    - int(read_budget["bytes"])
+                    - 32
+                ),
             )
-            if durable_coverage is None:
-                raise RuntimeError("old-session durable coverage could not be revalidated")
-
+            self._charge_locked_publication_read(
+                read_budget,
+                rows=1,
+                serialized_bytes=encoded_bytes + 32,
+                label="rollover retained host sequence",
+            )
+            host_identities.append(
+                self._session_end_prefix_compare_identity(
+                    message,
+                    session_id=old_session_id,
+                    read_budget=read_budget,
+                )
+            )
+        unmatched = self._ordered_unmatched_retained_indices(
+            host_identities,
+            durable_identities,
+        )
         to_append = [
-            (message, estimate)
-            for host_index, message, estimate in tail_entries
-            if host_index >= int(durable_coverage)
+            (retained_entries[index][1], retained_entries[index][2])
+            for index in unmatched
         ]
         if not to_append:
             return []
@@ -4182,7 +4358,8 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             ).fetchone()
             lifecycle = conn.execute(
                 """
-                SELECT current_session_id, last_finalized_session_id
+                SELECT current_session_id, last_finalized_session_id,
+                       rollover_carry_over_context
                 FROM lcm_lifecycle_state WHERE conversation_id = ?
                 """,
                 (conversation_id,),
@@ -4191,6 +4368,11 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             active_session_id = str(active[1] or "") if active else ""
             lifecycle_session_id = str(lifecycle[0] or "") if lifecycle else ""
             finalized_session_id = str(lifecycle[1] or "") if lifecycle else ""
+            winner_carry_over = (
+                True
+                if lifecycle is None or lifecycle[2] is None
+                else bool(lifecycle[2])
+            )
             expected = (
                 current_generation
                 if expected_generation is None
@@ -4206,6 +4388,12 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             ):
                 completed_session_id = active_session_id
             if completed_session_id:
+                if not winner_carry_over:
+                    outcome = (
+                        "idempotent" if completed_session_id == new_session_id else "competing"
+                    )
+                    result = (0, outcome, completed_session_id)
+                    return result if return_outcome else 0
                 self._revalidate_and_append_old_session_tail_no_commit(
                     conn,
                     conversation_id=conversation_id,
@@ -4287,7 +4475,6 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                         source_end_store_id=old_frontier,
                         include_existing=True,
                         read_budget=read_budget,
-                        preserve_existing_raw=False,
                     )
                 )
             elif carry_over_context:
@@ -4301,7 +4488,6 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                         source_end_store_id=old_frontier,
                         include_existing=False,
                         read_budget=read_budget,
-                        preserve_existing_raw=False,
                     )
                 )
             new_generation = self._frontier.advance_frontier_generation_with_items_no_commit(
@@ -4341,6 +4527,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 new_session_id=new_session_id,
                 current_frontier_store_id=new_frontier,
                 finalized_frontier_store_id=max(old_frontier, new_frontier),
+                carry_over_context=carry_over_context,
             )
             self._rollover_publication_boundary("after_lifecycle")
 
@@ -4355,7 +4542,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         *,
         conversation_id: str,
     ) -> list[tuple[int, Dict[str, Any], int]]:
-        """Prepare only the host suffix missing from durable old-session storage.
+        """Prepare the bounded, ignore-normalized host retained sequence.
 
         This phase performs no database writes.  A mismatch is fail-closed: the
         caller keeps its untouched host list and rollover does not prune or bind
@@ -4364,21 +4551,12 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         if not previous_messages:
             return []
         read_budget = self._new_locked_publication_read_budget()
-        prefix_count = self._session_end_store_prefix_count(
-            old_session_id,
-            list(previous_messages),
-            conversation_id=conversation_id,
-            raise_on_read_error=True,
-            read_budget=read_budget,
-        )
-        if prefix_count is None:
-            # The host replay may legitimately be a transformed active view
-            # (for example an objective plus an ignored-message placeholder)
-            # rather than a byte-for-byte durable prefix.  Preserve it in full
-            # instead of treating it as already durable or dropping it.
-            prefix_count = 0
-        suffix = list(previous_messages[int(prefix_count):])
-        if not suffix:
+        retained = [
+            message
+            for message in previous_messages
+            if not self._matches_ignore_message_patterns(message)
+        ]
+        if not retained:
             return []
         # The durable-prefix comparison charges only rows it actually
         # compares.  Charge every unmatched host row against that same budget
@@ -4386,7 +4564,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         # or the writer transaction can materialize it.
         resolved_suffix: list[Dict[str, Any]] = []
         resolver_cache: dict[tuple[str, str], str] = {}
-        for message in suffix:
+        for message in retained:
             encoded_bytes = self._bounded_rollover_active_encoded_bytes(
                 message,
                 read_budget=read_budget,
@@ -4475,7 +4653,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             hermes_home=self._hermes_home,
         )
         return [
-            (int(prefix_count) + offset, message, count_message_tokens(message))
+            (offset, message, count_message_tokens(message))
             for offset, message in enumerate(protected)
         ]
 
@@ -4887,6 +5065,9 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     "last_maintenance_attempt_at": lifecycle_state.last_maintenance_attempt_at,
                     "last_rollover_at": lifecycle_state.last_rollover_at,
                     "last_reset_at": lifecycle_state.last_reset_at,
+                    "rollover_carry_over_context": (
+                        lifecycle_state.rollover_carry_over_context
+                    ),
                     "updated_at": lifecycle_state.updated_at,
                 }
             try:

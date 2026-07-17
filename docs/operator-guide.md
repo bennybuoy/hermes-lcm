@@ -261,20 +261,31 @@ Below that pressure, simpler existing behavior is preserved. Until Hermes core
 supplies the explicit signal contract, cache state remains `unknown` and LCM
 uses the normal bounded route strategy.
 
-### Schema v8 deployment and rollback
+### Schema v10 deployment and rollback
 
-Schema v8 adds immutable `lcm_focus_briefs` records and the
-`resolved_policy_json` prepared-batch column. Startup migration is idempotent;
-existing v7 batches receive an empty metadata object, while new batches persist
-the complete resolved policy used at preparation. Focus content and evidence
-fields are protected by an immutability trigger; refocus publishes a new row.
+Schema v10 adds the nullable `rollover_carry_over_context` lifecycle field. It
+records the carry-over decision that won an atomic rollover so a late session
+end cannot reinterpret the policy. Existing schema v9 rows migrate with `NULL`,
+which preserves the legacy compatibility behavior; newly published rollovers
+store an explicit boolean. The migration and schema-version publication occur
+under one SQLite writer transaction and are safe to retry after interruption.
 
-Older v7 plugin builds intentionally refuse a v8 database. Before upgrading,
+The read-only `hermes-lcm status` command reports `schema_version: 10` together
+with `supported_schema_version: 10`. It does not migrate older databases and
+refuses databases newer than the installed build.
+
+Schema v8 previously added immutable `lcm_focus_briefs` records and the
+`resolved_policy_json` prepared-batch column. Existing v7 batches receive an
+empty metadata object, while new batches persist the complete resolved policy
+used at preparation. Focus content and evidence fields are protected by an
+immutability trigger; refocus publishes a new row.
+
+Older plugin builds intentionally refuse newer databases. Before upgrading,
 take a SQLite backup with `/lcm backup` or the maintenance backup primitive. A
-code rollback therefore requires restoring that pre-v8 database (including its
-matching WAL/SHM state if copied outside SQLite's backup API), not editing the
-schema-version marker. No production database should be migrated as part of
-package build or offline test installation.
+code rollback therefore requires restoring the matching pre-upgrade database
+(including its matching WAL/SHM state if copied outside SQLite's backup API),
+not editing the schema-version marker. No production database should be
+migrated as part of package build or offline test installation.
 
 ### Threshold ownership
 

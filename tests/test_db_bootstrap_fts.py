@@ -89,6 +89,32 @@ def _table_names(db_path):
         conn.close()
 
 
+def _reconstruct_v9_database(db_path):
+    """Create a structurally genuine v9 lifecycle schema from current DDL."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        db_bootstrap.run_versioned_migrations(conn)
+        conn.execute(
+            """INSERT INTO lcm_lifecycle_state(
+                   conversation_id, current_session_id, current_frontier_store_id
+               ) VALUES('legacy-conversation', 'legacy-session', 17)"""
+        )
+        conn.execute("DROP TRIGGER lcm_schema_version_monotonic")
+        conn.execute(
+            "ALTER TABLE lcm_lifecycle_state DROP COLUMN rollover_carry_over_context"
+        )
+        conn.execute(
+            "DELETE FROM lcm_migration_state WHERE step_name = 'v10_rollover_carry_policy'"
+        )
+        conn.execute(
+            "UPDATE metadata SET value = '9' WHERE key = 'schema_version'"
+        )
+        db_bootstrap.ensure_schema_version_monotonic_guard(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @pytest.fixture
 def integrity_calls(monkeypatch):
     """Spy that counts real integrity-check invocations by table name."""
@@ -340,6 +366,87 @@ def test_run_versioned_migrations_accepts_current_schema(tmp_path):
         conn.close()
 
 
+def test_fresh_database_is_schema_v10_with_rollover_carry_policy(tmp_path):
+    conn = sqlite3.connect(tmp_path / "fresh-v10.db")
+    try:
+        db_bootstrap.run_versioned_migrations(conn)
+
+        assert db_bootstrap.SCHEMA_VERSION == 10
+        assert db_bootstrap.get_schema_version(conn) == 10
+        lifecycle_columns = {
+            row[1]: row
+            for row in conn.execute(
+                "PRAGMA table_info(lcm_lifecycle_state)"
+            ).fetchall()
+        }
+        assert "rollover_carry_over_context" in lifecycle_columns
+        assert lifecycle_columns["rollover_carry_over_context"][4] is None
+        assert conn.execute(
+            "SELECT 1 FROM lcm_migration_state WHERE step_name = 'v10_rollover_carry_policy'"
+        ).fetchone() == (1,)
+        conn.execute(
+            "INSERT INTO lcm_lifecycle_state(conversation_id) VALUES('fresh-v10')"
+        )
+        assert conn.execute(
+            "SELECT rollover_carry_over_context FROM lcm_lifecycle_state WHERE conversation_id = 'fresh-v10'"
+        ).fetchone() == (None,)
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """INSERT INTO lcm_lifecycle_state(
+                       conversation_id, rollover_carry_over_context
+                   ) VALUES('invalid-v10', 2)"""
+            )
+    finally:
+        conn.close()
+
+
+def test_v9_rollover_carry_policy_migrates_to_v10_and_restarts_idempotently(tmp_path):
+    db_path = tmp_path / "v9-to-v10.db"
+    _reconstruct_v9_database(db_path)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        assert db_bootstrap.get_schema_version(conn) == 9
+        assert "rollover_carry_over_context" not in {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(lcm_lifecycle_state)"
+            ).fetchall()
+        }
+
+        db_bootstrap.run_versioned_migrations(conn)
+
+        assert db_bootstrap.get_schema_version(conn) == db_bootstrap.SCHEMA_VERSION == 10
+        assert "rollover_carry_over_context" in {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(lcm_lifecycle_state)"
+            ).fetchall()
+        }
+        assert conn.execute(
+            """SELECT current_session_id, current_frontier_store_id,
+                      rollover_carry_over_context
+               FROM lcm_lifecycle_state
+               WHERE conversation_id = 'legacy-conversation'"""
+        ).fetchone() == ("legacy-session", 17, None)
+        assert conn.execute(
+            "SELECT 1 FROM lcm_migration_state WHERE step_name = 'v10_rollover_carry_policy'"
+        ).fetchone() == (1,)
+    finally:
+        conn.close()
+
+    restarted = sqlite3.connect(db_path)
+    try:
+        db_bootstrap.run_versioned_migrations(restarted)
+        assert db_bootstrap.get_schema_version(restarted) == 10
+        assert restarted.execute("PRAGMA quick_check").fetchone() == ("ok",)
+        assert restarted.execute(
+            "SELECT COUNT(*) FROM lcm_lifecycle_state WHERE conversation_id = 'legacy-conversation'"
+        ).fetchone() == (1,)
+    finally:
+        restarted.close()
+
+
 def test_migration_serializes_version_read_and_prevents_marker_downgrade(
     tmp_path, monkeypatch
 ):
@@ -525,6 +632,100 @@ def test_v8_migration_blocks_base_v7_unconditional_schema_upsert(
         base_v7_thread.join(timeout=5.0)
         migrator.close()
         base_v7.close()
+
+
+def test_v10_migration_blocks_concurrent_base_v9_schema_downgrade(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "mixed-v9-v10-schema-migration.db"
+    _reconstruct_v9_database(db_path)
+
+    migrator = sqlite3.connect(db_path, timeout=5.0, check_same_thread=False)
+    base_v9 = sqlite3.connect(db_path, timeout=5.0, check_same_thread=False)
+    db_bootstrap.configure_connection(migrator)
+    db_bootstrap.configure_connection(base_v9)
+    cached_v9 = base_v9.execute(
+        "SELECT value FROM metadata WHERE key = 'schema_version'"
+    ).fetchone()[0]
+    assert cached_v9 == "9"
+
+    migration_holds_writer_lock = threading.Event()
+    allow_migration = threading.Event()
+    original_get_schema_version = db_bootstrap.get_schema_version
+
+    def pause_v10_after_locked_version_read(conn):
+        version = original_get_schema_version(conn)
+        if conn is migrator:
+            migration_holds_writer_lock.set()
+            assert allow_migration.wait(timeout=5.0)
+        return version
+
+    monkeypatch.setattr(
+        db_bootstrap,
+        "get_schema_version",
+        pause_v10_after_locked_version_read,
+    )
+    outcomes: dict[str, object] = {}
+
+    def migrate_to_v10():
+        try:
+            db_bootstrap.run_versioned_migrations(migrator)
+        except Exception as exc:
+            outcomes["migration_error"] = exc
+
+    def execute_base_v9_cached_marker_write():
+        try:
+            base_v9.execute(
+                """INSERT INTO metadata(key, value)
+                   VALUES('schema_version', ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (cached_v9,),
+            )
+            base_v9.commit()
+            outcomes["base_v9_version"] = base_v9.execute(
+                "SELECT value FROM metadata WHERE key = 'schema_version'"
+            ).fetchone()[0]
+        except Exception as exc:
+            outcomes["base_v9_error"] = exc
+
+    migration_thread = threading.Thread(target=migrate_to_v10)
+    base_v9_thread = threading.Thread(target=execute_base_v9_cached_marker_write)
+    try:
+        migration_thread.start()
+        assert migration_holds_writer_lock.wait(timeout=5.0)
+        base_v9_thread.start()
+        time.sleep(0.1)
+        assert base_v9_thread.is_alive(), (
+            "base-v9 marker write must wait behind the v10 migration lock"
+        )
+
+        allow_migration.set()
+        migration_thread.join(timeout=5.0)
+        base_v9_thread.join(timeout=5.0)
+
+        assert not migration_thread.is_alive()
+        assert not base_v9_thread.is_alive()
+        assert "migration_error" not in outcomes
+        assert "base_v9_error" not in outcomes
+        assert outcomes["base_v9_version"] == "10"
+        check = sqlite3.connect(db_path)
+        try:
+            assert db_bootstrap.get_schema_version(check) == 10
+            assert "rollover_carry_over_context" in {
+                row[1]
+                for row in check.execute(
+                    "PRAGMA table_info(lcm_lifecycle_state)"
+                ).fetchall()
+            }
+            assert check.execute("PRAGMA quick_check").fetchone() == ("ok",)
+        finally:
+            check.close()
+    finally:
+        allow_migration.set()
+        migration_thread.join(timeout=5.0)
+        base_v9_thread.join(timeout=5.0)
+        migrator.close()
+        base_v9.close()
 
 
 def test_message_store_refuses_newer_schema_before_startup_ddl(tmp_path):

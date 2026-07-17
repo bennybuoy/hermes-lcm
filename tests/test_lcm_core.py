@@ -3003,12 +3003,17 @@ class TestLifecycleStateStore:
         assert loaded.current_frontier_store_id == 7
         assert loaded.last_rollover_at is None
         assert loaded.last_reset_at is None
+        assert loaded.rollover_carry_over_context is None
 
         columns = {
             row[1]
             for row in state._conn.execute("PRAGMA table_info(lcm_lifecycle_state)").fetchall()
         }
-        assert {"last_rollover_at", "last_reset_at"} <= columns
+        assert {
+            "last_rollover_at",
+            "last_reset_at",
+            "rollover_carry_over_context",
+        } <= columns
 
         state.close()
 

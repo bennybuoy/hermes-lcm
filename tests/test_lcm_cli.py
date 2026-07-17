@@ -18,6 +18,7 @@ import yaml
 import hermes_lcm.lcm_cli as lcm_cli
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
+from hermes_lcm.db_bootstrap import SCHEMA_VERSION
 from hermes_lcm.engine import LCMEngine
 
 
@@ -73,9 +74,79 @@ def test_cli_status_is_json_first_and_works_without_gateway(tmp_path):
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["database_path"] == str(db)
-    assert payload["schema_version"] == 9
+    assert payload["schema_version"] == SCHEMA_VERSION == 10
+    assert payload["supported_schema_version"] == SCHEMA_VERSION
     assert payload["counts"]["messages"] == 2
     assert payload["read_only"] is True
+
+
+def test_cli_reads_legacy_v9_without_migrating_it(tmp_path):
+    db = _seed(tmp_path)
+    conn = sqlite3.connect(db)
+    conn.execute("DROP TRIGGER lcm_schema_version_monotonic")
+    conn.execute(
+        "ALTER TABLE lcm_lifecycle_state DROP COLUMN rollover_carry_over_context"
+    )
+    conn.execute(
+        "DELETE FROM lcm_migration_state WHERE step_name = 'v10_rollover_carry_policy'"
+    )
+    conn.execute(
+        "UPDATE metadata SET value = '9' WHERE key = 'schema_version'"
+    )
+    conn.commit()
+    conn.close()
+
+    result = _run(db, "status")
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["schema_version"] == 9
+    assert payload["supported_schema_version"] == SCHEMA_VERSION == 10
+    check = sqlite3.connect(db)
+    try:
+        assert check.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("9",)
+        assert "rollover_carry_over_context" not in {
+            row[1]
+            for row in check.execute(
+                "PRAGMA table_info(lcm_lifecycle_state)"
+            ).fetchall()
+        }
+        assert check.execute(
+            "SELECT 1 FROM lcm_migration_state WHERE step_name = 'v10_rollover_carry_policy'"
+        ).fetchone() is None
+    finally:
+        check.close()
+
+
+def test_cli_refuses_schema_newer_than_authoritative_version_without_writes(tmp_path):
+    db = tmp_path / "future-cli.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute(
+        "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
+        (str(SCHEMA_VERSION + 1),),
+    )
+    conn.commit()
+    conn.close()
+
+    result = _run(db, "status")
+
+    assert result.returncode == lcm_cli.EXIT_DATABASE
+    error = json.loads(result.stdout)["error"]
+    assert f"schema version {SCHEMA_VERSION + 1}" in error
+    assert f"supports (v{SCHEMA_VERSION})" in error
+    check = sqlite3.connect(db)
+    try:
+        assert check.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone() == (str(SCHEMA_VERSION + 1),)
+        assert check.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+        ).fetchall() == [("metadata",)]
+    finally:
+        check.close()
 
 
 def test_cli_message_list_is_preview_only_and_keyset_paginated(tmp_path):

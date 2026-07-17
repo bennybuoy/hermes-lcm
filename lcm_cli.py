@@ -14,13 +14,27 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+if __package__:
+    from .db_bootstrap import (
+        SCHEMA_VERSION,
+        SchemaVersionTooNewError,
+        read_existing_schema_version,
+        refuse_schema_version_too_new,
+    )
+else:  # Support direct execution from a source checkout.
+    from db_bootstrap import (  # type: ignore[no-redef]
+        SCHEMA_VERSION,
+        SchemaVersionTooNewError,
+        read_existing_schema_version,
+        refuse_schema_version_too_new,
+    )
+
 
 EXIT_OK = 0
 EXIT_INVALID = 2
 EXIT_NOT_FOUND = 3
 EXIT_CONFIG = 4
 EXIT_DATABASE = 5
-SCHEMA_VERSION = 9
 _CLI_MAX_PREVIEW_CHARS = 20_000
 _CLI_MAX_OUTPUT_CHARS = 100_000
 _CLI_MAX_OUTPUT_NODES = 2_000
@@ -98,13 +112,21 @@ def _open_read_only(path: Path) -> sqlite3.Connection:
     if not path.exists() or not path.is_file():
         raise CliError(f"database not found: {path}", EXIT_NOT_FOUND)
     uri = f"file:{quote(str(path), safe='/')}?mode=ro"
+    conn: sqlite3.Connection | None = None
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=2.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=ON")
         conn.execute("PRAGMA busy_timeout=2000")
+        refuse_schema_version_too_new(conn)
         return conn
+    except SchemaVersionTooNewError as exc:
+        if conn is not None:
+            conn.close()
+        raise CliError(str(exc), EXIT_DATABASE) from exc
     except sqlite3.Error as exc:
+        if conn is not None:
+            conn.close()
         raise CliError(f"database open failed: {exc}", EXIT_DATABASE) from exc
 
 
@@ -245,15 +267,7 @@ def _preview(value: Any, chars: int, full: bool) -> tuple[str, bool]:
 
 
 def _schema_version(conn: sqlite3.Connection) -> int:
-    if not _table_exists(conn, "metadata"):
-        return 0
-    row = conn.execute(
-        "SELECT value FROM metadata WHERE key='schema_version'"
-    ).fetchone()
-    try:
-        return int(row[0]) if row else 0
-    except (TypeError, ValueError):
-        return 0
+    return read_existing_schema_version(conn)
 
 
 def _count(conn: sqlite3.Connection, table: str) -> int:

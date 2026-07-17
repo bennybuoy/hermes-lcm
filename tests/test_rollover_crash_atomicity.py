@@ -20,6 +20,8 @@ NEW = "rollover-crash-new"
 CONVERSATION = "rollover-crash-conversation"
 PRECOMMIT_PHASES = (
     "after_begin",
+    "after_revalidation",
+    "after_tail_ingest",
     "after_prune",
     "after_reassign",
     "after_frontier",
@@ -150,7 +152,7 @@ def _snapshot(db_path: Path) -> dict:
         lifecycle = conn.execute(
             """
             SELECT current_session_id, last_finalized_session_id,
-                   current_frontier_store_id
+                   current_frontier_store_id, rollover_carry_over_context
             FROM lcm_lifecycle_state WHERE conversation_id = ?
             """,
             (CONVERSATION,),
@@ -189,11 +191,13 @@ def test_rollover_crash_is_wholly_old_or_wholly_new(
         assert state["items"] == old["items"]
         assert state["lifecycle"][0] in {OLD, None}
         assert state["lifecycle"][1] in {None, OLD}
+        assert state["lifecycle"][3] is None
     elif carry_over:
         assert state["active"][1:] == (NEW, store_id)
         assert state["lifecycle"][0] == NEW
         assert state["lifecycle"][1] == OLD
         assert state["lifecycle"][2] == store_id
+        assert state["lifecycle"][3] == 1
         assert state["nodes"] == [(retained_id, NEW, 2)]
         assert state["items"] == [("node", retained_id)]
     else:
@@ -201,6 +205,7 @@ def test_rollover_crash_is_wholly_old_or_wholly_new(
         assert state["lifecycle"][0] == NEW
         assert state["lifecycle"][1] == OLD
         assert state["lifecycle"][2] == 0
+        assert state["lifecycle"][3] == 0
         assert state["nodes"] == [(retained_id, OLD, 2)]
         assert state["items"] == []
     assert all(node_id != pruned_id for node_id, _session, _depth in state["nodes"]) or phase in PRECOMMIT_PHASES

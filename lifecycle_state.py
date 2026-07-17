@@ -51,6 +51,7 @@ class LifecycleState:
     last_maintenance_attempt_at: float | None
     last_rollover_at: float | None
     last_reset_at: float | None
+    rollover_carry_over_context: bool | None
     updated_at: float
 
 
@@ -128,6 +129,11 @@ class LifecycleStateStore:
             last_maintenance_attempt_at=row["last_maintenance_attempt_at"],
             last_rollover_at=row["last_rollover_at"],
             last_reset_at=row["last_reset_at"],
+            rollover_carry_over_context=(
+                None
+                if row["rollover_carry_over_context"] is None
+                else bool(row["rollover_carry_over_context"])
+            ),
             updated_at=float(row["updated_at"] or 0.0),
         )
 
@@ -186,6 +192,7 @@ class LifecycleStateStore:
         last_maintenance_attempt_at = None
         last_rollover_at = None
         last_reset_at = None
+        rollover_carry_over_context = None
 
         if existing is not None:
             if existing.current_session_id == session_id:
@@ -233,8 +240,9 @@ class LifecycleStateStore:
                 last_maintenance_attempt_at,
                 last_rollover_at,
                 last_reset_at,
+                rollover_carry_over_context,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(conversation_id) DO UPDATE SET
                 current_session_id = excluded.current_session_id,
                 last_finalized_session_id = excluded.last_finalized_session_id,
@@ -248,6 +256,7 @@ class LifecycleStateStore:
                 last_maintenance_attempt_at = excluded.last_maintenance_attempt_at,
                 last_rollover_at = excluded.last_rollover_at,
                 last_reset_at = excluded.last_reset_at,
+                rollover_carry_over_context = excluded.rollover_carry_over_context,
                 updated_at = excluded.updated_at
             """,
             (
@@ -264,6 +273,7 @@ class LifecycleStateStore:
                 last_maintenance_attempt_at,
                 last_rollover_at,
                 last_reset_at,
+                rollover_carry_over_context,
                 now,
             ),
         )
@@ -299,6 +309,7 @@ class LifecycleStateStore:
                 last_finalized_session_id = ?,
                 current_frontier_store_id = ?,
                 last_finalized_frontier_store_id = ?,
+                rollover_carry_over_context = NULL,
                 debt_kind = debt_kind,
                 debt_size_estimate = debt_size_estimate,
                 last_finalized_at = ?,
@@ -326,6 +337,7 @@ class LifecycleStateStore:
         old_session_id: str,
         new_session_id: str,
         finalized_frontier_store_id: int = 0,
+        carry_over_context: bool = True,
     ) -> LifecycleState:
         state = self.get_by_conversation(conversation_id)
         if (
@@ -352,8 +364,9 @@ class LifecycleStateStore:
                 last_finalized_at,
                 last_rollover_at,
                 last_reset_at,
+                rollover_carry_over_context,
                 updated_at
-            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(conversation_id) DO UPDATE SET
                 current_session_id = excluded.current_session_id,
                 last_finalized_session_id = excluded.last_finalized_session_id,
@@ -363,6 +376,7 @@ class LifecycleStateStore:
                 last_finalized_at = excluded.last_finalized_at,
                 last_rollover_at = excluded.last_rollover_at,
                 last_reset_at = excluded.last_reset_at,
+                rollover_carry_over_context = excluded.rollover_carry_over_context,
                 updated_at = excluded.updated_at
             """,
             (
@@ -374,6 +388,7 @@ class LifecycleStateStore:
                 now,
                 now,
                 now,
+                1 if carry_over_context else 0,
                 now,
             ),
         )
@@ -391,6 +406,7 @@ class LifecycleStateStore:
         new_session_id: str,
         current_frontier_store_id: int,
         finalized_frontier_store_id: int,
+        carry_over_context: bool,
     ) -> None:
         """Publish the rollover lifecycle row on a caller-owned transaction."""
         now = time.time()
@@ -400,8 +416,8 @@ class LifecycleStateStore:
                 conversation_id, current_session_id, last_finalized_session_id,
                 current_frontier_store_id, last_finalized_frontier_store_id,
                 current_bound_at, last_finalized_at, last_rollover_at,
-                last_reset_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                last_reset_at, rollover_carry_over_context, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(conversation_id) DO UPDATE SET
                 current_session_id = excluded.current_session_id,
                 last_finalized_session_id = excluded.last_finalized_session_id,
@@ -414,6 +430,7 @@ class LifecycleStateStore:
                 last_finalized_at = excluded.last_finalized_at,
                 last_rollover_at = excluded.last_rollover_at,
                 last_reset_at = excluded.last_reset_at,
+                rollover_carry_over_context = excluded.rollover_carry_over_context,
                 debt_kind = NULL,
                 debt_size_estimate = 0,
                 debt_updated_at = excluded.updated_at,
@@ -425,7 +442,7 @@ class LifecycleStateStore:
                 old_session_id,
                 max(0, int(current_frontier_store_id or 0)),
                 max(0, int(finalized_frontier_store_id or 0)),
-                now, now, now, now, now,
+                now, now, now, now, 1 if carry_over_context else 0, now,
             ),
         )
 
@@ -447,7 +464,8 @@ class LifecycleStateStore:
                    updated_at = ?
                WHERE conversation_id = ?
                  AND current_session_id = ?
-                 AND last_finalized_session_id = ?""",
+                 AND last_finalized_session_id = ?
+                 AND COALESCE(rollover_carry_over_context, 1) = 1""",
             (
                 max(0, int(frontier_store_id or 0)),
                 max(0, int(frontier_store_id or 0)),
@@ -475,6 +493,7 @@ class LifecycleStateStore:
                SET current_session_id = NULL,
                    last_finalized_session_id = ?,
                    current_frontier_store_id = 0,
+                   rollover_carry_over_context = NULL,
                    last_finalized_frontier_store_id = MAX(
                        last_finalized_frontier_store_id, ?
                    ),
@@ -998,7 +1017,8 @@ class LifecycleStateStore:
                        last_finalized_frontier_store_id, debt_kind,
                        debt_size_estimate, current_bound_at, last_finalized_at,
                        debt_updated_at, last_maintenance_attempt_at,
-                       last_rollover_at, last_reset_at, updated_at
+                       last_rollover_at, last_reset_at,
+                       rollover_carry_over_context, updated_at
                 FROM lcm_lifecycle_state WHERE conversation_id = ?
                 """,
                 (conversation_id,),
@@ -1019,7 +1039,10 @@ class LifecycleStateStore:
                 last_maintenance_attempt_at=row[10],
                 last_rollover_at=row[11],
                 last_reset_at=row[12],
-                updated_at=float(row[13] or 0.0),
+                rollover_carry_over_context=(
+                    None if row[13] is None else bool(row[13])
+                ),
+                updated_at=float(row[14] or 0.0),
             )
         with self._lock:
             state = self.get_by_conversation(conversation_id)

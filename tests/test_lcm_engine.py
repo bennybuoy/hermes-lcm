@@ -20097,7 +20097,7 @@ class TestSessionRollover:
         assert after_failure is not None
         assert after_failure.current_frontier_store_id == frontier_before_failure
 
-    def test_rollover_resets_active_frontier_but_preserves_last_finalized_frontier(self, engine, monkeypatch):
+    def test_rollover_carries_active_frontier_and_preserves_last_finalized_frontier(self, engine, monkeypatch):
         engine.on_session_start("frontier-old", platform="cli", context_length=200000)
         monkeypatch.setattr(
             lcm_engine,
@@ -20114,16 +20114,21 @@ class TestSessionRollover:
             {"role": "assistant", "content": "zeta"},
         ]
         engine.compress(messages)
-        old_frontier = engine._last_compacted_store_id
+        compacted_frontier = engine._last_compacted_store_id
+        durable_frontier = engine._store._conn.execute(
+            "SELECT MAX(store_id) FROM messages WHERE session_id = 'frontier-old'"
+        ).fetchone()[0]
+        assert durable_frontier > compacted_frontier
 
         engine.rollover_session("frontier-old", "frontier-new", previous_messages=[], platform="cli", context_length=200000)
 
         state = engine._lifecycle.get_by_conversation(engine._conversation_id)
         assert state is not None
         assert state.current_session_id == "frontier-new"
-        assert state.current_frontier_store_id == 0
+        assert state.current_frontier_store_id == durable_frontier
         assert state.last_finalized_session_id == "frontier-old"
-        assert state.last_finalized_frontier_store_id == old_frontier
+        assert state.last_finalized_frontier_store_id == durable_frontier
+        assert state.rollover_carry_over_context is True
         assert state.last_rollover_at is not None
         assert state.last_reset_at is not None
 

@@ -16,6 +16,11 @@ List commands use bounded keyset pagination. Message and summary content is a
 bounded preview unless `--full` is explicitly supplied. JSON is the default;
 `--pretty` and `--table` provide human-oriented rendering.
 
+`status` reports both the database's `schema_version` and this build's
+`supported_schema_version` (currently 10). The CLI can inspect older databases
+without migrating them, reads schema v10, and exits with database failure code
+`5` before running a command when the database schema is newer than the build.
+
 Path precedence is `--database`, `LCM_DATABASE_PATH`, a named `--profile`, then
 the default Hermes home. `config show/get` exposes only the `lcm` mapping and
 never prints unrelated Hermes configuration or credentials.

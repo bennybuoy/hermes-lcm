@@ -80,6 +80,42 @@ def _seed(db_path: Path) -> tuple[list[dict], int, int]:
     return [*messages, {"role": "assistant", "content": TAIL}], int(retained.node_id), int(pruned_id)
 
 
+def _seed_mixed_frontier(db_path: Path) -> tuple[list[dict], int, int]:
+    previous_messages, retained_id, _pruned_id = _seed(db_path)
+    engine = LCMEngine(config=_config(db_path))
+    engine.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
+    raw = {"role": "assistant", "content": "PREEXISTING RAW FRONTIER ITEM"}
+    engine.ingest([raw])
+    raw_id = engine._get_store_ids_for_messages([raw])[0]
+    active = engine._frontier.get_active_frontier(CONVERSATION)
+    assert active is not None
+    generation = engine._frontier.advance_frontier_generation_with_items(
+        CONVERSATION,
+        OLD,
+        raw_id,
+        str(active["policy_fingerprint"] or ""),
+        str(active["route_fingerprint"] or ""),
+        int(active["generation"]),
+        [
+            {
+                "kind": "node",
+                "ref_id": retained_id,
+                "source_start": int(active["source_end_store_id"]),
+                "source_end": int(active["source_end_store_id"]),
+            },
+            {
+                "kind": "message",
+                "ref_id": raw_id,
+                "source_start": raw_id,
+                "source_end": raw_id,
+            },
+        ],
+    )
+    assert generation == int(active["generation"]) + 1
+    engine.shutdown()
+    return [previous_messages[0], raw, previous_messages[-1]], retained_id, raw_id
+
+
 def _snapshot(db_path: Path) -> dict:
     conn = sqlite3.connect(str(db_path))
     try:
@@ -712,7 +748,250 @@ def test_late_old_session_end_extends_winner_once_and_duplicate_replay_is_noop(t
         engine.shutdown()
 
 
-def test_simultaneous_late_end_and_competing_rollover_preserve_both_suffixes(tmp_path):
+def test_rollover_preserves_preexisting_mixed_node_and_raw_frontier(tmp_path):
+    db_path = tmp_path / "rollover-mixed-frontier.db"
+    previous_messages, retained_id, existing_raw_id = _seed_mixed_frontier(db_path)
+    engine = LCMEngine(config=_config(db_path))
+    engine.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
+    try:
+        engine.rollover_session(
+            OLD,
+            NEW,
+            previous_messages=previous_messages,
+            carry_over_context=True,
+            platform="test",
+        )
+        state = _canonical_snapshot(db_path)
+        assert state["active"][1] == NEW
+        assert ("node", retained_id) in [item[:2] for item in state["items"]]
+        assert ("message", existing_raw_id) in [item[:2] for item in state["items"]]
+        _assert_raw_frontier_coverage(
+            state,
+            {"PREEXISTING RAW FRONTIER ITEM", TAIL},
+        )
+    finally:
+        engine.shutdown()
+
+
+def test_reconverged_suffix_is_matched_and_not_duplicated_by_competing_rollover(tmp_path):
+    db_path = tmp_path / "rollover-reconverged-suffix.db"
+    previous_messages, _retained_id, _pruned_id = _seed(db_path)
+    prefix = previous_messages[:1]
+    winner_history = prefix + [
+        {"role": "assistant", "content": "BRANCH B"},
+        {"role": "assistant", "content": "SHARED SUFFIX"},
+    ]
+    competing_history = prefix + [
+        {"role": "assistant", "content": "BRANCH A"},
+        {"role": "assistant", "content": "SHARED SUFFIX"},
+    ]
+    winner = LCMEngine(config=_config(db_path))
+    competing = LCMEngine(config=_config(db_path))
+    winner.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
+    competing.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
+    try:
+        winner.rollover_session(OLD, NEW, previous_messages=winner_history, platform="test")
+        competing.rollover_session(
+            OLD,
+            "losing-target",
+            previous_messages=competing_history,
+            platform="test",
+        )
+        rows = competing._store._conn.execute(
+            "SELECT content FROM messages WHERE session_id = ? ORDER BY store_id",
+            (OLD,),
+        ).fetchall()
+        contents = [row[0] for row in rows]
+        assert contents.count("BRANCH B") == 1
+        assert contents.count("BRANCH A") == 1
+        assert contents.count("SHARED SUFFIX") == 1
+    finally:
+        winner.shutdown()
+        competing.shutdown()
+
+
+def test_ordered_occurrence_reconciliation_preserves_multiplicity_and_scales_linearly():
+    reconcile = LCMEngine._ordered_unmatched_retained_indices
+    assert reconcile(
+        ["P", "A", "S", "A", "T", "S"],
+        ["P", "B", "S", "C", "T", "S"],
+    ) == [1, 3]
+    assert reconcile(["R", "R", "R"], ["R", "R"]) == [2]
+
+    size = 100_000
+    host = ["adversarial-repeat"] * size
+    durable = ["adversarial-repeat"] * (size - 1)
+    assert reconcile(host, durable) == [size - 1]
+
+
+def test_duplicate_late_end_with_ignored_host_row_is_exact_noop(tmp_path, monkeypatch):
+    db_path = tmp_path / "rollover-ignored-late-replay.db"
+    config = _config(db_path)
+    config.ignore_message_patterns = ["^IGNORE THIS ROW$"]
+    engine = LCMEngine(config=config)
+    monkeypatch.setattr(
+        engine,
+        "_matches_ignore_message_patterns",
+        lambda message, **_kwargs: message.get("content") == "IGNORE THIS ROW",
+    )
+    engine.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
+    prefix = {"role": "user", "content": "retained prefix"}
+    engine.ingest([prefix])
+    ignored = {"role": "assistant", "content": "IGNORE THIS ROW"}
+    suffix = {"role": "assistant", "content": "retained suffix after ignored row"}
+    history = [prefix, ignored, suffix]
+    try:
+        engine.rollover_session(OLD, NEW, previous_messages=history, platform="test")
+        first = _canonical_snapshot(db_path)
+        assert sum(row[3] == suffix["content"] for row in first["messages"]) == 1
+        assert all(row[3] != ignored["content"] for row in first["messages"])
+
+        engine.on_session_end(OLD, history)
+        second = _canonical_snapshot(db_path)
+        engine.on_session_end(OLD, history)
+        third = _canonical_snapshot(db_path)
+        assert third == second
+        assert sum(row[3] == suffix["content"] for row in third["messages"]) == 1
+        assert all(row[3] != ignored["content"] for row in third["messages"])
+    finally:
+        engine.shutdown()
+
+
+def test_no_carry_winner_rejects_competing_and_late_old_tails_without_repopulation(tmp_path):
+    db_path = tmp_path / "rollover-no-carry-winner.db"
+    previous_messages, _retained_id, _pruned_id = _seed(db_path)
+    winner = LCMEngine(config=_config(db_path))
+    competing = LCMEngine(config=_config(db_path))
+    winner.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
+    competing.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
+    rejected = {"role": "assistant", "content": "REJECTED OLD TAIL"}
+    try:
+        winner.rollover_session(
+            OLD,
+            NEW,
+            previous_messages=previous_messages,
+            carry_over_context=False,
+            platform="test",
+        )
+        competing.rollover_session(
+            OLD,
+            "losing-target",
+            previous_messages=previous_messages + [rejected],
+            carry_over_context=True,
+            platform="test",
+        )
+        before_late_end = _canonical_snapshot(db_path)
+        assert before_late_end["active"][1:] == (NEW, 0)
+        assert before_late_end["items"] == []
+        assert all(row[3] != rejected["content"] for row in before_late_end["messages"])
+        conn = sqlite3.connect(str(db_path))
+        try:
+            policy = conn.execute(
+                "SELECT rollover_carry_over_context FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                (CONVERSATION,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert policy == (0,)
+
+        with pytest.raises(RuntimeError, match="carry-over policy"):
+            winner.on_session_end(OLD, previous_messages + [rejected])
+        after_late_end = _canonical_snapshot(db_path)
+        assert after_late_end == before_late_end
+    finally:
+        winner.shutdown()
+        competing.shutdown()
+
+
+def test_two_engine_stale_generation_race_obeys_no_carry_winner(tmp_path, monkeypatch):
+    db_path = tmp_path / "rollover-no-carry-generation-race.db"
+    previous_messages, _retained_id, _pruned_id = _seed(db_path)
+    winner = LCMEngine(config=_config(db_path))
+    stale = LCMEngine(config=_config(db_path))
+    winner.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
+    stale.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
+    stale_captured = threading.Event()
+    release_stale = threading.Event()
+    failures: list[BaseException] = []
+    original_prepare = stale._prepare_rollover_final_tail
+
+    def pause_stale_after_generation_capture(*args, **kwargs):
+        prepared = original_prepare(*args, **kwargs)
+        stale_captured.set()
+        assert release_stale.wait(5)
+        return prepared
+
+    monkeypatch.setattr(stale, "_prepare_rollover_final_tail", pause_stale_after_generation_capture)
+
+    def run_stale():
+        try:
+            stale.rollover_session(
+                OLD,
+                "stale-carry-target",
+                previous_messages=previous_messages
+                + [{"role": "assistant", "content": "STALE RACE TAIL"}],
+                carry_over_context=True,
+                platform="test",
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    worker = threading.Thread(target=run_stale)
+    try:
+        worker.start()
+        assert stale_captured.wait(5)
+        winner.rollover_session(
+            OLD,
+            NEW,
+            previous_messages=previous_messages,
+            carry_over_context=False,
+            platform="test",
+        )
+        release_stale.set()
+        worker.join(5)
+        assert not worker.is_alive()
+        assert failures == []
+        state = _canonical_snapshot(db_path)
+        assert state["active"][1:] == (NEW, 0)
+        assert state["items"] == []
+        assert all(row[3] != "STALE RACE TAIL" for row in state["messages"])
+    finally:
+        release_stale.set()
+        worker.join(5)
+        winner.shutdown()
+        stale.shutdown()
+
+
+def test_off_current_session_end_begin_immediate_uses_50ms_busy_bound(tmp_path):
+    db_path = tmp_path / "rollover-late-end-busy-bound.db"
+    previous_messages, _retained_id, _pruned_id = _seed(db_path)
+    rollover = LCMEngine(config=_config(db_path))
+    late_end = LCMEngine(config=_config(db_path))
+    rollover.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
+    rollover.rollover_session(OLD, NEW, previous_messages=previous_messages, platform="test")
+    late_end.on_session_start(NEW, conversation_id=CONVERSATION, platform="test")
+    late_end._frontier._conn.execute("PRAGMA busy_timeout=700")
+    locker = sqlite3.connect(str(db_path), timeout=1.0, isolation_level=None)
+    locker.execute("PRAGMA journal_mode=WAL")
+    locker.execute("BEGIN IMMEDIATE")
+    try:
+        started = time.monotonic()
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            late_end.on_session_end(
+                OLD,
+                previous_messages + [{"role": "assistant", "content": "LOCKED LATE TAIL"}],
+            )
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.3
+        assert late_end._frontier._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 700
+    finally:
+        locker.execute("ROLLBACK")
+        locker.close()
+        rollover.shutdown()
+        late_end.shutdown()
+
+
+def test_simultaneous_late_end_and_competing_rollover_is_exact_or_bounded_locked(tmp_path):
     db_path = tmp_path / "rollover-late-end-versus-rollover.db"
     previous_messages, retained_id, _pruned_id = _seed(db_path)
     winner = LCMEngine(config=_config(db_path))
@@ -763,16 +1042,25 @@ def test_simultaneous_late_end_and_competing_rollover_preserve_both_suffixes(tmp
         for worker in workers:
             worker.join(10)
         assert all(not worker.is_alive() for worker in workers)
-        assert failures == []
+        assert all(
+            isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
+            for exc in failures
+        )
+        assert len(failures) <= 1
 
         state = _canonical_snapshot(db_path)
-        assert state["active"][:2] == (rolled["active"][0] + 2, NEW)
+        expected_advance = 1 if failures else 2
+        assert state["active"][:2] == (rolled["active"][0] + expected_advance, NEW)
         assert state["lifecycle"][:2] == (NEW, OLD)
         assert any(item[:2] == ("node", retained_id) for item in state["items"])
-        expected = {TAIL, late_content, rollover_content}
+        expected = {TAIL, rollover_content}
+        if not failures:
+            expected.add(late_content)
         _assert_raw_frontier_coverage(state, expected)
         for content in expected:
             assert sum(row[3] == content for row in state["messages"]) == 1
+        if failures:
+            assert all(row[3] != late_content for row in state["messages"])
     finally:
         winner.shutdown()
         stale.shutdown()
