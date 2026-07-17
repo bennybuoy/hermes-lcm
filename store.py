@@ -855,32 +855,53 @@ class MessageStore:
         if token_estimates is None:
             token_estimates = [0] * len(messages)
 
-        ids = []
         with self._write_lock, self._conn:
-            for msg, est in zip(messages, token_estimates):
-                tc = msg.get("tool_calls")
-                tc_json = json.dumps(tc) if tc else None
-                ts = time.time()
-                cur = self._conn.execute(
-                    """INSERT INTO messages
-                       (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
-                        tool_name, timestamp, token_estimate, pinned)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        session_id,
-                        _normalize_source_value(source),
-                        _normalize_conversation_id_value(conversation_id),
-                        msg.get("role", "unknown"),
-                        _normalize_content_value(msg.get("content")),
-                        msg.get("tool_call_id"),
-                        tc_json,
-                        msg.get("tool_name"),
-                        ts,
-                        est,
-                        0,
-                    ),
-                )
-                ids.append(cur.lastrowid)
+            return self.append_protected_batch_no_commit(
+                self._conn,
+                session_id,
+                messages,
+                token_estimates,
+                source=source,
+                conversation_id=conversation_id,
+            )
+
+    @staticmethod
+    def append_protected_batch_no_commit(
+        conn: sqlite3.Connection,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        token_estimates: List[int] | None = None,
+        *,
+        source: str = "",
+        conversation_id: str = "",
+    ) -> List[int]:
+        """Append already-protected messages on a caller-owned transaction."""
+        if token_estimates is None:
+            token_estimates = [0] * len(messages)
+        ids: List[int] = []
+        for msg, est in zip(messages, token_estimates):
+            tc = msg.get("tool_calls")
+            tc_json = json.dumps(tc) if tc else None
+            cur = conn.execute(
+                """INSERT INTO messages
+                   (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
+                    tool_name, timestamp, token_estimate, pinned)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    _normalize_source_value(source),
+                    _normalize_conversation_id_value(conversation_id),
+                    msg.get("role", "unknown"),
+                    _normalize_content_value(msg.get("content")),
+                    msg.get("tool_call_id"),
+                    tc_json,
+                    msg.get("tool_name"),
+                    time.time(),
+                    est,
+                    0,
+                ),
+            )
+            ids.append(int(cur.lastrowid))
         return ids
 
     def reassign_session_messages(self, old_session_id: str, new_session_id: str) -> int:

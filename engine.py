@@ -2970,6 +2970,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         conversation_id: str | None = None,
         raise_on_read_error: bool = False,
         read_budget: dict[str, float | int] | None = None,
+        conn: sqlite3.Connection | None = None,
     ) -> Optional[int]:
         if read_budget is None:
             read_budget = self._new_locked_publication_read_budget()
@@ -3030,7 +3031,8 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     where.append("conversation_id = ?")
                     query_params.append(str(conversation_id).strip())
                 query_params.append(page_limit)
-                rows = self._store._conn.execute(
+                query_conn = conn if conn is not None else self._store._conn
+                rows = query_conn.execute(
                     f"""SELECT store_id, {', '.join(bounded)}, {', '.join(lengths)}
                         FROM messages WHERE {' AND '.join(where)}
                         ORDER BY store_id LIMIT ?""",
@@ -3837,13 +3839,92 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         *,
         carry_over_context: bool,
         final_tail: Sequence[tuple[Dict[str, Any], int]],
-    ) -> int:
+        previous_messages: Sequence[Dict[str, Any]] | None = None,
+        expected_generation: int | None = None,
+        return_outcome: bool = False,
+    ) -> int | tuple[int, str, str]:
         """Publish final tail, DAG/frontier, batches, and lifecycle atomically."""
         moved = 0
         with self._frontier.publication_transaction() as conn:
             self._rollover_publication_boundary("after_begin")
             read_budget = self._new_locked_publication_read_budget()
-            for message, token_estimate in final_tail:
+            active = conn.execute(
+                """
+                SELECT generation, session_id, source_end_store_id,
+                       policy_fingerprint, route_fingerprint
+                FROM lcm_active_frontiers
+                WHERE conversation_id = ? ORDER BY generation DESC LIMIT 1
+                """,
+                (conversation_id,),
+            ).fetchone()
+            lifecycle = conn.execute(
+                """
+                SELECT current_session_id, last_finalized_session_id
+                FROM lcm_lifecycle_state WHERE conversation_id = ?
+                """,
+                (conversation_id,),
+            ).fetchone()
+            current_generation = int(active[0]) if active else 0
+            active_session_id = str(active[1] or "") if active else ""
+            lifecycle_session_id = str(lifecycle[0] or "") if lifecycle else ""
+            finalized_session_id = str(lifecycle[1] or "") if lifecycle else ""
+            expected = (
+                current_generation
+                if expected_generation is None
+                else int(expected_generation)
+            )
+
+            completed_session_id = ""
+            if (
+                active is not None
+                and current_generation > expected
+                and active_session_id != old_session_id
+                and lifecycle_session_id == active_session_id
+                and finalized_session_id == old_session_id
+            ):
+                completed_session_id = active_session_id
+            if completed_session_id:
+                outcome = (
+                    "idempotent" if completed_session_id == new_session_id else "competing"
+                )
+                result = (0, outcome, completed_session_id)
+                return result if return_outcome else 0
+
+            if current_generation != expected:
+                raise RuntimeError("canonical frontier generation changed during rollover")
+            if active is not None and active_session_id != old_session_id:
+                raise RuntimeError("canonical frontier is not owned by rollover old session")
+            if lifecycle is None or lifecycle_session_id != old_session_id:
+                raise RuntimeError("lifecycle is not owned by rollover old session")
+
+            tail_to_publish = list(final_tail)
+            if previous_messages:
+                durable_prefix_count = self._session_end_store_prefix_count(
+                    old_session_id,
+                    list(previous_messages),
+                    conversation_id=conversation_id,
+                    raise_on_read_error=True,
+                    read_budget=read_budget,
+                    conn=conn,
+                )
+                if durable_prefix_count is None:
+                    raise RuntimeError(
+                        "durable old-session ingest boundary is not a host prefix"
+                    )
+                prepared_prefix_count = len(previous_messages) - len(final_tail)
+                if durable_prefix_count < prepared_prefix_count:
+                    raise RuntimeError(
+                        "durable old-session ingest boundary moved backwards"
+                    )
+                already_durable = durable_prefix_count - prepared_prefix_count
+                if already_durable > len(tail_to_publish):
+                    raise RuntimeError(
+                        "durable old-session ingest boundary exceeds prepared tail"
+                    )
+                tail_to_publish = tail_to_publish[already_durable:]
+            self._rollover_publication_boundary("after_revalidation")
+
+            for message, token_estimate in tail_to_publish:
                 tool_calls = message.get("tool_calls")
                 conn.execute(
                     """
@@ -3867,15 +3948,6 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     ),
                 )
             self._rollover_publication_boundary("after_tail_ingest")
-            active = conn.execute(
-                """
-                SELECT generation, session_id, source_end_store_id,
-                       policy_fingerprint, route_fingerprint
-                FROM lcm_active_frontiers
-                WHERE conversation_id = ? ORDER BY generation DESC LIMIT 1
-                """,
-                (conversation_id,),
-            ).fetchone()
             base_generation = int(active[0]) if active else 0
             old_frontier = int(active[2] or 0) if active else 0
 
@@ -3963,7 +4035,8 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             self._rollover_publication_boundary("after_lifecycle")
 
         self._rollover_publication_boundary("after_commit")
-        return moved
+        result = (moved, "published", new_session_id)
+        return result if return_outcome else moved
 
     def _prepare_rollover_final_tail(
         self,
@@ -4171,21 +4244,49 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         moved = 0
         if old_session_id and can_carry_over:
             self._stop_async_worker()
+            active = self._frontier.get_active_frontier(conversation_id)
+            expected_generation = int(active["generation"]) if active else 0
+            if (
+                active is not None
+                and str(active.get("session_id") or "") != old_session_id
+            ):
+                state = self._lifecycle.get_by_conversation(conversation_id)
+                durable_session_id = str(active.get("session_id") or "")
+                if (
+                    state is None
+                    or state.current_session_id != durable_session_id
+                    or state.last_finalized_session_id != old_session_id
+                ):
+                    raise RuntimeError(
+                        "canonical frontier is not owned by rollover old session"
+                    )
+                self._on_session_reset_locked(persist_storage=False)
+                self._clear_pending_reset_boundary()
+                self.on_session_start(
+                    durable_session_id,
+                    conversation_id=conversation_id,
+                    **kwargs,
+                )
+                return 0
             final_tail = self._prepare_rollover_final_tail(
                 old_session_id,
                 previous_messages,
                 conversation_id=conversation_id,
             )
-            moved = self._publish_rollover_state(
+            moved, _, durable_session_id = self._publish_rollover_state(
                 conversation_id,
                 old_session_id,
                 new_session_id,
                 carry_over_context=carry_over_context,
                 final_tail=final_tail,
+                previous_messages=previous_messages,
+                expected_generation=expected_generation,
+                return_outcome=True,
             )
             published_rollover = True
             self._on_session_reset_locked(persist_storage=False)
             self._clear_pending_reset_boundary()
+            new_session_id = durable_session_id
         elif old_session_id and not carry_over_context:
             logger.warning(
                 "LCM rollover skipped old-session finalization: old_session_id=%s does not match bound session=%s",
@@ -5477,13 +5578,29 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 active_replay_messages[absolute_idx] = active_message
 
         estimates = [count_message_tokens(m) for m in protected_messages]
-        self._store._append_protected_batch(
-            self._session_id,
-            protected_messages,
-            estimates,
-            source=self._session_platform,
-            conversation_id=self._conversation_id,
-        )
+        ingest_session_id = self._session_id
+        ingest_conversation_id = self._conversation_id
+        with self._frontier.publication_transaction() as conn:
+            lifecycle = conn.execute(
+                """
+                SELECT current_session_id
+                FROM lcm_lifecycle_state WHERE conversation_id = ?
+                """,
+                (ingest_conversation_id,),
+            ).fetchone()
+            durable_session_id = str(lifecycle[0] or "") if lifecycle else ""
+            if lifecycle is not None and durable_session_id != ingest_session_id:
+                raise RuntimeError(
+                    "stale-session ingest rejected after durable session ownership changed"
+                )
+            self._store.append_protected_batch_no_commit(
+                conn,
+                ingest_session_id,
+                protected_messages,
+                estimates,
+                source=self._session_platform,
+                conversation_id=ingest_conversation_id,
+            )
         self._ingest_cursor = n
         self._compression_boundary_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget = {}
