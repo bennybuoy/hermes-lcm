@@ -1212,6 +1212,229 @@ def test_same_shape_stale_writer_cannot_rollback_cookie_or_version(
         winner_engine.shutdown()
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="requires durable directory cookies")
+def test_stale_root_reservation_cannot_reset_new_identity_progress(
+    tmp_path, monkeypatch
+):
+    state_root = tmp_path / "stale-root-state"
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    for index in range(240):
+        (payload_dir / f"stale-root-{index:04d}.json").write_text(
+            '{"session_id":"current","content":"ordinary haystack"}',
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(tools_module, "_EXTERNALIZED_MARKER_STATE_ROOT", state_root)
+    monkeypatch.setattr(tools_module, "_LCM_GREP_OPERATION_DEADLINE_SECONDS", 10.0)
+    stale_engine = _engine_with_payload_dir(tmp_path / "stale", payload_dir)
+    winner_engine = _engine_with_payload_dir(tmp_path / "winner", payload_dir)
+    args = {
+        "query": "NEVER-PRESENT-STALE-ROOT-NEEDLE",
+        "content_scope": "externalized",
+        "max_files": 20,
+        "limit": 1,
+    }
+    registry_path = state_root / ".owner-registry.db"
+
+    def scheduler_row() -> tuple[str, int, int]:
+        with sqlite3.connect(registry_path) as connection:
+            row = connection.execute(
+                "SELECT root_identity, listing_cookie, version "
+                "FROM scheduler_cursors"
+            ).fetchone()
+        assert row is not None
+        return str(row[0]), int(row[1]), int(row[2])
+
+    entered = threading.Event()
+    release = threading.Event()
+    captured: list[tuple[int, ...]] = []
+    real_reserve = tools_module._externalized_scheduler_reserve_locked
+
+    def barrier_reserve(*reserve_args, **reserve_kwargs):
+        if threading.current_thread().name == "stale-root-caller-a":
+            captured.append(reserve_kwargs["root_identity"])
+            entered.set()
+            assert release.wait(timeout=10)
+        return real_reserve(*reserve_args, **reserve_kwargs)
+
+    try:
+        initial = json.loads(tools_module.lcm_grep(args, engine=stale_engine))
+        assert initial["diagnostics"] == []
+        identity_a = tools_module._externalized_file_identity(payload_dir.stat())
+        initial_root, initial_cookie, initial_version = scheduler_row()
+        assert tuple(json.loads(initial_root)) == identity_a
+        assert initial_cookie > 0
+
+        monkeypatch.setattr(
+            tools_module, "_externalized_scheduler_reserve_locked", barrier_reserve
+        )
+        stale_outcome: list[object] = []
+
+        def stale_call() -> None:
+            try:
+                stale_outcome.append(
+                    json.loads(tools_module.lcm_grep(args, engine=stale_engine))
+                )
+            except BaseException as exc:  # noqa: BLE001 - asserted in parent
+                stale_outcome.append(exc)
+
+        stale_thread = threading.Thread(
+            target=stale_call,
+            name="stale-root-caller-a",
+        )
+        stale_thread.start()
+        assert entered.wait(timeout=10)
+        assert captured == [identity_a]
+
+        (payload_dir / "mutation-b.json").write_text(
+            '{"session_id":"current","content":"identity b"}',
+            encoding="utf-8",
+        )
+        identity_b = tools_module._externalized_file_identity(payload_dir.stat())
+        assert identity_b != identity_a
+        winner = json.loads(tools_module.lcm_grep(args, engine=winner_engine))
+        assert winner["diagnostics"] == []
+        won_row = scheduler_row()
+        assert tuple(json.loads(won_row[0])) == identity_b
+        assert won_row[1] > 0
+        assert won_row[2] > initial_version
+
+        release.set()
+        stale_thread.join(timeout=15)
+        assert not stale_thread.is_alive()
+        assert stale_outcome and not isinstance(stale_outcome[0], BaseException)
+        assert stale_outcome[0]["diagnostics"] == [
+            {"ref": "", "error": "private_state_unavailable"}
+        ]
+        assert scheduler_row() == won_row
+    finally:
+        release.set()
+        stale_engine.shutdown()
+        winner_engine.shutdown()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires durable directory cookies")
+def test_stale_root_reservations_preserve_progress_under_repeated_mutation_contention(
+    tmp_path, monkeypatch
+):
+    state_root = tmp_path / "stale-root-contention-state"
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    for index in range(240):
+        (payload_dir / f"contention-root-{index:04d}.json").write_text(
+            '{"session_id":"current","content":"ordinary haystack"}',
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(tools_module, "_EXTERNALIZED_MARKER_STATE_ROOT", state_root)
+    monkeypatch.setattr(tools_module, "_LCM_GREP_OPERATION_DEADLINE_SECONDS", 10.0)
+    stale_engines = [
+        _engine_with_payload_dir(tmp_path / f"stale-{index}", payload_dir)
+        for index in range(3)
+    ]
+    winner_engine = _engine_with_payload_dir(tmp_path / "winner", payload_dir)
+    args = {
+        "query": "NEVER-PRESENT-MUTATION-CONTENTION-NEEDLE",
+        "content_scope": "externalized",
+        "max_files": 20,
+        "limit": 1,
+    }
+    registry_path = state_root / ".owner-registry.db"
+
+    def scheduler_row() -> tuple[str, int, int]:
+        with sqlite3.connect(registry_path) as connection:
+            row = connection.execute(
+                "SELECT root_identity, listing_cookie, version "
+                "FROM scheduler_cursors"
+            ).fetchone()
+        assert row is not None
+        return str(row[0]), int(row[1]), int(row[2])
+
+    real_reserve = tools_module._externalized_scheduler_reserve_locked
+    entered = [threading.Event() for _ in stale_engines]
+    release = threading.Event()
+    captured: list[tuple[int, ...] | None] = [None] * len(stale_engines)
+
+    def barrier_reserve(*reserve_args, **reserve_kwargs):
+        name = threading.current_thread().name
+        if name.startswith("stale-root-contender-"):
+            index = int(name.rsplit("-", 1)[1])
+            captured[index] = reserve_kwargs["root_identity"]
+            entered[index].set()
+            assert release.wait(timeout=10)
+        return real_reserve(*reserve_args, **reserve_kwargs)
+
+    try:
+        initial = json.loads(tools_module.lcm_grep(args, engine=winner_engine))
+        assert initial["diagnostics"] == []
+        monkeypatch.setattr(
+            tools_module, "_externalized_scheduler_reserve_locked", barrier_reserve
+        )
+        previous_version = scheduler_row()[2]
+
+        for round_index in range(4):
+            release.clear()
+            for event in entered:
+                event.clear()
+            captured[:] = [None] * len(stale_engines)
+            identity_a = tools_module._externalized_file_identity(payload_dir.stat())
+            outcomes: list[list[object]] = [[] for _ in stale_engines]
+            threads = []
+
+            def stale_call(index: int) -> None:
+                try:
+                    outcomes[index].append(json.loads(
+                        tools_module.lcm_grep(args, engine=stale_engines[index])
+                    ))
+                except BaseException as exc:  # noqa: BLE001 - asserted in parent
+                    outcomes[index].append(exc)
+
+            for index in range(len(stale_engines)):
+                thread = threading.Thread(
+                    target=stale_call,
+                    args=(index,),
+                    name=f"stale-root-contender-{index}",
+                )
+                threads.append(thread)
+                thread.start()
+            for event in entered:
+                assert event.wait(timeout=10)
+            assert captured == [identity_a] * len(stale_engines)
+
+            for mutation_index in range(3):
+                (payload_dir / f"mutation-{round_index}-{mutation_index}.json").write_text(
+                    json.dumps({
+                        "session_id": "current",
+                        "content": f"mutation {round_index} {mutation_index}",
+                    }),
+                    encoding="utf-8",
+                )
+            identity_b = tools_module._externalized_file_identity(payload_dir.stat())
+            assert identity_b != identity_a
+            winner = json.loads(tools_module.lcm_grep(args, engine=winner_engine))
+            assert winner["diagnostics"] == []
+            won_row = scheduler_row()
+            assert tuple(json.loads(won_row[0])) == identity_b
+            assert won_row[1] > 0
+            assert won_row[2] > previous_version
+
+            release.set()
+            for thread in threads:
+                thread.join(timeout=15)
+                assert not thread.is_alive()
+            for outcome in outcomes:
+                assert outcome and not isinstance(outcome[0], BaseException)
+                assert outcome[0]["diagnostics"] == [
+                    {"ref": "", "error": "private_state_unavailable"}
+                ]
+            assert scheduler_row() == won_row
+            previous_version = won_row[2]
+    finally:
+        release.set()
+        for engine in stale_engines:
+            engine.shutdown()
+        winner_engine.shutdown()
+
+
 def _measure_marker_rss(tmp_path: Path, marker_count: int, stores: int) -> dict[str, int]:
     script = r'''
 import gc

@@ -2913,6 +2913,7 @@ def _externalized_scheduler_reserve_locked(
     runtime: _ExternalizedPrivateRuntimeState,
     *,
     key: str,
+    root: Path,
     root_identity: tuple[int, ...],
 ) -> tuple[bool, int, int]:
     """Durably reserve one no-ref shape before payload candidate discovery."""
@@ -2921,6 +2922,12 @@ def _externalized_scheduler_reserve_locked(
         return False, 0, 0
     try:
         connection.execute("BEGIN IMMEDIATE")
+        # The caller identity is only an optimistic observation. Re-stat under
+        # both the scheduler lock and its write transaction before allowing
+        # even private-state cleanup to become part of this reservation.
+        if _externalized_file_identity(root.stat()) != root_identity:
+            connection.rollback()
+            return False, 0, 0
         _externalized_scheduler_cleanup_disk_locked(
             connection, protected_keys=frozenset({key})
         )
@@ -2929,7 +2936,14 @@ def _externalized_scheduler_reserve_locked(
             "FROM scheduler_cursors "
             "WHERE shape_key = ?", (key,)
         ).fetchone()
-        encoded_root = json.dumps(root_identity, separators=(",", ":"))
+        # Cleanup and the row read are bounded, but the directory is governed
+        # outside SQLite. Verify it again immediately before any insert/reset
+        # and roll the transaction back if the caller's observation is stale.
+        current_root_identity = _externalized_file_identity(root.stat())
+        if current_root_identity != root_identity:
+            connection.rollback()
+            return False, 0, 0
+        encoded_root = json.dumps(current_root_identity, separators=(",", ":"))
         if row is None:
             count, total_bytes = connection.execute(
                 "SELECT COUNT(*), COALESCE(SUM(state_bytes), 0) "
@@ -2999,7 +3013,7 @@ def _externalized_scheduler_reserve_locked(
             version = max(1, int(row[2]))
         connection.commit()
         return True, listing_cookie, version
-    except (TypeError, ValueError, sqlite3.Error):
+    except (OSError, TypeError, ValueError, sqlite3.Error):
         try:
             connection.rollback()
         except sqlite3.Error:
@@ -4323,6 +4337,7 @@ def _search_externalized_payloads(
                     _externalized_scheduler_reserve_locked(
                         runtime_state,
                         key=scheduler_key,
+                        root=root,
                         root_identity=root_identity,
                     )
                 )
