@@ -198,31 +198,76 @@ class LifecycleStateStore:
                 observed_frontier_session = str(frontier[1] or "")
         existing = self.get_by_conversation(conversation_id) if conversation_id else self.get_by_session(session_id)
         conversation_id = conversation_id or (existing.conversation_id if existing else session_id)
-        policy = self._conn.execute(
-            """SELECT finalized_session_id, current_session_id,
-                      finalized_cutoff_store_id
-               FROM lcm_rollover_policies
-               WHERE conversation_id = ? AND carry_over_context = 0""",
+        if observed_generation == 0:
+            frontier = self._conn.execute(
+                """SELECT generation, session_id FROM lcm_active_frontiers
+                   WHERE conversation_id = ? ORDER BY generation DESC LIMIT 1""",
+                (conversation_id,),
+            ).fetchone()
+            if frontier is not None:
+                observed_generation = int(frontier[0] or 0)
+                observed_frontier_session = str(frontier[1] or "")
+        head = self._conn.execute(
+            """SELECT current_session_id, last_finalized_session_id,
+                      carry_over_context, rollover_epoch, frontier_generation
+               FROM lcm_rollover_heads WHERE conversation_id = ?""",
             (conversation_id,),
         ).fetchone()
-        if existing is None and policy is not None:
-            # Lifecycle cleanup/rewrite must not erase the independent winner.
-            # Rehydrate the canonical binding from policy before considering
-            # the requested session.
+        head_consistent = bool(
+            head is not None
+            and observed_frontier_session == str(head[0] or "")
+            and observed_generation >= int(head[4] or 0)
+        )
+        if head_consistent:
+            # The head is authoritative only while it agrees with the latest
+            # active frontier. Reconstruct or reconcile lifecycle from it;
+            # stale bind/rewrite calls cannot clear or replace the head.
             now = time.time()
+            protected = self._conn.execute(
+                """SELECT finalized_boundary_store_id
+                   FROM lcm_protected_sessions
+                   WHERE conversation_id = ? AND finalized_session_id = ?""",
+                (conversation_id, str(head[1])),
+            ).fetchone()
+            finalized_boundary = int(protected[0] or 0) if protected else (
+                existing.last_finalized_frontier_store_id if existing else 0
+            )
             self._conn.execute(
                 """INSERT INTO lcm_lifecycle_state(
                        conversation_id, current_session_id,
                        last_finalized_session_id,
+                       current_frontier_store_id,
                        last_finalized_frontier_store_id,
                        current_bound_at, last_finalized_at,
-                       rollover_carry_over_context, binding_generation,
+                       last_rollover_at, rollover_carry_over_context,
+                       binding_generation,
                        updated_at
-                   ) VALUES(?, ?, ?, ?, ?, ?, 0, 1, ?)
-                   ON CONFLICT(conversation_id) DO NOTHING""",
+                   ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                   ON CONFLICT(conversation_id) DO UPDATE SET
+                       current_session_id = excluded.current_session_id,
+                       last_finalized_session_id = excluded.last_finalized_session_id,
+                       current_frontier_store_id = excluded.current_frontier_store_id,
+                       last_finalized_frontier_store_id = MAX(
+                           lcm_lifecycle_state.last_finalized_frontier_store_id,
+                           excluded.last_finalized_frontier_store_id
+                       ),
+                       current_bound_at = excluded.current_bound_at,
+                       last_finalized_at = excluded.last_finalized_at,
+                       last_rollover_at = excluded.last_rollover_at,
+                       rollover_carry_over_context = excluded.rollover_carry_over_context,
+                       binding_generation = lcm_lifecycle_state.binding_generation + 1,
+                       updated_at = excluded.updated_at
+                   WHERE lcm_lifecycle_state.current_session_id IS NOT excluded.current_session_id
+                      OR lcm_lifecycle_state.last_finalized_session_id IS NOT excluded.last_finalized_session_id
+                      OR lcm_lifecycle_state.rollover_carry_over_context IS NOT excluded.rollover_carry_over_context""",
                 (
-                    conversation_id, str(policy[1]), str(policy[0]),
-                    int(policy[2] or 0), now, now, now,
+                    conversation_id, str(head[0]), str(head[1]),
+                    int(self._conn.execute(
+                        """SELECT source_end_store_id FROM lcm_active_frontiers
+                           WHERE conversation_id = ? AND generation = ?""",
+                        (conversation_id, observed_generation),
+                    ).fetchone()[0] or 0),
+                    finalized_boundary, now, now, now, int(head[2]), now,
                 ),
             )
             self._conn.commit()
@@ -246,7 +291,11 @@ class LifecycleStateStore:
         if existing is not None:
             if existing.current_session_id == session_id:
                 return existing
-            if policy is not None and str(policy[0] or "") == session_id:
+            if self._conn.execute(
+                """SELECT 1 FROM lcm_protected_sessions
+                   WHERE conversation_id = ? AND finalized_session_id = ?""",
+                (conversation_id, session_id),
+            ).fetchone():
                 return existing
             current_frontier = (
                 existing.current_frontier_store_id if existing.current_session_id == session_id else 0
@@ -469,6 +518,15 @@ class LifecycleStateStore:
     ) -> None:
         """Publish the rollover lifecycle row on a caller-owned transaction."""
         now = time.time()
+        LifecycleStateStore.record_rollover_head_no_commit(
+            conn,
+            conversation_id,
+            old_session_id=old_session_id,
+            new_session_id=new_session_id,
+            carry_over_context=carry_over_context,
+            rollover_generation=frozen_generation,
+            finalized_boundary_store_id=finalized_frontier_store_id,
+        )
         conn.execute(
             """
             INSERT INTO lcm_lifecycle_state(
@@ -507,6 +565,8 @@ class LifecycleStateStore:
             ),
         )
         if not carry_over_context:
+            # Retain the v11 row only for mixed-version writer compatibility;
+            # v12 enforcement never reads its scalar cutoff.
             LifecycleStateStore.record_no_carry_policy_no_commit(
                 conn,
                 conversation_id,
@@ -514,6 +574,93 @@ class LifecycleStateStore:
                 new_session_id=new_session_id,
                 finalized_cutoff_store_id=finalized_frontier_store_id,
                 frozen_generation=frozen_generation,
+            )
+
+    @staticmethod
+    def record_rollover_head_no_commit(
+        conn: sqlite3.Connection,
+        conversation_id: str,
+        *,
+        old_session_id: str,
+        new_session_id: str,
+        carry_over_context: bool,
+        rollover_generation: int,
+        finalized_boundary_store_id: int,
+    ) -> None:
+        """CAS the authoritative latest rollover head and historical set."""
+        now = time.time()
+        generation = max(0, int(rollover_generation or 0))
+        conn.execute(
+            """INSERT INTO lcm_rollover_heads(
+                   conversation_id, current_session_id,
+                   last_finalized_session_id, carry_over_context,
+                   rollover_epoch, frontier_generation, created_at, updated_at
+               )
+               SELECT ?, ?, ?, ?, 1, ?, ?, ?
+               WHERE EXISTS (
+                   SELECT 1 FROM lcm_active_frontiers AS f
+                   WHERE f.conversation_id = ? AND f.generation = ?
+                     AND f.session_id = ?
+                     AND NOT EXISTS (
+                         SELECT 1 FROM lcm_active_frontiers AS newer
+                         WHERE newer.conversation_id = f.conversation_id
+                           AND newer.generation > f.generation
+                     )
+               )
+               ON CONFLICT(conversation_id) DO UPDATE SET
+                   current_session_id = excluded.current_session_id,
+                   last_finalized_session_id = excluded.last_finalized_session_id,
+                   carry_over_context = excluded.carry_over_context,
+                   rollover_epoch = lcm_rollover_heads.rollover_epoch + 1,
+                   frontier_generation = excluded.frontier_generation,
+                   updated_at = excluded.updated_at
+               WHERE lcm_rollover_heads.current_session_id = ?
+                 AND excluded.frontier_generation > lcm_rollover_heads.frontier_generation""",
+            (
+                conversation_id, new_session_id, old_session_id,
+                1 if carry_over_context else 0, generation, now, now,
+                conversation_id, generation, new_session_id, old_session_id,
+            ),
+        )
+        head = conn.execute(
+            """SELECT current_session_id, last_finalized_session_id,
+                      carry_over_context, rollover_epoch, frontier_generation
+               FROM lcm_rollover_heads WHERE conversation_id = ?""",
+            (conversation_id,),
+        ).fetchone()
+        if not head or (
+            str(head[0]) != new_session_id
+            or str(head[1]) != old_session_id
+            or int(head[2]) != int(bool(carry_over_context))
+            or int(head[4]) != generation
+        ):
+            raise RuntimeError("rollover head owner/generation CAS lost")
+        if not carry_over_context:
+            conn.execute(
+                """INSERT INTO lcm_protected_sessions(
+                       conversation_id, finalized_session_id,
+                       finalized_boundary_store_id, protected_at_generation,
+                       rollover_epoch, created_at, updated_at
+                   ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(conversation_id, finalized_session_id) DO UPDATE SET
+                       finalized_boundary_store_id = MAX(
+                           lcm_protected_sessions.finalized_boundary_store_id,
+                           excluded.finalized_boundary_store_id
+                       ),
+                       protected_at_generation = MIN(
+                           lcm_protected_sessions.protected_at_generation,
+                           excluded.protected_at_generation
+                       ),
+                       rollover_epoch = MIN(
+                           lcm_protected_sessions.rollover_epoch,
+                           excluded.rollover_epoch
+                       ),
+                       updated_at = excluded.updated_at""",
+                (
+                    conversation_id, old_session_id,
+                    max(0, int(finalized_boundary_store_id or 0)), generation,
+                    int(head[3]), now, now,
+                ),
             )
 
     @staticmethod
@@ -566,26 +713,55 @@ class LifecycleStateStore:
         """Advance durable old-session coverage without changing frontier."""
         now = time.time()
         boundary = max(0, int(frontier_store_id or 0))
-        lifecycle = conn.execute(
+        authorization = conn.execute(
+            """SELECT h.rollover_epoch
+               FROM lcm_rollover_heads AS h
+               JOIN lcm_protected_sessions AS p
+                 ON p.conversation_id = h.conversation_id
+                AND p.finalized_session_id = ?
+               JOIN lcm_active_frontiers AS f
+                 ON f.conversation_id = h.conversation_id
+                AND f.session_id = h.current_session_id
+                AND f.generation >= h.frontier_generation
+               WHERE h.conversation_id = ? AND h.current_session_id = ?
+                 AND NOT EXISTS (
+                     SELECT 1 FROM lcm_active_frontiers AS newer
+                     WHERE newer.conversation_id = f.conversation_id
+                       AND newer.generation > f.generation
+                 )""",
+            (old_session_id, conversation_id, current_session_id),
+        ).fetchone()
+        if authorization is None:
+            raise RuntimeError("rollover head no longer authorizes protected storage extension")
+        conn.execute(
             """UPDATE lcm_lifecycle_state
                SET last_finalized_frontier_store_id = MAX(
                        last_finalized_frontier_store_id, ?
                    ), updated_at = ?
                WHERE conversation_id = ? AND current_session_id = ?
-                 AND last_finalized_session_id = ?
-                 AND rollover_carry_over_context = 0""",
+                 AND last_finalized_session_id = ?""",
             (boundary, now, conversation_id, current_session_id, old_session_id),
         )
-        policy = conn.execute(
+        protected = conn.execute(
+            """UPDATE lcm_protected_sessions
+               SET finalized_boundary_store_id = MAX(finalized_boundary_store_id, ?),
+                   updated_at = ?
+               WHERE conversation_id = ? AND finalized_session_id = ?
+            """,
+            (boundary, now, conversation_id, old_session_id),
+        )
+        # Best-effort compatibility for a schema-v11 process that was already
+        # open during migration. No v12 trigger or reader treats this scalar as
+        # authority, so interleaved newer-session store ids cannot freeze it.
+        conn.execute(
             """UPDATE lcm_rollover_policies
                SET finalized_cutoff_store_id = MAX(finalized_cutoff_store_id, ?),
                    updated_at = ?
-               WHERE conversation_id = ? AND finalized_session_id = ?
-                 AND current_session_id = ? AND carry_over_context = 0""",
-            (boundary, now, conversation_id, old_session_id, current_session_id),
+               WHERE conversation_id = ? AND finalized_session_id = ?""",
+            (boundary, now, conversation_id, old_session_id),
         )
-        if int(lifecycle.rowcount or 0) != 1 or int(policy.rowcount or 0) != 1:
-            raise RuntimeError("lifecycle no longer authorizes no-carry storage extension")
+        if int(protected.rowcount or 0) != 1:
+            raise RuntimeError("protected session disappeared during storage extension")
 
     @staticmethod
     def extend_finalized_rollover_no_commit(
@@ -598,6 +774,24 @@ class LifecycleStateStore:
     ) -> None:
         """Advance both winner and finalized boundaries under locked ownership."""
         now = time.time()
+        authorized = conn.execute(
+            """SELECT 1 FROM lcm_rollover_heads AS h
+               JOIN lcm_active_frontiers AS f
+                 ON f.conversation_id = h.conversation_id
+                AND f.session_id = h.current_session_id
+                AND f.generation >= h.frontier_generation
+               WHERE h.conversation_id = ? AND h.current_session_id = ?
+                 AND h.last_finalized_session_id = ?
+                 AND h.carry_over_context = 1
+                 AND NOT EXISTS (
+                     SELECT 1 FROM lcm_active_frontiers AS newer
+                     WHERE newer.conversation_id = f.conversation_id
+                       AND newer.generation > f.generation
+                 )""",
+            (conversation_id, current_session_id, old_session_id),
+        ).fetchone()
+        if authorized is None:
+            raise RuntimeError("rollover head no longer authorizes finalized-session extension")
         cur = conn.execute(
             """UPDATE lcm_lifecycle_state
                SET current_frontier_store_id = MAX(current_frontier_store_id, ?),
@@ -605,8 +799,7 @@ class LifecycleStateStore:
                    updated_at = ?
                WHERE conversation_id = ?
                  AND current_session_id = ?
-                 AND last_finalized_session_id = ?
-                 AND COALESCE(rollover_carry_over_context, 1) = 1""",
+                 AND last_finalized_session_id = ?""",
             (
                 max(0, int(frontier_store_id or 0)),
                 max(0, int(frontier_store_id or 0)),
@@ -616,8 +809,8 @@ class LifecycleStateStore:
                 old_session_id,
             ),
         )
-        if int(cur.rowcount or 0) != 1:
-            raise RuntimeError("lifecycle no longer authorizes finalized-session extension")
+        # Lifecycle is a reconstructable cache. A stale rewrite may make this
+        # update a no-op, but cannot invalidate the head-authorized frontier.
 
     @staticmethod
     def finalize_session_no_commit(

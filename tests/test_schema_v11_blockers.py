@@ -263,12 +263,27 @@ def _make_v10_database(path: Path) -> None:
             "lcm_no_carry_item_update",
         ):
             conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        for (trigger,) in conn.execute(
+            """SELECT name FROM sqlite_master WHERE type='trigger'
+               AND (name LIKE 'lcm_protected_%' OR name LIKE 'lcm_v12_%')"""
+        ).fetchall():
+            conn.execute(f'DROP TRIGGER IF EXISTS "{trigger}"')
+        for table in (
+            "lcm_session_end_receipts",
+            "lcm_rollover_heads",
+            "lcm_protected_sessions",
+        ):
+            conn.execute(f'DROP TABLE IF EXISTS "{table}"')
         conn.execute("DROP TABLE IF EXISTS lcm_rollover_policies")
         conn.execute(
             "ALTER TABLE lcm_lifecycle_state DROP COLUMN binding_generation"
         )
         conn.execute(
             "DELETE FROM lcm_migration_state WHERE step_name = 'v11_no_carry_frontier_policy'"
+        )
+        conn.execute(
+            """DELETE FROM lcm_migration_state
+               WHERE step_name = 'v12_protected_sessions_heads_and_ingest_receipts'"""
         )
         conn.execute("DROP TRIGGER IF EXISTS lcm_schema_version_monotonic")
         conn.execute("UPDATE metadata SET value = '10' WHERE key = 'schema_version'")
@@ -318,7 +333,7 @@ db_bootstrap.run_versioned_migrations(conn)
         assert interrupted.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
         db_bootstrap.run_versioned_migrations(interrupted)
-        assert db_bootstrap.get_schema_version(interrupted) == 11
+        assert db_bootstrap.get_schema_version(interrupted) == 12
         assert interrupted.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_rollover_policies'"
         ).fetchone() == (1,)
@@ -332,14 +347,16 @@ db_bootstrap.run_versioned_migrations(conn)
         triggers = {
             row[0]
             for row in interrupted.execute(
-                "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'lcm_no_carry_%'"
+                """SELECT name FROM sqlite_master WHERE type='trigger'
+                   AND name LIKE 'lcm_protected_frontier_%'"""
             )
         }
         assert triggers == {
-            "lcm_no_carry_frontier_insert",
-            "lcm_no_carry_frontier_update",
-            "lcm_no_carry_item_insert",
-            "lcm_no_carry_item_update",
+            "lcm_protected_frontier_insert",
+            "lcm_protected_frontier_update",
         }
+        assert interrupted.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_rollover_heads'"
+        ).fetchone() == (1,)
     finally:
         interrupted.close()

@@ -261,19 +261,34 @@ Below that pressure, simpler existing behavior is preserved. Until Hermes core
 supplies the explicit signal contract, cache state remains `unknown` and LCM
 uses the normal bounded route strategy.
 
-### Schema v11 deployment and rollback
+### Schema v12 deployment and rollback
 
-Schema v11 adds the lifecycle `binding_generation` CAS column, the independent
-`lcm_rollover_policies` cutoff ledger, and database triggers on active-frontier
-generations and items. A
-no-carry rollover keeps late or competing old-session messages losslessly in
-raw storage and advances the finalized durable cutoff, but those rows never
-repopulate the current canonical frontier. The triggers enforce that cutoff
-even for an already-running schema-v9 publisher: old processes may append raw
-messages, but cannot publish the finalized owner or any frontier item whose
-source range begins at or before the cutoff. The policy survives lifecycle-row
-rewrites. Table creation, trigger installation, migration-step recording, and
-schema-version publication are one crash-atomic SQLite writer transaction.
+Schema v12 replaces the schema-v11 scalar cutoff with two independent records.
+`lcm_protected_sessions` is historical and keyed by conversation plus finalized
+session. Database triggers reject frontier ownership or item provenance that
+references a protected session through raw-message ownership, summary-node
+ownership, or the item's raw source closure. Protection is therefore unaffected
+by global `store_id` ordering: a late old-session row remains protected, while a
+later new-session row remains publishable. `lcm_rollover_heads` stores only the
+latest current owner, last finalized owner, carry policy, rollover epoch, and
+frontier generation. Every carry and no-carry rollover updates it by owner and
+generation CAS; lifecycle rows are reconstructed from it only when it agrees
+with the latest active frontier.
+
+No-carry late and competing tails remain lossless raw history and advance only
+their protected session boundary; the canonical frontier stays frozen. Durable
+`lcm_session_end_receipts` make truncated end callbacks idempotent across process
+restart. The known host prefix is sliced before ignore filtering, so a retained
+payload with prefix count zero is fresh once even if it equals ancient content.
+Receipts are retained at a bounded 1,024 rows per conversation. The old
+`lcm_rollover_policies` table remains only as a mixed-version compatibility
+landing zone and is not consulted by v12 enforcement or reconstruction.
+
+The v10 lifecycle carry state and v11 compatibility rows are backfilled into
+the protected-session and head tables in the same crash-atomic writer
+transaction as DDL, trigger installation, migration-step recording, and schema
+version publication. Already-running v9-v11 publishers may append raw messages,
+but provenance triggers prevent them from restoring protected history.
 
 Schema v10 added the nullable `rollover_carry_over_context` lifecycle field. It
 records the carry-over decision that won an atomic rollover so application
@@ -281,10 +296,11 @@ code can route late session-end storage correctly. Existing schema v9 rows
 migrate with `NULL`, which preserves the legacy compatibility behavior; newly
 published rollovers store an explicit boolean.
 
-The read-only `hermes-lcm status` command reports `schema_version: 11` together
-with `supported_schema_version: 11` and a rollover-policy row count. `frontier
-show` includes the conversation's durable policy when present, and `doctor`
-checks for cutoff violations. The CLI does not migrate older databases and
+The read-only `hermes-lcm status` command reports `schema_version: 12` together
+with `supported_schema_version: 12` and protected-session, rollover-head, and
+receipt row counts. `frontier show` includes the conversation's head and
+historical protected sessions, and `doctor` checks provenance and head/frontier
+consistency. The CLI does not migrate older databases and
 refuses databases newer than the installed build.
 
 Schema v8 previously added immutable `lcm_focus_briefs` records and the

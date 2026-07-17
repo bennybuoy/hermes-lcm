@@ -289,7 +289,9 @@ def _status(conn: sqlite3.Connection, path: Path, _args: argparse.Namespace) -> 
             "frontier_generations": _count(conn, "lcm_active_frontiers"),
             "frontier_items": _count(conn, "lcm_frontier_items"),
             "prepared_batches": _count(conn, "lcm_prepared_batches"),
-            "rollover_policies": _count(conn, "lcm_rollover_policies"),
+            "protected_sessions": _count(conn, "lcm_protected_sessions"),
+            "rollover_heads": _count(conn, "lcm_rollover_heads"),
+            "session_end_receipts": _count(conn, "lcm_session_end_receipts"),
         },
     }
 
@@ -451,13 +453,21 @@ def _frontier(conn: sqlite3.Connection, args: argparse.Namespace) -> dict[str, A
     ).fetchall()
     payload["items_truncated"] = len(item_rows) > _FRONTIER_ITEMS_LIMIT
     payload["items"] = [dict(item) for item in item_rows[:_FRONTIER_ITEMS_LIMIT]]
-    payload["rollover_policy"] = None
-    if _table_exists(conn, "lcm_rollover_policies"):
-        policy = conn.execute(
-            "SELECT * FROM lcm_rollover_policies WHERE conversation_id = ?",
+    payload["rollover_head"] = None
+    payload["protected_sessions"] = []
+    if _table_exists(conn, "lcm_rollover_heads"):
+        head = conn.execute(
+            "SELECT * FROM lcm_rollover_heads WHERE conversation_id = ?",
             (payload["conversation_id"],),
         ).fetchone()
-        payload["rollover_policy"] = dict(policy) if policy is not None else None
+        payload["rollover_head"] = dict(head) if head is not None else None
+    if _table_exists(conn, "lcm_protected_sessions"):
+        protected = conn.execute(
+            """SELECT * FROM lcm_protected_sessions
+               WHERE conversation_id = ? ORDER BY protected_at_generation""",
+            (payload["conversation_id"],),
+        ).fetchall()
+        payload["protected_sessions"] = [dict(row) for row in protected]
     return payload
 
 
@@ -502,7 +512,8 @@ def _doctor(conn: sqlite3.Connection, path: Path, _args: argparse.Namespace) -> 
     foreign = conn.execute("PRAGMA foreign_key_check").fetchmany(100)
     itemless = 0
     missing_nodes = 0
-    no_carry_policy_violations = 0
+    protected_session_violations = 0
+    rollover_head_inconsistencies = 0
     if _table_exists(conn, "lcm_active_frontiers") and _table_exists(conn, "lcm_frontier_items"):
         itemless = int(conn.execute(
             """
@@ -523,24 +534,55 @@ def _doctor(conn: sqlite3.Connection, path: Path, _args: argparse.Namespace) -> 
                 """
             ).fetchone()[0])
     if (
-        _table_exists(conn, "lcm_rollover_policies")
+        _table_exists(conn, "lcm_protected_sessions")
         and _table_exists(conn, "lcm_active_frontiers")
         and _table_exists(conn, "lcm_frontier_items")
+        and _table_exists(conn, "messages")
+        and _table_exists(conn, "summary_nodes")
     ):
-        no_carry_policy_violations = int(conn.execute(
-            """SELECT COUNT(*) FROM lcm_rollover_policies AS p
-               WHERE p.carry_over_context = 0 AND (
+        protected_session_violations = int(conn.execute(
+            """SELECT COUNT(*) FROM lcm_protected_sessions AS p
+               WHERE (
                    EXISTS (
                        SELECT 1 FROM lcm_active_frontiers AS f
                        WHERE f.conversation_id = p.conversation_id
-                         AND f.generation > p.frozen_generation
                          AND f.session_id = p.finalized_session_id
                    )
                    OR EXISTS (
                        SELECT 1 FROM lcm_frontier_items AS i
                        WHERE i.conversation_id = p.conversation_id
-                         AND i.generation >= p.frozen_generation
-                         AND i.source_start <= p.finalized_cutoff_store_id
+                         AND (
+                           (i.kind='message' AND EXISTS (
+                             SELECT 1 FROM messages m WHERE m.store_id=i.ref_id
+                               AND m.conversation_id=i.conversation_id
+                               AND m.session_id=p.finalized_session_id
+                           ))
+                           OR (i.kind='node' AND EXISTS (
+                             SELECT 1 FROM summary_nodes n WHERE n.node_id=i.ref_id
+                               AND n.session_id=p.finalized_session_id
+                           ))
+                           OR EXISTS (
+                             SELECT 1 FROM messages m
+                             WHERE m.conversation_id=i.conversation_id
+                               AND m.session_id=p.finalized_session_id
+                               AND m.store_id BETWEEN i.source_start AND i.source_end
+                           )
+                         )
+                   )
+               )"""
+        ).fetchone()[0])
+    if _table_exists(conn, "lcm_rollover_heads") and _table_exists(conn, "lcm_active_frontiers"):
+        rollover_head_inconsistencies = int(conn.execute(
+            """SELECT COUNT(*) FROM lcm_rollover_heads h
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM lcm_active_frontiers f
+                 WHERE f.conversation_id=h.conversation_id
+                   AND f.session_id=h.current_session_id
+                   AND f.generation >= h.frontier_generation
+                   AND NOT EXISTS (
+                     SELECT 1 FROM lcm_active_frontiers newer
+                     WHERE newer.conversation_id=f.conversation_id
+                       AND newer.generation > f.generation
                    )
                )"""
         ).fetchone()[0])
@@ -552,10 +594,12 @@ def _doctor(conn: sqlite3.Connection, path: Path, _args: argparse.Namespace) -> 
         "foreign_key_violations": [list(row) for row in foreign],
         "itemless_positive_frontiers": itemless,
         "missing_frontier_nodes": missing_nodes,
-        "no_carry_policy_violations": no_carry_policy_violations,
+        "protected_session_violations": protected_session_violations,
+        "rollover_head_inconsistencies": rollover_head_inconsistencies,
         "status": "pass" if (
             ok and not foreign and not itemless and not missing_nodes
-            and not no_carry_policy_violations
+            and not protected_session_violations
+            and not rollover_head_inconsistencies
         ) else "fail",
     }
 

@@ -155,6 +155,7 @@ from . import tools as lcm_tools
 logger = logging.getLogger(__name__)
 
 _SESSION_END_BUSY_TIMEOUT_MS = 50
+_SESSION_END_RECEIPTS_PER_CONVERSATION = 1024
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 
 # Auto-focus topic derivation: infer a compact focus hint from the most recent
@@ -3129,6 +3130,40 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 raise
             return None
 
+    def _session_end_store_host_prefix_count(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        conversation_id: str,
+    ) -> Optional[int]:
+        """Translate retained durable matches back to a host-list boundary."""
+        retained: list[Dict[str, Any]] = []
+        host_indices: list[int] = []
+        for host_index, message in enumerate(messages):
+            if self._matches_ignore_message_patterns(message):
+                continue
+            retained.append(message)
+            host_indices.append(host_index)
+        compared = self._session_end_store_prefix_count(
+            session_id,
+            retained,
+            conversation_id=conversation_id,
+        )
+        if compared is None:
+            return None
+        if compared <= 0:
+            return 0
+        boundary = host_indices[min(compared, len(host_indices)) - 1] + 1
+        # Ignored rows immediately following the known retained prefix belong
+        # to that host prefix too; including them preserves the slice-before-
+        # ignore contract without claiming any later retained row is durable.
+        while boundary < len(messages) and self._matches_ignore_message_patterns(
+            messages[boundary]
+        ):
+            boundary += 1
+        return boundary
+
     @staticmethod
     def _ordered_unmatched_retained_indices(
         host_identities: Sequence[Any],
@@ -3260,6 +3295,36 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         }
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
         return hashlib.sha256(encoded.encode("utf-8", errors="replace")).hexdigest()
+
+    @classmethod
+    def _session_end_receipt_fingerprint(
+        cls,
+        messages: Sequence[Dict[str, Any]],
+        *,
+        prefix_count: int,
+    ) -> str:
+        """Hash one callback payload incrementally, including prefix evidence."""
+        digest = hashlib.sha256()
+        digest.update(b"lcm-session-end-receipt-v1\0")
+        digest.update(str(max(0, int(prefix_count))).encode("ascii"))
+        digest.update(b"\0")
+        for message in messages:
+            encoded = json.dumps(
+                {
+                    "role": message.get("role"),
+                    "content": normalize_content_value(message.get("content")),
+                    "tool_call_id": message.get("tool_call_id"),
+                    "tool_name": message.get("tool_name"),
+                    "tool_calls": message.get("tool_calls"),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8", errors="replace")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+        return digest.hexdigest()
 
     def _remember_lcm_bypass_message_prefix(
         self,
@@ -3409,10 +3474,17 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
     ) -> list[int]:
         if not session_id or not messages:
             return []
+        prefix_count = min(len(messages), max(0, int(prefix_count)))
+        payload_fingerprint = self._session_end_receipt_fingerprint(
+            messages,
+            prefix_count=prefix_count,
+        )
         kept: list[tuple[int, Dict[str, Any]]] = []
-        # Reconcile the complete retained sequence below.  A host index is not
-        # durable evidence because ignored rows legitimately leave gaps.
-        for host_index, msg in enumerate(messages):
+        # prefix_count is durable host-prefix evidence. Slice first, because an
+        # ignored host row still occupies a host position. Every retained row
+        # after that boundary is fresh on the first durable receipt, even when
+        # its content is byte-identical to an ancient durable occurrence.
+        for host_index, msg in enumerate(messages[prefix_count:], start=prefix_count):
             if self._matches_ignore_message_patterns(msg):
                 self._ignored_message_count += 1
                 excerpt = (text_content_for_pattern_matching(msg.get("content")) or "")[:80].replace("\n", " ")
@@ -3459,16 +3531,45 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                        ORDER BY generation DESC LIMIT 1""",
                     (conversation_id,),
                 ).fetchone()
+                head = conn.execute(
+                    """SELECT current_session_id, last_finalized_session_id,
+                              carry_over_context, rollover_epoch,
+                              frontier_generation
+                       FROM lcm_rollover_heads WHERE conversation_id = ?""",
+                    (conversation_id,),
+                ).fetchone()
+                protected = conn.execute(
+                    """SELECT finalized_boundary_store_id
+                       FROM lcm_protected_sessions
+                       WHERE conversation_id = ? AND finalized_session_id = ?""",
+                    (conversation_id, session_id),
+                ).fetchone()
                 current_session_id = str(lifecycle[0] or "") if lifecycle else ""
                 finalized_session_id = str(lifecycle[1] or "") if lifecycle else ""
                 active_session_id = str(active[1] or "") if active else ""
-                extends_rollover = bool(
-                    lifecycle is not None
+                active_generation = int(active[0] or 0) if active else 0
+                head_consistent = bool(
+                    head is not None
                     and active is not None
-                    and current_session_id
-                    and current_session_id != session_id
-                    and finalized_session_id == session_id
-                    and active_session_id == current_session_id
+                    and str(head[0] or "") == active_session_id
+                    and int(head[4] or 0) <= active_generation
+                )
+                head_current_session_id = (
+                    str(head[0] or "") if head_consistent else ""
+                )
+                head_finalized_session_id = (
+                    str(head[1] or "") if head_consistent else ""
+                )
+                head_carry = bool(head[2]) if head_consistent else True
+                receipt_epoch = int(head[3] or 0) if head_consistent else 0
+                extends_protected = bool(
+                    protected is not None and head_consistent
+                )
+                extends_rollover = bool(
+                    not extends_protected
+                    and head_consistent
+                    and head_current_session_id != session_id
+                    and head_finalized_session_id == session_id
                 )
                 finalizes_current = bool(
                     lifecycle is not None and current_session_id == session_id
@@ -3478,24 +3579,71 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     and not current_session_id
                     and finalized_session_id == session_id
                 )
-                if not (extends_rollover or finalizes_current or extends_finalized):
+                if not (
+                    extends_protected or extends_rollover
+                    or finalizes_current or extends_finalized
+                ):
                     raise RuntimeError(
                         "late session-end rejected after durable lifecycle ownership changed"
                     )
-                appended_ids = self._revalidate_and_append_old_session_tail_no_commit(
-                    conn,
-                    conversation_id=conversation_id,
-                    old_session_id=session_id,
-                    previous_messages=messages,
-                    prepared_tail=prepared_tail,
-                    source=source,
-                    read_budget=read_budget,
+                receipt = conn.execute(
+                    """INSERT INTO lcm_session_end_receipts(
+                           conversation_id, session_id, payload_fingerprint,
+                           rollover_epoch, prefix_count, retained_count, created_at
+                       ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(
+                           conversation_id, session_id,
+                           payload_fingerprint, rollover_epoch
+                       ) DO NOTHING""",
+                    (
+                        conversation_id, session_id, payload_fingerprint,
+                        receipt_epoch, prefix_count, len(prepared_tail), time.time(),
+                    ),
                 )
+                if int(receipt.rowcount or 0) == 0:
+                    return []
+                self._rollover_publication_boundary("after_receipt")
+                conn.execute(
+                    """DELETE FROM lcm_session_end_receipts
+                       WHERE conversation_id = ? AND rowid NOT IN (
+                           SELECT rowid FROM lcm_session_end_receipts
+                           WHERE conversation_id = ?
+                           ORDER BY created_at DESC, rowid DESC LIMIT ?
+                       )""",
+                    (
+                        conversation_id, conversation_id,
+                        _SESSION_END_RECEIPTS_PER_CONVERSATION,
+                    ),
+                )
+                if prepared_tail:
+                    appended_ids = self._store.append_protected_batch_no_commit(
+                        conn,
+                        session_id,
+                        [message for _host_index, message, _estimate in prepared_tail],
+                        [estimate for _host_index, _message, estimate in prepared_tail],
+                        source=source,
+                        conversation_id=conversation_id,
+                    )
                 self._rollover_publication_boundary("after_revalidation")
                 self._rollover_publication_boundary("after_tail_ingest")
 
-                if extends_rollover:
-                    if lifecycle[4] is not None and not bool(lifecycle[4]):
+                if extends_protected:
+                    finalized_boundary = self._durable_session_boundary_no_commit(
+                        conn,
+                        conversation_id=conversation_id,
+                        session_id=session_id,
+                        floor=int(protected[0] or 0),
+                    )
+                    self._lifecycle.extend_no_carry_finalized_boundary_no_commit(
+                        conn,
+                        conversation_id,
+                        old_session_id=session_id,
+                        current_session_id=head_current_session_id,
+                        frontier_store_id=finalized_boundary,
+                    )
+                    self._rollover_publication_boundary("after_lifecycle")
+                elif extends_rollover:
+                    if not head_carry:
                         finalized_boundary = self._durable_session_boundary_no_commit(
                             conn,
                             conversation_id=conversation_id,
@@ -3506,7 +3654,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                             conn,
                             conversation_id,
                             old_session_id=session_id,
-                            current_session_id=current_session_id,
+                            current_session_id=head_current_session_id,
                             frontier_store_id=finalized_boundary,
                         )
                         self._rollover_publication_boundary("after_lifecycle")
@@ -3515,7 +3663,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                             conn,
                             conversation_id=conversation_id,
                             old_session_id=session_id,
-                            winner_session_id=current_session_id,
+                            winner_session_id=head_current_session_id,
                             active=active,
                             read_budget=read_budget,
                             batch_reason="late_finalized_session_suffix",
@@ -3642,6 +3790,47 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 self._deactivate_auxiliary_session(session_id, generation=ended_generation)
                 self._clear_thread_context_stateless(session_id)
             return
+        protected_conversation_id = ""
+        lifecycle_conn = self._lifecycle.connection
+        if lifecycle_conn is not None and session_id != self._session_id:
+            known_conversation = self._lcm_session_last_normal_conversation_id.get(
+                session_id
+            )
+            if known_conversation:
+                protected_row = lifecycle_conn.execute(
+                    """SELECT conversation_id FROM lcm_protected_sessions
+                       WHERE conversation_id = ? AND finalized_session_id = ?""",
+                    (known_conversation, session_id),
+                ).fetchone()
+            else:
+                protected_row = lifecycle_conn.execute(
+                    """SELECT conversation_id FROM lcm_protected_sessions
+                       WHERE finalized_session_id = ?
+                       ORDER BY updated_at DESC LIMIT 1""",
+                    (session_id,),
+                ).fetchone()
+            protected_conversation_id = (
+                str(protected_row[0] or "") if protected_row else ""
+            )
+        if protected_conversation_id:
+            durable_prefix_count = self._session_end_store_host_prefix_count(
+                session_id,
+                messages,
+                conversation_id=protected_conversation_id,
+            )
+            self._append_off_current_session_end_suffix(
+                session_id,
+                messages,
+                prefix_count=max(0, int(durable_prefix_count or 0)),
+                source=(
+                    self._lcm_session_last_normal_platform.get(session_id)
+                    or self._lcm_session_last_platform.get(
+                        session_id, self._session_platform
+                    )
+                ),
+                conversation_id=protected_conversation_id,
+            )
+            return
         durable_end_state = self._lifecycle.get_by_session(session_id)
         if (
             durable_end_state is not None
@@ -3649,7 +3838,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             and durable_end_state.current_session_id != session_id
             and durable_end_state.last_finalized_session_id == session_id
         ):
-            durable_prefix_count = self._session_end_store_prefix_count(
+            durable_prefix_count = self._session_end_store_host_prefix_count(
                 session_id,
                 messages,
                 conversation_id=durable_end_state.conversation_id,
@@ -4404,13 +4593,38 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 """,
                 (conversation_id,),
             ).fetchone()
+            head = conn.execute(
+                """SELECT current_session_id, last_finalized_session_id,
+                          carry_over_context, rollover_epoch,
+                          frontier_generation
+                   FROM lcm_rollover_heads WHERE conversation_id = ?""",
+                (conversation_id,),
+            ).fetchone()
+            protected_old = conn.execute(
+                """SELECT finalized_boundary_store_id
+                   FROM lcm_protected_sessions
+                   WHERE conversation_id = ? AND finalized_session_id = ?""",
+                (conversation_id, old_session_id),
+            ).fetchone()
             current_generation = int(active[0]) if active else 0
             active_session_id = str(active[1] or "") if active else ""
-            lifecycle_session_id = str(lifecycle[0] or "") if lifecycle else ""
-            finalized_session_id = str(lifecycle[1] or "") if lifecycle else ""
+            head_consistent = bool(
+                head is not None
+                and active is not None
+                and str(head[0] or "") == active_session_id
+                and int(head[4] or 0) <= current_generation
+            )
+            lifecycle_session_id = (
+                str(head[0] or "") if head_consistent
+                else str(lifecycle[0] or "") if lifecycle else ""
+            )
+            finalized_session_id = (
+                str(head[1] or "") if head_consistent
+                else str(lifecycle[1] or "") if lifecycle else ""
+            )
             winner_carry_over = (
-                True
-                if lifecycle is None or lifecycle[2] is None
+                bool(head[2]) if head_consistent
+                else True if lifecycle is None or lifecycle[2] is None
                 else bool(lifecycle[2])
             )
             expected = (
@@ -4424,7 +4638,10 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 active is not None
                 and active_session_id != old_session_id
                 and lifecycle_session_id == active_session_id
-                and finalized_session_id == old_session_id
+                and (
+                    finalized_session_id == old_session_id
+                    or protected_old is not None
+                )
             ):
                 completed_session_id = active_session_id
             if completed_session_id:
@@ -4437,9 +4654,45 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     source=self._session_platform or "unknown",
                     read_budget=read_budget,
                 )
+                # A competing rollover supplies a full host history. Preserve
+                # multiplicity-union semantics now, then receipt the exact
+                # payload so a later session-end callback cannot reinterpret a
+                # reordered full history as a fresh prefix_count=0 truncation.
+                if previous_messages:
+                    receipt_epoch = int(head[3] or 0) if head_consistent else 0
+                    conn.execute(
+                        """INSERT INTO lcm_session_end_receipts(
+                               conversation_id, session_id,
+                               payload_fingerprint, rollover_epoch,
+                               prefix_count, retained_count, created_at
+                           ) VALUES(?, ?, ?, ?, 0, ?, ?)
+                           ON CONFLICT(
+                               conversation_id, session_id,
+                               payload_fingerprint, rollover_epoch
+                           ) DO NOTHING""",
+                        (
+                            conversation_id, old_session_id,
+                            self._session_end_receipt_fingerprint(
+                                previous_messages, prefix_count=0
+                            ),
+                            receipt_epoch, len(previous_messages), time.time(),
+                        ),
+                    )
+                    conn.execute(
+                        """DELETE FROM lcm_session_end_receipts
+                           WHERE conversation_id = ? AND rowid NOT IN (
+                               SELECT rowid FROM lcm_session_end_receipts
+                               WHERE conversation_id = ?
+                               ORDER BY created_at DESC, rowid DESC LIMIT ?
+                           )""",
+                        (
+                            conversation_id, conversation_id,
+                            _SESSION_END_RECEIPTS_PER_CONVERSATION,
+                        ),
+                    )
                 self._rollover_publication_boundary("after_revalidation")
                 self._rollover_publication_boundary("after_tail_ingest")
-                if winner_carry_over:
+                if winner_carry_over and protected_old is None:
                     self._extend_completed_rollover_no_commit(
                         conn,
                         conversation_id=conversation_id,
@@ -4454,6 +4707,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                         conn,
                         conversation_id=conversation_id,
                         session_id=old_session_id,
+                        floor=int(protected_old[0] or 0) if protected_old else 0,
                     )
                     self._lifecycle.extend_no_carry_finalized_boundary_no_commit(
                         conn,
@@ -4473,7 +4727,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 raise RuntimeError("canonical frontier generation changed during rollover")
             if active is not None and active_session_id != old_session_id:
                 raise RuntimeError("canonical frontier is not owned by rollover old session")
-            if lifecycle is None or lifecycle_session_id != old_session_id:
+            if lifecycle_session_id != old_session_id:
                 raise RuntimeError("lifecycle is not owned by rollover old session")
 
             self._revalidate_and_append_old_session_tail_no_commit(

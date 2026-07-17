@@ -100,6 +100,17 @@ def _reconstruct_v9_database(db_path):
                ) VALUES('legacy-conversation', 'legacy-session', 17)"""
         )
         conn.execute("DROP TRIGGER lcm_schema_version_monotonic")
+        for (trigger,) in conn.execute(
+            """SELECT name FROM sqlite_master WHERE type='trigger'
+               AND (name LIKE 'lcm_protected_%' OR name LIKE 'lcm_v12_%')"""
+        ).fetchall():
+            conn.execute(f'DROP TRIGGER IF EXISTS "{trigger}"')
+        for table in (
+            "lcm_session_end_receipts",
+            "lcm_rollover_heads",
+            "lcm_protected_sessions",
+        ):
+            conn.execute(f'DROP TABLE IF EXISTS "{table}"')
         conn.execute(
             "ALTER TABLE lcm_lifecycle_state DROP COLUMN rollover_carry_over_context"
         )
@@ -119,6 +130,10 @@ def _reconstruct_v9_database(db_path):
         conn.execute("DROP TABLE IF EXISTS lcm_rollover_policies")
         conn.execute(
             "DELETE FROM lcm_migration_state WHERE step_name = 'v11_no_carry_frontier_policy'"
+        )
+        conn.execute(
+            """DELETE FROM lcm_migration_state
+               WHERE step_name = 'v12_protected_sessions_heads_and_ingest_receipts'"""
         )
         conn.execute(
             "UPDATE metadata SET value = '9' WHERE key = 'schema_version'"
@@ -380,13 +395,13 @@ def test_run_versioned_migrations_accepts_current_schema(tmp_path):
         conn.close()
 
 
-def test_fresh_database_is_schema_v11_with_durable_rollover_policy(tmp_path):
+def test_fresh_database_is_schema_v12_with_durable_rollover_state(tmp_path):
     conn = sqlite3.connect(tmp_path / "fresh-v11.db")
     try:
         db_bootstrap.run_versioned_migrations(conn)
 
-        assert db_bootstrap.SCHEMA_VERSION == 11
-        assert db_bootstrap.get_schema_version(conn) == 11
+        assert db_bootstrap.SCHEMA_VERSION == 12
+        assert db_bootstrap.get_schema_version(conn) == 12
         lifecycle_columns = {
             row[1]: row
             for row in conn.execute(
@@ -437,7 +452,7 @@ def test_v9_rollover_carry_policy_migrates_to_v11_and_restarts_idempotently(tmp_
 
         db_bootstrap.run_versioned_migrations(conn)
 
-        assert db_bootstrap.get_schema_version(conn) == db_bootstrap.SCHEMA_VERSION == 11
+        assert db_bootstrap.get_schema_version(conn) == db_bootstrap.SCHEMA_VERSION == 12
         assert "rollover_carry_over_context" in {
             row[1]
             for row in conn.execute(
@@ -462,7 +477,7 @@ def test_v9_rollover_carry_policy_migrates_to_v11_and_restarts_idempotently(tmp_
     restarted = sqlite3.connect(db_path)
     try:
         db_bootstrap.run_versioned_migrations(restarted)
-        assert db_bootstrap.get_schema_version(restarted) == 11
+        assert db_bootstrap.get_schema_version(restarted) == 12
         assert restarted.execute("PRAGMA quick_check").fetchone() == ("ok",)
         assert restarted.execute(
             "SELECT COUNT(*) FROM lcm_lifecycle_state WHERE conversation_id = 'legacy-conversation'"
@@ -731,10 +746,10 @@ def test_v11_migration_blocks_concurrent_base_v9_schema_downgrade(
         assert not base_v9_thread.is_alive()
         assert "migration_error" not in outcomes
         assert "base_v9_error" not in outcomes
-        assert outcomes["base_v9_version"] == "11"
+        assert outcomes["base_v9_version"] == "12"
         check = sqlite3.connect(db_path)
         try:
-            assert db_bootstrap.get_schema_version(check) == 11
+            assert db_bootstrap.get_schema_version(check) == 12
             assert "rollover_carry_over_context" in {
                 row[1]
                 for row in check.execute(

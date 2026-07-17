@@ -17,9 +17,9 @@ bounded preview unless `--full` is explicitly supplied. JSON is the default;
 `--pretty` and `--table` provide human-oriented rendering.
 
 `status` reports both the database's `schema_version` and this build's
-`supported_schema_version` (currently 11). The CLI can inspect older databases
-without migrating them, reads schema v11 (including durable rollover-policy
-counts and per-conversation frontier policy), and exits with database failure code
+`supported_schema_version` (currently 12). The CLI can inspect older databases
+without migrating them, reads schema v12 (including protected-session, rollover-head,
+and bounded session-end receipt counts plus per-conversation frontier protection), and exits with database failure code
 `5` before running a command when the database schema is newer than the build.
 
 Path precedence is `--database`, `LCM_DATABASE_PATH`, a named `--profile`, then

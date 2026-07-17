@@ -72,7 +72,7 @@ Storage and lifecycle
   store.py               SQLite message store and FTS
   dag.py                 summary DAG and FTS
   lifecycle_state.py     lifecycle/frontier state store
-  db_bootstrap.py        schema bootstrap, migrations, and DB-enforced rollover cutoffs
+  db_bootstrap.py        schema bootstrap, migrations, and DB-enforced rollover provenance
   diagnostics.py         state-db path containment and doctor helpers
 
 Ingest, content and retrieval

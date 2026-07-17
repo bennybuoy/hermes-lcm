@@ -31,7 +31,7 @@ class SQLiteStartupBusyError(RuntimeError):
     """Raised when bounded SQLite startup lock waiting is exhausted."""
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 SQLITE_STARTUP_BACKOFF_INITIAL_SECONDS = 0.01
 SQLITE_STARTUP_BACKOFF_MAX_SECONDS = 0.25
@@ -46,7 +46,9 @@ REQUIRED_CORE_TABLES = (
     "metadata",
     "summary_nodes",
     "lcm_lifecycle_state",
-    "lcm_rollover_policies",
+    "lcm_protected_sessions",
+    "lcm_rollover_heads",
+    "lcm_session_end_receipts",
     "lcm_migration_state",
     "lcm_focus_briefs",
     "messages_fts",
@@ -353,7 +355,12 @@ def ensure_lifecycle_state_columns(conn: sqlite3.Connection) -> None:
 
 
 def ensure_rollover_policy_table(conn: sqlite3.Connection) -> None:
-    """Create the lifecycle-independent schema-v11 no-carry cutoff ledger."""
+    """Keep the schema-v11 ledger available to already-running old writers.
+
+    Schema v12 never reads this scalar-cutoff table as authority.  It remains
+    solely as a compatibility landing zone until a deployment can guarantee
+    that no schema-v11 process is still alive.
+    """
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS lcm_rollover_policies (
@@ -377,91 +384,400 @@ def ensure_rollover_policy_table(conn: sqlite3.Connection) -> None:
     )
 
 
-def ensure_rollover_policy_triggers(conn: sqlite3.Connection) -> None:
-    """Install DB-level cutoff enforcement that schema-v9 SQL cannot bypass.
+def ensure_rollover_v12_tables(conn: sqlite3.Connection) -> None:
+    """Create the v12 historical protection, head, and ingest receipt schema."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_protected_sessions (
+            conversation_id TEXT NOT NULL,
+            finalized_session_id TEXT NOT NULL,
+            finalized_boundary_store_id INTEGER NOT NULL DEFAULT 0
+                CHECK (finalized_boundary_store_id >= 0),
+            protected_at_generation INTEGER NOT NULL DEFAULT 0
+                CHECK (protected_at_generation >= 0),
+            rollover_epoch INTEGER NOT NULL DEFAULT 0
+                CHECK (rollover_epoch >= 0),
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (conversation_id, finalized_session_id)
+        )
+        """
+    )
+    _migration_crash_boundary("v12_after_protected_table")
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_lcm_protected_session
+           ON lcm_protected_sessions(finalized_session_id, conversation_id)"""
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_rollover_heads (
+            conversation_id TEXT PRIMARY KEY,
+            current_session_id TEXT NOT NULL,
+            last_finalized_session_id TEXT NOT NULL,
+            carry_over_context INTEGER NOT NULL
+                CHECK (carry_over_context IN (0, 1)),
+            rollover_epoch INTEGER NOT NULL DEFAULT 1
+                CHECK (rollover_epoch > 0),
+            frontier_generation INTEGER NOT NULL DEFAULT 0
+                CHECK (frontier_generation >= 0),
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    _migration_crash_boundary("v12_after_head_table")
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_lcm_rollover_head_current
+           ON lcm_rollover_heads(current_session_id)"""
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_session_end_receipts (
+            conversation_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            payload_fingerprint TEXT NOT NULL,
+            rollover_epoch INTEGER NOT NULL DEFAULT 0
+                CHECK (rollover_epoch >= 0),
+            prefix_count INTEGER NOT NULL DEFAULT 0
+                CHECK (prefix_count >= 0),
+            retained_count INTEGER NOT NULL DEFAULT 0
+                CHECK (retained_count >= 0),
+            created_at REAL NOT NULL,
+            PRIMARY KEY (
+                conversation_id, session_id, payload_fingerprint, rollover_epoch
+            )
+        )
+        """
+    )
+    _migration_crash_boundary("v12_after_receipt_table")
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_lcm_session_end_receipts_retention
+           ON lcm_session_end_receipts(conversation_id, created_at DESC)"""
+    )
 
-    The active-frontier trigger rejects attempts to restore the finalized
-    owner or publish a positive boundary at/below the frozen cutoff. The item
-    trigger is the range-level guard: even a frontier ending after the cutoff
-    cannot include an item whose covered range starts at/before it.
-    """
-    ensure_rollover_policy_table(conn)
+
+def _drop_schema_v11_cutoff_triggers(conn: sqlite3.Connection) -> None:
+    for name in (
+        "lcm_no_carry_frontier_insert",
+        "lcm_no_carry_frontier_update",
+        "lcm_no_carry_item_insert",
+        "lcm_no_carry_item_update",
+    ):
+        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+
+
+def backfill_rollover_v12(conn: sqlite3.Connection) -> None:
+    """Atomically translate v10 lifecycle and v11 policy state into v12."""
+    ensure_rollover_v12_tables(conn)
+    now = time.time()
+    # Every v11 no-carry policy is historical protection, even when its
+    # current owner later became stale after a carry rollover.
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_rollover_policies'"
+    ).fetchone():
+        conn.execute(
+            """INSERT INTO lcm_protected_sessions(
+                   conversation_id, finalized_session_id,
+                   finalized_boundary_store_id, protected_at_generation,
+                   rollover_epoch, created_at, updated_at
+               )
+               SELECT conversation_id, finalized_session_id,
+                      MAX(0, finalized_cutoff_store_id),
+                      MAX(0, frozen_generation), 1, created_at, updated_at
+               FROM lcm_rollover_policies WHERE carry_over_context = 0
+               ON CONFLICT(conversation_id, finalized_session_id) DO UPDATE SET
+                   finalized_boundary_store_id = MAX(
+                       lcm_protected_sessions.finalized_boundary_store_id,
+                       excluded.finalized_boundary_store_id
+                   ),
+                   protected_at_generation = MAX(
+                       lcm_protected_sessions.protected_at_generation,
+                       excluded.protected_at_generation
+                   ),
+                   updated_at = MAX(lcm_protected_sessions.updated_at, excluded.updated_at)"""
+        )
+        _migration_crash_boundary("v12_after_policy_protected_backfill")
+
+    # Use lifecycle policy only when its owner agrees with the latest active
+    # frontier. This both backfills v10 carry=0 rows and avoids reviving a stale
+    # v11 policy owner after a later carry rollover.
     conn.execute(
-        """
-        CREATE TRIGGER IF NOT EXISTS lcm_no_carry_frontier_insert
-        BEFORE INSERT ON lcm_active_frontiers
-        WHEN EXISTS (
-            SELECT 1 FROM lcm_rollover_policies AS p
-            WHERE p.conversation_id = NEW.conversation_id
-              AND p.carry_over_context = 0
-              AND NEW.generation > p.frozen_generation
-              AND (
-                  NEW.session_id = p.finalized_session_id
-                  OR (
-                      NEW.source_end_store_id > 0
-                      AND NEW.source_end_store_id <= p.finalized_cutoff_store_id
+        """INSERT INTO lcm_rollover_heads(
+               conversation_id, current_session_id,
+               last_finalized_session_id, carry_over_context,
+               rollover_epoch, frontier_generation, created_at, updated_at
+           )
+           SELECT l.conversation_id, l.current_session_id,
+                  l.last_finalized_session_id,
+                  l.rollover_carry_over_context, 1, f.generation, ?, ?
+           FROM lcm_lifecycle_state AS l
+           JOIN lcm_active_frontiers AS f
+             ON f.conversation_id = l.conversation_id
+            AND f.session_id = l.current_session_id
+            AND NOT EXISTS (
+                SELECT 1 FROM lcm_active_frontiers AS newer
+                WHERE newer.conversation_id = f.conversation_id
+                  AND newer.generation > f.generation
+            )
+           WHERE l.current_session_id IS NOT NULL
+             AND l.last_finalized_session_id IS NOT NULL
+             AND l.rollover_carry_over_context IN (0, 1)
+           ON CONFLICT(conversation_id) DO NOTHING""",
+        (now, now),
+    )
+    _migration_crash_boundary("v12_after_lifecycle_head_backfill")
+    # A policy may be the only durable lifecycle-independent evidence left.
+    conn.execute(
+        """INSERT INTO lcm_rollover_heads(
+               conversation_id, current_session_id,
+               last_finalized_session_id, carry_over_context,
+               rollover_epoch, frontier_generation, created_at, updated_at
+           )
+           SELECT p.conversation_id, p.current_session_id,
+                  p.finalized_session_id, 0, 1, f.generation,
+                  p.created_at, p.updated_at
+           FROM lcm_rollover_policies AS p
+           JOIN lcm_active_frontiers AS f
+             ON f.conversation_id = p.conversation_id
+            AND f.session_id = p.current_session_id
+            AND NOT EXISTS (
+                SELECT 1 FROM lcm_active_frontiers AS newer
+                WHERE newer.conversation_id = f.conversation_id
+                  AND newer.generation > f.generation
+            )
+           WHERE p.carry_over_context = 0
+           ON CONFLICT(conversation_id) DO NOTHING"""
+    )
+    _migration_crash_boundary("v12_after_policy_head_backfill")
+    # v10 did not have the v11 table at all.
+    conn.execute(
+        """INSERT INTO lcm_protected_sessions(
+               conversation_id, finalized_session_id,
+               finalized_boundary_store_id, protected_at_generation,
+               rollover_epoch, created_at, updated_at
+           )
+           SELECT h.conversation_id, h.last_finalized_session_id,
+                  MAX(0, l.last_finalized_frontier_store_id),
+                  h.frontier_generation, h.rollover_epoch, ?, ?
+           FROM lcm_rollover_heads AS h
+           JOIN lcm_lifecycle_state AS l USING(conversation_id)
+           WHERE h.carry_over_context = 0
+           ON CONFLICT(conversation_id, finalized_session_id) DO UPDATE SET
+               finalized_boundary_store_id = MAX(
+                   lcm_protected_sessions.finalized_boundary_store_id,
+                   excluded.finalized_boundary_store_id
+               ), updated_at = excluded.updated_at""",
+        (now, now),
+    )
+    _migration_crash_boundary("v12_after_lifecycle_protected_backfill")
+
+
+def ensure_rollover_v12_triggers(conn: sqlite3.Connection) -> None:
+    """Enforce historical session provenance against legacy frontier SQL."""
+    ensure_rollover_v12_tables(conn)
+    _drop_schema_v11_cutoff_triggers(conn)
+    source_tables_ready = all(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+            (table,),
+        ).fetchone()
+        for table in ("messages", "summary_nodes")
+    )
+    for operation, reference in (("insert", "NEW"), ("update", "NEW")):
+        conn.execute(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS lcm_protected_frontier_{operation}
+            BEFORE {operation.upper()} ON lcm_active_frontiers
+            WHEN EXISTS (
+                SELECT 1 FROM lcm_protected_sessions AS p
+                WHERE p.conversation_id = {reference}.conversation_id
+                  AND p.finalized_session_id = {reference}.session_id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'no-carry protected session blocks frontier ownership');
+            END
+            """
+        )
+        if source_tables_ready:
+            conn.execute(
+                f"""
+            CREATE TRIGGER IF NOT EXISTS lcm_protected_item_{operation}
+            BEFORE {operation.upper()} ON lcm_frontier_items
+            WHEN EXISTS (
+                SELECT 1 FROM lcm_protected_sessions AS p
+                WHERE p.conversation_id = {reference}.conversation_id
+                  AND (
+                      ({reference}.kind = 'message' AND EXISTS (
+                          SELECT 1 FROM messages AS m
+                          WHERE m.store_id = {reference}.ref_id
+                            AND m.conversation_id = {reference}.conversation_id
+                            AND m.session_id = p.finalized_session_id
+                      ))
+                      OR ({reference}.kind = 'node' AND EXISTS (
+                          WITH RECURSIVE closure(
+                              node_id, session_id, source_type, source_ids
+                          ) AS (
+                              SELECT n.node_id, n.session_id,
+                                     n.source_type, n.source_ids
+                              FROM summary_nodes AS n
+                              WHERE n.node_id = {reference}.ref_id
+                              UNION
+                              SELECT child.node_id, child.session_id,
+                                     child.source_type, child.source_ids
+                              FROM closure AS parent
+                              JOIN json_each(parent.source_ids) AS edge
+                                ON parent.source_type = 'nodes'
+                              JOIN summary_nodes AS child
+                                ON child.node_id = CAST(edge.value AS INTEGER)
+                          )
+                          SELECT 1 FROM closure AS c
+                          WHERE c.session_id = p.finalized_session_id
+                             OR (
+                                 c.source_type = 'messages'
+                                 AND EXISTS (
+                                     SELECT 1
+                                     FROM json_each(c.source_ids) AS source
+                                     JOIN messages AS m
+                                       ON m.store_id = CAST(source.value AS INTEGER)
+                                     WHERE m.conversation_id = {reference}.conversation_id
+                                       AND m.session_id = p.finalized_session_id
+                                 )
+                             )
+                      ))
+                      OR EXISTS (
+                          SELECT 1 FROM messages AS covered
+                          WHERE covered.conversation_id = {reference}.conversation_id
+                            AND covered.session_id = p.finalized_session_id
+                            AND covered.store_id BETWEEN {reference}.source_start
+                                                     AND {reference}.source_end
+                      )
                   )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'no-carry protected session blocks frontier item provenance');
+            END
+                """
+            )
+        else:
+            conn.execute(f"DROP TRIGGER IF EXISTS lcm_protected_item_{operation}")
+    _migration_crash_boundary("v12_after_provenance_triggers")
+
+    # Compatibility for a schema-v9/v10 process that was already open during
+    # migration. Only a lifecycle rollover consistent with the newest frontier
+    # may advance the head; same-generation rewrites are inert.
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS lcm_v12_legacy_lifecycle_rollover
+        AFTER INSERT ON lcm_lifecycle_state
+        WHEN NEW.current_session_id IS NOT NULL
+          AND NEW.last_finalized_session_id IS NOT NULL
+          AND NEW.rollover_carry_over_context IN (0, 1)
+        BEGIN
+            INSERT INTO lcm_rollover_heads(
+                conversation_id, current_session_id,
+                last_finalized_session_id, carry_over_context,
+                rollover_epoch, frontier_generation, created_at, updated_at
+            )
+            SELECT NEW.conversation_id, NEW.current_session_id,
+                   NEW.last_finalized_session_id,
+                   NEW.rollover_carry_over_context, 1,
+                   f.generation, NEW.updated_at, NEW.updated_at
+            FROM lcm_active_frontiers AS f
+            WHERE f.conversation_id = NEW.conversation_id
+              AND f.session_id = NEW.current_session_id
+              AND NOT EXISTS (
+                  SELECT 1 FROM lcm_active_frontiers AS newer
+                  WHERE newer.conversation_id = f.conversation_id
+                    AND newer.generation > f.generation
               )
-        )
-        BEGIN
-            SELECT RAISE(ABORT, 'no-carry finalized cutoff blocks frontier publication');
+            ON CONFLICT(conversation_id) DO UPDATE SET
+                current_session_id = excluded.current_session_id,
+                last_finalized_session_id = excluded.last_finalized_session_id,
+                carry_over_context = excluded.carry_over_context,
+                rollover_epoch = lcm_rollover_heads.rollover_epoch + 1,
+                frontier_generation = excluded.frontier_generation,
+                updated_at = excluded.updated_at
+            WHERE excluded.frontier_generation > lcm_rollover_heads.frontier_generation;
+            INSERT INTO lcm_protected_sessions(
+                conversation_id, finalized_session_id,
+                finalized_boundary_store_id, protected_at_generation,
+                rollover_epoch, created_at, updated_at
+            )
+            SELECT NEW.conversation_id, NEW.last_finalized_session_id,
+                   MAX(0, NEW.last_finalized_frontier_store_id),
+                   h.frontier_generation, h.rollover_epoch,
+                   NEW.updated_at, NEW.updated_at
+            FROM lcm_rollover_heads AS h
+            WHERE h.conversation_id = NEW.conversation_id
+              AND h.current_session_id = NEW.current_session_id
+              AND h.last_finalized_session_id = NEW.last_finalized_session_id
+              AND h.carry_over_context = 0
+            ON CONFLICT(conversation_id, finalized_session_id) DO UPDATE SET
+                finalized_boundary_store_id = MAX(
+                    lcm_protected_sessions.finalized_boundary_store_id,
+                    excluded.finalized_boundary_store_id
+                ), updated_at = excluded.updated_at;
         END
         """
     )
+    _migration_crash_boundary("v12_after_legacy_insert_trigger")
+    conn.execute("DROP TRIGGER IF EXISTS lcm_v12_legacy_lifecycle_rollover_update")
     conn.execute(
-        """
-        CREATE TRIGGER IF NOT EXISTS lcm_no_carry_frontier_update
-        BEFORE UPDATE OF session_id, source_end_store_id ON lcm_active_frontiers
-        WHEN EXISTS (
-            SELECT 1 FROM lcm_rollover_policies AS p
-            WHERE p.conversation_id = NEW.conversation_id
-              AND p.carry_over_context = 0
-              AND NEW.generation >= p.frozen_generation
-              AND (
-                  NEW.session_id = p.finalized_session_id
-                  OR (
-                      NEW.source_end_store_id > 0
-                      AND NEW.source_end_store_id <= p.finalized_cutoff_store_id
-                  )
-              )
-        )
-        BEGIN
-            SELECT RAISE(ABORT, 'no-carry finalized cutoff blocks frontier publication');
-        END
-        """
+        """CREATE TRIGGER lcm_v12_legacy_lifecycle_rollover_update
+           AFTER UPDATE OF current_session_id, last_finalized_session_id,
+                           rollover_carry_over_context
+           ON lcm_lifecycle_state
+           WHEN NEW.current_session_id IS NOT NULL
+             AND NEW.last_finalized_session_id IS NOT NULL
+             AND NEW.rollover_carry_over_context IN (0, 1)
+           BEGIN
+             INSERT INTO lcm_rollover_heads(
+                 conversation_id, current_session_id,
+                 last_finalized_session_id, carry_over_context,
+                 rollover_epoch, frontier_generation, created_at, updated_at
+             )
+             SELECT NEW.conversation_id, NEW.current_session_id,
+                    NEW.last_finalized_session_id,
+                    NEW.rollover_carry_over_context, 1,
+                    f.generation, NEW.updated_at, NEW.updated_at
+             FROM lcm_active_frontiers AS f
+             WHERE f.conversation_id = NEW.conversation_id
+               AND f.session_id = NEW.current_session_id
+               AND NOT EXISTS (
+                   SELECT 1 FROM lcm_active_frontiers AS newer
+                   WHERE newer.conversation_id = f.conversation_id
+                     AND newer.generation > f.generation
+               )
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                 current_session_id = excluded.current_session_id,
+                 last_finalized_session_id = excluded.last_finalized_session_id,
+                 carry_over_context = excluded.carry_over_context,
+                 rollover_epoch = lcm_rollover_heads.rollover_epoch + 1,
+                 frontier_generation = excluded.frontier_generation,
+                 updated_at = excluded.updated_at
+             WHERE excluded.frontier_generation > lcm_rollover_heads.frontier_generation;
+             INSERT INTO lcm_protected_sessions(
+                 conversation_id, finalized_session_id,
+                 finalized_boundary_store_id, protected_at_generation,
+                 rollover_epoch, created_at, updated_at
+             )
+             SELECT NEW.conversation_id, NEW.last_finalized_session_id,
+                    MAX(0, NEW.last_finalized_frontier_store_id),
+                    h.frontier_generation, h.rollover_epoch,
+                    NEW.updated_at, NEW.updated_at
+             FROM lcm_rollover_heads AS h
+             WHERE h.conversation_id = NEW.conversation_id
+               AND h.current_session_id = NEW.current_session_id
+               AND h.last_finalized_session_id = NEW.last_finalized_session_id
+               AND h.carry_over_context = 0
+             ON CONFLICT(conversation_id, finalized_session_id) DO UPDATE SET
+                 finalized_boundary_store_id = MAX(
+                     lcm_protected_sessions.finalized_boundary_store_id,
+                     excluded.finalized_boundary_store_id
+                 ), updated_at = excluded.updated_at;
+           END"""
     )
-    conn.execute(
-        """
-        CREATE TRIGGER IF NOT EXISTS lcm_no_carry_item_insert
-        BEFORE INSERT ON lcm_frontier_items
-        WHEN EXISTS (
-            SELECT 1 FROM lcm_rollover_policies AS p
-            WHERE p.conversation_id = NEW.conversation_id
-              AND p.carry_over_context = 0
-              AND NEW.generation >= p.frozen_generation
-              AND NEW.source_start <= p.finalized_cutoff_store_id
-        )
-        BEGIN
-            SELECT RAISE(ABORT, 'no-carry finalized cutoff blocks frontier item');
-        END
-        """
-    )
-    conn.execute(
-        """
-        CREATE TRIGGER IF NOT EXISTS lcm_no_carry_item_update
-        BEFORE UPDATE OF source_start, source_end ON lcm_frontier_items
-        WHEN EXISTS (
-            SELECT 1 FROM lcm_rollover_policies AS p
-            WHERE p.conversation_id = NEW.conversation_id
-              AND p.carry_over_context = 0
-              AND NEW.generation >= p.frozen_generation
-              AND NEW.source_start <= p.finalized_cutoff_store_id
-        )
-        BEGIN
-            SELECT RAISE(ABORT, 'no-carry finalized cutoff blocks frontier item');
-        END
-        """
-    )
+    _migration_crash_boundary("v12_after_legacy_update_trigger")
 def ensure_message_origin_columns(conn: sqlite3.Connection) -> None:
     table_row = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'"
@@ -1323,14 +1639,32 @@ def run_versioned_migrations(
             _migration_crash_boundary("v11_after_column")
             ensure_rollover_policy_table(conn)
             _migration_crash_boundary("v11_after_table")
-            ensure_rollover_policy_triggers(conn)
+            # v11's scalar triggers are intentionally not installed by v12;
+            # the migration transaction proceeds directly to provenance-based
+            # protection below.
             _migration_crash_boundary("v11_after_trigger")
             mark_migration_step_complete(conn, "v11_no_carry_frontier_policy")
             _migration_crash_boundary("v11_after_migration_step")
             current_version = 11
         else:
             ensure_rollover_policy_table(conn)
-            ensure_rollover_policy_triggers(conn)
+
+        migrating_to_v12 = current_version < 12
+        if migrating_to_v12:
+            ensure_rollover_v12_tables(conn)
+            _migration_crash_boundary("v12_after_ddl")
+            backfill_rollover_v12(conn)
+            _migration_crash_boundary("v12_after_backfill")
+            ensure_rollover_v12_triggers(conn)
+            _migration_crash_boundary("v12_after_triggers")
+            mark_migration_step_complete(
+                conn, "v12_protected_sessions_heads_and_ingest_receipts"
+            )
+            _migration_crash_boundary("v12_after_migration_step")
+            current_version = 12
+        else:
+            ensure_rollover_v12_tables(conn)
+            ensure_rollover_v12_triggers(conn)
 
         # Startup FTS inspection, repair, rebuild, and trigger installation are
         # part of the same cross-connection writer transaction as schema
@@ -1347,6 +1681,8 @@ def run_versioned_migrations(
         set_schema_version(conn, current_version)
         if migrating_to_v11:
             _migration_crash_boundary("v11_after_schema_version")
+        if migrating_to_v12:
+            _migration_crash_boundary("v12_after_schema_version")
         conn.commit()
     except Exception:
         conn.rollback()
