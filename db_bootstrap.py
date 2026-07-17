@@ -27,8 +27,14 @@ class SchemaVersionTooNewError(RuntimeError):
     """
 
 
+class SQLiteStartupBusyError(RuntimeError):
+    """Raised when bounded SQLite startup lock waiting is exhausted."""
+
+
 SCHEMA_VERSION = 9
 SQLITE_BUSY_TIMEOUT_MS = 30_000
+SQLITE_STARTUP_BACKOFF_INITIAL_SECONDS = 0.01
+SQLITE_STARTUP_BACKOFF_MAX_SECONDS = 0.25
 # Bounded busy wait for foreground cutover so compress() cannot hang
 # indefinitely behind a concurrent writer (gateway host holds compression_locks).
 FOREGROUND_COMPRESS_BUSY_TIMEOUT_MS = 2_000
@@ -62,6 +68,47 @@ class ExternalContentFtsSpec:
         self.content_rowid = content_rowid
         self.indexed_column = indexed_column
         self.trigger_sqls = tuple(trigger_sqls)
+
+
+def _is_sqlite_busy_error(exc: BaseException) -> bool:
+    error_code = getattr(exc, "sqlite_errorcode", None)
+    if error_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+        return True
+    message = str(exc).lower()
+    return isinstance(exc, sqlite3.Error) and (
+        "locked" in message or "busy" in message
+    )
+
+
+def _execute_startup_pragma_with_retry(
+    conn: sqlite3.Connection,
+    sql: str,
+    *,
+    deadline: float,
+) -> None:
+    """Execute a startup PRAGMA with bounded retry for SQLITE_BUSY/LOCKED.
+
+    SQLite's journal-mode transition does not consistently invoke the busy
+    handler when another connection is publishing WAL/DDL frames.  Retrying
+    that one connection-local startup operation closes the gap left by
+    ``busy_timeout`` without weakening the database writer lock that protects
+    migrations and FTS repair.
+    """
+    delay = SQLITE_STARTUP_BACKOFF_INITIAL_SECONDS
+    while True:
+        try:
+            conn.execute(sql)
+            return
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_busy_error(exc):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SQLiteStartupBusyError(
+                    f"SQLite startup remained busy while executing {sql!r}"
+                ) from exc
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, SQLITE_STARTUP_BACKOFF_MAX_SECONDS)
 
 
 def configure_connection(conn: sqlite3.Connection) -> None:
@@ -100,11 +147,15 @@ def configure_connection(conn: sqlite3.Connection) -> None:
     # process startups can otherwise fail immediately while one connection is
     # publishing migration/DDL frames.
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=FULL")
-    conn.execute("PRAGMA wal_autocheckpoint=500")
-    conn.execute("PRAGMA journal_size_limit=67108864")
-    conn.execute("PRAGMA mmap_size=268435456")
+    deadline = time.monotonic() + (SQLITE_BUSY_TIMEOUT_MS / 1000.0)
+    for pragma in (
+        "PRAGMA journal_mode=WAL",
+        "PRAGMA synchronous=FULL",
+        "PRAGMA wal_autocheckpoint=500",
+        "PRAGMA journal_size_limit=67108864",
+        "PRAGMA mmap_size=268435456",
+    ):
+        _execute_startup_pragma_with_retry(conn, pragma, deadline=deadline)
 
 
 def add_column_if_missing(
@@ -313,7 +364,8 @@ def ensure_content_scan_checkpoint_schema(
             content_fingerprint TEXT NOT NULL,
             content_chars INTEGER NOT NULL,
             content_bytes INTEGER NOT NULL DEFAULT 0,
-            storage_version INTEGER NOT NULL DEFAULT 2
+            storage_version INTEGER NOT NULL DEFAULT 2,
+            scan_byte_offset INTEGER NOT NULL DEFAULT 0
         )
         """
     )
@@ -331,6 +383,12 @@ def ensure_content_scan_checkpoint_schema(
         revision_columns,
         "storage_version",
         "ALTER TABLE lcm_content_revisions ADD COLUMN storage_version INTEGER NOT NULL DEFAULT 1",
+    )
+    add_column_if_missing(
+        conn,
+        revision_columns,
+        "scan_byte_offset",
+        "ALTER TABLE lcm_content_revisions ADD COLUMN scan_byte_offset INTEGER NOT NULL DEFAULT 0",
     )
 
     conn.execute(
@@ -384,13 +442,15 @@ def ensure_content_scan_checkpoint_schema(
         CREATE TRIGGER IF NOT EXISTS lcm_content_revision_insert
         AFTER INSERT ON messages BEGIN
             INSERT OR REPLACE INTO lcm_content_revisions
-                (store_id, content_fingerprint, content_chars, content_bytes, storage_version)
+                (store_id, content_fingerprint, content_chars, content_bytes,
+                 storage_version, scan_byte_offset)
             VALUES (
                 new.store_id,
                 lower(hex(randomblob(16))),
                 COALESCE(length(CAST(new.content AS TEXT)), 0),
                 COALESCE(length(CAST(new.content AS BLOB)), 0),
-                2
+                2,
+                COALESCE(length(CAST(new.content AS BLOB)), 0)
             );
             DELETE FROM lcm_content_scan_checkpoints WHERE store_id = new.store_id;
         END
@@ -401,13 +461,15 @@ def ensure_content_scan_checkpoint_schema(
         CREATE TRIGGER IF NOT EXISTS lcm_content_revision_update
         AFTER UPDATE OF content ON messages BEGIN
             INSERT OR REPLACE INTO lcm_content_revisions
-                (store_id, content_fingerprint, content_chars, content_bytes, storage_version)
+                (store_id, content_fingerprint, content_chars, content_bytes,
+                 storage_version, scan_byte_offset)
             VALUES (
                 new.store_id,
                 lower(hex(randomblob(16))),
                 COALESCE(length(CAST(new.content AS TEXT)), 0),
                 COALESCE(length(CAST(new.content AS BLOB)), 0),
-                2
+                2,
+                COALESCE(length(CAST(new.content AS BLOB)), 0)
             );
             DELETE FROM lcm_content_scan_checkpoints WHERE store_id = new.store_id;
         END
@@ -994,6 +1056,7 @@ def repair_external_content_fts(
     *,
     now: float | None = None,
     throttle: bool = False,
+    commit: bool = True,
 ) -> dict[str, bool]:
     rebuilt = False
     degraded = False
@@ -1008,7 +1071,8 @@ def repair_external_content_fts(
                     _MIN_DISK_SPACE_BYTES // (1024 * 1024),
                 )
                 _drop_fts_artifacts(conn, spec)
-                conn.commit()
+                if commit:
+                    conn.commit()
                 return {"rebuilt": False, "degraded": True, "triggers_recreated": False}
         _drop_fts_table(conn, spec.table_name)
         conn.execute(
@@ -1032,7 +1096,8 @@ def repair_external_content_fts(
         # A freshly rebuilt index is known-consistent; record the marker so the
         # next startup can skip the deep integrity-check within the interval.
         _record_integrity_checked(conn, spec, now=now)
-    conn.commit()
+    if commit:
+        conn.commit()
     return {"rebuilt": rebuilt, "degraded": degraded, "triggers_recreated": triggers_were_missing}
 
 
@@ -1044,7 +1109,11 @@ def ensure_external_content_fts(
     repair_external_content_fts(conn, spec, now=now, throttle=True)
 
 
-def run_versioned_migrations(conn: sqlite3.Connection) -> None:
+def run_versioned_migrations(
+    conn: sqlite3.Connection,
+    *,
+    fts_specs: Sequence[ExternalContentFtsSpec] = (),
+) -> None:
     # Preserve the refusal-before-DDL contract for databases already marked by
     # a newer build, then serialize the authoritative re-check, every migration
     # step, and the marker update behind one SQLite writer lock. Without this,
@@ -1107,6 +1176,18 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
         if current_version < 9:
             mark_migration_step_complete(conn, "v9_content_scan_checkpoints")
             current_version = 9
+
+        # Startup FTS inspection, repair, rebuild, and trigger installation are
+        # part of the same cross-connection writer transaction as schema
+        # migration.  A concurrent opener therefore cannot observe v9, release
+        # the migration lock, and race this connection's drop/create sequence.
+        for spec in fts_specs:
+            repair_external_content_fts(
+                conn,
+                spec,
+                throttle=True,
+                commit=False,
+            )
 
         set_schema_version(conn, current_version)
         conn.commit()

@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import queue
 import sqlite3
 import threading
+import time
 
 import pytest
 
@@ -30,6 +32,22 @@ def _crash_during_v9_schema_publication(db_path: str) -> None:
 
     db_bootstrap.ensure_content_scan_checkpoint_schema = create_partial_schema_then_crash
     db_bootstrap.run_versioned_migrations(conn)
+
+
+def _open_message_store_process(db_path: str, start_gate, outcomes) -> None:
+    """Open one independent MessageStore connection after a process barrier."""
+    try:
+        start_gate.wait(timeout=10)
+        store = store_module.MessageStore(db_path)
+        try:
+            version = store._conn.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()[0]
+            outcomes.put(("ok", version))
+        finally:
+            store.close()
+    except BaseException as exc:  # noqa: BLE001 - reported to parent process
+        outcomes.put(("error", type(exc).__name__, str(exc)))
 
 
 def _engine(tmp_path, **overrides) -> LCMEngine:
@@ -65,7 +83,13 @@ def test_expand_uses_bounded_blob_reads_progress_budget_and_restores_handler(
     monkeypatch.setattr(store_module.sqlite3, "connect", tracked_connect)
     engine = _engine(tmp_path)
     content = ("utf8-π-bounded-record\n" * 80_000) + "TAIL"
-    store_id = engine._store.append("current", {"role": "user", "content": content})
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": "placeholder"}
+    )
+    engine._store._conn.execute(
+        "UPDATE messages SET content=? WHERE store_id=?", (content, store_id)
+    )
+    engine._store._conn.commit()
     prior_calls = 0
 
     def prior_handler():
@@ -235,6 +259,23 @@ def test_checkpoint_schema_is_v9_atomic_lazy_and_concurrent(tmp_path, monkeypatc
         return conn
 
     monkeypatch.setattr(store_module.sqlite3, "connect", traced_connect)
+    rebuild_gate = threading.Barrier(2)
+    rebuild_checks: list[int] = []
+    real_needs_rebuild = db_bootstrap._fts_needs_rebuild
+
+    def synchronize_missing_fts(connection, spec, **kwargs):
+        needed = real_needs_rebuild(connection, spec, **kwargs)
+        if needed and spec.table_name == "messages_fts":
+            rebuild_checks.append(id(connection))
+            try:
+                rebuild_gate.wait(timeout=0.5)
+            except threading.BrokenBarrierError:
+                pass
+        return needed
+
+    monkeypatch.setattr(
+        db_bootstrap, "_fts_needs_rebuild", synchronize_missing_fts
+    )
     stores = []
     errors = []
 
@@ -252,6 +293,7 @@ def test_checkpoint_schema_is_v9_atomic_lazy_and_concurrent(tmp_path, monkeypatc
     try:
         assert not errors
         assert len(stores) == 2
+        assert len(rebuild_checks) == 1
         sql = "\n".join(statements).lower()
         assert "from messages\n               where store_id not in" not in sql
         conn = stores[0]._conn
@@ -265,6 +307,112 @@ def test_checkpoint_schema_is_v9_atomic_lazy_and_concurrent(tmp_path, monkeypatc
     finally:
         for store in stores:
             store.close()
+
+
+def test_message_store_repeated_concurrent_process_startup(tmp_path):
+    """Independent startup losers wait through WAL negotiation and migration."""
+    ctx = multiprocessing.get_context("fork")
+    process_count = 4
+
+    for iteration in range(5):
+        db_path = tmp_path / f"concurrent-process-{iteration}.db"
+        legacy = sqlite3.connect(db_path)
+        legacy.executescript(
+            """
+            CREATE TABLE messages (
+                store_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                source TEXT DEFAULT '',
+                conversation_id TEXT DEFAULT '',
+                role TEXT NOT NULL,
+                content TEXT,
+                tool_call_id TEXT,
+                tool_calls TEXT,
+                tool_name TEXT,
+                timestamp REAL NOT NULL,
+                token_estimate INTEGER DEFAULT 0,
+                pinned INTEGER DEFAULT 0
+            );
+            CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO metadata(key, value) VALUES('schema_version', '8');
+            INSERT INTO messages(session_id, role, content, timestamp)
+            VALUES('s', 'user', 'concurrent process FTS rebuild', 1);
+            """
+        )
+        legacy.commit()
+        legacy.close()
+
+        start_gate = ctx.Barrier(process_count)
+        outcomes = ctx.Queue()
+        processes = [
+            ctx.Process(
+                target=_open_message_store_process,
+                args=(str(db_path), start_gate, outcomes),
+            )
+            for _ in range(process_count)
+        ]
+        try:
+            for process in processes:
+                process.start()
+            for process in processes:
+                process.join(timeout=15)
+
+            assert all(not process.is_alive() for process in processes)
+            assert all(process.exitcode == 0 for process in processes)
+            try:
+                results = [outcomes.get(timeout=2) for _ in processes]
+            except queue.Empty:  # pragma: no cover - explicit regression failure
+                pytest.fail("concurrent startup process exited without an outcome")
+            assert results == [
+                ("ok", str(db_bootstrap.SCHEMA_VERSION))
+            ] * process_count
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                process.join(timeout=2)
+            outcomes.close()
+            outcomes.join_thread()
+
+
+def test_message_store_startup_does_not_leak_raw_operational_error(
+    tmp_path, monkeypatch
+):
+    def fail_configuration(_connection):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store_module, "configure_connection", fail_configuration)
+    with pytest.raises(store_module.MessageStoreStartupError) as caught:
+        store_module.MessageStore(tmp_path / "locked-startup.db")
+
+    assert isinstance(caught.value.__cause__, sqlite3.OperationalError)
+    assert "database is locked" in str(caught.value)
+
+
+def test_sqlite_startup_pragma_lock_retries_with_backoff(monkeypatch):
+    statements: list[str] = []
+    sleeps: list[float] = []
+    journal_attempts = 0
+
+    class FlakyConnection:
+        def execute(self, sql):
+            nonlocal journal_attempts
+            statements.append(sql)
+            if sql == "PRAGMA journal_mode=WAL":
+                journal_attempts += 1
+                if journal_attempts < 3:
+                    raise sqlite3.OperationalError("database is locked")
+            return self
+
+    monkeypatch.setattr(db_bootstrap.time, "sleep", sleeps.append)
+    db_bootstrap.configure_connection(FlakyConnection())
+
+    assert journal_attempts == 3
+    assert sleeps == [
+        db_bootstrap.SQLITE_STARTUP_BACKOFF_INITIAL_SECONDS,
+        db_bootstrap.SQLITE_STARTUP_BACKOFF_INITIAL_SECONDS * 2,
+    ]
+    assert statements[-1] == "PRAGMA mmap_size=268435456"
 
 
 def test_checkpoint_schema_and_marker_survive_process_crash_atomically(tmp_path):
@@ -352,6 +500,160 @@ def test_incremental_blob_paging_preserves_multibyte_utf8_losslessly(tmp_path):
         engine.shutdown()
 
 
+def test_reported_checkpoint_is_persisted_and_restart_advances_after_offset_timeout(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    content = ("ordinary durable checkpoint record\n" * 80_000) + "TAIL"
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": "placeholder"}
+    )
+    engine._store._conn.execute(
+        "UPDATE messages SET content=? WHERE store_id=?", (content, store_id)
+    )
+    engine._store._conn.commit()
+    requested_offset = 1_500_000
+    monkeypatch.setattr(
+        tools_module, "_EXPAND_BOUNDARY_SCAN_DEADLINE_SECONDS", 10.0
+    )
+    try:
+        with monkeypatch.context() as scoped:
+            original_byte_offset = store_module._ContentBlobReader.byte_offset
+
+            def expire_offset_conversion(reader, char_offset):
+                if char_offset > 0:
+                    raise TimeoutError("forced byte-offset deadline")
+                return original_byte_offset(reader, char_offset)
+
+            scoped.setattr(
+                store_module._ContentBlobReader,
+                "byte_offset",
+                expire_offset_conversion,
+            )
+            first = json.loads(
+                tools_module.lcm_expand(
+                    {
+                        "store_id": store_id,
+                        "content_offset": requested_offset,
+                        "max_tokens": 64,
+                    },
+                    engine=engine,
+                )
+            )
+
+        persisted = engine._store._conn.execute(
+            """SELECT char_offset FROM lcm_content_scan_checkpoints
+               WHERE store_id=? ORDER BY char_offset DESC LIMIT 1""",
+            (store_id,),
+        ).fetchone()
+        assert first.get("content_boundary_scan_pending") is True, first
+        assert persisted is not None
+        assert first["content_scan_checkpoint_offset"] == persisted[0]
+
+        engine.shutdown()
+        engine = _engine(tmp_path)
+        restarted = json.loads(
+            tools_module.lcm_expand(
+                {
+                    "store_id": store_id,
+                    "content_offset": requested_offset,
+                    "max_tokens": 64,
+                },
+                engine=engine,
+            )
+        )
+        restarted_persisted = engine._store._conn.execute(
+            """SELECT char_offset FROM lcm_content_scan_checkpoints
+               WHERE store_id=? ORDER BY char_offset DESC LIMIT 1""",
+            (store_id,),
+        ).fetchone()
+        assert restarted_persisted is not None
+        assert restarted_persisted[0] > first["content_scan_checkpoint_offset"]
+        if restarted.get("content_boundary_scan_pending"):
+            assert restarted["content_scan_checkpoint_offset"] == restarted_persisted[0]
+        else:
+            assert restarted["content_offset"] == requested_offset
+    finally:
+        engine.shutdown()
+
+
+def test_legacy_v8_first_expand_128mib_respects_one_ms_and_returns_scan_pending(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    conn = engine._store._conn
+    for trigger_name in (
+        "lcm_content_revision_insert",
+        "lcm_content_revision_update",
+        "lcm_content_revision_delete",
+        "msg_fts_insert",
+        "msg_fts_update",
+        "msg_fts_delete",
+    ):
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+    size = 128 * 1024 * 1024
+    cursor = conn.execute(
+        """INSERT INTO messages(session_id, role, content, timestamp)
+           VALUES('current', 'user', zeroblob(?), 1)""",
+        (size,),
+    )
+    store_id = int(cursor.lastrowid)
+    conn.commit()
+    blob = conn.blobopen("messages", "content", store_id, readonly=False)
+    try:
+        chunk = b"x" * (1024 * 1024)
+        for _ in range(size // len(chunk)):
+            blob.write(chunk)
+    finally:
+        blob.close()
+    conn.execute(
+        "UPDATE messages SET content=CAST(content AS TEXT) WHERE store_id=?",
+        (store_id,),
+    )
+    conn.commit()
+    assert conn.execute(
+        "SELECT typeof(content) FROM messages WHERE store_id=?", (store_id,)
+    ).fetchone()[0] == "text"
+    db_bootstrap.ensure_content_scan_checkpoint_schema(conn)
+    for trigger_sql in store_module.build_message_fts_spec().trigger_sqls:
+        conn.execute(trigger_sql)
+    conn.commit()
+
+    monkeypatch.setattr(
+        tools_module, "_EXPAND_BOUNDARY_SCAN_DEADLINE_SECONDS", 0.001
+    )
+    started = time.monotonic()
+    try:
+        result = json.loads(
+            tools_module.lcm_expand(
+                {"store_id": store_id, "content_offset": 0, "max_tokens": 64},
+                engine=engine,
+            )
+        )
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.1
+        assert result["content_scan_pending"] is True
+        revision = conn.execute(
+            """SELECT content_chars, content_bytes, storage_version, scan_byte_offset
+               FROM lcm_content_revisions WHERE store_id=?""",
+            (store_id,),
+        ).fetchone()
+        assert revision is not None
+        assert revision[1] == size
+        assert revision[2] == 1
+        assert 0 <= revision[3] < size
+        retry = json.loads(
+            tools_module.lcm_expand(
+                {"store_id": store_id, "content_offset": 0, "max_tokens": 64},
+                engine=engine,
+            )
+        )
+        assert retry["content_scan_pending"] is True
+        assert retry["content_scan_byte_offset"] > result["content_scan_byte_offset"]
+    finally:
+        engine.shutdown()
+
+
 @pytest.mark.parametrize(
     "credential",
     [
@@ -396,13 +698,19 @@ def test_deep_checkpoint_never_marks_inside_standalone_credential_normal(
         engine.shutdown()
 
 
-def test_externalized_grep_rejects_trailing_duplicate_security_key(tmp_path):
+@pytest.mark.parametrize(
+    "suffix",
+    ['"session_id":"foreign"', '"unexpected_override":"foreign"'],
+    ids=["duplicate-security-key", "unknown-key"],
+)
+def test_externalized_grep_rejects_trailing_duplicate_security_key(tmp_path, suffix):
     payload_dir = tmp_path / "payloads"
     payload_dir.mkdir()
     ref = "duplicate-session.json"
     (payload_dir / ref).write_text(
         '{"session_id":"current","content":"DUPLICATE-OWNER-SECRET",'
-        '"session_id":"foreign"}',
+        + suffix
+        + "}",
         encoding="utf-8",
     )
     engine = _engine(tmp_path)
@@ -419,5 +727,46 @@ def test_externalized_grep_rejects_trailing_duplicate_security_key(tmp_path):
         )
         assert result["results"] == []
         assert result["diagnostics"] == [{"ref": ref, "error": "ambiguous_metadata"}]
+    finally:
+        engine.shutdown()
+
+
+def test_externalized_grep_accepts_old_canonical_trailing_metadata_losslessly(
+    tmp_path,
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    ref = "old-canonical.json"
+    content = "first line\nOLD-CANONICAL-π🙂-NEEDLE\nlast escaped \\\" line"
+    payload = {
+        "kind": "ingest_payload",
+        "role": "tool",
+        "session_id": "current",
+        "field_path": "result.content",
+        "content": content,
+        "content_chars": len(content),
+        "content_bytes": len(content.encode("utf-8")),
+        "created_at": 1234.5,
+    }
+    (payload_dir / ref).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    engine = _engine(tmp_path)
+    try:
+        result = json.loads(
+            tools_module.lcm_grep(
+                {
+                    "query": "OLD-CANONICAL-π🙂-NEEDLE",
+                    "content_scope": "externalized",
+                    "ref": ref,
+                    "max_payload_chars": len(content) + 1,
+                },
+                engine=engine,
+            )
+        )
+        assert result["diagnostics"] == []
+        assert result["total_results"] == 1
+        assert result["results"][0]["matched_text"] == "OLD-CANONICAL-π🙂-NEEDLE"
+        assert result["results"][0]["session_id"] == "current"
     finally:
         engine.shutdown()

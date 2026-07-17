@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import json
 import logging
+import math
 import multiprocessing
 import os
 import re
@@ -253,8 +254,17 @@ def _credential_mode_at_offset(
                     if data[index] == "-"
                     else None
                 )
-                assignment = _BOUNDARY_ASSIGNMENT_START_RE.match(data, index)
-                standalone = _BOUNDARY_STANDALONE_START_RE.match(data, index)
+                lowered_start = data[index].lower()
+                assignment = (
+                    _BOUNDARY_ASSIGNMENT_START_RE.match(data, index)
+                    if lowered_start in {"a", "s", "c", "p"}
+                    else None
+                )
+                standalone = (
+                    _BOUNDARY_STANDALONE_START_RE.match(data, index)
+                    if lowered_start in {"s", "a", "g", "x", "b"}
+                    else None
+                )
                 if pem_begin is not None:
                     mode = "pem"
                     index = pem_begin.end()
@@ -742,6 +752,21 @@ def _externalized_literal_match(content: str, query: str) -> re.Match[str] | Non
     return re.search(re.escape(terms[0]), content, flags=re.IGNORECASE)
 
 
+_EXTERNALIZED_CANONICAL_KEYS = frozenset({
+    "kind", "tool_call_id", "role", "session_id", "field_path", "content",
+    "content_chars", "content_bytes", "created_at",
+    "persisted_output_source_path", "persisted_output_expected_chars",
+    "persisted_output_preview_prefix", "persisted_output_preview_sha256",
+    "persisted_output_redacted_preview_sha256", "persisted_output_file_size",
+    "persisted_output_file_mtime_ns", "persisted_output_file_ctime_ns",
+    "persisted_output_markers",
+})
+_EXTERNALIZED_TRAILING_CANONICAL_KEYS = frozenset({
+    "content_chars", "content_bytes", "created_at",
+})
+_EXTERNALIZED_SUFFIX_MAX_CHARS = 16 * 1024
+
+
 def _externalized_prefix_authorization(
     text: str,
 ) -> tuple[dict[str, Any], set[str], str | None]:
@@ -771,6 +796,8 @@ def _externalized_prefix_authorization(
             return fields, seen, "invalid_payload"
         if not isinstance(key, str):
             return fields, seen, "invalid_payload"
+        if key not in _EXTERNALIZED_CANONICAL_KEYS:
+            return fields, seen, "ambiguous_metadata"
         if key in seen:
             return fields, seen, "ambiguous_metadata"
         seen.add(key)
@@ -793,14 +820,89 @@ def _externalized_prefix_authorization(
         index += 1
 
 
+def _externalized_suffix_metadata(
+    text: str, *, seen: set[str]
+) -> dict[str, Any]:
+    """Parse the bounded canonical metadata following an old-layout body."""
+    decoder = json.JSONDecoder()
+    fields: dict[str, Any] = {}
+    index = 0
+    length = len(text)
+
+    def whitespace(pos: int) -> int:
+        while pos < length and text[pos] in " \t\n\r":
+            pos += 1
+        return pos
+
+    index = whitespace(index)
+    if index < length and text[index] == "}":
+        index = whitespace(index + 1)
+        if index != length:
+            raise ValueError("ambiguous_metadata")
+        return fields
+    if index >= length or text[index] != ",":
+        raise ValueError("ambiguous_metadata")
+    index += 1
+    while True:
+        index = whitespace(index)
+        if index >= length or text[index] != '"':
+            raise ValueError("invalid_payload")
+        try:
+            key, index = decoder.raw_decode(text, index)
+        except json.JSONDecodeError as exc:
+            raise ValueError("invalid_payload") from exc
+        if not isinstance(key, str):
+            raise ValueError("invalid_payload")
+        if key in seen or key not in _EXTERNALIZED_TRAILING_CANONICAL_KEYS:
+            raise ValueError("ambiguous_metadata")
+        seen.add(key)
+        index = whitespace(index)
+        if index >= length or text[index] != ":":
+            raise ValueError("invalid_payload")
+        index = whitespace(index + 1)
+        try:
+            value, index = decoder.raw_decode(text, index)
+        except json.JSONDecodeError as exc:
+            raise ValueError("invalid_payload") from exc
+        fields[key] = value
+        index = whitespace(index)
+        if index >= length:
+            raise ValueError("invalid_payload")
+        if text[index] == ",":
+            index += 1
+            continue
+        if text[index] != "}":
+            raise ValueError("invalid_payload")
+        index = whitespace(index + 1)
+        if index != length:
+            raise ValueError("ambiguous_metadata")
+        break
+
+    for key in ("content_chars", "content_bytes"):
+        if key in fields and (
+            isinstance(fields[key], bool)
+            or not isinstance(fields[key], int)
+            or fields[key] < 0
+        ):
+            raise ValueError("invalid_payload")
+    if "created_at" in fields and (
+        isinstance(fields["created_at"], bool)
+        or not isinstance(fields["created_at"], (int, float))
+        or not math.isfinite(float(fields["created_at"]))
+    ):
+        raise ValueError("invalid_payload")
+    return fields
+
+
 def _stream_externalized_json_content(
     handle,
     *,
     max_payload_chars: int,
     max_bytes: int,
     deadline: float | None,
-) -> tuple[str, int, bool]:
-    """Stream one JSON string and require content to be the final object field."""
+    seen_keys: set[str],
+) -> tuple[str, int, bool, dict[str, Any], int, int]:
+    """Stream content and structurally validate a bounded canonical suffix."""
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
     pieces: list[str] = []
     kept_chars = 0
@@ -809,14 +911,19 @@ def _stream_externalized_json_content(
     escaped = False
     unicode_digits = ""
     pending_high_surrogate: int | None = None
-    suffix_closed = False
+    suffix_parts: list[str] = []
+    suffix_chars = 0
+    total_content_chars = 0
+    total_content_bytes = 0
 
     def check_deadline() -> None:
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError("body_deadline")
 
     def emit(character: str) -> None:
-        nonlocal kept_chars
+        nonlocal kept_chars, total_content_chars, total_content_bytes
+        total_content_chars += 1
+        total_content_bytes += len(character.encode("utf-8", errors="surrogatepass"))
         if kept_chars < max_payload_chars:
             pieces.append(character)
             kept_chars += 1
@@ -847,15 +954,10 @@ def _stream_externalized_json_content(
             if index % 4096 == 0:
                 check_deadline()
             if closed:
-                if suffix_closed:
-                    if character not in " \t\n\r":
-                        raise ValueError("ambiguous_metadata")
-                elif character in " \t\n\r":
-                    pass
-                elif character == "}":
-                    suffix_closed = True
-                else:
+                suffix_chars += 1
+                if suffix_chars > _EXTERNALIZED_SUFFIX_MAX_CHARS:
                     raise ValueError("ambiguous_metadata")
+                suffix_parts.append(character)
             elif unicode_digits:
                 if character not in "0123456789abcdefABCDEF":
                     raise ValueError("invalid_payload")
@@ -892,21 +994,23 @@ def _stream_externalized_json_content(
     if bytes_read < max_bytes:
         final = decoder.decode(b"", final=True)
         for character in final:
-            if suffix_closed:
-                if character not in " \t\n\r":
-                    raise ValueError("ambiguous_metadata")
-            elif character in " \t\n\r":
-                pass
-            elif character == "}":
-                suffix_closed = True
-            else:
+            suffix_chars += 1
+            if suffix_chars > _EXTERNALIZED_SUFFIX_MAX_CHARS:
                 raise ValueError("ambiguous_metadata")
+            suffix_parts.append(character)
     if not closed or escaped or unicode_digits:
-        return "".join(pieces), bytes_read, False
-    # A trailing comma makes both ownership and content semantics overridable.
-    if not suffix_closed:
-        raise ValueError("ambiguous_metadata")
-    return "".join(pieces), bytes_read, True
+        return "".join(pieces), bytes_read, False, {}, total_content_chars, total_content_bytes
+    suffix_fields = _externalized_suffix_metadata(
+        "".join(suffix_parts), seen=seen_keys
+    )
+    return (
+        "".join(pieces),
+        bytes_read,
+        True,
+        suffix_fields,
+        total_content_chars,
+        total_content_bytes,
+    )
 
 
 def _deadline_checked_literal_span(
@@ -1140,7 +1244,7 @@ def _search_externalized_payloads(
                     )
                 )
                 metadata_bytes = handle.tell()
-                metadata_fields, _seen_keys, metadata_error = (
+                metadata_fields, seen_keys, metadata_error = (
                     _externalized_prefix_authorization(metadata_prefix)
                 )
                 if metadata_error is not None:
@@ -1175,11 +1279,19 @@ def _search_externalized_payloads(
                     })
                     continue
                 read_phase = "body"
-                content, body_bytes, content_closed = _stream_externalized_json_content(
+                (
+                    content,
+                    body_bytes,
+                    content_closed,
+                    suffix_fields,
+                    total_content_chars,
+                    total_content_bytes,
+                ) = _stream_externalized_json_content(
                     handle,
                     max_payload_chars=max_payload_chars,
                     max_bytes=max(0, read_limit - metadata_bytes),
                     deadline=deadline,
+                    seen_keys=seen_keys,
                 )
                 total_file_bytes = metadata_bytes + body_bytes
                 raw_truncated = opened_stat.st_size > total_file_bytes
@@ -1188,6 +1300,45 @@ def _search_externalized_payloads(
                     scan_truncated = True
                     diagnostics.append({"ref": path.name, "error": "payload_truncated"})
                     continue
+                final_metadata = dict(metadata_fields)
+                final_metadata.update(suffix_fields)
+                payload_session_id = final_metadata.get("session_id", "")
+                if (
+                    "session_id" not in seen_keys
+                    or not isinstance(payload_session_id, str)
+                    or not payload_session_id
+                ):
+                    bytes_scanned += total_file_bytes
+                    diagnostics.append({
+                        "ref": path.name,
+                        "error": "session_metadata_unavailable",
+                    })
+                    continue
+                if payload_session_id not in allowed_session_ids:
+                    bytes_scanned += total_file_bytes
+                    diagnostics.append({"ref": path.name, "error": "session_mismatch"})
+                    continue
+                declared_chars = final_metadata.get("content_chars")
+                declared_bytes = final_metadata.get("content_bytes")
+                if (
+                    declared_chars is not None
+                    and (
+                        isinstance(declared_chars, bool)
+                        or not isinstance(declared_chars, int)
+                        or declared_chars != total_content_chars
+                    )
+                ) or (
+                    declared_bytes is not None
+                    and (
+                        isinstance(declared_bytes, bool)
+                        or not isinstance(declared_bytes, int)
+                        or declared_bytes != total_content_bytes
+                    )
+                ):
+                    bytes_scanned += total_file_bytes
+                    diagnostics.append({"ref": path.name, "error": "invalid_payload"})
+                    continue
+                metadata_fields = final_metadata
         except TimeoutError:
             scan_truncated = True
             diagnostics.append({
@@ -4599,6 +4750,21 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
                     "error": "store_id session is not authorized by the trusted host capability",
                 })
             return json.dumps({"error": "store_id expansion authorization failed closed"})
+        if status == "scan_pending":
+            return json.dumps({
+                "store_id": store_id,
+                "source_type": "raw_message",
+                "session_id": loaded.get("session_id") or "",
+                "content_scan_pending": True,
+                "content_chars_scanned": int(
+                    loaded.get("content_chars_scanned") or 0
+                ),
+                "content_bytes": int(loaded.get("content_bytes") or 0),
+                "content_scan_byte_offset": int(
+                    loaded.get("content_scan_byte_offset") or 0
+                ),
+                "retryable": True,
+            })
         if status != "ok":
             return json.dumps({
                 "error": f"Message store_id {store_id} has invalid or changed bounded metadata",

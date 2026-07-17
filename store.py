@@ -22,7 +22,6 @@ from .db_bootstrap import (
     ExternalContentFtsSpec,
     add_column_if_missing,
     configure_connection,
-    ensure_external_content_fts,
     refuse_schema_version_too_new,
     run_versioned_migrations,
 )
@@ -74,6 +73,7 @@ _EXPAND_SCALAR_MAX_CHARS = 8 * 1024
 _EXPAND_TOOL_CALLS_MAX_CHARS = 64 * 1024
 _EXPAND_CONTENT_LOOKBEHIND_CHARS = 8 * 1024
 _EXPAND_CONTENT_BLOB_READ_BYTES = 16 * 1024
+_EXPAND_LEGACY_REVISION_READ_BYTES = 1024 * 1024
 _EXPAND_SQL_PROGRESS_OPCODES = 1_000
 _EXPAND_SQL_PROGRESS_CALLBACK_CAP = 20_000
 
@@ -125,6 +125,18 @@ def _temporary_sqlite_progress_budget(
         conn.set_progress_handler(previous, previous_n if previous is not None else 0)
 
 
+@contextmanager
+def _suspended_sqlite_progress_handler(conn: sqlite3.Connection) -> Iterator[None]:
+    """Permit one bounded bookkeeping statement after a work deadline expires."""
+    previous = getattr(conn, "_lcm_progress_handler", None)
+    previous_n = max(0, int(getattr(conn, "_lcm_progress_handler_n", 0) or 0))
+    conn.set_progress_handler(None, 0)
+    try:
+        yield
+    finally:
+        conn.set_progress_handler(previous, previous_n if previous is not None else 0)
+
+
 class _ContentBlobReader:
     """Bounded UTF-8 character reads over SQLite's O(1)-seek incremental BLOB."""
 
@@ -146,15 +158,29 @@ class _ContentBlobReader:
         self._deadline = deadline
         self._blob = conn.blobopen("messages", "content", self._store_id, readonly=True)
         self._positions: dict[int, int] = {0: 0, self._total_chars: self._total_bytes}
+        self._decoded_spans: list[tuple[int, int, str]] = []
+        self._expired_read_allowance = 0
 
     def close(self) -> None:
         self._blob.close()
 
     def _check_deadline(self) -> None:
         if self._deadline is not None and time.monotonic() >= self._deadline:
+            if self._expired_read_allowance > 0:
+                self._expired_read_allowance -= 1
+                return
             raise TimeoutError("content_scan_deadline")
 
+    def allow_one_expired_bounded_read(self) -> None:
+        """Guarantee restart progress by permitting one already-bounded read."""
+        self._expired_read_allowance = max(self._expired_read_allowance, 1)
+
+    def remember_byte_offset(self, char_offset: int, byte_offset: int) -> None:
+        self._positions[max(0, int(char_offset))] = max(0, int(byte_offset))
+
     def _nearest_position(self, char_offset: int) -> tuple[int, int]:
+        if char_offset in self._positions:
+            return char_offset, self._positions[char_offset]
         candidates = [offset for offset in self._positions if offset <= char_offset]
         best_char = max(candidates) if candidates else 0
         best_byte = self._positions.get(best_char, 0)
@@ -184,7 +210,11 @@ class _ContentBlobReader:
         requested = min(max(0, int(offset)), self._total_chars)
         wanted = min(max(0, int(chars)), 128 * 1024)
         target_end = min(self._total_chars, requested + wanted)
-        cursor_char, cursor_byte = self._nearest_position(requested)
+        known_requested_byte = self.known_byte_offset(requested)
+        if known_requested_byte is not None:
+            cursor_char, cursor_byte = requested, known_requested_byte
+        else:
+            cursor_char, cursor_byte = self._nearest_position(requested)
         self._blob.seek(cursor_byte)
         carry = b""
         pieces: list[str] = []
@@ -207,6 +237,16 @@ class _ContentBlobReader:
             decoded_start_byte = cursor_byte
             decoded_end_byte = read_end - len(carry)
             if decoded:
+                self._decoded_spans.append(
+                    (decoded_start_char, decoded_start_byte, decoded)
+                )
+                del self._decoded_spans[:-8]
+                decoded_end_char = decoded_start_char + len(decoded)
+                for exact_char in (requested, target_end):
+                    if decoded_start_char <= exact_char <= decoded_end_char:
+                        self._positions[exact_char] = decoded_start_byte + len(
+                            decoded[: exact_char - decoded_start_char].encode("utf-8")
+                        )
                 take_start = max(0, requested - decoded_start_char)
                 take_end = min(len(decoded), target_end - decoded_start_char)
                 if take_end > take_start:
@@ -220,7 +260,12 @@ class _ContentBlobReader:
                 self._positions[cursor_char] = cursor_byte
             elif carry:
                 cursor_byte = decoded_end_byte
-            self._check_deadline()
+            # Once one bounded transport read has been decoded, return its
+            # proven cursor even if the deadline crossed during that chunk.
+            # The caller can then persist monotonic lexer progress instead of
+            # discarding the completed read and reporting the old checkpoint.
+            if cursor_char < target_end:
+                self._check_deadline()
         if cursor_char >= target_end and target_end not in self._positions:
             # The target can fall within the final decoded block; derive its
             # byte boundary from the bounded returned suffix rather than from a
@@ -229,6 +274,21 @@ class _ContentBlobReader:
             if nearest_char == target_end:
                 self._positions[target_end] = nearest_byte
         return "".join(pieces)
+
+    def known_byte_offset(self, char_offset: int) -> int | None:
+        """Return an offset already proved while decoding bounded BLOB chunks."""
+        target = min(max(0, int(char_offset)), self._total_chars)
+        exact = self._positions.get(target)
+        if exact is not None:
+            return exact
+        for start_char, start_byte, decoded in reversed(self._decoded_spans):
+            if start_char <= target <= start_char + len(decoded):
+                exact = start_byte + len(
+                    decoded[: target - start_char].encode("utf-8")
+                )
+                self._positions[target] = exact
+                return exact
+        return None
 
     def byte_offset(self, char_offset: int) -> int:
         target = min(max(0, int(char_offset)), self._total_chars)
@@ -243,6 +303,157 @@ class _ContentBlobReader:
             self.read_chars(nearest_char, min(16 * 1024, target - nearest_char))
             nearest_char, _ = self._nearest_position(target)
         return self._positions.get(target, self._total_bytes)
+
+
+def _advance_legacy_content_revision(
+    conn: sqlite3.Connection,
+    *,
+    store_id: int,
+    revision_row: tuple | None,
+    deadline: float | None,
+    allow_one_expired_chunk: bool,
+) -> dict[str, Any]:
+    """Incrementally publish legacy content length metadata from a BLOB handle.
+
+    ``len(sqlite3.Blob)`` delegates to SQLite's native blob-size metadata and is
+    O(1). Character counting then advances in bounded byte chunks, persisting a
+    UTF-8 boundary after every call so restarts make monotonic progress.
+    """
+    with _suspended_sqlite_progress_handler(conn):
+        content_type = conn.execute(
+            "SELECT typeof(content) FROM messages WHERE store_id=?", (store_id,)
+        ).fetchone()
+    if content_type is None:
+        return {"status": "changed"}
+    if content_type[0] == "null":
+        with _suspended_sqlite_progress_handler(conn):
+            conn.execute(
+                """INSERT OR REPLACE INTO lcm_content_revisions
+                       (store_id, content_fingerprint, content_chars, content_bytes,
+                        storage_version, scan_byte_offset)
+                   VALUES (?, lower(hex(randomblob(16))), 0, 0, 2, 0)""",
+                (store_id,),
+            )
+        return {
+            "status": "complete",
+            "content_chars": 0,
+            "content_bytes": 0,
+            "scan_byte_offset": 0,
+            "storage_version": 2,
+        }
+    if content_type[0] not in {"text", "blob"}:
+        return {"status": "invalid_payload"}
+
+    blob = conn.blobopen("messages", "content", int(store_id), readonly=True)
+    try:
+        total_bytes = len(blob)
+        if revision_row is None:
+            with _suspended_sqlite_progress_handler(conn):
+                fingerprint = conn.execute(
+                    "SELECT lower(hex(randomblob(16)))"
+                ).fetchone()[0]
+            content_chars = 0
+            scan_byte_offset = 0
+            with _suspended_sqlite_progress_handler(conn):
+                conn.execute(
+                    "DELETE FROM lcm_content_scan_checkpoints WHERE store_id=?",
+                    (store_id,),
+                )
+                conn.execute(
+                    """INSERT OR REPLACE INTO lcm_content_revisions
+                           (store_id, content_fingerprint, content_chars, content_bytes,
+                            storage_version, scan_byte_offset)
+                       VALUES (?, ?, 0, ?, 1, 0)""",
+                    (store_id, fingerprint, total_bytes),
+                )
+        else:
+            fingerprint = str(revision_row[0])
+            content_chars = max(0, int(revision_row[1] or 0))
+            recorded_bytes = max(0, int(revision_row[2] or 0))
+            scan_byte_offset = max(0, int(revision_row[4] or 0))
+            if (
+                recorded_bytes != total_bytes
+                or scan_byte_offset > total_bytes
+                or (scan_byte_offset == 0 and content_chars != 0)
+            ):
+                with _suspended_sqlite_progress_handler(conn):
+                    fingerprint = conn.execute(
+                        "SELECT lower(hex(randomblob(16)))"
+                    ).fetchone()[0]
+                content_chars = 0
+                scan_byte_offset = 0
+                with _suspended_sqlite_progress_handler(conn):
+                    conn.execute(
+                        "DELETE FROM lcm_content_scan_checkpoints WHERE store_id=?",
+                        (store_id,),
+                    )
+
+        blob.seek(scan_byte_offset)
+        durable_byte_offset = scan_byte_offset
+        added_chars = 0
+        bytes_read = 0
+        carry = b""
+        while (
+            durable_byte_offset < total_bytes
+            and bytes_read < _EXPAND_LEGACY_REVISION_READ_BYTES
+        ):
+            if (
+                deadline is not None
+                and time.monotonic() >= deadline
+                and (bytes_read > 0 or not allow_one_expired_chunk)
+            ):
+                break
+            remaining = total_bytes - blob.tell()
+            if remaining <= 0:
+                break
+            raw = blob.read(
+                min(
+                    _EXPAND_CONTENT_BLOB_READ_BYTES,
+                    remaining,
+                    _EXPAND_LEGACY_REVISION_READ_BYTES - bytes_read,
+                )
+            )
+            if not raw:
+                break
+            bytes_read += len(raw)
+            candidate = carry + raw
+            final = blob.tell() >= total_bytes
+            decoded, carry = _ContentBlobReader._decode_complete_prefix(
+                candidate, final=final
+            )
+            durable_byte_offset += len(candidate) - len(carry)
+            added_chars += len(decoded)
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+
+        complete = durable_byte_offset >= total_bytes and not carry
+        content_chars += added_chars
+        storage_version = 2 if complete else 1
+        with _suspended_sqlite_progress_handler(conn):
+            conn.execute(
+                """INSERT OR REPLACE INTO lcm_content_revisions
+                       (store_id, content_fingerprint, content_chars, content_bytes,
+                        storage_version, scan_byte_offset)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    store_id,
+                    fingerprint,
+                    content_chars,
+                    total_bytes,
+                    storage_version,
+                    durable_byte_offset,
+                ),
+            )
+        return {
+            "status": "complete" if complete else "scan_pending",
+            "content_fingerprint": fingerprint,
+            "content_chars": content_chars,
+            "content_bytes": total_bytes,
+            "scan_byte_offset": durable_byte_offset,
+            "storage_version": storage_version,
+        }
+    finally:
+        blob.close()
 
 
 def _grep_bounded_search_projection(
@@ -462,6 +673,10 @@ def build_message_fts_spec() -> ExternalContentFtsSpec:
     )
 
 
+class MessageStoreStartupError(RuntimeError):
+    """Raised when SQLite cannot complete MessageStore initialization."""
+
+
 class MessageStore:
     """SQLite-backed immutable message store."""
 
@@ -497,41 +712,51 @@ class MessageStore:
             check_same_thread=False,
             factory=_LCMSQLiteConnection,
         )
-        refuse_schema_version_too_new(self._conn)
-        configure_connection(self._conn)
-        self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS messages (
-                store_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                source TEXT DEFAULT '',
-                conversation_id TEXT DEFAULT '',
-                role TEXT NOT NULL,
-                content TEXT,
-                tool_call_id TEXT,
-                tool_calls TEXT,
-                tool_name TEXT,
-                timestamp REAL NOT NULL,
-                token_estimate INTEGER DEFAULT 0,
-                pinned INTEGER DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_msg_session
-                ON messages(session_id, store_id);
-            CREATE INDEX IF NOT EXISTS idx_msg_session_ts
-                ON messages(session_id, timestamp);
+        try:
+            refuse_schema_version_too_new(self._conn)
+            configure_connection(self._conn)
+            self._conn.executescript("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    store_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    source TEXT DEFAULT '',
+                    conversation_id TEXT DEFAULT '',
+                    role TEXT NOT NULL,
+                    content TEXT,
+                    tool_call_id TEXT,
+                    tool_calls TEXT,
+                    tool_name TEXT,
+                    timestamp REAL NOT NULL,
+                    token_estimate INTEGER DEFAULT 0,
+                    pinned INTEGER DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_msg_session
+                    ON messages(session_id, store_id);
+                CREATE INDEX IF NOT EXISTS idx_msg_session_ts
+                    ON messages(session_id, timestamp);
 
-            CREATE TABLE IF NOT EXISTS metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
-        """)
-        run_versioned_migrations(self._conn)
-        ensure_external_content_fts(
-            self._conn,
-            build_message_fts_spec(),
-        )
-        self._ensure_source_column()
-        self._ensure_conversation_id_column()
-        self._conn.commit()
+                CREATE TABLE IF NOT EXISTS metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+            """)
+            run_versioned_migrations(
+                self._conn,
+                fts_specs=(build_message_fts_spec(),),
+            )
+            self._ensure_source_column()
+            self._ensure_conversation_id_column()
+            self._conn.commit()
+        except sqlite3.OperationalError as exc:
+            self._conn.close()
+            self._conn = None
+            raise MessageStoreStartupError(
+                f"Could not initialize MessageStore at {self.db_path}: {exc}"
+            ) from exc
+        except Exception:
+            self._conn.close()
+            self._conn = None
+            raise
 
     def _ensure_source_column(self) -> None:
         columns = {
@@ -758,6 +983,10 @@ class MessageStore:
         bounded_offset = max(0, int(content_offset))
         visible_chars = max(1, int(max_content_chars))
         lookahead_chars = max(0, int(content_lookahead_chars))
+        deadline_was_future = (
+            boundary_scan_deadline is None
+            or time.monotonic() < boundary_scan_deadline
+        )
         with self._write_lock:
             progress_budget = _temporary_sqlite_progress_budget(
                 self._conn, deadline=boundary_scan_deadline
@@ -816,28 +1045,49 @@ class MessageStore:
                             for column in scalar_columns
                         )
                         revision_row = self._conn.execute(
-                            """SELECT storage_version
+                            """SELECT content_fingerprint, content_chars,
+                                      content_bytes, storage_version, scan_byte_offset
                                FROM lcm_content_revisions WHERE store_id = ?""",
                             (store_id,),
                         ).fetchone()
-                        if revision_row is None or int(revision_row[0] or 0) < 2:
-                            # Lazy per-row v9 publication keeps startup O(1) in
-                            # message count. This one legacy-row traversal is
-                            # governed by the same VM/deadline progress budget.
-                            self._conn.execute(
-                                "DELETE FROM lcm_content_scan_checkpoints WHERE store_id = ?",
-                                (store_id,),
+                        if revision_row is None or int(revision_row[3] or 0) < 2:
+                            revision_progress = _advance_legacy_content_revision(
+                                self._conn,
+                                store_id=store_id,
+                                revision_row=revision_row,
+                                deadline=boundary_scan_deadline,
+                                allow_one_expired_chunk=deadline_was_future,
                             )
-                            self._conn.execute(
-                                """INSERT OR REPLACE INTO lcm_content_revisions
-                                       (store_id, content_fingerprint, content_chars,
-                                        content_bytes, storage_version)
-                                   SELECT store_id, lower(hex(randomblob(16))),
-                                          COALESCE(length(CAST(content AS TEXT)), 0),
-                                          COALESCE(length(CAST(content AS BLOB)), 0), 2
-                                   FROM messages WHERE store_id = ?""",
-                                (store_id,),
-                            )
+                            if revision_progress["status"] in {
+                                "changed", "invalid_payload"
+                            }:
+                                result = {"status": revision_progress["status"]}
+                                with _suspended_sqlite_progress_handler(self._conn):
+                                    self._conn.execute(f"RELEASE {savepoint}")
+                                return result
+                            if (
+                                revision_progress["status"] == "scan_pending"
+                                or (
+                                    boundary_scan_deadline is not None
+                                    and time.monotonic() >= boundary_scan_deadline
+                                )
+                            ):
+                                result = {
+                                    "status": "scan_pending",
+                                    "session_id": session_id,
+                                    "content_chars_scanned": int(
+                                        revision_progress["content_chars"]
+                                    ),
+                                    "content_bytes": int(
+                                        revision_progress["content_bytes"]
+                                    ),
+                                    "content_scan_byte_offset": int(
+                                        revision_progress["scan_byte_offset"]
+                                    ),
+                                }
+                                with _suspended_sqlite_progress_handler(self._conn):
+                                    self._conn.execute(f"RELEASE {savepoint}")
+                                return result
                         content_metadata = self._conn.execute(
                             """SELECT r.content_chars, typeof(m.content),
                                       r.content_fingerprint, r.content_bytes
@@ -905,6 +1155,16 @@ class MessageStore:
                                 "quote": None,
                                 "quote_backslashes": 0,
                             }
+                            if (
+                                checkpoint_row is not None
+                                and int(checkpoint["offset"]) < bounded_offset
+                                and content_reader is not None
+                            ):
+                                content_reader.remember_byte_offset(
+                                    int(checkpoint["offset"]),
+                                    int(checkpoint["byte_offset"]),
+                                )
+                                content_reader.allow_one_expired_bounded_read()
 
                             def read_content_chunk(offset: int, chars: int) -> str:
                                 bounded_chunk_offset = min(
@@ -929,12 +1189,25 @@ class MessageStore:
                                         raise
                                     return ""
 
+                            effective_scan_deadline = boundary_scan_deadline
+                            if (
+                                boundary_scan_deadline is not None
+                                and deadline_was_future
+                                and time.monotonic() >= boundary_scan_deadline
+                            ):
+                                # Authorization/metadata work consumed the
+                                # caller's positive budget. Permit only a tiny
+                                # recovery slice so the byte-native cursor can
+                                # advance instead of livelocking across restarts.
+                                effective_scan_deadline = time.monotonic() + 0.005
+                                if content_reader is not None:
+                                    content_reader.allow_one_expired_bounded_read()
                             boundary_scan = boundary_scanner(
                                 read_content_chunk,
                                 total_content_chars,
                                 bounded_offset,
                                 checkpoint=checkpoint,
-                                deadline=boundary_scan_deadline,
+                                deadline=effective_scan_deadline,
                             )
                             checkpoint_offset = min(
                                 total_content_chars,
@@ -952,10 +1225,15 @@ class MessageStore:
                                 ) or 0
                             ))
                             try:
-                                checkpoint_byte_offset = (
-                                    content_reader.byte_offset(checkpoint_offset)
+                                known_byte_offset = (
+                                    content_reader.known_byte_offset(checkpoint_offset)
                                     if content_reader is not None
                                     else 0
+                                )
+                                checkpoint_byte_offset = (
+                                    known_byte_offset
+                                    if known_byte_offset is not None
+                                    else content_reader.byte_offset(checkpoint_offset)
                                 )
                             except (TimeoutError, sqlite3.OperationalError) as exc:
                                 if (
@@ -973,21 +1251,22 @@ class MessageStore:
                                     checkpoint["quote_backslashes"]
                                 )
                             try:
-                                self._conn.execute(
-                                    """INSERT OR REPLACE INTO lcm_content_scan_checkpoints
-                                           (store_id, content_fingerprint, char_offset, byte_offset,
-                                            mode, quote, quote_backslashes)
-                                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                                    (
-                                        store_id,
-                                        content_metadata[2],
-                                        checkpoint_offset,
-                                        checkpoint_byte_offset,
-                                        checkpoint_mode,
-                                        checkpoint_quote,
-                                        checkpoint_backslashes,
-                                    ),
-                                )
+                                with _suspended_sqlite_progress_handler(self._conn):
+                                    self._conn.execute(
+                                        """INSERT OR REPLACE INTO lcm_content_scan_checkpoints
+                                               (store_id, content_fingerprint, char_offset, byte_offset,
+                                                mode, quote, quote_backslashes)
+                                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                        (
+                                            store_id,
+                                            content_metadata[2],
+                                            checkpoint_offset,
+                                            checkpoint_byte_offset,
+                                            checkpoint_mode,
+                                            checkpoint_quote,
+                                            checkpoint_backslashes,
+                                        ),
+                                    )
                             except sqlite3.OperationalError as exc:
                                 # A sibling writer can advance the row after the
                                 # authorization snapshot. The old checkpoint is
@@ -998,6 +1277,16 @@ class MessageStore:
                                     for marker in ("locked", "interrupted")
                                 ):
                                     raise
+                                checkpoint_offset = int(checkpoint["offset"])
+                                checkpoint_byte_offset = int(
+                                    checkpoint.get("byte_offset", 0) or 0
+                                )
+                                checkpoint_mode = str(checkpoint["mode"])
+                                checkpoint_quote = checkpoint["quote"]
+                                checkpoint_backslashes = int(
+                                    checkpoint["quote_backslashes"]
+                                )
+                            boundary_scan["checkpoint_offset"] = checkpoint_offset
 
                         scan_offset = min(
                             max(
@@ -1097,7 +1386,7 @@ class MessageStore:
                                     boundary_scan.get("boundary_safe_prefix") or ""
                                 )[:512]
                                 item["boundary_checkpoint_offset"] = int(
-                                    boundary_scan.get("checkpoint_offset", scan_offset)
+                                    checkpoint_offset
                                 )
                             item["tool_calls_chars"] = int(payload[13] or 0)
                             item["tool_calls_omitted"] = (
