@@ -209,37 +209,32 @@ def test_v11_policy_rejects_covered_new_session_item_and_survives_lifecycle_rewr
         engine.shutdown()
 
 
-def test_bind_session_stale_owner_generation_cas_cannot_replace_rollover_winner(tmp_path, monkeypatch):
+def test_bind_session_stale_owner_generation_cas_cannot_replace_rollover_winner(tmp_path):
     db_path = tmp_path / "stale-bind.db"
     engine = LCMEngine(config=_config(db_path))
     stale = LifecycleStateStore(db_path)
     engine.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
-    original = stale.get_by_conversation
-    observed = []
-
-    def win_after_stale_read(conversation_id):
-        state = original(conversation_id)
-        if not observed:
-            observed.append(state.current_session_id)
-            engine.rollover_session(
-                OLD,
-                NEW,
-                previous_messages=[],
-                carry_over_context=False,
-                platform="test",
-            )
-        return state
-
-    monkeypatch.setattr(stale, "get_by_conversation", win_after_stale_read)
-    try:
-        returned = stale.bind_session("stale-target", conversation_id=CONVERSATION)
-    finally:
-        monkeypatch.setattr(stale, "get_by_conversation", original)
+    statements = []
+    stale._conn.set_trace_callback(statements.append)
+    returned = stale.bind_session(OLD, conversation_id=CONVERSATION)
+    stale._conn.set_trace_callback(None)
+    engine.rollover_session(
+        OLD,
+        NEW,
+        previous_messages=[],
+        carry_over_context=False,
+        platform="test",
+    )
 
     try:
         durable = stale.get_by_conversation(CONVERSATION)
-        assert observed == [OLD]
-        assert returned.current_session_id == NEW
+        begin = next(i for i, sql in enumerate(statements) if sql == "BEGIN IMMEDIATE")
+        snapshot = next(
+            i for i, sql in enumerate(statements)
+            if "FROM lcm_active_frontiers" in sql
+        )
+        assert begin < snapshot
+        assert returned.current_session_id == OLD
         assert durable.current_session_id == NEW
         assert durable.rollover_carry_over_context is False
         policy = stale._conn.execute(
@@ -333,7 +328,7 @@ db_bootstrap.run_versioned_migrations(conn)
         assert interrupted.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
         db_bootstrap.run_versioned_migrations(interrupted)
-        assert db_bootstrap.get_schema_version(interrupted) == 12
+        assert db_bootstrap.get_schema_version(interrupted) == 13
         assert interrupted.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_rollover_policies'"
         ).fetchone() == (1,)

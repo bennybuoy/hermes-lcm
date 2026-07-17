@@ -10,6 +10,7 @@ import tempfile
 import pytest
 
 import hermes_lcm.engine as engine_module
+import hermes_lcm.db_bootstrap as db_bootstrap_module
 import hermes_lcm.externalize as externalize_module
 import hermes_lcm.frontier as frontier_module
 import hermes_lcm.maintenance as maintenance_module
@@ -796,6 +797,8 @@ def _many_node_rewrite_fixture(tmp_path) -> tuple[object, int, dict[int, str]]:
             """UPDATE summary_nodes SET summary=?, expand_hint=? WHERE node_id=?""",
             ("many-node-root-" + ("r" * 700), "many-node-root-hint-" + ("q" * 700), parent),
         )
+        for node_id in node_ids:
+            db_bootstrap_module.materialize_node_provenance_no_commit(conn, node_id)
         conn.execute(
             """UPDATE lcm_frontier_items SET ref_id=?
                WHERE conversation_id='source-conv' AND generation=1 AND ordinal=0""",

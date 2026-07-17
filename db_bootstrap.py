@@ -6,6 +6,7 @@ same schema-version marker, PRAGMA settings, and FTS repair behavior.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -31,7 +32,7 @@ class SQLiteStartupBusyError(RuntimeError):
     """Raised when bounded SQLite startup lock waiting is exhausted."""
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 SQLITE_STARTUP_BACKOFF_INITIAL_SECONDS = 0.01
 SQLITE_STARTUP_BACKOFF_MAX_SECONDS = 0.25
@@ -49,11 +50,27 @@ REQUIRED_CORE_TABLES = (
     "lcm_protected_sessions",
     "lcm_rollover_heads",
     "lcm_session_end_receipts",
+    "lcm_node_provenance",
+    "lcm_node_provenance_sessions",
     "lcm_migration_state",
     "lcm_focus_briefs",
     "messages_fts",
     "nodes_fts",
 )
+
+# A proof is computed only from an exact, bounded node closure.  These are the
+# same hard limits used by locked canonical publication; migration uses a
+# smaller root budget below so startup can never turn malformed historical DAG
+# state into unbounded writer work.
+NODE_PROVENANCE_MAX_ROWS = 10_000
+NODE_PROVENANCE_MAX_EDGES = 40_000
+NODE_PROVENANCE_MAX_DEPTH = 64
+NODE_PROVENANCE_MAX_BYTES = 4 * 1024 * 1024
+NODE_PROVENANCE_MAX_SOURCE_IDS_BYTES = 128_000
+NODE_PROVENANCE_MAX_SOURCE_IDS = 6_400
+NODE_PROVENANCE_MAX_SESSIONS = 10_000
+NODE_PROVENANCE_SESSION_ID_MAX_BYTES = 2 * 1024
+NODE_PROVENANCE_MIGRATION_ROOTS = 256
 
 # Test-only subprocess crash injection. Production callers never set this;
 # tests assign a phase name in the child process and verify SQLite rolls the
@@ -384,6 +401,69 @@ def ensure_rollover_policy_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def ensure_rollover_policy_triggers(conn: sqlite3.Connection) -> None:
+    """Install the authentic schema-v11 scalar-cutoff enforcement objects."""
+    ensure_rollover_policy_table(conn)
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS lcm_no_carry_frontier_insert
+           BEFORE INSERT ON lcm_active_frontiers
+           WHEN EXISTS (
+               SELECT 1 FROM lcm_rollover_policies AS p
+               WHERE p.conversation_id = NEW.conversation_id
+                 AND p.carry_over_context = 0
+                 AND NEW.generation > p.frozen_generation
+                 AND (NEW.session_id = p.finalized_session_id OR (
+                     NEW.source_end_store_id > 0
+                     AND NEW.source_end_store_id <= p.finalized_cutoff_store_id
+                 ))
+           ) BEGIN
+               SELECT RAISE(ABORT, 'no-carry finalized cutoff blocks frontier publication');
+           END"""
+    )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS lcm_no_carry_frontier_update
+           BEFORE UPDATE OF session_id, source_end_store_id ON lcm_active_frontiers
+           WHEN EXISTS (
+               SELECT 1 FROM lcm_rollover_policies AS p
+               WHERE p.conversation_id = NEW.conversation_id
+                 AND p.carry_over_context = 0
+                 AND NEW.generation >= p.frozen_generation
+                 AND (NEW.session_id = p.finalized_session_id OR (
+                     NEW.source_end_store_id > 0
+                     AND NEW.source_end_store_id <= p.finalized_cutoff_store_id
+                 ))
+           ) BEGIN
+               SELECT RAISE(ABORT, 'no-carry finalized cutoff blocks frontier publication');
+           END"""
+    )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS lcm_no_carry_item_insert
+           BEFORE INSERT ON lcm_frontier_items
+           WHEN EXISTS (
+               SELECT 1 FROM lcm_rollover_policies AS p
+               WHERE p.conversation_id = NEW.conversation_id
+                 AND p.carry_over_context = 0
+                 AND NEW.generation >= p.frozen_generation
+                 AND NEW.source_start <= p.finalized_cutoff_store_id
+           ) BEGIN
+               SELECT RAISE(ABORT, 'no-carry finalized cutoff blocks frontier item');
+           END"""
+    )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS lcm_no_carry_item_update
+           BEFORE UPDATE OF source_start, source_end ON lcm_frontier_items
+           WHEN EXISTS (
+               SELECT 1 FROM lcm_rollover_policies AS p
+               WHERE p.conversation_id = NEW.conversation_id
+                 AND p.carry_over_context = 0
+                 AND NEW.generation >= p.frozen_generation
+                 AND NEW.source_start <= p.finalized_cutoff_store_id
+           ) BEGIN
+               SELECT RAISE(ABORT, 'no-carry finalized cutoff blocks frontier item');
+           END"""
+    )
+
+
 def ensure_rollover_v12_tables(conn: sqlite3.Connection) -> None:
     """Create the v12 historical protection, head, and ingest receipt schema."""
     conn.execute(
@@ -456,6 +536,281 @@ def ensure_rollover_v12_tables(conn: sqlite3.Connection) -> None:
     )
 
 
+def _receipt_primary_key_columns(conn: sqlite3.Connection) -> tuple[str, ...]:
+    rows = conn.execute("PRAGMA table_info(lcm_session_end_receipts)").fetchall()
+    return tuple(
+        str(row[1])
+        for row in sorted((row for row in rows if int(row[5] or 0) > 0), key=lambda row: row[5])
+    )
+
+
+def _rebuild_session_end_receipts_v13(conn: sqlite3.Connection) -> None:
+    """Collapse mutable-epoch duplicates into one durable exact receipt."""
+    expected_key = ("conversation_id", "session_id", "payload_fingerprint")
+    if _receipt_primary_key_columns(conn) == expected_key:
+        return
+    conn.execute("DROP TABLE IF EXISTS lcm_session_end_receipts_v13")
+    conn.execute(
+        """
+        CREATE TABLE lcm_session_end_receipts_v13 (
+            conversation_id TEXT NOT NULL
+                CHECK (length(CAST(conversation_id AS BLOB)) BETWEEN 1 AND 8192),
+            session_id TEXT NOT NULL
+                CHECK (length(CAST(session_id AS BLOB)) BETWEEN 1 AND 8192),
+            payload_fingerprint TEXT NOT NULL
+                CHECK (length(payload_fingerprint) = 64
+                       AND payload_fingerprint NOT GLOB '*[^0-9a-f]*'),
+            rollover_epoch INTEGER NOT NULL DEFAULT 0
+                CHECK (rollover_epoch >= 0),
+            prefix_count INTEGER NOT NULL DEFAULT 0
+                CHECK (prefix_count >= 0),
+            retained_count INTEGER NOT NULL DEFAULT 0
+                CHECK (retained_count >= 0),
+            created_at REAL NOT NULL,
+            PRIMARY KEY (conversation_id, session_id, payload_fingerprint)
+        )
+        """
+    )
+    _migration_crash_boundary("v13_after_receipt_shadow_table")
+    conn.execute(
+        """INSERT INTO lcm_session_end_receipts_v13(
+               conversation_id, session_id, payload_fingerprint, rollover_epoch,
+               prefix_count, retained_count, created_at
+           )
+           SELECT conversation_id, session_id, payload_fingerprint,
+                  MIN(rollover_epoch), MIN(prefix_count), MAX(retained_count),
+                  MIN(created_at)
+           FROM lcm_session_end_receipts
+           GROUP BY conversation_id, session_id, payload_fingerprint"""
+    )
+    _migration_crash_boundary("v13_after_receipt_copy")
+    conn.execute("DROP TABLE lcm_session_end_receipts")
+    conn.execute(
+        "ALTER TABLE lcm_session_end_receipts_v13 RENAME TO lcm_session_end_receipts"
+    )
+
+
+def ensure_rollover_v13_tables(conn: sqlite3.Connection) -> None:
+    """Create exact node proofs and epoch-independent durable receipts."""
+    ensure_rollover_v12_tables(conn)
+    _rebuild_session_end_receipts_v13(conn)
+    conn.execute("DROP INDEX IF EXISTS idx_lcm_session_end_receipts_retention")
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_lcm_session_end_receipts_session
+           ON lcm_session_end_receipts(session_id, conversation_id)"""
+    )
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_lcm_session_end_receipts_created
+           ON lcm_session_end_receipts(conversation_id, created_at)"""
+    )
+    _migration_crash_boundary("v13_after_receipt_rebuild")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_node_provenance (
+            node_id INTEGER PRIMARY KEY,
+            proof_complete INTEGER NOT NULL DEFAULT 0
+                CHECK (proof_complete IN (0, 1)),
+            closure_node_count INTEGER NOT NULL DEFAULT 0
+                CHECK (closure_node_count >= 0),
+            closure_edge_count INTEGER NOT NULL DEFAULT 0
+                CHECK (closure_edge_count >= 0),
+            source_session_count INTEGER NOT NULL DEFAULT 0
+                CHECK (source_session_count >= 0),
+            proved_at REAL NOT NULL
+        )
+        """
+    )
+    _migration_crash_boundary("v13_after_node_provenance_table")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_node_provenance_sessions (
+            node_id INTEGER NOT NULL,
+            source_session_id TEXT NOT NULL
+                CHECK (length(CAST(source_session_id AS BLOB)) BETWEEN 1 AND 2048),
+            PRIMARY KEY (node_id, source_session_id)
+        )
+        """
+    )
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_lcm_node_provenance_session
+           ON lcm_node_provenance_sessions(source_session_id, node_id)"""
+    )
+    _migration_crash_boundary("v13_after_proof_tables")
+
+
+def _decode_bounded_node_sources(raw: object, *, encoded_bytes: int) -> list[int]:
+    if encoded_bytes > NODE_PROVENANCE_MAX_SOURCE_IDS_BYTES or not isinstance(raw, str):
+        raise ValueError("node provenance source_ids byte bound exceeded")
+    stripped = raw.strip()
+    if stripped not in {"", "[]"} and stripped.count(",") + 1 > NODE_PROVENANCE_MAX_SOURCE_IDS:
+        raise ValueError("node provenance source_ids cardinality bound exceeded")
+    try:
+        values = json.loads(stripped or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("node provenance source_ids are malformed") from exc
+    if not isinstance(values, list) or len(values) > NODE_PROVENANCE_MAX_SOURCE_IDS:
+        raise ValueError("node provenance source_ids must be a bounded list")
+    result: list[int] = []
+    for value in values:
+        if isinstance(value, bool):
+            raise ValueError("node provenance source id is invalid")
+        parsed = int(value)
+        if parsed <= 0:
+            raise ValueError("node provenance source id is invalid")
+        result.append(parsed)
+    if len(set(result)) != len(result):
+        raise ValueError("node provenance source ids are not unique")
+    return result
+
+
+def materialize_node_provenance_no_commit(
+    conn: sqlite3.Connection,
+    node_id: int,
+    *,
+    conversation_id: str | None = None,
+    max_rows: int = NODE_PROVENANCE_MAX_ROWS,
+    max_edges: int = NODE_PROVENANCE_MAX_EDGES,
+    max_depth: int = NODE_PROVENANCE_MAX_DEPTH,
+    max_bytes: int = NODE_PROVENANCE_MAX_BYTES,
+) -> bool:
+    """Materialize an exact node-to-source-session proof under fixed bounds.
+
+    ``conversation_id`` is accepted for publisher call-site clarity; message
+    store ids are globally unique, so the durable proof itself is safely
+    conversation-independent.  Any missing, malformed, or oversized closure
+    leaves no completeness row and therefore fails closed at frontier publish.
+    """
+    del conversation_id
+    ensure_rollover_v13_tables(conn)
+    root = int(node_id or 0)
+    if root <= 0:
+        raise ValueError("node provenance requires a positive node id")
+    stack: list[tuple[int, int]] = [(root, 0)]
+    seen: set[int] = set()
+    sessions: set[str] = set()
+    edges = 0
+    encoded_total = 0
+    try:
+        while stack:
+            current, depth = stack.pop()
+            if current in seen:
+                continue
+            if depth > int(max_depth) or len(seen) >= int(max_rows):
+                raise ValueError("node provenance closure bound exceeded")
+            row = conn.execute(
+                """SELECT session_id, source_type,
+                          COALESCE(length(CAST(source_ids AS BLOB)), 0),
+                          CASE
+                            WHEN COALESCE(length(CAST(source_ids AS BLOB)), 0) <= ?
+                            THEN substr(CAST(source_ids AS TEXT), 1, ?)
+                            ELSE NULL
+                          END
+                   FROM summary_nodes WHERE node_id = ?""",
+                (
+                    NODE_PROVENANCE_MAX_SOURCE_IDS_BYTES,
+                    NODE_PROVENANCE_MAX_SOURCE_IDS_BYTES + 1,
+                    current,
+                ),
+            ).fetchone()
+            if row is None:
+                raise ValueError("node provenance closure references a missing node")
+            session_id = str(row[0] or "")
+            if not session_id or len(session_id.encode("utf-8")) > NODE_PROVENANCE_SESSION_ID_MAX_BYTES:
+                raise ValueError("node provenance session id bound exceeded")
+            sessions.add(session_id)
+            if len(sessions) > NODE_PROVENANCE_MAX_SESSIONS:
+                raise ValueError("node provenance session bound exceeded")
+            encoded_bytes = int(row[2] or 0)
+            encoded_total += encoded_bytes
+            if encoded_total > int(max_bytes) or row[3] is None:
+                raise ValueError("node provenance closure byte bound exceeded")
+            source_ids = _decode_bounded_node_sources(row[3], encoded_bytes=encoded_bytes)
+            edges += len(source_ids)
+            if edges > int(max_edges):
+                raise ValueError("node provenance closure edge bound exceeded")
+            source_type = str(row[1] or "")
+            if source_type == "nodes":
+                stack.extend((source_id, depth + 1) for source_id in reversed(source_ids))
+            elif source_type == "messages":
+                found: dict[int, str] = {}
+                for offset in range(0, len(source_ids), 400):
+                    page = source_ids[offset:offset + 400]
+                    placeholders = ",".join("?" for _ in page)
+                    for store_id, owner in conn.execute(
+                        f"SELECT store_id, session_id FROM messages WHERE store_id IN ({placeholders})",
+                        tuple(page),
+                    ):
+                        owner_id = str(owner or "")
+                        if not owner_id or len(owner_id.encode("utf-8")) > NODE_PROVENANCE_SESSION_ID_MAX_BYTES:
+                            raise ValueError("node provenance message session bound exceeded")
+                        found[int(store_id)] = owner_id
+                if set(found) != set(source_ids):
+                    raise ValueError("node provenance closure references a missing message")
+                sessions.update(found.values())
+                if len(sessions) > NODE_PROVENANCE_MAX_SESSIONS:
+                    raise ValueError("node provenance session bound exceeded")
+            else:
+                raise ValueError("node provenance source type is invalid")
+            seen.add(current)
+        if not seen or not sessions:
+            raise ValueError("node provenance closure is empty")
+    except (sqlite3.Error, TypeError, ValueError, OverflowError):
+        conn.execute("DELETE FROM lcm_node_provenance_sessions WHERE node_id = ?", (root,))
+        conn.execute("DELETE FROM lcm_node_provenance WHERE node_id = ?", (root,))
+        raise
+
+    conn.execute("DELETE FROM lcm_node_provenance_sessions WHERE node_id = ?", (root,))
+    conn.executemany(
+        """INSERT INTO lcm_node_provenance_sessions(node_id, source_session_id)
+           VALUES(?, ?)""",
+        [(root, session_id) for session_id in sorted(sessions)],
+    )
+    conn.execute(
+        """INSERT INTO lcm_node_provenance(
+               node_id, proof_complete, closure_node_count, closure_edge_count,
+               source_session_count, proved_at
+           ) VALUES(?, 1, ?, ?, ?, ?)
+           ON CONFLICT(node_id) DO UPDATE SET
+               proof_complete=1,
+               closure_node_count=excluded.closure_node_count,
+               closure_edge_count=excluded.closure_edge_count,
+               source_session_count=excluded.source_session_count,
+               proved_at=excluded.proved_at""",
+        (root, len(seen), edges, len(sessions), time.time()),
+    )
+    return True
+
+
+def backfill_node_provenance_v13(conn: sqlite3.Connection) -> None:
+    """Best-effort bounded proof backfill; unproved legacy nodes fail closed."""
+    ensure_rollover_v13_tables(conn)
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='summary_nodes'"
+    ).fetchone():
+        _migration_crash_boundary("v13_after_provenance_backfill")
+        return
+    # node_id is the table's integer primary key, so this fixed LIMIT is an
+    # indexed tail read.  Avoid scanning frontier history for roots: a sparse
+    # or malformed legacy frontier could otherwise make startup writer work
+    # proportional to all historical items.  Older unproved nodes remain
+    # intentionally unusable until republished by a v13-aware writer.
+    candidates = [
+        int(row[0])
+        for row in conn.execute(
+            """SELECT node_id FROM summary_nodes
+               ORDER BY node_id DESC LIMIT ?""",
+            (NODE_PROVENANCE_MIGRATION_ROOTS,),
+        )
+    ]
+    for candidate in candidates:
+        try:
+            materialize_node_provenance_no_commit(conn, candidate)
+        except (sqlite3.Error, TypeError, ValueError, OverflowError):
+            # Absence of a complete proof is the durable fail-closed marker.
+            continue
+    _migration_crash_boundary("v13_after_provenance_backfill")
+
+
 def _drop_schema_v11_cutoff_triggers(conn: sqlite3.Connection) -> None:
     for name in (
         "lcm_no_carry_frontier_insert",
@@ -509,7 +864,7 @@ def backfill_rollover_v12(conn: sqlite3.Connection) -> None:
            )
            SELECT l.conversation_id, l.current_session_id,
                   l.last_finalized_session_id,
-                  l.rollover_carry_over_context, 1, f.generation, ?, ?
+                  COALESCE(l.rollover_carry_over_context, 1), 1, f.generation, ?, ?
            FROM lcm_lifecycle_state AS l
            JOIN lcm_active_frontiers AS f
              ON f.conversation_id = l.conversation_id
@@ -521,7 +876,6 @@ def backfill_rollover_v12(conn: sqlite3.Connection) -> None:
             )
            WHERE l.current_session_id IS NOT NULL
              AND l.last_finalized_session_id IS NOT NULL
-             AND l.rollover_carry_over_context IN (0, 1)
            ON CONFLICT(conversation_id) DO NOTHING""",
         (now, now),
     )
@@ -571,18 +925,108 @@ def backfill_rollover_v12(conn: sqlite3.Connection) -> None:
     )
     _migration_crash_boundary("v12_after_lifecycle_protected_backfill")
 
+    # A v10 lifecycle row retained only the latest no-carry edge.  Recover all
+    # prior session identities that durable conversation-scoped data can prove,
+    # excluding the active owner.  This deliberately errs toward protection:
+    # missing historical protection can republish finalized data, while an
+    # extra protected legacy identity merely fails closed.
+    messages_evidence = ""
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'"
+    ).fetchone():
+        messages_evidence = """
+                 UNION ALL
+                 SELECT n.conversation_id, m.session_id, MAX(m.store_id),
+                        n.current_generation
+                 FROM no_carry AS n
+                 JOIN messages AS m USING(conversation_id)
+                 WHERE m.session_id IS NOT NULL
+                   AND m.session_id <> n.current_session_id
+                 GROUP BY n.conversation_id, m.session_id
+        """
+    nodes_evidence = ""
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='summary_nodes'"
+    ).fetchone():
+        nodes_evidence = """
+                 UNION ALL
+                 SELECT n.conversation_id, sn.session_id,
+                        MAX(0, i.source_end), n.current_generation
+                 FROM no_carry AS n
+                 JOIN lcm_frontier_items AS i USING(conversation_id)
+                 JOIN summary_nodes AS sn ON sn.node_id = i.ref_id
+                 WHERE i.kind = 'node' AND sn.session_id <> n.current_session_id
+        """
+    conn.execute(
+        f"""WITH no_carry AS (
+                 SELECT l.conversation_id, l.current_session_id,
+                        COALESCE(f.generation, 0) AS current_generation,
+                        l.updated_at
+                 FROM lcm_lifecycle_state AS l
+                 LEFT JOIN lcm_active_frontiers AS f
+                   ON f.conversation_id = l.conversation_id
+                  AND f.session_id = l.current_session_id
+                  AND NOT EXISTS (
+                      SELECT 1 FROM lcm_active_frontiers AS newer
+                      WHERE newer.conversation_id = f.conversation_id
+                        AND newer.generation > f.generation
+                  )
+                 WHERE l.rollover_carry_over_context = 0
+                   AND l.current_session_id IS NOT NULL
+             ), evidence(conversation_id, session_id, boundary, generation) AS (
+                 SELECT n.conversation_id, l.last_finalized_session_id,
+                        MAX(0, l.last_finalized_frontier_store_id),
+                        n.current_generation
+                 FROM no_carry AS n
+                 JOIN lcm_lifecycle_state AS l USING(conversation_id)
+                 WHERE l.last_finalized_session_id IS NOT NULL
+                 {messages_evidence}
+                 UNION ALL
+                 SELECT n.conversation_id, f.session_id,
+                        MAX(0, f.source_end_store_id), MAX(0, f.generation)
+                 FROM no_carry AS n
+                 JOIN lcm_active_frontiers AS f USING(conversation_id)
+                 WHERE f.session_id <> n.current_session_id
+                 {nodes_evidence}
+                 UNION ALL
+                 SELECT n.conversation_id, p.finalized_session_id,
+                        MAX(0, p.finalized_cutoff_store_id),
+                        MAX(0, p.frozen_generation)
+                 FROM no_carry AS n
+                 JOIN lcm_rollover_policies AS p USING(conversation_id)
+                 WHERE p.carry_over_context = 0
+                   AND p.finalized_session_id <> n.current_session_id
+             )
+           INSERT INTO lcm_protected_sessions(
+               conversation_id, finalized_session_id,
+               finalized_boundary_store_id, protected_at_generation,
+               rollover_epoch, created_at, updated_at
+           )
+           SELECT e.conversation_id, e.session_id, MAX(e.boundary),
+                  MAX(e.generation), COALESCE(MAX(h.rollover_epoch), 1), ?, ?
+           FROM evidence AS e
+           LEFT JOIN lcm_rollover_heads AS h USING(conversation_id)
+           WHERE e.session_id IS NOT NULL AND e.session_id <> ''
+           GROUP BY e.conversation_id, e.session_id
+           ON CONFLICT(conversation_id, finalized_session_id) DO UPDATE SET
+               finalized_boundary_store_id = MAX(
+                   lcm_protected_sessions.finalized_boundary_store_id,
+                   excluded.finalized_boundary_store_id
+               ),
+               protected_at_generation = MAX(
+                   lcm_protected_sessions.protected_at_generation,
+                   excluded.protected_at_generation
+               ),
+               updated_at = MAX(lcm_protected_sessions.updated_at, excluded.updated_at)""",
+        (now, now),
+    )
+    _migration_crash_boundary("v12_after_historical_protected_backfill")
+
 
 def ensure_rollover_v12_triggers(conn: sqlite3.Connection) -> None:
     """Enforce historical session provenance against legacy frontier SQL."""
     ensure_rollover_v12_tables(conn)
     _drop_schema_v11_cutoff_triggers(conn)
-    source_tables_ready = all(
-        conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
-            (table,),
-        ).fetchone()
-        for table in ("messages", "summary_nodes")
-    )
     for operation, reference in (("insert", "NEW"), ("update", "NEW")):
         conn.execute(
             f"""
@@ -598,68 +1042,9 @@ def ensure_rollover_v12_triggers(conn: sqlite3.Connection) -> None:
             END
             """
         )
-        if source_tables_ready:
-            conn.execute(
-                f"""
-            CREATE TRIGGER IF NOT EXISTS lcm_protected_item_{operation}
-            BEFORE {operation.upper()} ON lcm_frontier_items
-            WHEN EXISTS (
-                SELECT 1 FROM lcm_protected_sessions AS p
-                WHERE p.conversation_id = {reference}.conversation_id
-                  AND (
-                      ({reference}.kind = 'message' AND EXISTS (
-                          SELECT 1 FROM messages AS m
-                          WHERE m.store_id = {reference}.ref_id
-                            AND m.conversation_id = {reference}.conversation_id
-                            AND m.session_id = p.finalized_session_id
-                      ))
-                      OR ({reference}.kind = 'node' AND EXISTS (
-                          WITH RECURSIVE closure(
-                              node_id, session_id, source_type, source_ids
-                          ) AS (
-                              SELECT n.node_id, n.session_id,
-                                     n.source_type, n.source_ids
-                              FROM summary_nodes AS n
-                              WHERE n.node_id = {reference}.ref_id
-                              UNION
-                              SELECT child.node_id, child.session_id,
-                                     child.source_type, child.source_ids
-                              FROM closure AS parent
-                              JOIN json_each(parent.source_ids) AS edge
-                                ON parent.source_type = 'nodes'
-                              JOIN summary_nodes AS child
-                                ON child.node_id = CAST(edge.value AS INTEGER)
-                          )
-                          SELECT 1 FROM closure AS c
-                          WHERE c.session_id = p.finalized_session_id
-                             OR (
-                                 c.source_type = 'messages'
-                                 AND EXISTS (
-                                     SELECT 1
-                                     FROM json_each(c.source_ids) AS source
-                                     JOIN messages AS m
-                                       ON m.store_id = CAST(source.value AS INTEGER)
-                                     WHERE m.conversation_id = {reference}.conversation_id
-                                       AND m.session_id = p.finalized_session_id
-                                 )
-                             )
-                      ))
-                      OR EXISTS (
-                          SELECT 1 FROM messages AS covered
-                          WHERE covered.conversation_id = {reference}.conversation_id
-                            AND covered.session_id = p.finalized_session_id
-                            AND covered.store_id BETWEEN {reference}.source_start
-                                                     AND {reference}.source_end
-                      )
-                  )
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'no-carry protected session blocks frontier item provenance');
-            END
-                """
-            )
-        else:
-            conn.execute(f"DROP TRIGGER IF EXISTS lcm_protected_item_{operation}")
+        # Schema v13 installs indexed exact-proof item triggers before commit.
+        # Never recreate v12's recursive JSON/range trigger, even transiently.
+        conn.execute(f"DROP TRIGGER IF EXISTS lcm_protected_item_{operation}")
     _migration_crash_boundary("v12_after_provenance_triggers")
 
     # Compatibility for a schema-v9/v10 process that was already open during
@@ -671,7 +1056,7 @@ def ensure_rollover_v12_triggers(conn: sqlite3.Connection) -> None:
         AFTER INSERT ON lcm_lifecycle_state
         WHEN NEW.current_session_id IS NOT NULL
           AND NEW.last_finalized_session_id IS NOT NULL
-          AND NEW.rollover_carry_over_context IN (0, 1)
+          AND COALESCE(NEW.rollover_carry_over_context, 1) IN (0, 1)
         BEGIN
             INSERT INTO lcm_rollover_heads(
                 conversation_id, current_session_id,
@@ -680,7 +1065,7 @@ def ensure_rollover_v12_triggers(conn: sqlite3.Connection) -> None:
             )
             SELECT NEW.conversation_id, NEW.current_session_id,
                    NEW.last_finalized_session_id,
-                   NEW.rollover_carry_over_context, 1,
+                   COALESCE(NEW.rollover_carry_over_context, 1), 1,
                    f.generation, NEW.updated_at, NEW.updated_at
             FROM lcm_active_frontiers AS f
             WHERE f.conversation_id = NEW.conversation_id
@@ -729,7 +1114,7 @@ def ensure_rollover_v12_triggers(conn: sqlite3.Connection) -> None:
            ON lcm_lifecycle_state
            WHEN NEW.current_session_id IS NOT NULL
              AND NEW.last_finalized_session_id IS NOT NULL
-             AND NEW.rollover_carry_over_context IN (0, 1)
+             AND COALESCE(NEW.rollover_carry_over_context, 1) IN (0, 1)
            BEGIN
              INSERT INTO lcm_rollover_heads(
                  conversation_id, current_session_id,
@@ -738,7 +1123,7 @@ def ensure_rollover_v12_triggers(conn: sqlite3.Connection) -> None:
              )
              SELECT NEW.conversation_id, NEW.current_session_id,
                     NEW.last_finalized_session_id,
-                    NEW.rollover_carry_over_context, 1,
+                    COALESCE(NEW.rollover_carry_over_context, 1), 1,
                     f.generation, NEW.updated_at, NEW.updated_at
              FROM lcm_active_frontiers AS f
              WHERE f.conversation_id = NEW.conversation_id
@@ -778,6 +1163,98 @@ def ensure_rollover_v12_triggers(conn: sqlite3.Connection) -> None:
            END"""
     )
     _migration_crash_boundary("v12_after_legacy_update_trigger")
+
+
+def ensure_rollover_v13_triggers(conn: sqlite3.Connection) -> None:
+    """Use only indexed, precomputed proof lookups in frontier triggers."""
+    ensure_rollover_v13_tables(conn)
+    source_tables_ready = all(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        for table in ("messages", "summary_nodes")
+    )
+    for operation, reference in (("insert", "NEW"), ("update", "NEW")):
+        conn.execute(f"DROP TRIGGER IF EXISTS lcm_protected_item_{operation}")
+        if not source_tables_ready:
+            continue
+        conn.execute(
+            f"""
+            CREATE TRIGGER lcm_protected_item_{operation}
+            BEFORE {operation.upper()} ON lcm_frontier_items
+            WHEN (
+                {reference}.kind = 'node' AND (
+                    NOT EXISTS (
+                        SELECT 1 FROM lcm_node_provenance AS proof
+                        WHERE proof.node_id = {reference}.ref_id
+                          AND proof.proof_complete = 1
+                          AND proof.source_session_count > 0
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM lcm_node_provenance_sessions AS source
+                        JOIN lcm_protected_sessions AS protected
+                          ON protected.conversation_id = {reference}.conversation_id
+                         AND protected.finalized_session_id = source.source_session_id
+                        WHERE source.node_id = {reference}.ref_id
+                    )
+                )
+            ) OR (
+                {reference}.kind = 'message' AND EXISTS (
+                    SELECT 1
+                    FROM messages AS message
+                    JOIN lcm_protected_sessions AS protected
+                      ON protected.conversation_id = {reference}.conversation_id
+                     AND protected.finalized_session_id = message.session_id
+                    WHERE message.store_id = {reference}.ref_id
+                      AND message.conversation_id = {reference}.conversation_id
+                )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'no-carry protected session frontier item provenance proof rejected');
+            END
+            """
+        )
+    conn.execute("DROP TRIGGER IF EXISTS lcm_node_provenance_delete")
+    conn.execute("DROP TRIGGER IF EXISTS lcm_node_provenance_lineage_update")
+    conn.execute("DROP TRIGGER IF EXISTS lcm_node_provenance_session_update")
+    if source_tables_ready:
+        conn.execute(
+            """CREATE TRIGGER lcm_node_provenance_delete
+               AFTER DELETE ON summary_nodes BEGIN
+                   DELETE FROM lcm_node_provenance_sessions WHERE node_id = OLD.node_id;
+                   DELETE FROM lcm_node_provenance WHERE node_id = OLD.node_id;
+               END"""
+        )
+        conn.execute(
+            """CREATE TRIGGER lcm_node_provenance_lineage_update
+               AFTER UPDATE OF source_ids, source_type ON summary_nodes BEGIN
+                   DELETE FROM lcm_node_provenance_sessions WHERE node_id = OLD.node_id;
+                   DELETE FROM lcm_node_provenance WHERE node_id = OLD.node_id;
+               END"""
+        )
+        conn.execute(
+            """CREATE TRIGGER lcm_node_provenance_session_update
+               AFTER UPDATE OF session_id ON summary_nodes
+               WHEN OLD.source_ids IS NEW.source_ids
+                AND OLD.source_type IS NEW.source_type
+                AND EXISTS (
+                    SELECT 1 FROM lcm_node_provenance
+                    WHERE node_id=NEW.node_id AND proof_complete=1
+                )
+               BEGIN
+                   INSERT OR IGNORE INTO lcm_node_provenance_sessions(
+                       node_id, source_session_id
+                   ) VALUES(NEW.node_id, NEW.session_id);
+                   UPDATE lcm_node_provenance
+                   SET source_session_count=(
+                       SELECT COUNT(*) FROM lcm_node_provenance_sessions
+                       WHERE node_id=NEW.node_id
+                   ), proved_at=strftime('%s','now')
+                   WHERE node_id=NEW.node_id;
+               END"""
+        )
+    _migration_crash_boundary("v13_after_triggers")
 def ensure_message_origin_columns(conn: sqlite3.Connection) -> None:
     table_row = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'"
@@ -1639,9 +2116,7 @@ def run_versioned_migrations(
             _migration_crash_boundary("v11_after_column")
             ensure_rollover_policy_table(conn)
             _migration_crash_boundary("v11_after_table")
-            # v11's scalar triggers are intentionally not installed by v12;
-            # the migration transaction proceeds directly to provenance-based
-            # protection below.
+            ensure_rollover_policy_triggers(conn)
             _migration_crash_boundary("v11_after_trigger")
             mark_migration_step_complete(conn, "v11_no_carry_frontier_policy")
             _migration_crash_boundary("v11_after_migration_step")
@@ -1664,7 +2139,28 @@ def run_versioned_migrations(
             current_version = 12
         else:
             ensure_rollover_v12_tables(conn)
+            # Replace compatibility triggers from an already-open v12 database
+            # so legacy NULL carry is interpreted as the historical default
+            # (carry=true).
+            if current_version < 13:
+                conn.execute("DROP TRIGGER IF EXISTS lcm_v12_legacy_lifecycle_rollover")
+                conn.execute("DROP TRIGGER IF EXISTS lcm_v12_legacy_lifecycle_rollover_update")
             ensure_rollover_v12_triggers(conn)
+
+        migrating_to_v13 = current_version < 13
+        if migrating_to_v13:
+            ensure_rollover_v13_tables(conn)
+            _migration_crash_boundary("v13_after_ddl")
+            backfill_node_provenance_v13(conn)
+            ensure_rollover_v13_triggers(conn)
+            mark_migration_step_complete(
+                conn, "v13_exact_node_provenance_and_durable_receipts"
+            )
+            _migration_crash_boundary("v13_after_migration_step")
+            current_version = 13
+        else:
+            ensure_rollover_v13_tables(conn)
+            ensure_rollover_v13_triggers(conn)
 
         # Startup FTS inspection, repair, rebuild, and trigger installation are
         # part of the same cross-connection writer transaction as schema
@@ -1683,6 +2179,8 @@ def run_versioned_migrations(
             _migration_crash_boundary("v11_after_schema_version")
         if migrating_to_v12:
             _migration_crash_boundary("v12_after_schema_version")
+        if migrating_to_v13:
+            _migration_crash_boundary("v13_after_schema_version")
         conn.commit()
     except Exception:
         conn.rollback()

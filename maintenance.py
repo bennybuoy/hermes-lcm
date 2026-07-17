@@ -20,7 +20,12 @@ import tempfile
 import time
 from typing import Any
 
-from .db_bootstrap import configure_connection, read_existing_schema_version, SCHEMA_VERSION
+from .db_bootstrap import (
+    SCHEMA_VERSION,
+    configure_connection,
+    materialize_node_provenance_no_commit,
+    read_existing_schema_version,
+)
 from .dag import MAX_SOURCE_IDS_JSON_CHARS, MAX_SOURCE_IDS_PER_NODE
 from .frontier import finalize_generation_winner_no_commit
 from .tokens import count_tokens
@@ -1288,7 +1293,9 @@ def _insert_node_copy(
             float(row[10] or 0),
         ),
     )
-    return int(cur.lastrowid)
+    node_id = int(cur.lastrowid)
+    materialize_node_provenance_no_commit(conn, node_id)
+    return node_id
 
 
 def _publish_items(

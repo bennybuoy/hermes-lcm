@@ -180,10 +180,35 @@ class LifecycleStateStore:
         *,
         conversation_id: str | None = None,
     ) -> LifecycleState:
+        """Bind/reconcile from one writer-locked snapshot and commit."""
+        if self._conn.in_transaction:
+            raise RuntimeError("bind_session requires no active transaction")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            phase_hook = getattr(self, "_bind_session_phase_hook", None)
+            if callable(phase_hook):
+                phase_hook("after_begin")
+            state = self._bind_session_no_commit(
+                session_id,
+                conversation_id=conversation_id,
+            )
+            self._conn.commit()
+            durable = self.get_by_conversation(state.conversation_id)
+            assert durable is not None
+            return durable
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def _bind_session_no_commit(
+        self,
+        session_id: str,
+        *,
+        conversation_id: str | None = None,
+    ) -> LifecycleState:
         # Capture the canonical owner/generation before reading lifecycle. The
-        # conditional write below requires this exact snapshot still to be the
-        # active tip, so a rollover that wins after this read makes the bind a
-        # harmless no-op instead of letting stale startup state steal ownership.
+        # BEGIN IMMEDIATE acquired by bind_session guarantees the snapshot and
+        # reconciliation write cannot straddle a rollover commit.
         observed_generation = 0
         observed_frontier_session = ""
         if conversation_id:
@@ -218,6 +243,9 @@ class LifecycleStateStore:
             and observed_frontier_session == str(head[0] or "")
             and observed_generation >= int(head[4] or 0)
         )
+        phase_hook = getattr(self, "_bind_session_phase_hook", None)
+        if callable(phase_hook):
+            phase_hook("after_snapshot")
         if head_consistent:
             # The head is authoritative only while it agrees with the latest
             # active frontier. Reconstruct or reconcile lifecycle from it;
@@ -270,7 +298,6 @@ class LifecycleStateStore:
                     finalized_boundary, now, now, now, int(head[2]), now,
                 ),
             )
-            self._conn.commit()
             restored = self.get_by_conversation(conversation_id)
             assert restored is not None
             return restored
@@ -382,7 +409,6 @@ class LifecycleStateStore:
                     observed_frontier_session,
                 ),
             )
-        self._conn.commit()
         state = self.get_by_conversation(conversation_id)
         assert state is not None
         return state

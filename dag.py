@@ -24,6 +24,7 @@ from .db_bootstrap import (
     ExternalContentFtsSpec,
     add_column_if_missing,
     configure_connection,
+    materialize_node_provenance_no_commit,
     refuse_schema_version_too_new,
     run_versioned_migrations,
 )
@@ -284,14 +285,26 @@ class SummaryDAG:
             ),
         )
         node.node_id = int(cur.lastrowid)
+        # SummaryDAG is also used standalone in diagnostics/tests before the
+        # message store has created its table. Such nodes remain deliberately
+        # unproved (and therefore cannot enter a v13 frontier) until a complete
+        # database can materialize their exact closure.
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'"
+        ).fetchone():
+            materialize_node_provenance_no_commit(conn, node.node_id)
         return node.node_id
 
     def add_node(self, node: SummaryNode) -> int:
         """Insert a summary node and return its node_id."""
         with self._db_lock:
-            node_id = self.add_node_no_commit(self._conn, node)
-            self._conn.commit()
-            return node_id
+            try:
+                node_id = self.add_node_no_commit(self._conn, node)
+                self._conn.commit()
+                return node_id
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def delete_node(self, node_id: int) -> bool:
         """Delete a single summary node by id. Returns True if a row was removed.

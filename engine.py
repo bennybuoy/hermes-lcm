@@ -155,7 +155,6 @@ from . import tools as lcm_tools
 logger = logging.getLogger(__name__)
 
 _SESSION_END_BUSY_TIMEOUT_MS = 50
-_SESSION_END_RECEIPTS_PER_CONVERSATION = 1024
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 
 # Auto-focus topic derivation: infer a compact focus hint from the most recent
@@ -3592,8 +3591,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                            rollover_epoch, prefix_count, retained_count, created_at
                        ) VALUES(?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(
-                           conversation_id, session_id,
-                           payload_fingerprint, rollover_epoch
+                           conversation_id, session_id, payload_fingerprint
                        ) DO NOTHING""",
                     (
                         conversation_id, session_id, payload_fingerprint,
@@ -3603,18 +3601,6 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 if int(receipt.rowcount or 0) == 0:
                     return []
                 self._rollover_publication_boundary("after_receipt")
-                conn.execute(
-                    """DELETE FROM lcm_session_end_receipts
-                       WHERE conversation_id = ? AND rowid NOT IN (
-                           SELECT rowid FROM lcm_session_end_receipts
-                           WHERE conversation_id = ?
-                           ORDER BY created_at DESC, rowid DESC LIMIT ?
-                       )""",
-                    (
-                        conversation_id, conversation_id,
-                        _SESSION_END_RECEIPTS_PER_CONVERSATION,
-                    ),
-                )
                 if prepared_tail:
                     appended_ids = self._store.append_protected_batch_no_commit(
                         conn,
@@ -4667,8 +4653,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                                prefix_count, retained_count, created_at
                            ) VALUES(?, ?, ?, ?, 0, ?, ?)
                            ON CONFLICT(
-                               conversation_id, session_id,
-                               payload_fingerprint, rollover_epoch
+                               conversation_id, session_id, payload_fingerprint
                            ) DO NOTHING""",
                         (
                             conversation_id, old_session_id,
@@ -4676,18 +4661,6 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                                 previous_messages, prefix_count=0
                             ),
                             receipt_epoch, len(previous_messages), time.time(),
-                        ),
-                    )
-                    conn.execute(
-                        """DELETE FROM lcm_session_end_receipts
-                           WHERE conversation_id = ? AND rowid NOT IN (
-                               SELECT rowid FROM lcm_session_end_receipts
-                               WHERE conversation_id = ?
-                               ORDER BY created_at DESC, rowid DESC LIMIT ?
-                           )""",
-                        (
-                            conversation_id, conversation_id,
-                            _SESSION_END_RECEIPTS_PER_CONVERSATION,
                         ),
                     )
                 self._rollover_publication_boundary("after_revalidation")

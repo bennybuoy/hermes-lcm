@@ -261,13 +261,15 @@ Below that pressure, simpler existing behavior is preserved. Until Hermes core
 supplies the explicit signal contract, cache state remains `unknown` and LCM
 uses the normal bounded route strategy.
 
-### Schema v12 deployment and rollback
+### Schema v13 deployment and rollback
 
-Schema v12 replaces the schema-v11 scalar cutoff with two independent records.
+Schema v12 replaced the schema-v11 scalar cutoff with two independent records.
 `lcm_protected_sessions` is historical and keyed by conversation plus finalized
-session. Database triggers reject frontier ownership or item provenance that
-references a protected session through raw-message ownership, summary-node
-ownership, or the item's raw source closure. Protection is therefore unaffected
+session. Schema v13 materializes an exact, bounded node-to-source-session proof
+when a node is published. Database triggers reject frontier ownership or item
+provenance through indexed proof rows, while direct message items use
+`messages.session_id`. They never recursively traverse DAG JSON or infer
+provenance from a `min..max` range. Protection is therefore unaffected
 by global `store_id` ordering: a late old-session row remains protected, while a
 later new-session row remains publishable. `lcm_rollover_heads` stores only the
 latest current owner, last finalized owner, carry policy, rollover epoch, and
@@ -280,11 +282,14 @@ their protected session boundary; the canonical frontier stays frozen. Durable
 `lcm_session_end_receipts` make truncated end callbacks idempotent across process
 restart. The known host prefix is sliced before ignore filtering, so a retained
 payload with prefix count zero is fresh once even if it equals ancient content.
-Receipts are retained at a bounded 1,024 rows per conversation. The old
+Receipt identity excludes the mutable rollover epoch and exact receipts are
+retained until their associated session data is explicitly deleted; there is no
+global count-based eviction. The old
 `lcm_rollover_policies` table remains only as a mixed-version compatibility
 landing zone and is not consulted by v12 enforcement or reconstruction.
 
-The v10 lifecycle carry state and v11 compatibility rows are backfilled into
+The v10 lifecycle carry state and all inferable historical session evidence from
+messages, frontiers, nodes, lifecycle, and available v11 compatibility rows are backfilled into
 the protected-session and head tables in the same crash-atomic writer
 transaction as DDL, trigger installation, migration-step recording, and schema
 version publication. Already-running v9-v11 publishers may append raw messages,
@@ -296,10 +301,10 @@ code can route late session-end storage correctly. Existing schema v9 rows
 migrate with `NULL`, which preserves the legacy compatibility behavior; newly
 published rollovers store an explicit boolean.
 
-The read-only `hermes-lcm status` command reports `schema_version: 12` together
-with `supported_schema_version: 12` and protected-session, rollover-head, and
-receipt row counts. `frontier show` includes the conversation's head and
-historical protected sessions, and `doctor` checks provenance and head/frontier
+The read-only `hermes-lcm status` command reports `schema_version: 13` together
+with `supported_schema_version: 13` and protected-session, rollover-head,
+receipt, and node-proof row counts. `frontier show` includes the conversation's head and
+historical protected sessions, and `doctor` checks exact proof and head/frontier
 consistency. The CLI does not migrate older databases and
 refuses databases newer than the installed build.
 

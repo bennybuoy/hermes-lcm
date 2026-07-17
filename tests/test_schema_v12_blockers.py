@@ -28,6 +28,7 @@ V12_MIGRATION_PHASES = (
     "v12_after_lifecycle_head_backfill",
     "v12_after_policy_head_backfill",
     "v12_after_lifecycle_protected_backfill",
+    "v12_after_historical_protected_backfill",
     "v12_after_backfill",
     "v12_after_provenance_triggers",
     "v12_after_legacy_insert_trigger",
@@ -50,7 +51,8 @@ def _drop_v12(conn: sqlite3.Connection, *, version: int) -> None:
         row[0]
         for row in conn.execute(
             """SELECT name FROM sqlite_master WHERE type='trigger'
-               AND (name LIKE 'lcm_protected_%' OR name LIKE 'lcm_v12_%')"""
+               AND (name LIKE 'lcm_protected_%' OR name LIKE 'lcm_v12_%'
+                    OR name LIKE 'lcm_node_provenance%')"""
         )
     ]
     for name in trigger_names:
@@ -59,18 +61,64 @@ def _drop_v12(conn: sqlite3.Connection, *, version: int) -> None:
         "lcm_session_end_receipts",
         "lcm_rollover_heads",
         "lcm_protected_sessions",
+        "lcm_node_provenance_sessions",
+        "lcm_node_provenance",
     ):
         conn.execute(f'DROP TABLE IF EXISTS "{table}"')
     conn.execute(
         """DELETE FROM lcm_migration_state
            WHERE step_name='v12_protected_sessions_heads_and_ingest_receipts'"""
     )
+    conn.execute(
+        """DELETE FROM lcm_migration_state
+           WHERE step_name='v13_exact_node_provenance_and_durable_receipts'"""
+    )
+    if version == 10:
+        conn.execute("DROP TABLE IF EXISTS lcm_rollover_policies")
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(lcm_lifecycle_state)")}
+        if "binding_generation" in columns:
+            conn.execute("ALTER TABLE lcm_lifecycle_state DROP COLUMN binding_generation")
+        conn.execute(
+            "DELETE FROM lcm_migration_state WHERE step_name='v11_no_carry_frontier_policy'"
+        )
     conn.execute("DROP TRIGGER IF EXISTS lcm_schema_version_monotonic")
     conn.execute(
         "UPDATE metadata SET value=? WHERE key='schema_version'", (str(version),)
     )
     db_bootstrap.ensure_schema_version_monotonic_guard(conn)
+    if version == 11:
+        db_bootstrap.ensure_rollover_policy_triggers(conn)
     conn.commit()
+
+
+def _populated_legacy_fixture(path: Path, *, version: int) -> dict[str, object]:
+    engine = LCMEngine(config=_config(path))
+    engine.on_session_start(A, conversation_id=CONVERSATION, platform="test")
+    engine.ingest([{"role": "user", "content": "durable-a"}])
+    engine.rollover_session(A, B, carry_over_context=False, platform="test")
+    engine.ingest([{"role": "assistant", "content": "durable-b"}])
+    engine.rollover_session(B, C, carry_over_context=False, platform="test")
+    engine.shutdown()
+    conn = sqlite3.connect(path)
+    _drop_v12(conn, version=version)
+    snapshot = {
+        "lifecycle": conn.execute("SELECT * FROM lcm_lifecycle_state").fetchall(),
+        "frontiers": conn.execute("SELECT * FROM lcm_active_frontiers").fetchall(),
+        "items": conn.execute("SELECT * FROM lcm_frontier_items").fetchall(),
+        "messages": conn.execute(
+            "SELECT store_id, session_id, conversation_id, content FROM messages ORDER BY store_id"
+        ).fetchall(),
+        "policies": (
+            conn.execute("SELECT * FROM lcm_rollover_policies").fetchall()
+            if version == 11 else []
+        ),
+        "triggers": conn.execute(
+            """SELECT name, sql FROM sqlite_master WHERE type='trigger'
+               AND name LIKE 'lcm_no_carry_%' ORDER BY name"""
+        ).fetchall(),
+    }
+    conn.close()
+    return snapshot
 
 
 def test_historical_protection_survives_multiple_rollovers_and_interleaved_ids(tmp_path):
@@ -232,7 +280,7 @@ def test_v10_lifecycle_and_v11_policy_backfill_atomically(tmp_path, source_versi
         conn.execute("DROP TABLE lcm_rollover_policies")
     _drop_v12(conn, version=source_version)
     db_bootstrap.run_versioned_migrations(conn)
-    assert db_bootstrap.get_schema_version(conn) == 12
+    assert db_bootstrap.get_schema_version(conn) == 13
     assert conn.execute(
         """SELECT finalized_session_id FROM lcm_protected_sessions
            WHERE conversation_id=?""", (CONVERSATION,),
@@ -244,13 +292,13 @@ def test_v10_lifecycle_and_v11_policy_backfill_atomically(tmp_path, source_versi
     conn.close()
 
 
+@pytest.mark.parametrize("source_version", [10, 11])
 @pytest.mark.parametrize("phase", V12_MIGRATION_PHASES)
-def test_v12_process_kill_leaves_wholly_v11_then_recovers(tmp_path, phase):
-    db_path = tmp_path / f"kill-{phase}.db"
-    conn = sqlite3.connect(db_path)
-    db_bootstrap.run_versioned_migrations(conn)
-    _drop_v12(conn, version=11)
-    conn.close()
+def test_v12_process_kill_restores_populated_authentic_source(
+    tmp_path, phase, source_version
+):
+    db_path = tmp_path / f"kill-v{source_version}-{phase}.db"
+    snapshot = _populated_legacy_fixture(db_path, version=source_version)
     script = """
 import sqlite3, sys
 from hermes_lcm import db_bootstrap
@@ -266,15 +314,38 @@ db_bootstrap.run_versioned_migrations(conn)
     )
     assert result.returncode == 88, result.stderr
     conn = sqlite3.connect(db_path)
-    assert db_bootstrap.get_schema_version(conn) == 11
+    assert db_bootstrap.get_schema_version(conn) == source_version
     assert conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_rollover_heads'"
     ).fetchone() is None
     assert conn.execute("PRAGMA quick_check").fetchone() == ("ok",)
+    assert conn.execute("SELECT * FROM lcm_lifecycle_state").fetchall() == snapshot["lifecycle"]
+    assert conn.execute("SELECT * FROM lcm_active_frontiers").fetchall() == snapshot["frontiers"]
+    assert conn.execute("SELECT * FROM lcm_frontier_items").fetchall() == snapshot["items"]
+    assert conn.execute(
+        "SELECT store_id, session_id, conversation_id, content FROM messages ORDER BY store_id"
+    ).fetchall() == snapshot["messages"]
+    assert (
+        conn.execute("SELECT * FROM lcm_rollover_policies").fetchall()
+        if source_version == 11 else []
+    ) == snapshot["policies"]
+    assert conn.execute(
+        """SELECT name, sql FROM sqlite_master WHERE type='trigger'
+           AND name LIKE 'lcm_no_carry_%' ORDER BY name"""
+    ).fetchall() == snapshot["triggers"]
+    if source_version == 11:
+        assert len(snapshot["triggers"]) == 4
+    else:
+        assert snapshot["triggers"] == []
     db_bootstrap._MIGRATION_CRASH_PHASE = None
     db_bootstrap.run_versioned_migrations(conn)
-    assert db_bootstrap.get_schema_version(conn) == 12
+    assert db_bootstrap.get_schema_version(conn) == 13
     assert conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_rollover_heads'"
     ).fetchone() == (1,)
+    assert conn.execute(
+        """SELECT finalized_session_id FROM lcm_protected_sessions
+           WHERE conversation_id=? ORDER BY finalized_session_id""",
+        (CONVERSATION,),
+    ).fetchall() == [(A,), (B,)]
     conn.close()

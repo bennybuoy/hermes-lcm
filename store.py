@@ -923,6 +923,10 @@ class MessageStore:
                 "DELETE FROM messages WHERE session_id = ?",
                 (session_id,),
             )
+            self._conn.execute(
+                "DELETE FROM lcm_session_end_receipts WHERE session_id = ?",
+                (session_id,),
+            )
             self._conn.commit()
             deleted = cur.rowcount if cur.rowcount is not None else 0
             return deleted

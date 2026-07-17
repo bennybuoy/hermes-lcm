@@ -1307,6 +1307,10 @@ def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[s
         conn.execute("BEGIN IMMEDIATE")
         msg_cur = conn.execute(f"DELETE FROM messages WHERE session_id IN ({placeholders})", params)
         node_cur = conn.execute(f"DELETE FROM summary_nodes WHERE session_id IN ({placeholders})", params)
+        conn.execute(
+            f"DELETE FROM lcm_session_end_receipts WHERE session_id IN ({placeholders})",
+            params,
+        )
         lifecycle_deleted = 0
         for conversation_id in lifecycle_delete_conversation_ids:
             cur = conn.execute(
