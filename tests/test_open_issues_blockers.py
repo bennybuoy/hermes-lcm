@@ -197,6 +197,11 @@ def test_externalized_grep_streams_body_in_bounded_reads_and_honors_body_deadlin
         assert result["total_results"] == 1
         assert 1 < largest_read <= 16 * 1024
 
+        # Completed immutable parses remain reusable until stat invalidation.
+        # Change only the stat identity so this probe still exercises bounded
+        # body I/O and its deadline rather than the completed cache fast path.
+        path_stat = path.stat()
+        os.utime(path, ns=(path_stat.st_atime_ns, path_stat.st_mtime_ns + 1))
         deadline_mode = True
         virtual_now = 0.0
         body_bytes_before = body_bytes_read
@@ -834,6 +839,33 @@ def _move_persisted_metadata_before_content(payload: dict) -> dict:
     } | {"content": payload["content"]}
 
 
+def _write_compact_marker_payload(
+    path, *, marker_count: int, pre_content: bool, needle: str
+) -> None:
+    """Write a large canonical marker list without constructing it in memory."""
+    before_content = (
+        '{"session_id":"current","persisted_output_source_path":"/p/0",'
+        '"persisted_output_expected_chars":1,"persisted_output_markers":['
+    )
+    after_markers = f'],"content":"{needle}"}}'
+    if not pre_content:
+        before_content = (
+            f'{{"session_id":"current","content":"{needle}",'
+            '"persisted_output_source_path":"/p/0",'
+            '"persisted_output_expected_chars":1,"persisted_output_markers":['
+        )
+        after_markers = "]}"
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write(before_content)
+        for index in range(marker_count):
+            if index:
+                handle.write(",")
+            handle.write(
+                '{"source_path":"/p/' + str(index) + '","expected_chars":1}'
+            )
+        handle.write(after_markers)
+
+
 @pytest.mark.parametrize(
     ("kind", "role", "tool_call_id", "needle"),
     [
@@ -1143,6 +1175,58 @@ def test_externalized_grep_exact_canonical_markers_progress_at_production_cap(
         assert all(end <= next_start for (_, end), (next_start, _) in zip(
             read_ranges, read_ranges[1:]
         ))
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("pre_content", [True, False], ids=["pre-content", "post-content"])
+def test_externalized_grep_streams_100001_writer_markers_without_count_failure(
+    tmp_path, pre_content
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    marker_count = 100_001
+    ref = f"uncapped-writer-{pre_content}.json"
+    needle = f"UNCAPPED-WRITER-{pre_content}-NEEDLE"
+    path = payload_dir / ref
+    _write_compact_marker_payload(
+        path,
+        marker_count=marker_count,
+        pre_content=pre_content,
+        needle=needle,
+    )
+    assert path.stat().st_size > tools_module._LCM_GREP_OPERATION_MAX_BYTES
+
+    engine = _engine(tmp_path)
+    try:
+        total_bytes_read = 0
+        max_retained = 0
+        for _attempt in range(30):
+            result = json.loads(tools_module.lcm_grep(
+                {"query": needle, "content_scope": "externalized", "ref": ref},
+                engine=engine,
+            ))
+            bytes_this_call = result["scan"]["bytes_scanned"]
+            assert 0 <= bytes_this_call <= tools_module._LCM_GREP_OPERATION_MAX_BYTES
+            total_bytes_read += bytes_this_call
+            if result["total_results"] == 1:
+                break
+            assert result["diagnostics"] in (
+                [{"ref": ref, "error": "payload_truncated"}],
+                [{"ref": ref, "error": "metadata_deadline"}],
+                [{"ref": ref, "error": "body_deadline"}],
+            )
+            checkpoint = next(iter(engine._externalized_grep_continuations.values()))
+            max_retained = max(max_retained, checkpoint.retained_bytes())
+            assert len(checkpoint.prefix_parser.buffer) < 200_000
+            assert checkpoint.retained_bytes() < 3_500_000
+        else:
+            pytest.fail("100001-marker payload did not complete under bounded retries")
+
+        assert result["diagnostics"] == []
+        assert result["results"][0]["matched_text"] == needle
+        assert total_bytes_read == path.stat().st_size
+        assert max_retained > 0
     finally:
         engine.shutdown()
 
@@ -1709,7 +1793,7 @@ def test_externalized_grep_reuses_completed_parse_after_outer_deadline(
         assert retry["total_results"] == 1
         assert retry["scan"]["continuation_reused_bytes"] == path.stat().st_size
         assert bytes_read == before_retry
-        assert engine._externalized_grep_continuations == {}
+        assert next(iter(engine._externalized_grep_continuations.values())) is checkpoint
     finally:
         engine.shutdown()
 
@@ -1757,6 +1841,150 @@ def test_externalized_grep_rejects_cross_retry_five_megabyte_scalar_boundedly(
             first["scan"]["bytes_scanned"] + second["scan"]["bytes_scanned"]
             < 300_000
         )
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("layout", ["pre-content", "post-content"])
+def test_externalized_grep_discards_long_delimiter_whitespace_across_retries(
+    tmp_path, monkeypatch, layout
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    ref = f"long-delimiter-whitespace-{layout}.json"
+    needle = f"LONG-DELIMITER-WHITESPACE-{layout}-NEEDLE"
+    short_whitespace = " " * 20_000
+    long_whitespace = " " * (5 * 1024 * 1024)
+    marker_zero = '{"source_path":"/p/0","expected_chars":1}'
+    marker_one = '{"source_path":"/p/1","expected_chars":1}'
+    if layout == "pre-content":
+        raw = (
+            '{"session_id":"current"' + short_whitespace
+            + ',"persisted_output_source_path":"/p/0",'
+            '"persisted_output_expected_chars":1,"persisted_output_markers":['
+            + marker_zero + long_whitespace + "]" + short_whitespace
+            + ',"content":"' + needle + '"}'
+        )
+    else:
+        raw = (
+            '{"session_id":"current","content":"' + needle + '",'
+            '"persisted_output_source_path":"/p/0"' + short_whitespace
+            + ',"persisted_output_expected_chars":1,"persisted_output_markers":['
+            + marker_zero + short_whitespace + "," + marker_one
+            + long_whitespace + "]" + short_whitespace + "}"
+        )
+    path = payload_dir / ref
+    path.write_text(raw, encoding="utf-8")
+    monkeypatch.setattr(tools_module.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(tools_module, "_external_metadata_now", lambda: 0.0)
+
+    engine = _engine(tmp_path)
+    try:
+        total_bytes_read = 0
+        for _attempt in range(12):
+            result = json.loads(tools_module.lcm_grep(
+                {"query": needle, "content_scope": "externalized", "ref": ref},
+                engine=engine,
+            ))
+            total_bytes_read += result["scan"]["bytes_scanned"]
+            if result["total_results"] == 1:
+                break
+            assert result["diagnostics"] == [
+                {"ref": ref, "error": "payload_truncated"}
+            ]
+            checkpoint = next(iter(engine._externalized_grep_continuations.values()))
+            parser = (
+                checkpoint.prefix_parser
+                if checkpoint.phase == "metadata"
+                else checkpoint.content_state.suffix_parser
+            )
+            assert parser.state in {
+                "value_delimiter", "marker_delimiter", "marker_or_end", "key",
+            }
+            assert len(parser.buffer) <= 16 * 1024
+            assert checkpoint.retained_bytes() < 100_000
+        else:
+            pytest.fail("legal delimiter whitespace did not complete across retries")
+
+        assert result["diagnostics"] == []
+        assert result["results"][0]["matched_text"] == needle
+        assert total_bytes_read == path.stat().st_size
+    finally:
+        engine.shutdown()
+
+
+def test_externalized_grep_long_delimiter_wait_is_stat_invalidated(
+    tmp_path, monkeypatch
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    ref = "mutated-delimiter-wait.json"
+    path = payload_dir / ref
+    whitespace = " " * 200_000
+    path.write_text(
+        '{"session_id":"current"' + whitespace + ',"content":"OLD-NEEDLE"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tools_module, "_LCM_GREP_OPERATION_MAX_BYTES", 64 * 1024)
+    engine = _engine(tmp_path)
+    try:
+        first = json.loads(tools_module.lcm_grep(
+            {"query": "NEW-NEEDLE", "content_scope": "externalized", "ref": ref},
+            engine=engine,
+        ))
+        assert first["diagnostics"] == [{"ref": ref, "error": "payload_truncated"}]
+        checkpoint = next(iter(engine._externalized_grep_continuations.values()))
+        assert checkpoint.prefix_parser.state == "value_delimiter"
+        assert len(checkpoint.prefix_parser.buffer) <= 16 * 1024
+
+        path.write_text(
+            '{"session_id":"current"' + whitespace + ',"content":"NEW-NEEDLE"}',
+            encoding="utf-8",
+        )
+        os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 1))
+        monkeypatch.setattr(tools_module, "_LCM_GREP_OPERATION_MAX_BYTES", 512 * 1024)
+        retry = json.loads(tools_module.lcm_grep(
+            {"query": "NEW-NEEDLE", "content_scope": "externalized", "ref": ref},
+            engine=engine,
+        ))
+        assert retry["diagnostics"] == []
+        assert retry["total_results"] == 1
+        assert retry["scan"]["continuation_reused_bytes"] == 0
+    finally:
+        engine.shutdown()
+
+
+def test_externalized_grep_long_delimiter_wait_rejects_malformed_delimiter(
+    tmp_path, monkeypatch
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    ref = "malformed-delimiter-wait.json"
+    path = payload_dir / ref
+    path.write_text(
+        '{"session_id":"current"' + (" " * 200_000) + '!"content":"needle"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tools_module, "_LCM_GREP_OPERATION_MAX_BYTES", 64 * 1024)
+    engine = _engine(tmp_path)
+    try:
+        first = json.loads(tools_module.lcm_grep(
+            {"query": "needle", "content_scope": "externalized", "ref": ref},
+            engine=engine,
+        ))
+        assert first["diagnostics"] == [{"ref": ref, "error": "payload_truncated"}]
+        checkpoint = next(iter(engine._externalized_grep_continuations.values()))
+        assert checkpoint.prefix_parser.state == "value_delimiter"
+        assert len(checkpoint.prefix_parser.buffer) <= 16 * 1024
+
+        monkeypatch.setattr(tools_module, "_LCM_GREP_OPERATION_MAX_BYTES", 512 * 1024)
+        retry = json.loads(tools_module.lcm_grep(
+            {"query": "needle", "content_scope": "externalized", "ref": ref},
+            engine=engine,
+        ))
+        assert retry["results"] == []
+        assert retry["diagnostics"] == [{"ref": ref, "error": "invalid_payload"}]
+        assert retry["scan"]["continuation_reused_bytes"] > 0
     finally:
         engine.shutdown()
 
@@ -1833,7 +2061,139 @@ def test_externalized_grep_concurrent_same_ref_uses_distinct_mutable_checkouts(
         assert len(set(observed_ids)) == 2
         assert all(result["total_results"] == 1 for result in concurrent_results)
         assert all(result["scan"]["bytes_scanned"] <= 2 * 1024 * 1024 for result in concurrent_results)
-        assert engine._externalized_grep_continuations == {}
+        cached = list(engine._externalized_grep_continuations.values())
+        assert len(cached) == 1
+        assert cached[0].completed is True
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize(
+    "ordering", ["preserve-then-commit", "commit-then-preserve"]
+)
+def test_completed_continuation_mixed_acknowledgements_never_delete_checkpoint(
+    tmp_path, ordering
+):
+    engine = _engine(tmp_path)
+    try:
+        key = str((tmp_path / "payloads" / "shared-completed.json").resolve())
+        checkpoint = tools_module._ExternalizedPayloadContinuation(
+            identity=(1, 2, 3, 4, 5),
+            allowed_session_ids=frozenset({"current"}),
+            max_payload_chars=100,
+            operation_budget=tools_module._ExternalizedSuffixOperationBudget(),
+        )
+        checkpoint.completed = True
+        checkpoint.offset = 3
+        tools_module._store_externalized_continuation(engine, key, checkpoint)
+        first = tools_module._checkout_externalized_continuation(
+            engine,
+            key,
+            identity=checkpoint.identity,
+            allowed_session_ids=checkpoint.allowed_session_ids,
+            max_payload_chars=checkpoint.max_payload_chars,
+            file_size=checkpoint.offset,
+        )
+        second = tools_module._checkout_externalized_continuation(
+            engine,
+            key,
+            identity=checkpoint.identity,
+            allowed_session_ids=checkpoint.allowed_session_ids,
+            max_payload_chars=checkpoint.max_payload_chars,
+            file_size=checkpoint.offset,
+        )
+        assert first is checkpoint and second is checkpoint
+
+        start_gate = threading.Barrier(2)
+        first_done = threading.Event()
+        failures: queue.Queue = queue.Queue()
+
+        def acknowledge(kind: str) -> None:
+            try:
+                completion = tools_module._ExternalizedContinuationCompletion(
+                    engine, key, checkpoint
+                )
+                start_gate.wait(timeout=10)
+                goes_first = kind == ordering.split("-then-")[0]
+                if not goes_first:
+                    assert first_done.wait(timeout=10)
+                getattr(completion, kind)()
+                if goes_first:
+                    first_done.set()
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                failures.put(exc)
+
+        threads = [
+            threading.Thread(target=acknowledge, args=(kind,))
+            for kind in ("commit", "preserve")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+            assert not thread.is_alive()
+        assert failures.empty(), list(failures.queue)
+        assert engine._externalized_grep_continuations.get(key) is checkpoint
+        assert checkpoint.completed is True
+    finally:
+        engine.shutdown()
+
+
+def test_completed_acknowledgement_does_not_resurrect_evicted_checkpoint(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        key = str((tmp_path / "payloads" / "evicted-completed.json").resolve())
+        checkpoint = tools_module._ExternalizedPayloadContinuation(
+            identity=(10, 20, 30, 40, 50),
+            allowed_session_ids=frozenset({"current"}),
+            max_payload_chars=100,
+            operation_budget=tools_module._ExternalizedSuffixOperationBudget(),
+        )
+        checkpoint.completed = True
+        completion = tools_module._ExternalizedContinuationCompletion(
+            engine, key, checkpoint
+        )
+
+        tools_module._store_externalized_continuation(engine, key, checkpoint)
+        checkpoint.cached_at = (
+            time.monotonic()
+            - tools_module._EXTERNALIZED_CONTINUATION_TTL_SECONDS
+            - 1
+        )
+        completion.preserve()
+        assert key not in engine._externalized_grep_continuations
+
+        tools_module._store_externalized_continuation(engine, key, checkpoint)
+        incompatible = tools_module._checkout_externalized_continuation(
+            engine,
+            key,
+            identity=(10, 20, 31, 40, 50),
+            allowed_session_ids=checkpoint.allowed_session_ids,
+            max_payload_chars=checkpoint.max_payload_chars,
+            file_size=checkpoint.offset,
+        )
+        assert incompatible is None
+        completion.preserve()
+        assert key not in engine._externalized_grep_continuations
+
+        tools_module._store_externalized_continuation(engine, key, checkpoint)
+        for index in range(tools_module._EXTERNALIZED_CONTINUATION_MAX_FILES):
+            replacement = tools_module._ExternalizedPayloadContinuation(
+                identity=(index, index, index, index, index),
+                allowed_session_ids=frozenset({"current"}),
+                max_payload_chars=100,
+                operation_budget=tools_module._ExternalizedSuffixOperationBudget(),
+            )
+            replacement.completed = True
+            tools_module._store_externalized_continuation(
+                engine, f"replacement-{index}", replacement
+            )
+        assert key not in engine._externalized_grep_continuations
+        completion.preserve()
+        assert key not in engine._externalized_grep_continuations
+        assert len(engine._externalized_grep_continuations) == (
+            tools_module._EXTERNALIZED_CONTINUATION_MAX_FILES
+        )
     finally:
         engine.shutdown()
 

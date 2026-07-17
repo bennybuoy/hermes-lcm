@@ -793,7 +793,6 @@ _EXTERNALIZED_MARKER_STRING_MAX_CHARS = {
     "preview_sha256": 64,
     "redacted_preview_sha256": 64,
 }
-_EXTERNALIZED_CANONICAL_MARKERS_MAX = 100_000
 # JSON string escapes can consume twelve source characters for one decoded
 # non-BMP character (a surrogate pair). These are transport-buffer ceilings,
 # not alternate value limits; decoded values are checked against the exact
@@ -836,15 +835,16 @@ class _ExternalizedSuffixOperationBudget:
 
     def __init__(self, max_markers: int | None = None):
         self.max_markers = (
-            _EXTERNALIZED_CANONICAL_MARKERS_MAX
-            if max_markers is None
-            else max(0, int(max_markers))
+            None if max_markers is None else max(0, int(max_markers))
         )
         self.markers = 0
 
     def charge(self, count: int = 1) -> None:
         count = max(0, int(count))
-        if self.markers + count > self.max_markers:
+        if (
+            self.max_markers is not None
+            and self.markers + count > self.max_markers
+        ):
             raise _ExternalizedSuffixBudgetExceeded
         self.markers += count
 
@@ -1071,7 +1071,6 @@ def _validate_externalized_metadata_field(key: str, value: Any) -> None:
         if isinstance(value, _ExternalizedPersistedOutputMarkers):
             if (
                 value.count <= 0
-                or value.count > _EXTERNALIZED_CANONICAL_MARKERS_MAX
                 or not value.first_marker
             ):
                 raise ValueError("invalid_payload")
@@ -1079,7 +1078,6 @@ def _validate_externalized_metadata_field(key: str, value: Any) -> None:
         if (
             not isinstance(value, list)
             or not value
-            or len(value) > _EXTERNALIZED_CANONICAL_MARKERS_MAX
         ):
             raise ValueError("invalid_payload")
         identities = [
@@ -1272,7 +1270,16 @@ class _ExternalizedSuffixParser:
             return None
         delimiter_index = self._whitespace(end)
         if delimiter_index >= len(self.buffer):
-            # A number/literal may continue in the next transport chunk.
+            # Whitespace proves that the decoded token is complete even when
+            # its comma/close delimiter arrives in a later transport call.
+            # Objects, strings, and literals are also syntactically complete
+            # at their closing token. Only a number ending exactly at the
+            # current buffer boundary can still gain digits/exponent bytes.
+            if delimiter_index > end or not (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+            ):
+                return value, end
             return None
         if self.buffer[delimiter_index] not in delimiters:
             if (
@@ -1287,7 +1294,6 @@ class _ExternalizedSuffixParser:
     def _finish_marker_list(self) -> None:
         if (
             self.marker_count <= 0
-            or self.marker_count > _EXTERNALIZED_CANONICAL_MARKERS_MAX
             or self.first_marker is None
         ):
             raise ValueError("invalid_payload")
@@ -1297,7 +1303,7 @@ class _ExternalizedSuffixParser:
                 self.first_marker,
             )
         )
-        self.state = "after_value"
+        self.state = "value_delimiter"
 
     def _process(self, *, final: bool) -> None:
         while True:
@@ -1374,7 +1380,7 @@ class _ExternalizedSuffixParser:
                     raise ValueError("invalid_payload") from exc
                 self.fields[self.current_key] = value
                 self.index = end
-                self.state = "after_value"
+                self.state = "value_delimiter"
             elif self.state == "marker_list_start":
                 if character != "[":
                     raise ValueError("invalid_payload")
@@ -1395,8 +1401,6 @@ class _ExternalizedSuffixParser:
                 digest = _externalized_marker_identity_digest(identity)
                 if digest in self.marker_identities:
                     raise ValueError("invalid_payload")
-                if self.marker_count >= _EXTERNALIZED_CANONICAL_MARKERS_MAX:
-                    raise ValueError("invalid_payload")
                 self.operation_budget.charge()
                 self.marker_count += 1
                 self.marker_identities.add(digest)
@@ -1413,7 +1417,7 @@ class _ExternalizedSuffixParser:
                     self._finish_marker_list()
                 else:
                     raise ValueError("invalid_payload")
-            elif self.state == "after_value":
+            elif self.state == "value_delimiter":
                 if character == ",":
                     self.index += 1
                     self.state = "key"
@@ -1455,7 +1459,7 @@ class _ExternalizedSuffixParser:
             return _EXTERNALIZED_CANONICAL_MARKER_MAX_ENCODED_CHARS
         if self.state in {
             "root_start", "start", "colon", "content_start",
-            "marker_list_start", "marker_delimiter", "after_value", "done",
+            "marker_list_start", "marker_delimiter", "value_delimiter", "done",
         }:
             return 4_096
         return None
@@ -2264,15 +2268,18 @@ def _store_externalized_continuation(
             cache.pop(next(iter(cache)))
 
 
-def _remove_externalized_continuation(
+def _touch_externalized_continuation(
     engine: "LCMEngine",
     key: str,
     continuation: _ExternalizedPayloadContinuation,
 ) -> None:
+    """Mark an immutable completion used without deleting or resurrecting it."""
     cache = _externalized_continuation_cache(engine)
     with _externalized_continuation_lock(engine):
+        now = time.monotonic()
+        _prune_externalized_continuations_locked(cache, now=now)
         if cache.get(key) is continuation:
-            cache.pop(key, None)
+            continuation.cached_at = now
 
 
 def _externalized_continuation_memory_bytes(
@@ -2318,12 +2325,12 @@ class _ExternalizedContinuationCompletion:
         self.continuation = continuation
 
     def commit(self) -> None:
-        _remove_externalized_continuation(
+        _touch_externalized_continuation(
             self.engine, self.key, self.continuation
         )
 
     def preserve(self) -> None:
-        _store_externalized_continuation(
+        _touch_externalized_continuation(
             self.engine, self.key, self.continuation
         )
 
@@ -2354,8 +2361,12 @@ def _search_externalized_payloads(
     )
     byte_operation_budget = _ExternalizedByteOperationBudget(effective_total_bytes)
     continuation_reused_bytes = 0
+    # Every accepted marker consumes transport bytes. Allow at most one
+    # carried, previously-read marker in addition to this call's byte budget,
+    # so CPU/allocation per call stays bounded without imposing a lifetime
+    # marker-count limit on historical writer output.
     suffix_operation_budget = _ExternalizedSuffixOperationBudget(
-        max_markers=_EXTERNALIZED_CANONICAL_MARKERS_MAX
+        max_markers=effective_total_bytes + 1
     )
     try:
         root = get_large_output_storage_dir(
@@ -2372,7 +2383,7 @@ def _search_externalized_payloads(
             "max_files": max_files,
             "max_payload_chars": max_payload_chars,
             "max_total_bytes": effective_total_bytes,
-            "max_persisted_output_markers": _EXTERNALIZED_CANONICAL_MARKERS_MAX,
+            "max_persisted_output_markers": None,
             "max_suffix_depth": _EXTERNALIZED_SUFFIX_MAX_DEPTH,
             "persisted_output_markers_scanned": suffix_operation_budget.markers,
             "byte_budget_exhausted": byte_operation_budget.exhausted,
@@ -2391,7 +2402,7 @@ def _search_externalized_payloads(
             "max_files": max_files,
             "max_payload_chars": max_payload_chars,
             "max_total_bytes": effective_total_bytes,
-            "max_persisted_output_markers": _EXTERNALIZED_CANONICAL_MARKERS_MAX,
+            "max_persisted_output_markers": None,
             "max_suffix_depth": _EXTERNALIZED_SUFFIX_MAX_DEPTH,
             "persisted_output_markers_scanned": suffix_operation_budget.markers,
             "byte_budget_exhausted": byte_operation_budget.exhausted,
@@ -2718,7 +2729,7 @@ def _search_externalized_payloads(
         "max_files": max_files,
         "max_payload_chars": max_payload_chars,
         "max_total_bytes": effective_total_bytes,
-        "max_persisted_output_markers": _EXTERNALIZED_CANONICAL_MARKERS_MAX,
+        "max_persisted_output_markers": None,
         "max_suffix_depth": _EXTERNALIZED_SUFFIX_MAX_DEPTH,
         "persisted_output_markers_scanned": suffix_operation_budget.markers,
         "byte_budget_exhausted": byte_operation_budget.exhausted,
