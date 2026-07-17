@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import codecs
+import hashlib
 import json
 import logging
 import math
@@ -772,7 +773,8 @@ _EXTERNALIZED_TRAILING_CANONICAL_KEYS = frozenset({
     "persisted_output_file_mtime_ns", "persisted_output_file_ctime_ns",
     "persisted_output_markers",
 })
-_EXTERNALIZED_SUFFIX_MAX_CHARS = 16 * 1024
+_EXTERNALIZED_SUFFIX_MAX_MARKERS = 4_096
+_EXTERNALIZED_SUFFIX_MAX_DEPTH = 3
 _EXTERNALIZED_CANONICAL_INTEGER_MAX = (1 << 63) - 1
 _EXTERNALIZED_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _EXTERNALIZED_PERSISTED_OUTPUT_KEYS = frozenset({
@@ -786,6 +788,40 @@ _EXTERNALIZED_PERSISTED_OUTPUT_MARKER_KEYS = frozenset({
     "source_path", "expected_chars", "preview_prefix", "preview_sha256",
     "redacted_preview_sha256", "file_size", "file_mtime_ns", "file_ctime_ns",
 })
+
+
+class _ExternalizedPersistedOutputMarkers:
+    """Bounded summary of an incrementally validated historical marker list."""
+
+    __slots__ = ("count", "first_marker")
+
+    def __init__(self, count: int, first_marker: dict[str, Any]):
+        self.count = count
+        self.first_marker = first_marker
+
+
+class _ExternalizedSuffixBudgetExceeded(Exception):
+    """A canonical-looking suffix exceeded this operation's marker budget."""
+
+
+class _ExternalizedSuffixOperationBudget:
+    """Shared marker accounting across every payload in one grep operation."""
+
+    __slots__ = ("max_markers", "markers")
+
+    def __init__(self, max_markers: int | None = None):
+        self.max_markers = (
+            _EXTERNALIZED_SUFFIX_MAX_MARKERS
+            if max_markers is None
+            else max(0, int(max_markers))
+        )
+        self.markers = 0
+
+    def charge(self, count: int = 1) -> None:
+        count = max(0, int(count))
+        if self.markers + count > self.max_markers:
+            raise _ExternalizedSuffixBudgetExceeded
+        self.markers += count
 
 
 def _externalized_object_without_duplicate_keys(
@@ -872,8 +908,14 @@ def _validate_externalized_metadata_field(key: str, value: Any) -> None:
         if not isinstance(value, str) or _EXTERNALIZED_SHA256_RE.fullmatch(value) is None:
             raise ValueError("invalid_payload")
     elif key == "persisted_output_markers":
+        if isinstance(value, _ExternalizedPersistedOutputMarkers):
+            if value.count <= 0 or not value.first_marker:
+                raise ValueError("invalid_payload")
+            return
         if not isinstance(value, list) or not value:
             raise ValueError("invalid_payload")
+        if len(value) > _EXTERNALIZED_SUFFIX_MAX_MARKERS:
+            raise ValueError("payload_truncated")
         identities = [
             _validate_externalized_persisted_output_marker(marker)
             for marker in value
@@ -897,7 +939,12 @@ def _validate_externalized_metadata(fields: dict[str, Any]) -> None:
     if not required.issubset(fields):
         raise ValueError("invalid_payload")
 
-    first_marker = fields["persisted_output_markers"][0]
+    markers = fields["persisted_output_markers"]
+    first_marker = (
+        markers.first_marker
+        if isinstance(markers, _ExternalizedPersistedOutputMarkers)
+        else markers[0]
+    )
     top_to_marker = {
         "persisted_output_source_path": "source_path",
         "persisted_output_expected_chars": "expected_chars",
@@ -967,7 +1014,9 @@ def _externalized_prefix_authorization(
             return (
                 fields,
                 seen,
-                error if error == "ambiguous_metadata" else "invalid_payload",
+                error
+                if error in {"ambiguous_metadata", "payload_truncated"}
+                else "invalid_payload",
             )
         fields[key] = value
         index = whitespace(index)
@@ -976,72 +1025,232 @@ def _externalized_prefix_authorization(
         index += 1
 
 
+def _externalized_marker_identity_digest(identity: tuple[Any, ...]) -> bytes:
+    encoded = json.dumps(
+        identity,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(encoded).digest()
+
+
+class _ExternalizedSuffixParser:
+    """Incrementally validate metadata following a canonical content string.
+
+    Historical writers could append an ever-growing marker list after content.
+    The parser therefore discards every completed marker, retaining only a
+    fixed-size identity digest for duplicate detection and the first marker for
+    the canonical top-level consistency check.
+    """
+
+    def __init__(
+        self,
+        *,
+        seen: set[str],
+        operation_budget: _ExternalizedSuffixOperationBudget | None = None,
+    ):
+        self.decoder = json.JSONDecoder(
+            object_pairs_hook=_externalized_object_without_duplicate_keys
+        )
+        self.seen = seen
+        self.fields: dict[str, Any] = {}
+        self.buffer = ""
+        self.index = 0
+        self.state = "start"
+        self.current_key = ""
+        self.marker_count = 0
+        self.first_marker: dict[str, Any] | None = None
+        self.marker_identities: set[bytes] = set()
+        self.operation_budget = (
+            operation_budget or _ExternalizedSuffixOperationBudget()
+        )
+        # The outer payload object is already open when suffix parsing starts.
+        self.lexical_depth = 1
+        self.lexical_in_string = False
+        self.lexical_escaped = False
+
+    def _scan_depth(self, text: str) -> None:
+        for character in text:
+            if self.lexical_in_string:
+                if self.lexical_escaped:
+                    self.lexical_escaped = False
+                elif character == "\\":
+                    self.lexical_escaped = True
+                elif character == '"':
+                    self.lexical_in_string = False
+                continue
+            if character == '"':
+                self.lexical_in_string = True
+            elif character in "[{":
+                self.lexical_depth += 1
+                if self.lexical_depth > _EXTERNALIZED_SUFFIX_MAX_DEPTH:
+                    raise ValueError("invalid_payload")
+            elif character in "]}":
+                self.lexical_depth -= 1
+                if self.lexical_depth < 0:
+                    raise ValueError("ambiguous_metadata")
+
+    def _whitespace(self, index: int) -> int:
+        while index < len(self.buffer) and self.buffer[index] in " \t\n\r":
+            index += 1
+        return index
+
+    def _raw_decode_with_delimiter(
+        self, index: int, delimiters: str
+    ) -> tuple[Any, int] | None:
+        try:
+            value, end = self.decoder.raw_decode(self.buffer, index)
+        except json.JSONDecodeError:
+            return None
+        delimiter_index = self._whitespace(end)
+        if delimiter_index >= len(self.buffer):
+            # A number/literal may continue in the next transport chunk.
+            return None
+        if self.buffer[delimiter_index] not in delimiters:
+            raise ValueError("invalid_payload")
+        return value, end
+
+    def _finish_marker_list(self) -> None:
+        if self.marker_count <= 0 or self.first_marker is None:
+            raise ValueError("invalid_payload")
+        self.fields["persisted_output_markers"] = (
+            _ExternalizedPersistedOutputMarkers(
+                self.marker_count,
+                self.first_marker,
+            )
+        )
+        self.state = "after_value"
+
+    def _process(self, *, final: bool) -> None:
+        while True:
+            self.index = self._whitespace(self.index)
+            if self.state == "done":
+                if self.index < len(self.buffer):
+                    raise ValueError("ambiguous_metadata")
+                break
+            if self.index >= len(self.buffer):
+                break
+
+            character = self.buffer[self.index]
+            if self.state == "start":
+                if character == "}":
+                    self.index += 1
+                    self.state = "done"
+                elif character == ",":
+                    self.index += 1
+                    self.state = "key"
+                else:
+                    raise ValueError("ambiguous_metadata")
+            elif self.state == "key":
+                if character != '"':
+                    raise ValueError("invalid_payload")
+                try:
+                    key, end = self.decoder.raw_decode(self.buffer, self.index)
+                except json.JSONDecodeError:
+                    break
+                if not isinstance(key, str):
+                    raise ValueError("invalid_payload")
+                if key in self.seen or key not in _EXTERNALIZED_TRAILING_CANONICAL_KEYS:
+                    raise ValueError("ambiguous_metadata")
+                self.seen.add(key)
+                self.current_key = key
+                self.index = end
+                self.state = "colon"
+            elif self.state == "colon":
+                if character != ":":
+                    raise ValueError("invalid_payload")
+                self.index += 1
+                self.state = (
+                    "marker_list_start"
+                    if self.current_key == "persisted_output_markers"
+                    else "value"
+                )
+            elif self.state == "value":
+                decoded = self._raw_decode_with_delimiter(self.index, ",}")
+                if decoded is None:
+                    break
+                value, end = decoded
+                try:
+                    _validate_externalized_metadata_field(self.current_key, value)
+                except ValueError as exc:
+                    if str(exc) == "ambiguous_metadata":
+                        raise
+                    raise ValueError("invalid_payload") from exc
+                self.fields[self.current_key] = value
+                self.index = end
+                self.state = "after_value"
+            elif self.state == "marker_list_start":
+                if character != "[":
+                    raise ValueError("invalid_payload")
+                self.index += 1
+                self.state = "marker_or_end"
+            elif self.state == "marker_or_end":
+                if character == "]":
+                    self.index += 1
+                    self._finish_marker_list()
+                    continue
+                if character != "{":
+                    raise ValueError("invalid_payload")
+                decoded = self._raw_decode_with_delimiter(self.index, ",]")
+                if decoded is None:
+                    break
+                marker, end = decoded
+                identity = _validate_externalized_persisted_output_marker(marker)
+                digest = _externalized_marker_identity_digest(identity)
+                if digest in self.marker_identities:
+                    raise ValueError("invalid_payload")
+                self.operation_budget.charge()
+                self.marker_count += 1
+                self.marker_identities.add(digest)
+                if self.first_marker is None:
+                    self.first_marker = dict(marker)
+                self.index = end
+                self.state = "marker_delimiter"
+            elif self.state == "marker_delimiter":
+                if character == ",":
+                    self.index += 1
+                    self.state = "marker_or_end"
+                elif character == "]":
+                    self.index += 1
+                    self._finish_marker_list()
+                else:
+                    raise ValueError("invalid_payload")
+            elif self.state == "after_value":
+                if character == ",":
+                    self.index += 1
+                    self.state = "key"
+                elif character == "}":
+                    self.index += 1
+                    self.state = "done"
+                else:
+                    raise ValueError("invalid_payload")
+            else:  # pragma: no cover - internal state invariant
+                raise ValueError("invalid_payload")
+
+        if self.index:
+            self.buffer = self.buffer[self.index:]
+            self.index = 0
+        if final and (
+            self.state != "done"
+            or self.buffer
+            or self.lexical_in_string
+            or self.lexical_depth != 0
+        ):
+            raise ValueError("invalid_payload")
+
+    def feed(self, text: str, *, final: bool = False) -> None:
+        self._scan_depth(text)
+        self.buffer += text
+        self._process(final=final)
+
+
 def _externalized_suffix_metadata(
     text: str, *, seen: set[str]
 ) -> dict[str, Any]:
-    """Parse the bounded canonical metadata following an old-layout body."""
-    decoder = json.JSONDecoder(
-        object_pairs_hook=_externalized_object_without_duplicate_keys
-    )
-    fields: dict[str, Any] = {}
-    index = 0
-    length = len(text)
-
-    def whitespace(pos: int) -> int:
-        while pos < length and text[pos] in " \t\n\r":
-            pos += 1
-        return pos
-
-    index = whitespace(index)
-    if index < length and text[index] == "}":
-        index = whitespace(index + 1)
-        if index != length:
-            raise ValueError("ambiguous_metadata")
-        return fields
-    if index >= length or text[index] != ",":
-        raise ValueError("ambiguous_metadata")
-    index += 1
-    while True:
-        index = whitespace(index)
-        if index >= length or text[index] != '"':
-            raise ValueError("invalid_payload")
-        try:
-            key, index = decoder.raw_decode(text, index)
-        except json.JSONDecodeError as exc:
-            raise ValueError("invalid_payload") from exc
-        if not isinstance(key, str):
-            raise ValueError("invalid_payload")
-        if key in seen or key not in _EXTERNALIZED_TRAILING_CANONICAL_KEYS:
-            raise ValueError("ambiguous_metadata")
-        seen.add(key)
-        index = whitespace(index)
-        if index >= length or text[index] != ":":
-            raise ValueError("invalid_payload")
-        index = whitespace(index + 1)
-        try:
-            value, index = decoder.raw_decode(text, index)
-            _validate_externalized_metadata_field(key, value)
-        except json.JSONDecodeError as exc:
-            raise ValueError("invalid_payload") from exc
-        except ValueError as exc:
-            if str(exc) == "ambiguous_metadata":
-                raise
-            raise ValueError("invalid_payload") from exc
-        fields[key] = value
-        index = whitespace(index)
-        if index >= length:
-            raise ValueError("invalid_payload")
-        if text[index] == ",":
-            index += 1
-            continue
-        if text[index] != "}":
-            raise ValueError("invalid_payload")
-        index = whitespace(index + 1)
-        if index != length:
-            raise ValueError("ambiguous_metadata")
-        break
-
-    return fields
+    """Parse canonical post-content metadata through the streaming validator."""
+    parser = _ExternalizedSuffixParser(seen=seen)
+    parser.feed(text, final=True)
+    return parser.fields
 
 
 def _stream_externalized_json_content(
@@ -1051,6 +1260,7 @@ def _stream_externalized_json_content(
     max_bytes: int,
     deadline: float | None,
     seen_keys: set[str],
+    suffix_operation_budget: _ExternalizedSuffixOperationBudget | None = None,
 ) -> tuple[str, int, bool, dict[str, Any], int, int]:
     """Stream content and structurally validate a bounded canonical suffix."""
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
@@ -1061,8 +1271,10 @@ def _stream_externalized_json_content(
     escaped = False
     unicode_digits = ""
     pending_high_surrogate: int | None = None
-    suffix_parts: list[str] = []
-    suffix_chars = 0
+    suffix_parser = _ExternalizedSuffixParser(
+        seen=seen_keys,
+        operation_budget=suffix_operation_budget,
+    )
     total_content_chars = 0
     total_content_bytes = 0
 
@@ -1100,14 +1312,12 @@ def _stream_externalized_json_content(
             break
         bytes_read += len(raw)
         decoded = decoder.decode(raw, final=False)
+        suffix_piece: list[str] = []
         for index, character in enumerate(decoded):
             if index % 4096 == 0:
                 check_deadline()
             if closed:
-                suffix_chars += 1
-                if suffix_chars > _EXTERNALIZED_SUFFIX_MAX_CHARS:
-                    raise ValueError("ambiguous_metadata")
-                suffix_parts.append(character)
+                suffix_piece.append(character)
             elif unicode_digits:
                 if character not in "0123456789abcdefABCDEF":
                     raise ValueError("invalid_payload")
@@ -1139,20 +1349,33 @@ def _stream_externalized_json_content(
                 raise ValueError("invalid_payload")
             else:
                 emit(character)
+        if suffix_piece:
+            try:
+                suffix_parser.feed("".join(suffix_piece))
+            except _ExternalizedSuffixBudgetExceeded:
+                return (
+                    "".join(pieces), bytes_read, False, {},
+                    total_content_chars, total_content_bytes,
+                )
         check_deadline()
 
     if bytes_read < max_bytes:
         final = decoder.decode(b"", final=True)
-        for character in final:
-            suffix_chars += 1
-            if suffix_chars > _EXTERNALIZED_SUFFIX_MAX_CHARS:
-                raise ValueError("ambiguous_metadata")
-            suffix_parts.append(character)
+        if final:
+            try:
+                suffix_parser.feed(final)
+            except _ExternalizedSuffixBudgetExceeded:
+                return (
+                    "".join(pieces), bytes_read, False, {},
+                    total_content_chars, total_content_bytes,
+                )
     if not closed or escaped or unicode_digits:
         return "".join(pieces), bytes_read, False, {}, total_content_chars, total_content_bytes
-    suffix_fields = _externalized_suffix_metadata(
-        "".join(suffix_parts), seen=seen_keys
-    )
+    if bytes_read < max_bytes:
+        suffix_parser.feed("", final=True)
+    elif suffix_parser.state != "done":
+        return "".join(pieces), bytes_read, False, {}, total_content_chars, total_content_bytes
+    suffix_fields = suffix_parser.fields
     return (
         "".join(pieces),
         bytes_read,
@@ -1296,6 +1519,11 @@ def _search_externalized_payloads(
     files_scanned = 0
     bytes_scanned = 0
     scan_truncated = False
+    effective_total_bytes = min(
+        _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES,
+        max(0, int(max_total_bytes)),
+    )
+    suffix_operation_budget = _ExternalizedSuffixOperationBudget()
     try:
         root = get_large_output_storage_dir(
             engine._config,
@@ -1310,6 +1538,10 @@ def _search_externalized_payloads(
             "scan_truncated": False,
             "max_files": max_files,
             "max_payload_chars": max_payload_chars,
+            "max_total_bytes": effective_total_bytes,
+            "max_persisted_output_markers": _EXTERNALIZED_SUFFIX_MAX_MARKERS,
+            "max_suffix_depth": _EXTERNALIZED_SUFFIX_MAX_DEPTH,
+            "persisted_output_markers_scanned": suffix_operation_budget.markers,
         }
     if not root.exists() or not root.is_dir():
         if ref:
@@ -1321,11 +1553,11 @@ def _search_externalized_payloads(
             "scan_truncated": False,
             "max_files": max_files,
             "max_payload_chars": max_payload_chars,
+            "max_total_bytes": effective_total_bytes,
+            "max_persisted_output_markers": _EXTERNALIZED_SUFFIX_MAX_MARKERS,
+            "max_suffix_depth": _EXTERNALIZED_SUFFIX_MAX_DEPTH,
+            "persisted_output_markers_scanned": suffix_operation_budget.markers,
         }
-    effective_total_bytes = min(
-        _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES,
-        max(0, int(max_total_bytes)),
-    )
     regex_deadline = min(
         time.monotonic() + _LCM_GREP_REGEX_OPERATION_DEADLINE_SECONDS,
         deadline if deadline is not None else float("inf"),
@@ -1399,8 +1631,22 @@ def _search_externalized_payloads(
                 )
                 if metadata_error is not None:
                     bytes_scanned += metadata_bytes
+                    if metadata_error == "payload_truncated":
+                        scan_truncated = True
                     diagnostics.append({"ref": path.name, "error": metadata_error})
                     continue
+                prefix_markers = metadata_fields.get("persisted_output_markers")
+                if isinstance(prefix_markers, list):
+                    try:
+                        suffix_operation_budget.charge(len(prefix_markers))
+                    except _ExternalizedSuffixBudgetExceeded:
+                        bytes_scanned += metadata_bytes
+                        scan_truncated = True
+                        diagnostics.append({
+                            "ref": path.name,
+                            "error": "payload_truncated",
+                        })
+                        continue
                 payload_session_id = metadata_fields.get("session_id", "")
                 if not isinstance(payload_session_id, str) or not payload_session_id:
                     bytes_scanned += metadata_bytes
@@ -1442,6 +1688,7 @@ def _search_externalized_payloads(
                     max_bytes=max(0, read_limit - metadata_bytes),
                     deadline=deadline,
                     seen_keys=seen_keys,
+                    suffix_operation_budget=suffix_operation_budget,
                 )
                 total_file_bytes = metadata_bytes + body_bytes
                 raw_truncated = opened_stat.st_size > total_file_bytes
@@ -1499,9 +1746,15 @@ def _search_externalized_payloads(
             break
         except ValueError as exc:
             error = str(exc)
+            if error == "payload_truncated":
+                scan_truncated = True
             diagnostics.append({
                 "ref": path.name,
-                "error": error if error in {"ambiguous_metadata", "invalid_payload"} else "invalid_payload",
+                "error": error
+                if error in {
+                    "ambiguous_metadata", "invalid_payload", "payload_truncated"
+                }
+                else "invalid_payload",
             })
             continue
         except (OSError, UnicodeDecodeError):
@@ -1600,6 +1853,9 @@ def _search_externalized_payloads(
         "max_files": max_files,
         "max_payload_chars": max_payload_chars,
         "max_total_bytes": effective_total_bytes,
+        "max_persisted_output_markers": _EXTERNALIZED_SUFFIX_MAX_MARKERS,
+        "max_suffix_depth": _EXTERNALIZED_SUFFIX_MAX_DEPTH,
+        "persisted_output_markers_scanned": suffix_operation_budget.markers,
         "regex_file_deadline_ms": int(_LCM_GREP_REGEX_FILE_DEADLINE_SECONDS * 1000),
         "regex_operation_deadline_ms": int(_LCM_GREP_REGEX_OPERATION_DEADLINE_SECONDS * 1000),
         "regex_timeouts": regex_timeouts,
@@ -6001,6 +6257,8 @@ def _read_externalized_payload_metadata_prefix_from_handle(
                 phase = "value_string"
             elif char in "[{":
                 container_stack[:] = [char]
+                if len(container_stack) + 1 > _EXTERNALIZED_SUFFIX_MAX_DEPTH:
+                    raise ValueError("invalid_payload")
                 complex_in_string = False
                 complex_escaped = False
                 phase = "value_complex"
@@ -6038,6 +6296,8 @@ def _read_externalized_payload_metadata_prefix_from_handle(
                 complex_in_string = True
             elif char in "[{":
                 container_stack.append(char)
+                if len(container_stack) + 1 > _EXTERNALIZED_SUFFIX_MAX_DEPTH:
+                    raise ValueError("invalid_payload")
             elif char in "]}":
                 if not container_stack:
                     phase = "invalid"
