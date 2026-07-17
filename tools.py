@@ -124,29 +124,14 @@ _BOUNDARY_STANDALONE_CREDENTIAL_RE = re.compile(
     r")\Z",
     re.IGNORECASE,
 )
-_BOUNDARY_QUOTED_ASSIGNMENT_RE = re.compile(
+_BOUNDARY_ASSIGNMENT_START_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])"
     r"(?:api[_-]?key|api[_-]?token|access[_-]?token|secret[_-]?key|"
     r"client[_-]?secret|password|passwd|pwd|passphrase)"
-    r"\s*(?:\\?[\"'])?\s*[:=]\s*(?P<quote>[\"'])\Z",
+    r"(?![A-Za-z0-9_-])\s*(?:\\?[\"'])?\s*[:=]\s*"
+    r"(?:(?P<quote>[\"'])|(?P<unquoted>[^\s,\"'\]}]))",
     re.IGNORECASE,
 )
-_BOUNDARY_PRIVATE_KEY_BEGIN_SUFFIX_RE = re.compile(
-    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----\Z", re.IGNORECASE
-)
-
-
-def _last_unescaped_quote(text: str) -> tuple[int, str] | None:
-    for index in range(len(text) - 1, -1, -1):
-        if text[index] not in {'"', "'"}:
-            continue
-        backslashes = 0
-        cursor = index - 1
-        while cursor >= 0 and text[cursor] == "\\":
-            backslashes += 1
-            cursor -= 1
-        if backslashes % 2 == 0:
-            return index, text[index]
-    return None
 
 
 def _first_unescaped_quote(text: str, quote: str | None = None) -> tuple[int, str] | None:
@@ -161,6 +146,119 @@ def _first_unescaped_quote(text: str, quote: str | None = None) -> tuple[int, st
         if backslashes % 2 == 0:
             return index, char
     return None
+
+
+def _credential_mode_at_offset(
+    read_chunk,
+    scan_start: int,
+    requested_offset: int,
+) -> tuple[str, str | None]:
+    """Stream credential syntax from a proven boundary to one raw offset."""
+    mode = "normal" if scan_start == 0 else "unknown"
+    quote: str | None = None
+    quote_backslashes = 0
+    cursor = scan_start
+    token_chars = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._~+/=-"
+    )
+
+    while cursor < requested_offset:
+        primary_chars = min(
+            _EXPAND_BOUNDARY_SCAN_CHARS, requested_offset - cursor
+        )
+        # Normal-mode openers can straddle a chunk edge. The bounded lookahead
+        # is inspected but never advances the state beyond requested_offset.
+        data = read_chunk(cursor, primary_chars + 512)
+        if not data:
+            return "unknown", None
+        primary_chars = min(primary_chars, len(data))
+        advance_chars = primary_chars
+        index = 0
+        while index < primary_chars:
+            if mode == "unknown":
+                # There is no sound way to infer an opening quote or an
+                # unquoted/PEM grammar from arbitrary body bytes. Keep the
+                # state unknown; the caller will fail closed.
+                index = primary_chars
+                continue
+            if mode == "normal":
+                pem_begin = (
+                    _BOUNDARY_PRIVATE_KEY_BEGIN_RE.match(data, index)
+                    if data[index] == "-"
+                    else None
+                )
+                assignment = _BOUNDARY_ASSIGNMENT_START_RE.match(data, index)
+                if pem_begin is not None:
+                    mode = "pem"
+                    index = pem_begin.end()
+                    advance_chars = max(
+                        advance_chars,
+                        min(index, requested_offset - cursor),
+                    )
+                    continue
+                if assignment is not None:
+                    if assignment.group("quote") is not None:
+                        mode = "quote"
+                        quote = assignment.group("quote")
+                        quote_backslashes = 0
+                        index = assignment.end()
+                    else:
+                        mode = "token"
+                        index = assignment.start("unquoted")
+                    advance_chars = max(
+                        advance_chars,
+                        min(assignment.end(), requested_offset - cursor),
+                    )
+                    continue
+                index += 1
+                continue
+            if mode == "quote":
+                char = data[index]
+                if char == "\\":
+                    quote_backslashes += 1
+                else:
+                    if char == quote and quote_backslashes % 2 == 0:
+                        mode = "normal"
+                        quote = None
+                    quote_backslashes = 0
+                index += 1
+                continue
+            if mode == "token":
+                if data[index] not in token_chars:
+                    mode = "normal"
+                    # Reprocess the delimiter: it may begin another expression.
+                    continue
+                index += 1
+                continue
+            if mode == "pem":
+                pem_end = (
+                    _BOUNDARY_PRIVATE_KEY_END_RE.match(data, index)
+                    if data[index] == "-"
+                    else None
+                )
+                if pem_end is not None:
+                    if cursor + pem_end.end() <= requested_offset:
+                        mode = "normal"
+                        index = pem_end.end()
+                        advance_chars = max(advance_chars, index)
+                    else:
+                        # The cursor itself lies inside the terminator. It is
+                        # still part of the sensitive PEM span.
+                        index = primary_chars
+                else:
+                    index += 1
+                continue
+        cursor += advance_chars
+        if advance_chars <= 0:
+            return "unknown", None
+    if mode == "token":
+        boundary_char = read_chunk(requested_offset, 1)
+        if boundary_char and boundary_char[0] not in token_chars:
+            # The requested cursor is exactly on the token terminator. It is a
+            # safe page boundary, but the benign delimiter still belongs to
+            # the caller's lossless output and must not be consumed here.
+            mode = "normal"
+    return mode, quote
 
 
 def _scan_raw_credential_boundary(
@@ -216,52 +314,31 @@ def _scan_raw_credential_boundary(
     else:
         forward_start = offset
 
-    # Search backwards chunk-by-chunk for the nearest decisive quote or PEM
-    # marker. Small overlap preserves markers split across SQL substrings.
+    # Establish a bounded, proven scan origin and stream forward to the
+    # requested offset. Ordinary quote characters are data in normal mode and
+    # cannot manufacture a safe boundary. Reaching the start of the row is a
+    # proof boundary; exhausting the backward budget is not.
     if not unsafe and offset > 0:
-        cursor = offset
-        overlap = ""
-        for _ in range(_EXPAND_BOUNDARY_SCAN_MAX_CHUNKS):
-            if cursor <= 0:
-                break
-            start = max(0, cursor - _EXPAND_BOUNDARY_SCAN_CHARS)
-            chunk = read_chunk(start, cursor - start)
-            combined = chunk + overlap
-            pem_begin = list(_BOUNDARY_PRIVATE_KEY_BEGIN_RE.finditer(combined))
-            pem_end = list(_BOUNDARY_PRIVATE_KEY_END_RE.finditer(combined))
-            nearest_pem_begin = pem_begin[-1].start() if pem_begin else -1
-            nearest_pem_end = pem_end[-1].start() if pem_end else -1
-            nearest_quote = _last_unescaped_quote(combined)
-            quote_index = nearest_quote[0] if nearest_quote is not None else -1
-            nearest_index = max(nearest_pem_begin, nearest_pem_end, quote_index)
-            if nearest_index >= 0:
-                if nearest_index == nearest_pem_begin:
-                    unsafe = True
-                    mode = "pem"
-                elif nearest_index == quote_index and nearest_quote is not None:
-                    prefix_start = max(0, nearest_index - 256)
-                    prefix = combined[prefix_start:nearest_index + 1]
-                    assignment = _BOUNDARY_QUOTED_ASSIGNMENT_RE.search(prefix)
-                    if assignment is not None:
-                        unsafe = True
-                        mode = "quote"
-                        quote = nearest_quote[1]
-                # A PEM end or a non-assignment quote is a safe left boundary.
-                break
-            if start == 0:
-                break
-            overlap = chunk[:128]
-            cursor = start
-        else:
-            # No bounded proof of a benign left boundary: fail closed.
+        backward_budget = (
+            _EXPAND_BOUNDARY_SCAN_CHARS * _EXPAND_BOUNDARY_SCAN_MAX_CHUNKS
+        )
+        scan_start = max(0, offset - backward_budget)
+        mode, quote = _credential_mode_at_offset(
+            read_chunk, scan_start, offset
+        )
+        if mode != "normal":
             unsafe = True
-            mode = "unknown"
+            forward_start = offset
 
     if not unsafe:
         return {"safe_content_offset": offset}
 
     cursor = forward_start
     overlap = ""
+    quote_backslashes = 0
+    token_chars = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._~+/=-"
+    )
     for _ in range(_EXPAND_BOUNDARY_SCAN_MAX_CHUNKS):
         if cursor >= total:
             return {
@@ -281,11 +358,26 @@ def _scan_raw_credential_boundary(
             if match is not None:
                 terminator_end = match.end()
         elif mode == "token":
-            match = re.search(r"[^A-Za-z0-9._~+/=-]", combined)
-            if match is not None:
-                terminator_end = match.start()
+            for index, char in enumerate(chunk):
+                if char not in token_chars:
+                    terminator_end = overlap_chars + index
+                    break
+        elif mode == "quote":
+            for index, char in enumerate(chunk):
+                if char == "\\":
+                    quote_backslashes += 1
+                    continue
+                if char == quote and quote_backslashes % 2 == 0:
+                    terminator_end = overlap_chars + index + 1
+                    break
+                quote_backslashes = 0
+        elif mode == "unknown":
+            # Without a proven assignment start, neither quote type, token
+            # whitespace, nor unrelated prose is a sound terminator. Advance
+            # only through redacted chunks; EOF is the sole universal boundary.
+            terminator_end = None
         else:
-            found_quote = _first_unescaped_quote(combined, quote if mode == "quote" else None)
+            found_quote = _first_unescaped_quote(combined, quote)
             pem_end = _BOUNDARY_PRIVATE_KEY_END_RE.search(combined)
             quote_end = found_quote[0] + 1 if found_quote is not None else None
             pem_end_index = pem_end.end() if pem_end is not None else None
@@ -1800,16 +1892,21 @@ def _grep_safe_snippet(
         # single token; otherwise uncertainty redacts the complete window.
         boundary_end = None
         boundary_name = "left_boundary_credential"
-        pem_end = _BOUNDARY_PRIVATE_KEY_END_RE.search(raw_window)
-        if pem_end is not None:
-            boundary_end = pem_end.end()
-            boundary_name = "private_key"
-        else:
-            quote_end = re.search(r"(?<!\\)[\"']", raw_window)
+        # A truncated left edge does not reveal the assignment opener. Neither
+        # quote type is therefore a safe boundary: an apostrophe inside a
+        # double-quoted value (or vice versa) is secret data. If an opener is
+        # present in this bounded window, track its exact delimiter and escape
+        # parity; otherwise redact the complete uncertain window.
+        assignment = _BOUNDARY_ASSIGNMENT_START_RE.search(raw_window)
+        if assignment is not None and assignment.group("quote") is not None:
+            opener_quote = assignment.group("quote")
+            quote_end = _first_unescaped_quote(
+                raw_window[assignment.end():], opener_quote
+            )
             if quote_end is not None:
-                boundary_end = quote_end.end()
-            else:
-                boundary_end = len(raw_window)
+                boundary_end = assignment.end() + quote_end[0] + 1
+        if boundary_end is None:
+            boundary_end = len(raw_window)
         entire_window_uncertain = boundary_end >= len(raw_window)
         raw_window = (
             f"[LCM sensitive redaction: name={boundary_name}; boundary-truncated]"
@@ -2027,6 +2124,9 @@ def _authorize_node_provenance_bounded(
             bounded_message_ids = list(message_ids)[:_CROSS_SESSION_AUTH_MAX_MESSAGES]
             if len(message_ids) > len(bounded_message_ids):
                 diagnostics["authorization_truncated"] = True
+            # Phase 1: read only bounded ownership metadata. Payload columns
+            # are deliberately absent so a foreign provenance edge cannot
+            # cause SQLite to touch content/tool_calls before closure auth.
             for offset in range(0, len(bounded_message_ids), _CROSS_SESSION_AUTH_QUERY_BATCH):
                 if time.monotonic() >= deadline:
                     diagnostics["authorization_timed_out"] = True
@@ -2040,18 +2140,7 @@ def _authorize_node_provenance_bounded(
                                           AND length(CAST(session_id AS BLOB)) <= {_CROSS_SESSION_AUTH_SESSION_ID_CHARS * 4}
                                           AND length(CAST(session_id AS TEXT)) <= {_CROSS_SESSION_AUTH_SESSION_ID_CHARS}
                                     THEN substr(CAST(session_id AS TEXT), 1, {_CROSS_SESSION_AUTH_SESSION_ID_CHARS}) END,
-                               substr(CAST(source AS TEXT), 1, 512),
-                               substr(CAST(role AS TEXT), 1, 128),
-                               CASE WHEN typeof(content) = 'text'
-                                    THEN substr(CAST(content AS TEXT), 1, {_CURRENT_SESSION_EXPAND_MAX_CHARS}) END,
-                               substr(CAST(tool_call_id AS TEXT), 1, 512),
-                               substr(CAST(tool_name AS TEXT), 1, 512),
-                               CASE WHEN typeof(timestamp) IN ('integer', 'real') THEN timestamp END,
-                               CASE WHEN typeof(token_estimate) = 'integer' THEN token_estimate END,
-                               CASE WHEN typeof(pinned) = 'integer' THEN pinned END,
-                               substr(CAST(conversation_id AS TEXT), 1, 512),
-                               COALESCE(length(CAST(content AS TEXT)), 0),
-                               typeof(session_id), typeof(content)
+                               typeof(session_id)
                         FROM messages WHERE store_id IN ({placeholders}) LIMIT ?""",
                     [*batch, len(batch)],
                 )
@@ -2065,28 +2154,12 @@ def _authorize_node_provenance_bounded(
                     if (
                         row[0] is None
                         or not isinstance(row[1], str)
-                        or row[12] != "text"
-                        or row[13] not in {"text", "null"}
+                        or row[2] != "text"
                     ):
                         diagnostics["authorization_truncated"] = True
                         continue
                     store_id = int(row[0])
                     message_sessions[store_id] = row[1]
-                    frozen_messages[store_id] = {
-                        "store_id": store_id,
-                        "session_id": row[1],
-                        "source": row[2] or "",
-                        "role": row[3] or "unknown",
-                        "content": row[4] or "",
-                        "tool_call_id": row[5] or "",
-                        "tool_calls": None,
-                        "tool_name": row[6] or "",
-                        "timestamp": row[7] or 0,
-                        "token_estimate": row[8] or 0,
-                        "pinned": row[9] or 0,
-                        "conversation_id": row[10] or "",
-                        "content_chars": int(row[11] or 0),
-                    }
             diagnostics["authorization_messages_checked"] = len(message_sessions)
 
             memo: dict[int, bool] = {}
@@ -2112,7 +2185,6 @@ def _authorize_node_provenance_bounded(
                 if node.source_type == "messages":
                     result = all(
                         message_sessions.get(int(source_id)) in allowed_session_ids
-                        and int(source_id) in frozen_messages
                         for source_id in node.source_ids
                     )
                 elif node.source_type == "nodes":
@@ -2134,6 +2206,92 @@ def _authorize_node_provenance_bounded(
                 node.search_rank, node.search_directness = candidate_rank[node_id]
                 authorized_candidates.append(node)
             diagnostics["authorization_candidates_checked"] = len(selected_ids)
+
+            # Phase 2: only after complete closure authorization, derive the
+            # exact authorized message ID set and materialize bounded payload
+            # for those IDs from the same SQLite read snapshot.
+            authorized_message_ids: set[int] = set()
+            collected_nodes: set[int] = set()
+
+            def collect_authorized_messages(node_id: int) -> None:
+                if node_id in collected_nodes:
+                    return
+                collected_nodes.add(node_id)
+                node = frozen_nodes[node_id]
+                if node.source_type == "messages":
+                    authorized_message_ids.update(
+                        int(source_id) for source_id in node.source_ids
+                    )
+                else:
+                    for child_id in node.source_ids:
+                        collect_authorized_messages(int(child_id))
+
+            for node in authorized_candidates:
+                collect_authorized_messages(int(node.node_id))
+
+            bounded_payload_ids = sorted(authorized_message_ids)
+            for offset in range(0, len(bounded_payload_ids), _CROSS_SESSION_AUTH_QUERY_BATCH):
+                if time.monotonic() >= deadline:
+                    diagnostics["authorization_timed_out"] = True
+                    break
+                batch = bounded_payload_ids[
+                    offset:offset + _CROSS_SESSION_AUTH_QUERY_BATCH
+                ]
+                placeholders = ",".join("?" for _ in batch)
+                cursor = conn.execute(
+                    f"""SELECT
+                               CASE WHEN typeof(store_id) = 'integer' THEN store_id END,
+                               substr(CAST(session_id AS TEXT), 1, {_CROSS_SESSION_AUTH_SESSION_ID_CHARS}),
+                               substr(CAST(source AS TEXT), 1, 512),
+                               substr(CAST(role AS TEXT), 1, 128),
+                               CASE WHEN typeof(content) = 'text'
+                                    THEN substr(CAST(content AS TEXT), 1, {_CURRENT_SESSION_EXPAND_MAX_CHARS}) END,
+                               substr(CAST(tool_call_id AS TEXT), 1, 512),
+                               substr(CAST(tool_name AS TEXT), 1, 512),
+                               CASE WHEN typeof(timestamp) IN ('integer', 'real') THEN timestamp END,
+                               CASE WHEN typeof(token_estimate) = 'integer' THEN token_estimate END,
+                               CASE WHEN typeof(pinned) = 'integer' THEN pinned END,
+                               substr(CAST(conversation_id AS TEXT), 1, 512),
+                               COALESCE(length(CAST(content AS TEXT)), 0),
+                               typeof(content)
+                        FROM messages WHERE store_id IN ({placeholders}) LIMIT ?""",
+                    [*batch, len(batch)],
+                )
+                while time.monotonic() < deadline:
+                    raw_row = cursor.fetchone()
+                    if raw_row is None:
+                        break
+                    row = tuple(raw_row)
+                    if not charge_row(row):
+                        break
+                    store_id = int(row[0]) if row[0] is not None else -1
+                    if (
+                        store_id not in authorized_message_ids
+                        or row[1] != message_sessions.get(store_id)
+                        or row[12] not in {"text", "null"}
+                    ):
+                        diagnostics["authorization_truncated"] = True
+                        continue
+                    frozen_messages[store_id] = {
+                        "store_id": store_id,
+                        "session_id": row[1],
+                        "source": row[2] or "",
+                        "role": row[3] or "unknown",
+                        "content": row[4] or "",
+                        "tool_call_id": row[5] or "",
+                        "tool_calls": None,
+                        "tool_name": row[6] or "",
+                        "timestamp": row[7] or 0,
+                        "token_estimate": row[8] or 0,
+                        "pinned": row[9] or 0,
+                        "conversation_id": row[10] or "",
+                        "content_chars": int(row[11] or 0),
+                    }
+
+            if set(frozen_messages) != authorized_message_ids:
+                diagnostics["authorization_truncated"] = True
+                authorized_candidates = []
+                frozen_messages = {}
             if diagnostics["authorization_timed_out"]:
                 authorized_candidates = []
                 frozen_nodes = {}

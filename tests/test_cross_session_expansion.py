@@ -169,6 +169,61 @@ def test_session_allowlist_is_authorization_boundary(tmp_path, monkeypatch):
         engine.shutdown()
 
 
+def test_unauthorized_provenance_never_reads_message_payload_columns(tmp_path):
+    engine = _engine(tmp_path)
+    foreign_store_id = engine._store.append(
+        "denied",
+        {
+            "role": "assistant",
+            "content": "UNAUTHORIZED-CONTENT-CANARY",
+            "tool_calls": [
+                {
+                    "id": "call_denied",
+                    "type": "function",
+                    "function": {"name": "denied", "arguments": "{}"},
+                }
+            ],
+        },
+    )
+    node_id = engine._dag.add_node(
+        SummaryNode(
+            session_id="archive",
+            depth=0,
+            summary="archive candidate with foreign provenance",
+            token_count=10,
+            source_token_count=20,
+            source_ids=[foreign_store_id],
+            source_type="messages",
+            created_at=0,
+        )
+    )
+    candidate = engine._dag.get_node(node_id)
+    message_reads = []
+
+    def record_reads(action, table, column, _db_name, _trigger):
+        if action == sqlite3.SQLITE_READ and table == "messages":
+            message_reads.append(column)
+        return sqlite3.SQLITE_OK
+
+    engine._store._conn.set_authorizer(record_reads)
+    try:
+        authorized, _diagnostics, frozen = (
+            lcm_tools._authorize_node_provenance_bounded(
+                engine,
+                [candidate],
+                frozenset({"archive"}),
+                deadline=time.monotonic() + 5,
+            )
+        )
+        assert authorized == []
+        assert frozen["messages"] == {}
+        assert "session_id" in message_reads
+        assert not {"content", "tool_calls"}.intersection(message_reads)
+    finally:
+        engine._store._conn.set_authorizer(None)
+        engine.shutdown()
+
+
 def test_authorization_and_evidence_use_one_frozen_snapshot(tmp_path, monkeypatch):
     engine = _engine(tmp_path)
     node_id = _node(

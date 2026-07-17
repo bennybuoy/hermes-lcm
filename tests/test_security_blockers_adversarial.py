@@ -1279,6 +1279,54 @@ def test_grep_left_boundary_fail_closes_quoted_and_pem_credentials(
 
 
 @pytest.mark.parametrize(
+    ("query", "secret_body", "leak_canary"),
+    [
+        (
+            "oppositequotefts",
+            'password="'
+            + ("D" * 20_000)
+            + "it's-still-secret \\\"escaped-double-quote\\\" "
+            + "oppositequotefts DOUBLE-QUOTED-LEAK-CANARY"
+            + '"',
+            "DOUBLE-QUOTED-LEAK-CANARY",
+        ),
+        (
+            "opposite-quote-like",
+            "password='"
+            + ("S" * 20_000)
+            + 'say "still-secret" \\\'escaped-single-quote\\\' '
+            + "opposite-quote-like SINGLE-QUOTED-LEAK-CANARY"
+            + "'",
+            "SINGLE-QUOTED-LEAK-CANARY",
+        ),
+    ],
+)
+def test_grep_truncated_quoted_window_ignores_opposite_quote_type(
+    tmp_path, query, secret_body, leak_canary
+):
+    engine = _engine(tmp_path)
+    store_id = engine._store.append(
+        "current",
+        {"role": "user", "content": secret_body + "\nBENIGN-GREP-SUFFIX"},
+    )
+    try:
+        response_text = tools_module.lcm_grep(
+            {"query": query, "session_scope": "current", "limit": 1},
+            engine=engine,
+        )
+        response = json.loads(response_text)
+        assert response["results"][0]["store_id"] == store_id
+        assert leak_canary not in response_text
+        assert "it's-still-secret" not in response_text
+        assert 'say \\"still-secret\\"' not in response_text
+        assert "escaped-double-quote" not in response_text
+        assert "escaped-single-quote" not in response_text
+        assert "LCM sensitive redaction" in response_text
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize(
     ("query", "credential"),
     [
         (
@@ -1584,6 +1632,56 @@ def test_store_expand_arbitrary_deep_offset_fail_closes_and_recovers_suffix(
             pytest.fail("bounded credential scan did not reach a terminal page")
         assert "BENIGN-SUFFIX-RECOVERED" in "".join(pages)
         assert pages and any("LCM sensitive redaction" in item for item in pages)
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("credential", "leak_canary"),
+    [
+        (
+            'password="'
+            + ("Q" * 24_000)
+            + "it's-still-secret \\\"escaped-matching-quote\\\" "
+            + "QUOTED-LEAK-CANARY"
+            + ("R" * 2_000)
+            + '"',
+            "QUOTED-LEAK-CANARY",
+        ),
+        (
+            "password=" + ("U" * 24_000) + "UNQUOTED-LEAK-CANARY" + ("V" * 2_000),
+            "UNQUOTED-LEAK-CANARY",
+        ),
+    ],
+)
+def test_store_expand_arbitrary_offset_detects_deep_assignment_and_recovers_suffix(
+    tmp_path, credential, leak_canary
+):
+    engine = _engine(tmp_path)
+    suffix = "\nBENIGN-DEEP-OFFSET-SUFFIX"
+    content = "benign prefix\n" + credential + suffix
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": content}
+    )
+    offset = content.index(leak_canary)
+    assert offset > 20_000
+    pages = []
+    try:
+        for _ in range(80):
+            page = json.loads(tools_module.lcm_expand(
+                {"store_id": store_id, "content_offset": offset, "max_tokens": 64},
+                engine=engine,
+            ))
+            pages.append(page["content"])
+            assert leak_canary not in json.dumps(page)
+            if not page["has_more"]:
+                break
+            assert page["next_content_offset"] > offset
+            offset = page["next_content_offset"]
+        else:
+            pytest.fail("bounded assignment scan did not reach the benign suffix")
+        assert "BENIGN-DEEP-OFFSET-SUFFIX" in "".join(pages)
+        assert any("LCM sensitive redaction" in item for item in pages)
     finally:
         engine.shutdown()
 
