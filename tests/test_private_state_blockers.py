@@ -54,6 +54,23 @@ def _engine(tmp_path: Path) -> LCMEngine:
     return engine
 
 
+def _engine_with_payload_dir(tmp_path: Path, payload_dir: Path) -> LCMEngine:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    engine = LCMEngine(config=LCMConfig(
+        database_path=str(tmp_path / "private-state.db"),
+        large_output_externalization_enabled=True,
+        large_output_externalization_path=str(payload_dir),
+        async_background_compaction_worker_enabled=False,
+    ), hermes_home=str(tmp_path))
+    engine.on_session_start(
+        "current",
+        conversation_id="private-state",
+        platform="test",
+        context_length=100_000,
+    )
+    return engine
+
+
 def _marker_payload(marker_count: int, needle: str) -> str:
     markers = ",".join(
         '{{"source_path":"/private/{0}","expected_chars":{0}}}'.format(index)
@@ -275,6 +292,134 @@ raise AssertionError("crash hook did not fire")
     assert not (state_root / owner_name).exists()
     with sqlite3.connect(registry_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM owner_registry").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "crash_phase",
+    [
+        "after_file_open",
+        "after_wal",
+        "after_owner_registry_ddl",
+        "after_registry_state_ddl",
+        "after_scheduler_cursors_ddl",
+        "after_scheduler_ttl_index_ddl",
+        "after_scheduler_fairness_index_ddl",
+        "after_schema_marker",
+        "before_commit",
+    ],
+)
+def test_registry_schema_bootstrap_recovers_every_crash_boundary(
+    tmp_path, monkeypatch, crash_phase
+):
+    state_root = tmp_path / f"registry-schema-{crash_phase}"
+    script = r'''
+import os
+from pathlib import Path
+import sys
+import hermes_lcm.tools as tools
+
+root = Path(sys.argv[1])
+root.mkdir(mode=0o700)
+tools._EXTERNALIZED_REGISTRY_SCHEMA_CRASH_PHASE = sys.argv[2]
+tools._externalized_open_owner_registry(root)
+raise AssertionError("schema crash hook did not fire")
+'''
+    crashed = subprocess.run(
+        [sys.executable, "-c", script, str(state_root), crash_phase],
+        env=_subprocess_package_env(tmp_path),
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert crashed.returncode == 91, (crashed.stdout, crashed.stderr)
+    registry_path = state_root / ".owner-registry.db"
+    assert registry_path.is_file()
+
+    monkeypatch.setattr(tools_module, "_EXTERNALIZED_MARKER_STATE_ROOT", state_root)
+    runtime = tools_module._ExternalizedPrivateRuntimeState()
+    runtime.ensure_owner_dir()
+    runtime.close_for_shutdown()
+    with sqlite3.connect(registry_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        objects = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')"
+            )
+        }
+        assert {
+            "owner_registry",
+            "registry_state",
+            "scheduler_cursors",
+            "scheduler_cursors_updated_idx",
+            "scheduler_cursors_fairness_idx",
+        } <= objects
+
+
+@pytest.mark.parametrize(
+    "slow_phase", ["after_registry_state_ddl", "before_commit"]
+)
+def test_slow_registry_schema_recovery_has_separate_cleanup_and_owner_budgets(
+    tmp_path, monkeypatch, slow_phase
+):
+    state_root = tmp_path / f"slow-registry-schema-{slow_phase}"
+    monkeypatch.setattr(tools_module, "_EXTERNALIZED_MARKER_STATE_ROOT", state_root)
+    delay = tools_module._EXTERNALIZED_OWNER_REAP_DEADLINE_SECONDS + 0.020
+
+    def slow_schema(phase: str) -> None:
+        if phase == slow_phase:
+            time.sleep(delay)
+
+    monkeypatch.setattr(
+        tools_module, "_externalized_registry_schema_crash_point", slow_schema
+    )
+    runtime = tools_module._ExternalizedPrivateRuntimeState()
+    started = time.monotonic()
+    owner_dir = runtime.ensure_owner_dir()
+    elapsed = time.monotonic() - started
+    try:
+        assert owner_dir.parent == state_root
+        assert elapsed < 0.50
+        with sqlite3.connect(state_root / ".owner-registry.db") as connection:
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+            assert connection.execute(
+                "SELECT COUNT(*) FROM owner_registry"
+            ).fetchone()[0] == 1
+    finally:
+        runtime.close_for_shutdown()
+
+
+def test_registry_schema_repairs_missing_v1_objects_and_rejects_newer_version(
+    tmp_path
+):
+    state_root = tmp_path / "registry-versioning"
+    state_root.mkdir()
+    registry_path = state_root / ".owner-registry.db"
+    with sqlite3.connect(registry_path) as connection:
+        connection.execute("PRAGMA user_version=1")
+        connection.execute(
+            "CREATE TABLE owner_registry ("
+            "owner_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "owner_name TEXT NOT NULL UNIQUE, pid INTEGER NOT NULL, "
+            "process_start TEXT NOT NULL, nonce TEXT NOT NULL, "
+            "phase TEXT NOT NULL, created_wall REAL NOT NULL)"
+        )
+        connection.commit()
+    repaired = tools_module._externalized_open_owner_registry(state_root)
+    repaired.close()
+    with sqlite3.connect(registry_path) as connection:
+        objects = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')"
+            )
+        }
+        assert {"registry_state", "scheduler_cursors"} <= objects
+        connection.execute("PRAGMA user_version=2")
+        connection.commit()
+    with pytest.raises(tools_module._ExternalizedRegistrySchemaMissing):
+        tools_module._externalized_open_owner_registry(state_root)
 
 
 def test_owner_registry_supports_concurrent_process_start_and_shutdown(tmp_path):
@@ -532,6 +677,35 @@ def test_reaper_deadline_includes_contended_registry_acquisition(tmp_path):
     assert stats["rows_visited"] == 0
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux flock")
+def test_held_cleanup_lock_does_not_make_valid_root_unwritable(
+    tmp_path, monkeypatch
+):
+    import fcntl
+
+    state_root = tmp_path / "held-cleanup-lock"
+    state_root.mkdir(mode=0o700)
+    monkeypatch.setattr(tools_module, "_EXTERNALIZED_MARKER_STATE_ROOT", state_root)
+    lock_path = state_root / ".owner-registry.db.lock"
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        started = time.monotonic()
+        assert tools_module._prepare_externalized_marker_state_root() == state_root
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.20
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+    runtime = tools_module._ExternalizedPrivateRuntimeState()
+    owner_dir = runtime.ensure_owner_dir()
+    try:
+        assert owner_dir.parent == state_root
+    finally:
+        runtime.close_for_shutdown()
+
+
 @pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="requires proc owner identity")
 def test_stale_reaper_cannot_delete_same_key_replacement(tmp_path, monkeypatch):
     state_root = tmp_path / "owner-registry-aba"
@@ -737,11 +911,23 @@ def test_no_ref_scheduler_resumes_evicted_query_shapes_from_private_disk(
         assert len(engine._externalized_grep_schedulers) <= (
             tools_module._EXTERNALIZED_SCHEDULER_MAX_QUERIES
         )
-        scheduler_db = next(state_root.rglob("scheduler.sqlite3"))
-        assert scheduler_db.stat().st_size <= tools_module._EXTERNALIZED_SCHEDULER_MAX_BYTES
+        scheduler_db = state_root / ".owner-registry.db"
         import sqlite3
         with sqlite3.connect(scheduler_db) as connection:
             rows = connection.execute("SELECT COUNT(*) FROM scheduler_cursors").fetchone()[0]
+            scheduler_bytes = connection.execute(
+                "SELECT COALESCE(SUM(state_bytes), 0) FROM scheduler_cursors"
+            ).fetchone()[0]
+            assert scheduler_bytes <= tools_module._EXTERNALIZED_SCHEDULER_MAX_BYTES
+            indexes = {
+                row[1] for row in connection.execute(
+                    "PRAGMA index_list(scheduler_cursors)"
+                )
+            }
+            assert {
+                "scheduler_cursors_updated_idx",
+                "scheduler_cursors_fairness_idx",
+            } <= indexes
             live_keys = {
                 row[0] for row in connection.execute(
                     "SELECT shape_key FROM scheduler_cursors"
@@ -785,9 +971,7 @@ def test_no_ref_scheduler_resumes_evicted_query_shapes_from_private_disk(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="requires durable directory cookies")
-def test_no_ref_listing_cookie_reaches_1500_files_across_mutation_and_eviction(
-    tmp_path, monkeypatch
-):
+def test_no_ref_listing_cookie_survives_shutdown_and_process_restart(tmp_path):
     state_root = tmp_path / "listing-cookie-state"
     payload_dir = tmp_path / "payloads"
     payload_dir.mkdir()
@@ -802,57 +986,230 @@ def test_no_ref_listing_cookie_reaches_1500_files_across_mutation_and_eviction(
         '{"session_id":"current","content":"COOKIE-LAST-NEEDLE"}',
         encoding="utf-8",
     )
+    process_a = r'''
+import json
+from pathlib import Path
+import sqlite3
+import sys
+from hermes_lcm.benchmarking.standalone import ensure_agent_context_engine_importable
+ensure_agent_context_engine_importable()
+from hermes_lcm.config import LCMConfig
+from hermes_lcm.engine import LCMEngine
+import hermes_lcm.tools as tools
+
+state_root, payload_dir, work_dir = map(Path, sys.argv[1:4])
+tools._EXTERNALIZED_MARKER_STATE_ROOT = state_root
+tools._LCM_GREP_OPERATION_DEADLINE_SECONDS = 10.0
+work_dir.mkdir()
+engine = LCMEngine(config=LCMConfig(
+    database_path=str(work_dir / "engine.db"),
+    large_output_externalization_enabled=True,
+    large_output_externalization_path=str(payload_dir),
+    async_background_compaction_worker_enabled=False,
+), hermes_home=str(work_dir))
+engine.on_session_start("current", conversation_id="restart-a", platform="test",
+                        context_length=100_000)
+entries = 0
+for _ in range(6):
+    result = json.loads(tools.lcm_grep({
+        "query": "COOKIE-LAST-NEEDLE", "content_scope": "externalized",
+        "max_files": 50, "limit": 1,
+    }, engine=engine))
+    assert result["total_results"] == 0
+    entries += result["scan"]["entries_scanned"]
+with sqlite3.connect(state_root / ".owner-registry.db") as connection:
+    cookie, version = connection.execute(
+        "SELECT listing_cookie, version FROM scheduler_cursors"
+    ).fetchone()
+engine.shutdown()
+print(json.dumps({"entries": entries, "cookie": cookie, "version": version}),
+      flush=True)
+'''
+    first = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            process_a,
+            str(state_root),
+            str(payload_dir),
+            str(tmp_path / "process-a"),
+        ],
+        env=_subprocess_package_env(tmp_path),
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert first.returncode == 0, (first.stdout, first.stderr)
+    first_state = json.loads(first.stdout)
+    assert first_state["entries"] == 300
+    assert first_state["cookie"] > 0
+    assert list(state_root.glob("owner-*")) == []
+
+    process_b = r'''
+import json
+from pathlib import Path
+import sqlite3
+import sys
+from hermes_lcm.benchmarking.standalone import ensure_agent_context_engine_importable
+ensure_agent_context_engine_importable()
+from hermes_lcm.config import LCMConfig
+from hermes_lcm.engine import LCMEngine
+import hermes_lcm.tools as tools
+
+state_root, payload_dir, work_dir = map(Path, sys.argv[1:4])
+tools._EXTERNALIZED_MARKER_STATE_ROOT = state_root
+tools._LCM_GREP_OPERATION_DEADLINE_SECONDS = 10.0
+work_dir.mkdir()
+observed_cookies = []
+real_listing = tools._externalized_bounded_sorted_refs
+def observed_listing(root, *, listing_cookie, max_files, deadline):
+    observed_cookies.append(listing_cookie)
+    return real_listing(root, listing_cookie=listing_cookie, max_files=max_files,
+                        deadline=deadline)
+tools._externalized_bounded_sorted_refs = observed_listing
+engine = LCMEngine(config=LCMConfig(
+    database_path=str(work_dir / "engine.db"),
+    large_output_externalization_enabled=True,
+    large_output_externalization_path=str(payload_dir),
+    async_background_compaction_worker_enabled=False,
+), hermes_home=str(work_dir))
+engine.on_session_start("current", conversation_id="restart-b", platform="test",
+                        context_length=100_000)
+entries = 0
+result = None
+for _ in range(30):
+    result = json.loads(tools.lcm_grep({
+        "query": "COOKIE-LAST-NEEDLE", "content_scope": "externalized",
+        "max_files": 50, "limit": 1,
+    }, engine=engine))
+    entries += result["scan"]["entries_scanned"]
+    if result["total_results"]:
+        break
+assert result is not None and result["total_results"] == 1
+with sqlite3.connect(state_root / ".owner-registry.db") as connection:
+    cookie, version = connection.execute(
+        "SELECT listing_cookie, version FROM scheduler_cursors"
+    ).fetchone()
+engine.shutdown()
+print(json.dumps({"entries": entries, "first_cookie": observed_cookies[0],
+                  "cookie": cookie, "version": version,
+                  "ref": result["results"][0]["ref"]}), flush=True)
+'''
+    second = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            process_b,
+            str(state_root),
+            str(payload_dir),
+            str(tmp_path / "process-b"),
+        ],
+        env=_subprocess_package_env(tmp_path),
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert second.returncode == 0, (second.stdout, second.stderr)
+    resumed = json.loads(second.stdout)
+    assert resumed["first_cookie"] == first_state["cookie"]
+    assert resumed["entries"] <= 1_500 - first_state["entries"]
+    assert resumed["version"] > first_state["version"]
+    assert resumed["ref"] == target
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires durable directory cookies")
+def test_same_shape_stale_writer_cannot_rollback_cookie_or_version(
+    tmp_path, monkeypatch
+):
+    state_root = tmp_path / "same-shape-state"
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    for index in range(240):
+        (payload_dir / f"contention-{index:04d}.json").write_text(
+            '{"session_id":"current","content":"ordinary haystack"}',
+            encoding="utf-8",
+        )
     monkeypatch.setattr(tools_module, "_EXTERNALIZED_MARKER_STATE_ROOT", state_root)
     monkeypatch.setattr(tools_module, "_LCM_GREP_OPERATION_DEADLINE_SECONDS", 10.0)
-    engine = _engine(tmp_path)
-    entries_per_call: list[int] = []
+    stale_engine = _engine_with_payload_dir(tmp_path / "stale", payload_dir)
+    winner_engine = _engine_with_payload_dir(tmp_path / "winner", payload_dir)
+    real_listing = tools_module._externalized_bounded_sorted_refs
+    call_lock = threading.Lock()
+    stale_entered = threading.Event()
+    release_stale = threading.Event()
+    make_first_stale = False
+
+    def barrier_listing(root, *, listing_cookie, max_files, deadline):
+        nonlocal make_first_stale
+        with call_lock:
+            stale_call = make_first_stale
+            if stale_call:
+                make_first_stale = False
+        if stale_call:
+            stale_entered.set()
+            assert release_stale.wait(timeout=10)
+            return (), 0, False, listing_cookie
+        return real_listing(
+            root,
+            listing_cookie=listing_cookie,
+            max_files=max_files,
+            deadline=deadline,
+        )
+
+    monkeypatch.setattr(
+        tools_module, "_externalized_bounded_sorted_refs", barrier_listing
+    )
+    args = {
+        "query": "NEVER-PRESENT-CONTENTION-NEEDLE",
+        "content_scope": "externalized",
+        "max_files": 20,
+        "limit": 1,
+    }
+    previous_cookie = -1
+    previous_version = -1
     try:
-        result = None
-        for attempt in range(80):
-            result = json.loads(tools_module.lcm_grep(
-                {
-                    "query": "COOKIE-LAST-NEEDLE",
-                    "content_scope": "externalized",
-                    "max_files": 50,
-                    "limit": 1,
-                },
-                engine=engine,
-            ))
-            entries_per_call.append(result["scan"]["entries_scanned"])
-            assert result["scan"]["entries_scanned"] <= 50
-            if result["total_results"]:
-                break
-            if attempt == 4:
-                (payload_dir / "cookie-inserted.json").write_text(
-                    '{"session_id":"current","content":"inserted"}',
-                    encoding="utf-8",
+        for _round in range(6):
+            stale_entered.clear()
+            release_stale.clear()
+            with call_lock:
+                make_first_stale = True
+            stale_results: list[dict] = []
+            stale_thread = threading.Thread(
+                target=lambda: stale_results.append(
+                    json.loads(tools_module.lcm_grep(args, engine=stale_engine))
                 )
-                (payload_dir / native_order[10]).unlink()
-                (payload_dir / native_order[11]).write_text(
-                    '{"session_id":"current","content":"mutated"}',
-                    encoding="utf-8",
-                )
-            if attempt in {9, 19}:
-                runtime = tools_module._externalized_runtime_state(engine)
-                with runtime.lock:
-                    connection = runtime.scheduler_connection
-                    runtime.scheduler_connection = None
-                if connection is not None:
-                    connection.close()
-                engine._externalized_grep_schedulers.clear()
-        else:
-            pytest.fail("durable directory cookie never reached the final native entry")
-        assert result is not None
-        assert result["results"][0]["ref"] == target
-        assert len(entries_per_call) > 20
-        scheduler_db = next(state_root.rglob("scheduler.sqlite3"))
-        with sqlite3.connect(scheduler_db) as connection:
-            columns = {
-                row[1] for row in connection.execute("PRAGMA table_info(scheduler_cursors)")
-            }
-            assert "listing_cookie" in columns
+            )
+            stale_thread.start()
+            assert stale_entered.wait(timeout=10)
+            winner = json.loads(
+                tools_module.lcm_grep(args, engine=winner_engine)
+            )
+            assert winner["diagnostics"] == []
+            registry_path = state_root / ".owner-registry.db"
+            with sqlite3.connect(registry_path) as connection:
+                won_cookie, won_version = connection.execute(
+                    "SELECT listing_cookie, version FROM scheduler_cursors"
+                ).fetchone()
+            assert won_cookie > previous_cookie
+            assert won_version > previous_version
+            release_stale.set()
+            stale_thread.join(timeout=15)
+            assert not stale_thread.is_alive()
+            assert stale_results[0]["diagnostics"] == [
+                {"ref": "", "error": "private_state_unavailable"}
+            ]
+            with sqlite3.connect(registry_path) as connection:
+                final_cookie, final_version = connection.execute(
+                    "SELECT listing_cookie, version FROM scheduler_cursors"
+                ).fetchone()
+            assert (final_cookie, final_version) == (won_cookie, won_version)
+            previous_cookie, previous_version = final_cookie, final_version
     finally:
-        engine.shutdown()
+        release_stale.set()
+        stale_engine.shutdown()
+        winner_engine.shutdown()
 
 
 def _measure_marker_rss(tmp_path: Path, marker_count: int, stores: int) -> dict[str, int]:
