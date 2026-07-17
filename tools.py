@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import codecs
+import bisect
 import hashlib
+import heapq
 import json
 import logging
 import math
 import multiprocessing
 import os
 import re
+import sqlite3
 import stat
+import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -813,6 +818,247 @@ _EXTERNALIZED_PERSISTED_OUTPUT_MARKER_KEYS = frozenset({
     "redacted_preview_sha256", "file_size", "file_mtime_ns", "file_ctime_ns",
 })
 
+_EXTERNALIZED_MARKER_STATE_ROOT = (
+    Path(tempfile.gettempdir())
+    / f"hermes-lcm-marker-state-{getattr(os, 'getuid', lambda: 0)()}"
+)
+_EXTERNALIZED_MARKER_STATE_TTL_SECONDS = 10 * 60.0
+_EXTERNALIZED_MARKER_STATE_MAX_ORPHANS = 64
+_EXTERNALIZED_MARKER_STATE_BATCH_ITEMS = 512
+_EXTERNALIZED_MARKER_STATE_BATCH_BYTES = 128 * 1024
+_EXTERNALIZED_MARKER_STATE_CACHE_BYTES = 256 * 1024
+_EXTERNALIZED_MARKER_STATE_GUARD = threading.Lock()
+
+
+def _unlink_externalized_marker_state(path: Path) -> None:
+    """Remove a private marker index and any SQLite sidecars."""
+    for candidate in (
+        path,
+        Path(f"{path}-journal"),
+        Path(f"{path}-wal"),
+        Path(f"{path}-shm"),
+    ):
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            logger.debug(
+                "LCM could not remove temporary marker state %s",
+                candidate,
+                exc_info=True,
+            )
+
+
+def _externalized_marker_state_owner_alive(name: str) -> bool:
+    """Return false only when a parseable temp-state owner is certainly dead."""
+    try:
+        owner_pid = int(name.split("-", 2)[1])
+    except (IndexError, ValueError):
+        return True
+    if owner_pid == os.getpid():
+        return True
+    try:
+        os.kill(owner_pid, 0)
+    except ProcessLookupError:
+        return False
+    except (OSError, PermissionError):
+        return True
+    return True
+
+
+def _prepare_externalized_marker_state_root() -> Path:
+    """Create the private temp root and reap stale/crashed process state."""
+    root = Path(_EXTERNALIZED_MARKER_STATE_ROOT)
+    with _EXTERNALIZED_MARKER_STATE_GUARD:
+        try:
+            root.mkdir(mode=0o700, parents=True, exist_ok=False)
+        except FileExistsError:
+            pass
+        root_stat = root.lstat()
+        if not stat.S_ISDIR(root_stat.st_mode) or root.is_symlink():
+            raise OSError("unsafe externalized marker-state root")
+        getuid = getattr(os, "getuid", None)
+        if callable(getuid) and root_stat.st_uid != getuid():
+            raise PermissionError("externalized marker-state root owner mismatch")
+        try:
+            root.chmod(0o700)
+        except OSError:
+            pass
+        now = time.time()
+        candidates: list[tuple[float, str, Path]] = []
+        try:
+            entries = os.scandir(root)
+        except OSError:
+            entries = None
+        if entries is not None:
+            with entries:
+                for entry in entries:
+                    if not (
+                        entry.name.startswith("markers-")
+                        and entry.name.endswith(".sqlite3")
+                    ):
+                        continue
+                    path = root / entry.name
+                    if not _externalized_marker_state_owner_alive(entry.name):
+                        _unlink_externalized_marker_state(path)
+                        continue
+                    try:
+                        modified = entry.stat().st_mtime
+                    except OSError:
+                        _unlink_externalized_marker_state(path)
+                        continue
+                    if now - modified > _EXTERNALIZED_MARKER_STATE_TTL_SECONDS:
+                        _unlink_externalized_marker_state(path)
+                        continue
+                    heapq.heappush(candidates, (modified, entry.name, path))
+                    # Reserve one slot for the state file this preparation
+                    # immediately creates, keeping the directory at the cap.
+                    if len(candidates) >= _EXTERNALIZED_MARKER_STATE_MAX_ORPHANS:
+                        _oldest_modified, _oldest_name, oldest = heapq.heappop(
+                            candidates
+                        )
+                        _unlink_externalized_marker_state(oldest)
+    return root
+
+
+def _externalized_marker_identity_bytes(identity: tuple[Any, ...]) -> bytes:
+    """Return the exact canonical marker identity stored in the UNIQUE index."""
+    return json.dumps(
+        identity,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+
+
+class _ExternalizedMarkerIdentityStore:
+    """Bounded-heap, disk-backed exact duplicate detector for one marker list."""
+
+    __slots__ = (
+        "path", "connection", "pending", "pending_set", "pending_bytes",
+        "deadline", "deadline_error", "closed", "stat_identity",
+    )
+
+    def __init__(self, *, stat_identity: tuple[int, ...] = ()):
+        root = _prepare_externalized_marker_state_root()
+        descriptor, raw_path = tempfile.mkstemp(
+            prefix=f"markers-{os.getpid()}-",
+            suffix=".sqlite3",
+            dir=root,
+        )
+        os.close(descriptor)
+        self.path = Path(raw_path)
+        try:
+            self.path.chmod(0o600)
+        except OSError:
+            pass
+        self.stat_identity = tuple(int(item) for item in stat_identity)
+        self.pending: list[bytes] = []
+        self.pending_set: set[bytes] = set()
+        self.pending_bytes = 0
+        self.deadline: float | None = None
+        self.deadline_error = "body_deadline"
+        self.closed = False
+        self.connection: sqlite3.Connection | None = None
+        try:
+            self.connection = sqlite3.connect(
+                str(self.path),
+                timeout=0.05,
+                check_same_thread=False,
+            )
+            # The index is disposable continuation state, never authoritative
+            # data. Avoid durable-journal I/O; process death reaps/culls it.
+            self.connection.execute("PRAGMA journal_mode=OFF")
+            self.connection.execute("PRAGMA synchronous=OFF")
+            self.connection.execute("PRAGMA temp_store=FILE")
+            self.connection.execute("PRAGMA mmap_size=0")
+            self.connection.execute(
+                f"PRAGMA cache_size=-{_EXTERNALIZED_MARKER_STATE_CACHE_BYTES // 1024}"
+            )
+            self.connection.execute(
+                "CREATE TABLE marker_identities "
+                "(identity BLOB PRIMARY KEY) WITHOUT ROWID"
+            )
+            self.connection.execute(
+                "CREATE TABLE state_metadata (stat_identity TEXT NOT NULL)"
+            )
+            self.connection.execute(
+                "INSERT INTO state_metadata(stat_identity) VALUES (?)",
+                (json.dumps(self.stat_identity, separators=(",", ":")),),
+            )
+            self.connection.commit()
+        except BaseException:
+            self.close()
+            raise
+
+    def configure_deadline(self, deadline: float | None, error: str) -> None:
+        self.deadline = deadline
+        self.deadline_error = error
+
+    def _check_deadline(self) -> None:
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise TimeoutError(self.deadline_error)
+
+    def add(self, identity: tuple[Any, ...]) -> None:
+        encoded = _externalized_marker_identity_bytes(identity)
+        if self.pending and (
+            len(self.pending) >= _EXTERNALIZED_MARKER_STATE_BATCH_ITEMS
+            or self.pending_bytes + len(encoded)
+            > _EXTERNALIZED_MARKER_STATE_BATCH_BYTES
+        ):
+            # Flush already-consumed markers before accepting the current one,
+            # so a deadline never leaves an unconsumed marker in pending state.
+            self.flush()
+        if encoded in self.pending_set:
+            raise ValueError("invalid_payload")
+        self.pending.append(encoded)
+        self.pending_set.add(encoded)
+        self.pending_bytes += len(encoded)
+
+    def flush(self) -> None:
+        if not self.pending:
+            self._check_deadline()
+            return
+        self._check_deadline()
+        expected = len(self.pending)
+        assert self.connection is not None
+        before = self.connection.total_changes
+        self.connection.executemany(
+            "INSERT OR IGNORE INTO marker_identities(identity) VALUES (?)",
+            ((identity,) for identity in self.pending),
+        )
+        self.connection.commit()
+        inserted = self.connection.total_changes - before
+        self.pending.clear()
+        self.pending_set.clear()
+        self.pending_bytes = 0
+        if inserted != expected:
+            raise ValueError("invalid_payload")
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            if self.connection is not None:
+                self.connection.close()
+        finally:
+            self.connection = None
+            self.pending.clear()
+            self.pending_set.clear()
+            self.pending_bytes = 0
+            _unlink_externalized_marker_state(self.path)
+
+    def retained_bytes(self) -> int:
+        return (
+            _externalized_python_retained_bytes(self)
+            + _EXTERNALIZED_MARKER_STATE_CACHE_BYTES
+        )
+
+    def __del__(self):  # pragma: no cover - best-effort interpreter cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
 
 class _ExternalizedPersistedOutputMarkers:
     """Bounded summary of an incrementally validated historical marker list."""
@@ -1189,22 +1435,13 @@ def _externalized_prefix_authorization(
         index += 1
 
 
-def _externalized_marker_identity_digest(identity: tuple[Any, ...]) -> bytes:
-    encoded = json.dumps(
-        identity,
-        ensure_ascii=True,
-        separators=(",", ":"),
-    ).encode("ascii")
-    return hashlib.sha256(encoded).digest()
-
-
 class _ExternalizedSuffixParser:
     """Incrementally validate canonical metadata on either side of content.
 
     Marker arrays may occur before content (current writer) or after content
     (historical writer). The parser discards every completed marker, retaining
-    only a fixed-size identity digest for duplicate detection and the first
-    marker for the canonical top-level consistency check.
+    exact identities in a private disk-backed UNIQUE index and the first marker
+    for the canonical top-level consistency check.
     """
 
     def __init__(
@@ -1213,6 +1450,7 @@ class _ExternalizedSuffixParser:
         seen: set[str],
         operation_budget: _ExternalizedSuffixOperationBudget | None = None,
         prefix: bool = False,
+        stat_identity: tuple[int, ...] = (),
     ):
         self.decoder = json.JSONDecoder(
             object_pairs_hook=_externalized_object_without_duplicate_keys
@@ -1226,7 +1464,10 @@ class _ExternalizedSuffixParser:
         self.current_key = ""
         self.marker_count = 0
         self.first_marker: dict[str, Any] | None = None
-        self.marker_identities: set[bytes] = set()
+        self.marker_store: _ExternalizedMarkerIdentityStore | None = None
+        self.deadline: float | None = None
+        self.deadline_error = "body_deadline"
+        self.stat_identity = stat_identity
         self.operation_budget = (
             operation_budget or _ExternalizedSuffixOperationBudget()
         )
@@ -1303,6 +1544,10 @@ class _ExternalizedSuffixParser:
                 self.first_marker,
             )
         )
+        if self.marker_store is not None:
+            self.marker_store.flush()
+            self.marker_store.close()
+            self.marker_store = None
         self.state = "value_delimiter"
 
     def _process(self, *, final: bool) -> None:
@@ -1398,12 +1643,16 @@ class _ExternalizedSuffixParser:
                     break
                 marker, end = decoded
                 identity = _validate_externalized_persisted_output_marker(marker)
-                digest = _externalized_marker_identity_digest(identity)
-                if digest in self.marker_identities:
-                    raise ValueError("invalid_payload")
                 self.operation_budget.charge()
+                if self.marker_store is None:
+                    self.marker_store = _ExternalizedMarkerIdentityStore(
+                        stat_identity=self.stat_identity
+                    )
+                    self.marker_store.configure_deadline(
+                        self.deadline, self.deadline_error
+                    )
+                self.marker_store.add(identity)
                 self.marker_count += 1
-                self.marker_identities.add(digest)
                 if self.first_marker is None:
                     self.first_marker = dict(marker)
                 self.index = end
@@ -1471,6 +1720,17 @@ class _ExternalizedSuffixParser:
         pending_limit = self._pending_encoded_limit()
         if pending_limit is not None and len(self.buffer) > pending_limit:
             raise ValueError("invalid_payload")
+
+    def configure_deadline(self, deadline: float | None, error: str) -> None:
+        self.deadline = deadline
+        self.deadline_error = error
+        if self.marker_store is not None:
+            self.marker_store.configure_deadline(deadline, error)
+
+    def close(self) -> None:
+        if self.marker_store is not None:
+            self.marker_store.close()
+            self.marker_store = None
 
     @property
     def content_ready(self) -> bool:
@@ -1802,6 +2062,84 @@ def _bounded_regex_span(
 _EXTERNALIZED_CONTINUATION_MAX_FILES = 4
 _EXTERNALIZED_CONTINUATION_TTL_SECONDS = 5 * 60.0
 _EXTERNALIZED_CONTINUATION_STATE_GUARD = threading.Lock()
+_EXTERNALIZED_SCHEDULER_MAX_QUERIES = 8
+_EXTERNALIZED_SCHEDULER_TTL_SECONDS = 5 * 60.0
+
+
+class _ExternalizedDiscoveryScheduler:
+    """Bounded deterministic cursor for one root and no-ref search shape."""
+
+    __slots__ = (
+        "root_identity", "refs", "cursor", "active_ref", "cached_at",
+    )
+
+    def __init__(
+        self,
+        *,
+        root_identity: tuple[int, ...],
+        refs: tuple[str, ...],
+        cached_at: float,
+    ):
+        self.root_identity = root_identity
+        self.refs = refs
+        self.cursor = 0
+        self.active_ref: str | None = None
+        self.cached_at = cached_at
+
+
+def _externalized_python_retained_bytes(
+    value: Any, seen: set[int] | None = None
+) -> int:
+    """Recursively account for retained Python containers and slot fields."""
+    if seen is None:
+        seen = set()
+    identity = id(value)
+    if identity in seen:
+        return 0
+    seen.add(identity)
+    size = sys.getsizeof(value)
+    if isinstance(value, dict):
+        return size + sum(
+            _externalized_python_retained_bytes(key, seen)
+            + _externalized_python_retained_bytes(item, seen)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return size + sum(
+            _externalized_python_retained_bytes(item, seen) for item in value
+        )
+    for cls in type(value).__mro__:
+        slots = cls.__dict__.get("__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        for slot in slots:
+            if slot in {"__dict__", "__weakref__"} or not hasattr(value, slot):
+                continue
+            size += _externalized_python_retained_bytes(
+                getattr(value, slot), seen
+            )
+    if hasattr(value, "__dict__"):
+        size += _externalized_python_retained_bytes(vars(value), seen)
+    return size
+
+
+def _externalized_marker_native_cache_bytes(value: Any) -> int:
+    stores: list[_ExternalizedMarkerIdentityStore] = []
+    if isinstance(value, _ExternalizedSuffixParser):
+        if value.marker_store is not None:
+            stores.append(value.marker_store)
+    elif isinstance(value, _ExternalizedContentContinuation):
+        if value.suffix_parser.marker_store is not None:
+            stores.append(value.suffix_parser.marker_store)
+    elif isinstance(value, _ExternalizedPayloadContinuation):
+        if value.prefix_parser.marker_store is not None:
+            stores.append(value.prefix_parser.marker_store)
+        if (
+            value.content_state is not None
+            and value.content_state.suffix_parser.marker_store is not None
+        ):
+            stores.append(value.content_state.suffix_parser.marker_store)
+    return len({id(store) for store in stores}) * _EXTERNALIZED_MARKER_STATE_CACHE_BYTES
 
 
 class _ExternalizedContentContinuation:
@@ -1820,6 +2158,7 @@ class _ExternalizedContentContinuation:
         seen_keys: set[str],
         max_payload_chars: int,
         operation_budget: _ExternalizedSuffixOperationBudget,
+        stat_identity: tuple[int, ...] = (),
     ):
         self.decoder = codecs.getincrementaldecoder("utf-8")("strict")
         self.max_payload_chars = max(0, int(max_payload_chars))
@@ -1832,6 +2171,7 @@ class _ExternalizedContentContinuation:
         self.suffix_parser = _ExternalizedSuffixParser(
             seen=seen_keys,
             operation_budget=operation_budget,
+            stat_identity=stat_identity,
         )
         self.total_content_chars = 0
         self.total_content_bytes = 0
@@ -1950,17 +2290,13 @@ class _ExternalizedContentContinuation:
         return "".join(self.pieces)
 
     def retained_bytes(self) -> int:
-        decoder_pending, _ = self.decoder.getstate()
         return (
-            len(decoder_pending)
-            + len(self.pending_text.encode("utf-8", errors="surrogatepass"))
-            + sum(
-                len(piece.encode("utf-8", errors="surrogatepass"))
-                for piece in self.pieces
-            )
-            + len(self.suffix_parser.buffer.encode("utf-8"))
-            + (32 * len(self.suffix_parser.marker_identities))
+            _externalized_python_retained_bytes(self)
+            + _externalized_marker_native_cache_bytes(self)
         )
+
+    def close(self) -> None:
+        self.suffix_parser.close()
 
 
 class _ExternalizedPayloadContinuation:
@@ -1990,6 +2326,7 @@ class _ExternalizedPayloadContinuation:
             seen=set(),
             operation_budget=operation_budget,
             prefix=True,
+            stat_identity=identity,
         )
         self.content_state: _ExternalizedContentContinuation | None = None
         self.metadata_fields: dict[str, Any] = {}
@@ -2031,7 +2368,9 @@ class _ExternalizedPayloadContinuation:
             seen_keys=self.prefix_parser.seen,
             max_payload_chars=self.max_payload_chars,
             operation_budget=operation_budget,
+            stat_identity=self.identity,
         )
+        content_state.suffix_parser.configure_deadline(deadline, "body_deadline")
         content_state.decoder.setstate(decoder_state)
         self.content_state = content_state
         self.phase = "body"
@@ -2093,8 +2432,12 @@ class _ExternalizedPayloadContinuation:
         if self.completed:
             return True
         self.prefix_parser.operation_budget = operation_budget
+        self.prefix_parser.configure_deadline(deadline, "metadata_deadline")
         if self.content_state is not None:
             self.content_state.suffix_parser.operation_budget = operation_budget
+            self.content_state.suffix_parser.configure_deadline(
+                deadline, "body_deadline"
+            )
         handle.seek(self.offset)
         while self.offset < file_size:
             if deadline is not None:
@@ -2145,15 +2488,15 @@ class _ExternalizedPayloadContinuation:
         return True
 
     def retained_bytes(self) -> int:
-        decoder_pending, _ = self.prefix_decoder.getstate()
-        retained = (
-            len(decoder_pending)
-            + len(self.prefix_parser.buffer.encode("utf-8"))
-            + (32 * len(self.prefix_parser.marker_identities))
+        return (
+            _externalized_python_retained_bytes(self)
+            + _externalized_marker_native_cache_bytes(self)
         )
+
+    def close(self) -> None:
+        self.prefix_parser.close()
         if self.content_state is not None:
-            retained += self.content_state.retained_bytes()
-        return retained
+            self.content_state.close()
 
 
 def _externalized_continuation_cache(
@@ -2179,6 +2522,147 @@ def _externalized_continuation_lock(engine: "LCMEngine"):
     return engine._externalized_grep_continuations_lock
 
 
+def _externalized_scheduler_cache(
+    engine: "LCMEngine",
+) -> dict[str, _ExternalizedDiscoveryScheduler]:
+    _externalized_continuation_cache(engine)
+    cache = getattr(engine, "_externalized_grep_schedulers", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(engine, "_externalized_grep_schedulers", cache)
+    return cache
+
+
+def _externalized_scheduler_shape_key(
+    *,
+    root: Path,
+    query: str,
+    regex_mode: bool,
+    allowed_session_ids: frozenset[str],
+    limit: int,
+    max_files: int,
+    max_payload_chars: int,
+) -> str:
+    shape = json.dumps(
+        {
+            "root": str(root),
+            "query": query,
+            "regex": bool(regex_mode),
+            "sessions": sorted(allowed_session_ids),
+            "limit": int(limit),
+            "max_files": int(max_files),
+            "max_payload_chars": int(max_payload_chars),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(shape).hexdigest()
+
+
+def _externalized_bounded_sorted_refs(
+    root: Path,
+    *,
+    max_files: int,
+    deadline: float | None,
+) -> tuple[tuple[str, ...], int, bool]:
+    """Select deterministic JSON refs without retaining an unbounded listing."""
+    selected: list[str] = []
+    entries_seen = 0
+    complete = True
+    exhausted = False
+    with os.scandir(root) as entries:
+        iterator = iter(entries)
+        while entries_seen < max_files:
+            if deadline is not None and time.monotonic() >= deadline:
+                complete = False
+                break
+            try:
+                entry = next(iterator)
+            except StopIteration:
+                exhausted = True
+                break
+            entries_seen += 1
+            name = entry.name
+            if not name.endswith(".json") or len(name) > _LCM_GREP_REF_MAX_CHARS:
+                continue
+            bisect.insort(selected, name)
+    if not exhausted and entries_seen >= max_files:
+        complete = False
+    return tuple(selected), entries_seen, complete
+
+
+def _checkout_externalized_scheduler(
+    engine: "LCMEngine",
+    *,
+    key: str,
+    root_identity: tuple[int, ...],
+    refs: tuple[str, ...],
+) -> _ExternalizedDiscoveryScheduler:
+    cache = _externalized_scheduler_cache(engine)
+    with _externalized_continuation_lock(engine):
+        now = time.monotonic()
+        for stale_key in [
+            item_key
+            for item_key, state in cache.items()
+            if not isinstance(state, _ExternalizedDiscoveryScheduler)
+            or now - state.cached_at > _EXTERNALIZED_SCHEDULER_TTL_SECONDS
+        ]:
+            cache.pop(stale_key, None)
+        state = cache.get(key)
+        if not (
+            isinstance(state, _ExternalizedDiscoveryScheduler)
+            and state.root_identity == root_identity
+            and state.refs == refs
+        ):
+            state = _ExternalizedDiscoveryScheduler(
+                root_identity=root_identity,
+                refs=refs,
+                cached_at=now,
+            )
+            cache.pop(key, None)
+            cache[key] = state
+        elif state.cursor >= len(state.refs) and state.active_ref is None:
+            # A fully acknowledged sweep starts a fresh deterministic cycle.
+            state.cursor = 0
+        state.cached_at = now
+        while len(cache) > _EXTERNALIZED_SCHEDULER_MAX_QUERIES:
+            cache.pop(next(iter(cache)), None)
+        return state
+
+
+def _externalized_scheduler_mark_active(
+    engine: "LCMEngine",
+    key: str,
+    state: _ExternalizedDiscoveryScheduler,
+    ref: str,
+) -> None:
+    cache = _externalized_scheduler_cache(engine)
+    with _externalized_continuation_lock(engine):
+        if cache.get(key) is state:
+            state.active_ref = ref
+            state.cached_at = time.monotonic()
+
+
+def _externalized_scheduler_advance(
+    engine: "LCMEngine",
+    key: str,
+    state: _ExternalizedDiscoveryScheduler,
+    ref: str,
+) -> None:
+    cache = _externalized_scheduler_cache(engine)
+    with _externalized_continuation_lock(engine):
+        if cache.get(key) is not state:
+            return
+        try:
+            index = state.refs.index(ref, state.cursor)
+        except ValueError:
+            return
+        state.cursor = max(state.cursor, index + 1)
+        if state.active_ref == ref:
+            state.active_ref = None
+        state.cached_at = time.monotonic()
+
+
 def _prune_externalized_continuations_locked(
     cache: dict[str, _ExternalizedPayloadContinuation],
     *,
@@ -2191,7 +2675,9 @@ def _prune_externalized_continuations_locked(
         or now - continuation.cached_at > _EXTERNALIZED_CONTINUATION_TTL_SECONDS
     ]
     for key in expired:
-        cache.pop(key, None)
+        continuation = cache.pop(key, None)
+        if isinstance(continuation, _ExternalizedPayloadContinuation):
+            continuation.close()
 
 
 def _checkout_externalized_continuation(
@@ -2217,7 +2703,9 @@ def _checkout_externalized_continuation(
             )
             and continuation.offset <= file_size
         ):
-            cache.pop(key, None)
+            stale = cache.pop(key, None)
+            if isinstance(stale, _ExternalizedPayloadContinuation):
+                stale.close()
             return None
         continuation.cached_at = now
         if not continuation.completed:
@@ -2260,12 +2748,36 @@ def _store_externalized_continuation(
             )
         ):
             existing.cached_at = now
+            if existing is not continuation:
+                continuation.close()
         else:
             continuation.cached_at = now
-            cache.pop(key, None)
+            replaced = cache.pop(key, None)
+            if (
+                isinstance(replaced, _ExternalizedPayloadContinuation)
+                and replaced is not continuation
+            ):
+                replaced.close()
             cache[key] = continuation
         while len(cache) > _EXTERNALIZED_CONTINUATION_MAX_FILES:
-            cache.pop(next(iter(cache)))
+            evicted = cache.pop(next(iter(cache)))
+            if isinstance(evicted, _ExternalizedPayloadContinuation):
+                evicted.close()
+
+
+def _delete_externalized_continuation(
+    engine: "LCMEngine",
+    key: str,
+    continuation: _ExternalizedPayloadContinuation | None = None,
+) -> None:
+    cache = _externalized_continuation_cache(engine)
+    with _externalized_continuation_lock(engine):
+        cached = cache.get(key)
+        if continuation is not None and cached is not continuation:
+            return
+        removed = cache.pop(key, None)
+        if isinstance(removed, _ExternalizedPayloadContinuation):
+            removed.close()
 
 
 def _touch_externalized_continuation(
@@ -2309,25 +2821,70 @@ def _externalized_continuation_stats(
         return len(visible), _externalized_continuation_memory_bytes(visible)
 
 
+def _cleanup_externalized_runtime_state(engine: "LCMEngine") -> None:
+    """Release private parser files and bounded discovery state on shutdown."""
+    cache = getattr(engine, "_externalized_grep_continuations", None)
+    if not isinstance(cache, dict):
+        cache = {}
+    lock = getattr(engine, "_externalized_grep_continuations_lock", None)
+    if hasattr(lock, "__enter__"):
+        context = lock
+    else:
+        context = _externalized_continuation_lock(engine)
+    with context:
+        for continuation in tuple(cache.values()):
+            if isinstance(continuation, _ExternalizedPayloadContinuation):
+                continuation.close()
+        cache.clear()
+        schedulers = getattr(engine, "_externalized_grep_schedulers", None)
+        if isinstance(schedulers, dict):
+            schedulers.clear()
+
+
 class _ExternalizedContinuationCompletion:
     """Outer lcm_grep acknowledgement for one frozen parser checkpoint."""
 
-    __slots__ = ("engine", "key", "continuation")
+    __slots__ = (
+        "engine", "key", "continuation", "scheduler_key",
+        "scheduler", "scheduler_ref",
+    )
 
     def __init__(
         self,
         engine: "LCMEngine",
         key: str,
         continuation: _ExternalizedPayloadContinuation,
+        *,
+        scheduler_key: str | None = None,
+        scheduler: _ExternalizedDiscoveryScheduler | None = None,
+        scheduler_ref: str | None = None,
     ):
         self.engine = engine
         self.key = key
         self.continuation = continuation
+        self.scheduler_key = scheduler_key
+        self.scheduler = scheduler
+        self.scheduler_ref = scheduler_ref
 
     def commit(self) -> None:
-        _touch_externalized_continuation(
-            self.engine, self.key, self.continuation
-        )
+        if (
+            self.scheduler_key is not None
+            and self.scheduler is not None
+            and self.scheduler_ref is not None
+        ):
+            _delete_externalized_continuation(
+                self.engine, self.key, self.continuation
+            )
+            _externalized_scheduler_advance(
+                self.engine,
+                self.scheduler_key,
+                self.scheduler,
+                self.scheduler_ref,
+            )
+        else:
+            _touch_externalized_continuation(
+                self.engine, self.key, self.continuation
+            )
 
     def preserve(self) -> None:
         _touch_externalized_continuation(
@@ -2417,6 +2974,8 @@ def _search_externalized_payloads(
     regex_timeouts = 0
     candidates_seen = 0
     paths: list[Path] = []
+    scheduler_key: str | None = None
+    scheduler: _ExternalizedDiscoveryScheduler | None = None
     _externalized_continuation_cache(engine)
 
     def acknowledge(
@@ -2432,23 +2991,42 @@ def _search_externalized_payloads(
         candidates_seen = 1
         paths.append(root / ref)
     else:
-        exhausted = False
-        with os.scandir(root) as entries:
-            iterator = iter(entries)
-            while candidates_seen < max_files:
-                if deadline is not None and time.monotonic() >= deadline:
-                    scan_truncated = True
-                    break
-                try:
-                    entry = next(iterator)
-                except StopIteration:
-                    exhausted = True
-                    break
-                candidates_seen += 1
-                if entry.name.endswith(".json"):
-                    paths.append(root / entry.name)
-        if not exhausted and candidates_seen >= max_files:
-            scan_truncated = True
+        try:
+            refs, candidates_seen, listing_complete = (
+                _externalized_bounded_sorted_refs(
+                    root,
+                    max_files=max_files,
+                    deadline=deadline,
+                )
+            )
+            root_identity = _externalized_file_identity(root.stat())
+        except OSError:
+            refs = ()
+            listing_complete = False
+            root_identity = ()
+        scan_truncated = not listing_complete
+        scheduler_key = _externalized_scheduler_shape_key(
+            root=root,
+            query=query,
+            regex_mode=regex_mode,
+            allowed_session_ids=allowed_session_ids,
+            limit=limit,
+            max_files=max_files,
+            max_payload_chars=max_payload_chars,
+        )
+        scheduler = _checkout_externalized_scheduler(
+            engine,
+            key=scheduler_key,
+            root_identity=root_identity,
+            refs=refs,
+        )
+        start_index = scheduler.cursor
+        if scheduler.active_ref is not None:
+            try:
+                start_index = scheduler.refs.index(scheduler.active_ref)
+            except ValueError:
+                scheduler.active_ref = None
+        paths.extend(root / item for item in scheduler.refs[start_index:])
 
     for path_index, path in enumerate(paths):
         if deadline is not None and time.monotonic() >= deadline:
@@ -2462,12 +3040,24 @@ def _search_externalized_payloads(
             resolved.relative_to(root)
         except FileNotFoundError:
             diagnostics.append({"ref": path.name, "error": "missing"})
+            if scheduler is not None and scheduler_key is not None:
+                _externalized_scheduler_advance(
+                    engine, scheduler_key, scheduler, path.name
+                )
             continue
         except (OSError, ValueError):
             diagnostics.append({"ref": path.name, "error": "path_escape"})
+            if scheduler is not None and scheduler_key is not None:
+                _externalized_scheduler_advance(
+                    engine, scheduler_key, scheduler, path.name
+                )
             continue
         if not resolved.is_file():
             diagnostics.append({"ref": path.name, "error": "not_a_file"})
+            if scheduler is not None and scheduler_key is not None:
+                _externalized_scheduler_advance(
+                    engine, scheduler_key, scheduler, path.name
+                )
             continue
         continuation_key = str(resolved)
         continuation: _ExternalizedPayloadContinuation | None = None
@@ -2477,7 +3067,15 @@ def _search_externalized_payloads(
                 opened_stat = os.fstat(raw_handle.fileno())
                 if not stat.S_ISREG(opened_stat.st_mode):
                     diagnostics.append({"ref": path.name, "error": "not_a_file"})
+                    if scheduler is not None and scheduler_key is not None:
+                        _externalized_scheduler_advance(
+                            engine, scheduler_key, scheduler, path.name
+                        )
                     continue
+                if scheduler is not None and scheduler_key is not None:
+                    _externalized_scheduler_mark_active(
+                        engine, scheduler_key, scheduler, path.name
+                    )
                 continuation_identity = _externalized_file_identity(opened_stat)
                 continuation = _checkout_externalized_continuation(
                     engine,
@@ -2545,9 +3143,17 @@ def _search_externalized_payloads(
                         "ref": path.name,
                         "error": "session_metadata_unavailable",
                     })
+                    if scheduler is not None and scheduler_key is not None:
+                        _externalized_scheduler_advance(
+                            engine, scheduler_key, scheduler, path.name
+                        )
                     continue
                 if payload_session_id not in allowed_session_ids:
                     diagnostics.append({"ref": path.name, "error": "session_mismatch"})
+                    if scheduler is not None and scheduler_key is not None:
+                        _externalized_scheduler_advance(
+                            engine, scheduler_key, scheduler, path.name
+                        )
                     continue
                 declared_chars = final_metadata.get("content_chars")
                 declared_bytes = final_metadata.get("content_bytes")
@@ -2567,6 +3173,10 @@ def _search_externalized_payloads(
                     )
                 ):
                     diagnostics.append({"ref": path.name, "error": "invalid_payload"})
+                    if scheduler is not None and scheduler_key is not None:
+                        _externalized_scheduler_advance(
+                            engine, scheduler_key, scheduler, path.name
+                        )
                     continue
                 metadata_fields = final_metadata
                 content = content_state.content
@@ -2584,6 +3194,9 @@ def _search_externalized_payloads(
                     engine,
                     continuation_key,
                     continuation,
+                    scheduler_key=scheduler_key,
+                    scheduler=scheduler,
+                    scheduler_ref=path.name if scheduler is not None else None,
                 )
         except TimeoutError:
             scan_truncated = True
@@ -2603,6 +3216,8 @@ def _search_externalized_payloads(
             })
             break
         except ValueError as exc:
+            if continuation is not None:
+                continuation.close()
             error = str(exc)
             if error == "payload_truncated":
                 scan_truncated = True
@@ -2616,9 +3231,23 @@ def _search_externalized_payloads(
                 }
                 else "invalid_payload",
             })
+            if (
+                error != "payload_truncated"
+                and scheduler is not None
+                and scheduler_key is not None
+            ):
+                _externalized_scheduler_advance(
+                    engine, scheduler_key, scheduler, path.name
+                )
             continue
         except (OSError, UnicodeDecodeError):
+            if continuation is not None:
+                continuation.close()
             diagnostics.append({"ref": path.name, "error": "unreadable"})
+            if scheduler is not None and scheduler_key is not None:
+                _externalized_scheduler_advance(
+                    engine, scheduler_key, scheduler, path.name
+                )
             continue
         files_scanned += 1
         if regex_mode:

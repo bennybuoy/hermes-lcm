@@ -9312,6 +9312,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         # concurrent session start/end, rebind, and late worker starts cannot
         # install or use helpers against storage that is closing.
         with self._storage_lifetime_lock:
+            lcm_tools._cleanup_externalized_runtime_state(self)
             worker_stopped = self._stop_async_worker()
             self._unregister_active_engine_binding()
             if worker_stopped:

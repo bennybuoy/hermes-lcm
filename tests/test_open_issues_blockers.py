@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import queue
 import sqlite3
+import sys
 import threading
 import time
 
@@ -62,6 +63,35 @@ def _engine(tmp_path, **overrides) -> LCMEngine:
         "current", conversation_id="conversation", platform="test", context_length=100_000
     )
     return engine
+
+
+def _recursive_python_size(value, seen=None) -> int:
+    """Count retained Python containers/slots without trusting diagnostics."""
+    if seen is None:
+        seen = set()
+    identity = id(value)
+    if identity in seen:
+        return 0
+    seen.add(identity)
+    size = sys.getsizeof(value)
+    if isinstance(value, dict):
+        return size + sum(
+            _recursive_python_size(key, seen) + _recursive_python_size(item, seen)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return size + sum(_recursive_python_size(item, seen) for item in value)
+    for cls in type(value).__mro__:
+        slots = cls.__dict__.get("__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        for slot in slots:
+            if slot in {"__dict__", "__weakref__"} or not hasattr(value, slot):
+                continue
+            size += _recursive_python_size(getattr(value, slot), seen)
+    if hasattr(value, "__dict__"):
+        size += _recursive_python_size(vars(value), seen)
+    return size
 
 
 def test_expand_uses_bounded_blob_reads_progress_budget_and_restores_handler(
@@ -1231,6 +1261,173 @@ def test_externalized_grep_streams_100001_writer_markers_without_count_failure(
         engine.shutdown()
 
 
+@pytest.mark.parametrize("marker_count", [100_000, 500_000])
+def test_externalized_marker_dedup_retains_bounded_real_python_heap(
+    tmp_path, monkeypatch, marker_count
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    state_dir = tmp_path / "marker-state"
+    monkeypatch.setattr(
+        tools_module, "_EXTERNALIZED_MARKER_STATE_ROOT", state_dir
+    )
+    monkeypatch.setattr(
+        tools_module, "_LCM_GREP_OPERATION_DEADLINE_SECONDS", 10.0
+    )
+    ref = f"heap-{marker_count}.json"
+    path = payload_dir / ref
+    _write_compact_marker_payload(
+        path,
+        marker_count=marker_count,
+        pre_content=True,
+        needle="BOUNDED-HEAP-NEEDLE",
+    )
+
+    engine = _engine(tmp_path)
+    try:
+        max_recursive = 0
+        for _attempt in range(80):
+            result = json.loads(tools_module.lcm_grep(
+                {
+                    "query": "BOUNDED-HEAP-NEEDLE",
+                    "content_scope": "externalized",
+                    "ref": ref,
+                },
+                engine=engine,
+            ))
+            cache = getattr(engine, "_externalized_grep_continuations", {})
+            if cache:
+                checkpoint = next(iter(cache.values()))
+                measured = _recursive_python_size(checkpoint)
+                max_recursive = max(max_recursive, measured)
+                assert checkpoint.retained_bytes() >= measured
+            if result["total_results"] == 1:
+                break
+        else:
+            pytest.fail(f"{marker_count}-marker payload did not complete")
+
+        # The old digest set retained ~100 bytes per marker, so recursive
+        # sizing fails by a wide margin at both 100k and 500k.
+        assert max_recursive < 8 * 1024 * 1024
+        assert result["results"][0]["matched_text"] == "BOUNDED-HEAP-NEEDLE"
+    finally:
+        engine.shutdown()
+
+
+def test_externalized_marker_state_is_private_exact_and_cleaned(
+    tmp_path, monkeypatch
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    state_dir = tmp_path / "marker-state"
+    monkeypatch.setattr(
+        tools_module, "_EXTERNALIZED_MARKER_STATE_ROOT", state_dir
+    )
+    monkeypatch.setattr(tools_module, "_LCM_GREP_OPERATION_MAX_BYTES", 32 * 1024)
+    ref = "disk-backed-duplicate.json"
+    path = payload_dir / ref
+    _write_compact_marker_payload(
+        path, marker_count=20_000, pre_content=True, needle="never-returned"
+    )
+
+    engine = _engine(tmp_path)
+    try:
+        first = json.loads(tools_module.lcm_grep(
+            {"query": "never-returned", "content_scope": "externalized", "ref": ref},
+            engine=engine,
+        ))
+        assert first["scan"]["continuations_pending"] == 1
+        state_files = list(state_dir.glob("*.sqlite3"))
+        assert len(state_files) == 1
+        assert not state_files[0].is_relative_to(payload_dir)
+        assert state_files[0].resolve() != (tmp_path / "open-issues.db").resolve()
+        with sqlite3.connect(state_files[0]) as state_connection:
+            stored_identity = tuple(json.loads(state_connection.execute(
+                "SELECT stat_identity FROM state_metadata"
+            ).fetchone()[0]))
+        assert stored_identity == tools_module._externalized_file_identity(path.stat())
+
+        # Stat mutation must invalidate and delete the old private index.
+        old_state = state_files[0]
+        path.write_text(
+            '{"session_id":"current","content":"x",'
+            '"persisted_output_source_path":"/p/0",'
+            '"persisted_output_expected_chars":1,'
+            '"persisted_output_markers":['
+            '{"source_path":"/p/0","expected_chars":1},'
+            '{"source_path":"/p/0","expected_chars":1}]}',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            tools_module, "_LCM_GREP_OPERATION_MAX_BYTES", 2 * 1024 * 1024
+        )
+        duplicate = json.loads(tools_module.lcm_grep(
+            {"query": "x", "content_scope": "externalized", "ref": ref},
+            engine=engine,
+        ))
+        assert duplicate["results"] == []
+        assert duplicate["diagnostics"] == [{"ref": ref, "error": "invalid_payload"}]
+        assert not old_state.exists()
+        assert list(state_dir.glob("*.sqlite3")) == []
+    finally:
+        engine.shutdown()
+
+
+def test_externalized_marker_state_reaps_crash_orphans_and_shutdown_files(
+    tmp_path, monkeypatch
+):
+    state_dir = tmp_path / "marker-state"
+    state_dir.mkdir()
+    stale = state_dir / "markers-dead-process.sqlite3"
+    stale.write_bytes(b"crashed")
+    stale_journal = state_dir / "markers-dead-process.sqlite3-journal"
+    stale_journal.write_bytes(b"partial")
+    fresh_dead = state_dir / "markers-99999999-fresh.sqlite3"
+    fresh_dead.write_bytes(b"fresh-crash")
+    old = time.time() - tools_module._EXTERNALIZED_MARKER_STATE_TTL_SECONDS - 2
+    os.utime(stale, (old, old))
+    os.utime(stale_journal, (old, old))
+    monkeypatch.setattr(
+        tools_module, "_EXTERNALIZED_MARKER_STATE_ROOT", state_dir
+    )
+
+    state = tools_module._ExternalizedMarkerIdentityStore()
+    live = state.path
+    assert live.exists()
+    assert not stale.exists()
+    assert not stale_journal.exists()
+    assert not fresh_dead.exists()
+    state.close()
+    assert not live.exists()
+    assert list(state_dir.iterdir()) == []
+
+
+def test_externalized_marker_state_directory_enforces_count_bound(
+    tmp_path, monkeypatch
+):
+    state_dir = tmp_path / "marker-state"
+    state_dir.mkdir()
+    oldest = None
+    for index in range(tools_module._EXTERNALIZED_MARKER_STATE_MAX_ORPHANS + 8):
+        path = state_dir / f"markers-crashed-{index:03d}.sqlite3"
+        path.write_bytes(b"orphan")
+        modified = time.time() - 20 + (index / 100)
+        os.utime(path, (modified, modified))
+        oldest = oldest or path
+    monkeypatch.setattr(
+        tools_module, "_EXTERNALIZED_MARKER_STATE_ROOT", state_dir
+    )
+
+    state = tools_module._ExternalizedMarkerIdentityStore()
+    try:
+        assert len(list(state_dir.glob("*.sqlite3"))) <= (
+            tools_module._EXTERNALIZED_MARKER_STATE_MAX_ORPHANS
+        )
+        assert oldest is not None and not oldest.exists()
+    finally:
+        state.close()
+
+
 def test_externalized_grep_file_mutation_invalidates_parser_continuation(
     tmp_path, monkeypatch
 ):
@@ -1331,6 +1528,165 @@ def test_externalized_grep_continuation_cache_enforces_count_and_ttl(
         ))
         assert expired_retry["scan"]["continuation_reused_bytes"] == 0
         assert len(engine._externalized_grep_continuations) == 1
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("file_count", [5, 20])
+def test_externalized_no_ref_discovery_is_eventual_beyond_cache_slots(
+    tmp_path, monkeypatch, file_count
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    monkeypatch.setattr(
+        tools_module, "_LCM_GREP_OPERATION_DEADLINE_SECONDS", 10.0
+    )
+    needle = f"NO-REF-LAST-OF-{file_count}"
+    for index in range(file_count):
+        content = ((needle + "-") if index == file_count - 1 else "no-match-")
+        content += "x" * (tools_module._LCM_GREP_OPERATION_MAX_BYTES + 32_768)
+        (payload_dir / f"payload-{index:03d}.json").write_text(
+            json.dumps({"session_id": "current", "content": content}, separators=(",", ":")),
+            encoding="utf-8",
+        )
+
+    engine = _engine(tmp_path)
+    try:
+        offsets = []
+        for attempt in range(1, (file_count * 3) + 6):
+            result = json.loads(tools_module.lcm_grep(
+                {
+                    "query": needle,
+                    "content_scope": "externalized",
+                    "limit": file_count,
+                    "max_files": file_count,
+                },
+                engine=engine,
+            ))
+            scheduler = next(iter(engine._externalized_grep_schedulers.values()))
+            offsets.append((scheduler.cursor, scheduler.active_ref))
+            assert len(engine._externalized_grep_schedulers) <= (
+                tools_module._EXTERNALIZED_SCHEDULER_MAX_QUERIES
+            )
+            mutable = [
+                checkpoint
+                for checkpoint in engine._externalized_grep_continuations.values()
+                if not checkpoint.completed
+            ]
+            assert len(mutable) <= 1
+            assert len(engine._externalized_grep_continuations) == len(mutable)
+            if result["total_results"]:
+                break
+        else:
+            pytest.fail("no-ref scheduler never reached the final payload")
+
+        assert result["results"][0]["ref"] == f"payload-{file_count - 1:03d}.json"
+        assert result["results"][0]["matched_text"] == needle
+        assert attempt <= (file_count * 2) + 2
+        assert len(set(offsets)) > file_count
+    finally:
+        engine.shutdown()
+
+
+def test_externalized_no_ref_schedulers_isolate_queries_and_survive_deletion(
+    tmp_path, monkeypatch
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    monkeypatch.setattr(
+        tools_module, "_LCM_GREP_OPERATION_DEADLINE_SECONDS", 10.0
+    )
+    large = "x" * (tools_module._LCM_GREP_OPERATION_MAX_BYTES + 16_384)
+    for index in range(5):
+        prefixes = []
+        if index == 0:
+            prefixes.append("QUERY-B-FIRST")
+        if index == 4:
+            prefixes.append("QUERY-A-LAST")
+        (payload_dir / f"isolation-{index}.json").write_text(
+            json.dumps({
+                "session_id": "current",
+                "content": " ".join(prefixes) + large,
+            }, separators=(",", ":")),
+            encoding="utf-8",
+        )
+
+    engine = _engine(tmp_path)
+    try:
+        first_a = json.loads(tools_module.lcm_grep(
+            {
+                "query": "QUERY-A-LAST", "content_scope": "externalized",
+                "limit": 5, "max_files": 5,
+            },
+            engine=engine,
+        ))
+        assert first_a["total_results"] == 0
+        (payload_dir / "isolation-0.json").unlink()
+
+        result_b = json.loads(tools_module.lcm_grep(
+            {
+                "query": "QUERY-B-FIRST", "content_scope": "externalized",
+                "limit": 5, "max_files": 5,
+            },
+            engine=engine,
+        ))
+        assert result_b["total_results"] == 0  # deleted candidate cannot leak
+        assert len(engine._externalized_grep_schedulers) == 2
+
+        for _attempt in range(20):
+            result_a = json.loads(tools_module.lcm_grep(
+                {
+                    "query": "QUERY-A-LAST", "content_scope": "externalized",
+                    "limit": 5, "max_files": 5,
+                },
+                engine=engine,
+            ))
+            if result_a["total_results"]:
+                break
+        else:
+            pytest.fail("query A was lost after active-candidate deletion")
+        assert result_a["results"][0]["ref"] == "isolation-4.json"
+    finally:
+        engine.shutdown()
+
+
+def test_externalized_no_ref_scheduler_cache_enforces_count_and_ttl(
+    tmp_path, monkeypatch
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    (payload_dir / "one.json").write_text(
+        '{"session_id":"current","content":"haystack"}', encoding="utf-8"
+    )
+    virtual_now = 100.0
+    monkeypatch.setattr(tools_module.time, "monotonic", lambda: virtual_now)
+    monkeypatch.setattr(tools_module, "_external_metadata_now", lambda: virtual_now)
+    engine = _engine(tmp_path)
+    try:
+        for index in range(tools_module._EXTERNALIZED_SCHEDULER_MAX_QUERIES + 1):
+            json.loads(tools_module.lcm_grep(
+                {
+                    "query": f"query-{index}",
+                    "content_scope": "externalized",
+                    "max_files": 1,
+                },
+                engine=engine,
+            ))
+            virtual_now += 0.01
+        assert len(engine._externalized_grep_schedulers) == (
+            tools_module._EXTERNALIZED_SCHEDULER_MAX_QUERIES
+        )
+
+        virtual_now += tools_module._EXTERNALIZED_SCHEDULER_TTL_SECONDS + 1
+        json.loads(tools_module.lcm_grep(
+            {
+                "query": "after-ttl",
+                "content_scope": "externalized",
+                "max_files": 1,
+            },
+            engine=engine,
+        ))
+        assert len(engine._externalized_grep_schedulers) == 1
     finally:
         engine.shutdown()
 
@@ -1902,7 +2258,9 @@ def test_externalized_grep_discards_long_delimiter_whitespace_across_retries(
                 "value_delimiter", "marker_delimiter", "marker_or_end", "key",
             }
             assert len(parser.buffer) <= 16 * 1024
-            assert checkpoint.retained_bytes() < 100_000
+            # Includes the explicitly bounded native SQLite page-cache budget,
+            # not only Python string payload bytes.
+            assert checkpoint.retained_bytes() < 600_000
         else:
             pytest.fail("legal delimiter whitespace did not complete across retries")
 
