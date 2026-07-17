@@ -837,6 +837,10 @@ class _ExternalizedStateUnavailable(OSError):
     """Private continuation state cannot be created safely on this host."""
 
 
+class _ExternalizedRegistrySchemaMissing(_ExternalizedStateUnavailable):
+    """The registry file exists but first-open schema work is incomplete."""
+
+
 def _externalized_process_start_identity(pid: int) -> str | None:
     """Return Linux's non-recycled process start tick for ``pid`` when known."""
     try:
@@ -940,10 +944,23 @@ def _externalized_state_root_candidates() -> tuple[Path, ...]:
     return tuple(unique)
 
 
-def _externalized_open_owner_registry_unlocked(root: Path) -> sqlite3.Connection:
+def _externalized_registry_remaining_ms(deadline: float) -> int:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _ExternalizedStateUnavailable("private-state registry deadline expired")
+    return max(1, min(50, int(remaining * 1000)))
+
+
+def _externalized_open_owner_registry_unlocked(
+    root: Path,
+    *,
+    deadline: float,
+    allow_schema_create: bool = True,
+) -> sqlite3.Connection:
     """Open the private, bounded-cache registry; never the production LCM DB."""
+    _externalized_registry_remaining_ms(deadline)
     path = root / _EXTERNALIZED_OWNER_REGISTRY_NAME
-    flags = os.O_RDWR | os.O_CREAT
+    flags = os.O_RDWR | (os.O_CREAT if allow_schema_create else 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(path, flags, 0o600)
@@ -958,19 +975,37 @@ def _externalized_open_owner_registry_unlocked(root: Path) -> sqlite3.Connection
     finally:
         os.close(descriptor)
 
+    remaining_ms = _externalized_registry_remaining_ms(deadline)
     connection = sqlite3.connect(
         str(path),
-        timeout=5.0,
+        timeout=remaining_ms / 1000.0,
         check_same_thread=False,
         cached_statements=8,
     )
     try:
-        connection.execute("PRAGMA busy_timeout=5000")
-        connection.execute("PRAGMA temp_store=FILE")
-        connection.execute("PRAGMA mmap_size=0")
-        connection.execute("PRAGMA cache_spill=OFF")
         connection.execute(
-            f"PRAGMA cache_size=-{_EXTERNALIZED_OWNER_REGISTRY_CACHE_BYTES // 1024}"
+            f"PRAGMA busy_timeout={_externalized_registry_remaining_ms(deadline)}"
+        )
+        connection.execute("PRAGMA busy_timeout=1")
+        for pragma in (
+            "PRAGMA temp_store=FILE",
+            "PRAGMA mmap_size=0",
+            "PRAGMA cache_spill=OFF",
+            f"PRAGMA cache_size=-{_EXTERNALIZED_OWNER_REGISTRY_CACHE_BYTES // 1024}",
+        ):
+            _externalized_registry_remaining_ms(deadline)
+            try:
+                connection.execute(pragma)
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower():
+                    raise
+                # These are connection-local memory controls, not schema or
+                # correctness state. A contended startup may keep SQLite's
+                # defaults for this short-lived registration connection.
+                connection.execute("PRAGMA busy_timeout=1")
+        _externalized_registry_remaining_ms(deadline)
+        connection.execute(
+            f"PRAGMA busy_timeout={_externalized_registry_remaining_ms(deadline)}"
         )
         existing_tables = {
             str(row[0]) for row in connection.execute(
@@ -979,35 +1014,64 @@ def _externalized_open_owner_registry_unlocked(root: Path) -> sqlite3.Connection
             )
         }
         if existing_tables != {"owner_registry", "registry_state"}:
+            if not allow_schema_create:
+                raise _ExternalizedRegistrySchemaMissing(
+                    "private-state registry schema is incomplete"
+                )
+            _externalized_registry_remaining_ms(deadline)
+            # No owner intent can exist until the schema is complete. Avoid
+            # unbounded per-DDL fsyncs while creating this disposable private
+            # registry, then enable FULL durability before returning it to
+            # registration callers.
+            connection.execute("PRAGMA synchronous=OFF")
+            _externalized_registry_remaining_ms(deadline)
             connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA synchronous=FULL")
+            _externalized_registry_remaining_ms(deadline)
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS owner_registry ("
-                "owner_id INTEGER PRIMARY KEY, owner_name TEXT NOT NULL UNIQUE, "
+                "owner_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "owner_name TEXT NOT NULL UNIQUE, "
                 "pid INTEGER NOT NULL, process_start TEXT NOT NULL, "
                 "nonce TEXT NOT NULL, phase TEXT NOT NULL, "
                 "created_wall REAL NOT NULL)"
             )
+            _externalized_registry_remaining_ms(deadline)
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS registry_state ("
                 "singleton INTEGER PRIMARY KEY CHECK(singleton = 1), "
                 "reap_cursor INTEGER NOT NULL)"
             )
+            _externalized_registry_remaining_ms(deadline)
             connection.execute(
                 "INSERT OR IGNORE INTO registry_state(singleton, reap_cursor) "
                 "VALUES (1, 0)"
             )
+            _externalized_registry_remaining_ms(deadline)
             connection.commit()
-        else:
+            _externalized_registry_remaining_ms(deadline)
             connection.execute("PRAGMA synchronous=FULL")
+        else:
+            # Legacy registries used reusable integer rowids. They remain safe
+            # because reaping now compares every immutable nonce-bearing
+            # registration field; newly created registries additionally use
+            # AUTOINCREMENT so normal inserts never recycle a registration ID.
+            pass
     except BaseException:
         connection.close()
         raise
     return connection
 
 
-def _externalized_open_owner_registry(root: Path) -> sqlite3.Connection:
+def _externalized_open_owner_registry(
+    root: Path,
+    *,
+    deadline: float | None = None,
+) -> sqlite3.Connection:
     """Serialize first-open/schema negotiation across concurrent processes."""
+    if deadline is None:
+        deadline = time.monotonic() + _EXTERNALIZED_OWNER_REAP_DEADLINE_SECONDS
+    _externalized_registry_remaining_ms(deadline)
     lock_path = root / f"{_EXTERNALIZED_OWNER_REGISTRY_NAME}.lock"
     lock_flags = os.O_RDWR | os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
@@ -1023,13 +1087,41 @@ def _externalized_open_owner_registry(root: Path) -> sqlite3.Connection:
         os.fchmod(lock_descriptor, 0o600)
         try:
             import fcntl
-        except ImportError:  # pragma: no cover - owner leases also unavailable
-            return _externalized_open_owner_registry_unlocked(root)
-        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        except ImportError as exc:  # pragma: no cover - no safe schema lock
+            raise _ExternalizedStateUnavailable(
+                "private-state registry locks are unavailable"
+            ) from exc
+        while True:
+            try:
+                fcntl.flock(
+                    lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB
+                )
+                break
+            except BlockingIOError as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise _ExternalizedStateUnavailable(
+                        "private-state registry lock deadline expired"
+                    ) from exc
+                time.sleep(min(0.002, remaining))
         try:
-            return _externalized_open_owner_registry_unlocked(root)
+            registry_path = root / _EXTERNALIZED_OWNER_REGISTRY_NAME
+            try:
+                registry_stat = registry_path.stat()
+            except FileNotFoundError:
+                registry_stat = None
+            if registry_stat is None or registry_stat.st_size == 0:
+                return _externalized_open_owner_registry_unlocked(
+                    root, deadline=deadline, allow_schema_create=True
+                )
         finally:
             fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        # Once the non-empty registry exists, the flock protects only schema
+        # creation. Release it before connection-local setup so concurrent
+        # registrations do not serialize their full SQLite open path.
+        return _externalized_open_owner_registry_unlocked(
+            root, deadline=deadline, allow_schema_create=False
+        )
     finally:
         os.close(lock_descriptor)
 
@@ -1080,7 +1172,6 @@ def _externalized_bounded_remove_private_tree(
 
 def _externalized_reap_dead_owners(root: Path) -> dict[str, Any]:
     """Visit an indexed, persistent-cursor slice of registered owners only."""
-    connection = _externalized_open_owner_registry(root)
     started = time.monotonic()
     deadline = started + _EXTERNALIZED_OWNER_REAP_DEADLINE_SECONDS
     stats: dict[str, Any] = {
@@ -1088,28 +1179,32 @@ def _externalized_reap_dead_owners(root: Path) -> dict[str, Any]:
         "entries_visited": 0,
         "elapsed": 0.0,
     }
-    connection.execute(
-        f"PRAGMA busy_timeout={int(_EXTERNALIZED_OWNER_REAP_DEADLINE_SECONDS * 1000)}"
-    )
+    try:
+        connection = _externalized_open_owner_registry(root, deadline=deadline)
+    except (OSError, sqlite3.Error):
+        stats["elapsed"] = time.monotonic() - started
+        return stats
     budget = {"entries": 0}
     try:
+        connection.execute(
+            f"PRAGMA busy_timeout={_externalized_registry_remaining_ms(deadline)}"
+        )
         cursor_row = connection.execute(
             "SELECT reap_cursor FROM registry_state WHERE singleton = 1"
         ).fetchone()
         cursor = int(cursor_row[0]) if cursor_row is not None else 0
         rows = connection.execute(
-            "SELECT owner_id, owner_name FROM owner_registry "
+            "SELECT owner_id, owner_name, pid, process_start, nonce, phase "
+            "FROM owner_registry "
             "WHERE owner_id > ? ORDER BY owner_id LIMIT ?",
             (cursor, _EXTERNALIZED_OWNER_REAP_MAX_ROWS),
         ).fetchall()
         if not rows:
             if cursor:
                 try:
-                    remaining_ms = max(
-                        1, int((deadline - time.monotonic()) * 1000)
-                    )
                     if time.monotonic() >= deadline:
                         return stats
+                    remaining_ms = _externalized_registry_remaining_ms(deadline)
                     connection.execute(f"PRAGMA busy_timeout={remaining_ms}")
                     connection.execute(
                         "UPDATE registry_state SET reap_cursor = 0 "
@@ -1123,19 +1218,34 @@ def _externalized_reap_dead_owners(root: Path) -> dict[str, Any]:
             return stats
 
         completed_cursor = cursor
-        delete_ids: list[int] = []
-        for raw_owner_id, raw_owner_name in rows:
+        delete_owners: list[tuple[int, str, int, str, str, str]] = []
+        for (
+            raw_owner_id,
+            raw_owner_name,
+            raw_pid,
+            raw_process_start,
+            raw_nonce,
+            raw_phase,
+        ) in rows:
             if time.monotonic() >= deadline:
                 break
             owner_id = int(raw_owner_id)
             owner_name = str(raw_owner_name)
+            owner_registration = (
+                owner_id,
+                owner_name,
+                int(raw_pid),
+                str(raw_process_start),
+                str(raw_nonce),
+                str(raw_phase),
+            )
             stats["rows_visited"] += 1
             identity = _externalized_owner_identity(owner_name)
             if identity is None:
                 # App-created owners always have a valid registered identity.
                 # Unknown legacy/malformed root entries are isolated: the
                 # shared root is never scanned to discover or adopt them.
-                delete_ids.append(owner_id)
+                delete_owners.append(owner_registration)
                 completed_cursor = owner_id
                 continue
             if not _externalized_owner_provably_dead(owner_name):
@@ -1161,19 +1271,21 @@ def _externalized_reap_dead_owners(root: Path) -> dict[str, Any]:
                 # Keep the cursor immediately before this row so a large dead
                 # owner is drained over repeated bounded initialization passes.
                 break
-            delete_ids.append(owner_id)
+            delete_owners.append(owner_registration)
             completed_cursor = owner_id
 
         if time.monotonic() >= deadline:
             return stats
-        remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+        remaining_ms = _externalized_registry_remaining_ms(deadline)
         connection.execute(f"PRAGMA busy_timeout={remaining_ms}")
         try:
             connection.execute("BEGIN IMMEDIATE")
-            if delete_ids:
+            if delete_owners:
                 connection.executemany(
-                    "DELETE FROM owner_registry WHERE owner_id = ?",
-                    ((owner_id,) for owner_id in delete_ids),
+                    "DELETE FROM owner_registry WHERE owner_id = ? "
+                    "AND owner_name = ? AND pid = ? AND process_start = ? "
+                    "AND nonce = ? AND phase = ?",
+                    delete_owners,
                 )
             connection.execute(
                 "UPDATE registry_state SET reap_cursor = ? WHERE singleton = 1",
@@ -1260,24 +1372,48 @@ class _ExternalizedPrivateRuntimeState:
             nonce = secrets.token_hex(16)
             owner_name = f"owner-{os.getpid()}-{start}-{nonce}"
             owner_dir = root / owner_name
-            registry = _externalized_open_owner_registry(root)
+            registry_open_deadline = time.monotonic() + 1.0
+            while True:
+                try:
+                    registry = _externalized_open_owner_registry(root)
+                    break
+                except sqlite3.OperationalError as exc:
+                    if (
+                        "locked" not in str(exc).lower()
+                        or time.monotonic() >= registry_open_deadline
+                    ):
+                        raise
+                    time.sleep(0.002)
             registered = False
             lease_descriptor: int | None = None
             try:
-                registry.execute(
-                    "INSERT INTO owner_registry("
-                    "owner_name, pid, process_start, nonce, phase, created_wall"
-                    ") VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        owner_name,
-                        os.getpid(),
-                        start,
-                        nonce,
-                        "intended",
-                        time.time(),
-                    ),
-                )
-                registry.commit()
+                registration_deadline = time.monotonic() + 1.0
+                while True:
+                    try:
+                        registry.execute("PRAGMA busy_timeout=50")
+                        registry.execute(
+                            "INSERT INTO owner_registry("
+                            "owner_name, pid, process_start, nonce, phase, created_wall"
+                            ") VALUES (?, ?, ?, ?, ?, ?)",
+                            (
+                                owner_name,
+                                os.getpid(),
+                                start,
+                                nonce,
+                                "intended",
+                                time.time(),
+                            ),
+                        )
+                        registry.commit()
+                        break
+                    except sqlite3.OperationalError as exc:
+                        registry.rollback()
+                        if (
+                            "locked" not in str(exc).lower()
+                            or time.monotonic() >= registration_deadline
+                        ):
+                            raise
+                        time.sleep(0.002)
                 registered = True
                 owner_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
                 lease_descriptor = _externalized_lock_new_lease(
@@ -1398,11 +1534,24 @@ class _ExternalizedPrivateRuntimeState:
             try:
                 registry = _externalized_open_owner_registry(owner_dir.parent)
                 try:
-                    registry.execute(
-                        "DELETE FROM owner_registry WHERE owner_name = ?",
-                        (owner_name,),
-                    )
-                    registry.commit()
+                    unregister_deadline = time.monotonic() + 1.0
+                    while True:
+                        try:
+                            registry.execute("PRAGMA busy_timeout=50")
+                            registry.execute(
+                                "DELETE FROM owner_registry WHERE owner_name = ?",
+                                (owner_name,),
+                            )
+                            registry.commit()
+                            break
+                        except sqlite3.OperationalError as exc:
+                            registry.rollback()
+                            if (
+                                "locked" not in str(exc).lower()
+                                or time.monotonic() >= unregister_deadline
+                            ):
+                                raise
+                            time.sleep(0.002)
                 finally:
                     registry.close()
             except (OSError, sqlite3.Error):
@@ -2612,7 +2761,8 @@ class _ExternalizedDiscoveryScheduler:
 
     __slots__ = (
         "key", "root_identity", "listing_identity", "refs", "cursor",
-        "active_ref", "cached_at", "updated_wall", "blocked",
+        "active_ref", "listing_cookie", "next_listing_cookie",
+        "listing_complete", "cached_at", "updated_wall", "blocked",
     )
 
     def __init__(
@@ -2625,6 +2775,9 @@ class _ExternalizedDiscoveryScheduler:
         listing_identity: str = "",
         cursor: int = 0,
         active_ref: str | None = None,
+        listing_cookie: int = 0,
+        next_listing_cookie: int = 0,
+        listing_complete: bool = False,
         updated_wall: float | None = None,
     ):
         self.key = key
@@ -2633,6 +2786,9 @@ class _ExternalizedDiscoveryScheduler:
         self.refs = refs
         self.cursor = max(0, min(int(cursor), len(refs)))
         self.active_ref = active_ref if active_ref in refs else None
+        self.listing_cookie = max(0, int(listing_cookie))
+        self.next_listing_cookie = max(0, int(next_listing_cookie))
+        self.listing_complete = bool(listing_complete)
         self.cached_at = cached_at
         self.updated_wall = time.time() if updated_wall is None else updated_wall
         self.blocked = False
@@ -2679,8 +2835,20 @@ def _externalized_scheduler_connection(
                 "CREATE TABLE IF NOT EXISTS scheduler_cursors ("
                 "shape_key TEXT PRIMARY KEY, root_identity TEXT NOT NULL, "
                 "listing_identity TEXT NOT NULL, cursor INTEGER NOT NULL, "
-                "active_ref TEXT, updated_wall REAL NOT NULL) WITHOUT ROWID"
+                "active_ref TEXT, listing_cookie INTEGER NOT NULL, "
+                "updated_wall REAL NOT NULL) WITHOUT ROWID"
             )
+            columns = {
+                str(row[1]) for row in connection.execute(
+                    "PRAGMA table_info(scheduler_cursors)"
+                )
+            }
+            if "listing_cookie" not in columns:
+                connection.execute(
+                    "ALTER TABLE scheduler_cursors ADD COLUMN "
+                    "listing_cookie INTEGER NOT NULL DEFAULT 0"
+                )
+                connection.execute("DELETE FROM scheduler_cursors")
             connection.commit()
         except (OSError, sqlite3.Error, _ExternalizedStateUnavailable):
             try:
@@ -2701,43 +2869,59 @@ def _externalized_scheduler_reserve_locked(
     *,
     key: str,
     root_identity: tuple[int, ...],
-) -> bool:
+) -> tuple[bool, int]:
     """Durably reserve one no-ref shape before payload candidate discovery."""
     connection = _externalized_scheduler_connection(runtime)
     if connection is None:
-        return False
+        return False, 0
     try:
         _externalized_scheduler_cleanup_disk_locked(
             connection, protected_keys=frozenset({key})
         )
-        exists = connection.execute(
-            "SELECT 1 FROM scheduler_cursors WHERE shape_key = ?", (key,)
+        row = connection.execute(
+            "SELECT root_identity, listing_cookie FROM scheduler_cursors "
+            "WHERE shape_key = ?", (key,)
         ).fetchone()
-        if exists is None:
+        encoded_root = json.dumps(root_identity, separators=(",", ":"))
+        if row is None:
             count = int(connection.execute(
                 "SELECT COUNT(*) FROM scheduler_cursors"
             ).fetchone()[0])
             if count >= _EXTERNALIZED_SCHEDULER_MAX_DISK_QUERIES:
-                return False
+                return False, 0
             connection.execute(
                 "INSERT INTO scheduler_cursors("
                 "shape_key, root_identity, listing_identity, cursor, "
-                "active_ref, updated_wall) VALUES (?, ?, '', 0, NULL, ?)",
+                "active_ref, listing_cookie, updated_wall) "
+                "VALUES (?, ?, '', 0, NULL, 0, ?)",
                 (
                     key,
-                    json.dumps(root_identity, separators=(",", ":")),
+                    encoded_root,
                     time.time(),
                 ),
             )
+            listing_cookie = 0
+        elif str(row[0]) != encoded_root:
+            # Directory mtime/ctime/identity changes invalidate every native
+            # cookie and in-slice cursor. Reset before touching the listing.
+            connection.execute(
+                "UPDATE scheduler_cursors SET root_identity = ?, "
+                "listing_identity = '', cursor = 0, active_ref = NULL, "
+                "listing_cookie = 0, updated_wall = ? WHERE shape_key = ?",
+                (encoded_root, time.time(), key),
+            )
+            listing_cookie = 0
+        else:
+            listing_cookie = max(0, int(row[1]))
         connection.commit()
-        return True
-    except sqlite3.Error:
+        return True, listing_cookie
+    except (TypeError, ValueError, sqlite3.Error):
         try:
             connection.rollback()
         except sqlite3.Error:
             pass
         logger.debug("LCM could not reserve scheduler cursor", exc_info=True)
-        return False
+        return False, 0
 
 
 def _externalized_scheduler_cleanup_disk_locked(
@@ -2787,17 +2971,21 @@ def _externalized_scheduler_persist_locked(
         state.updated_wall = time.time()
         connection.execute(
             "INSERT INTO scheduler_cursors("
-            "shape_key, root_identity, listing_identity, cursor, active_ref, updated_wall"
-            ") VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(shape_key) DO UPDATE SET "
+            "shape_key, root_identity, listing_identity, cursor, active_ref, "
+            "listing_cookie, updated_wall"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(shape_key) DO UPDATE SET "
             "root_identity=excluded.root_identity, "
             "listing_identity=excluded.listing_identity, cursor=excluded.cursor, "
-            "active_ref=excluded.active_ref, updated_wall=excluded.updated_wall",
+            "active_ref=excluded.active_ref, "
+            "listing_cookie=excluded.listing_cookie, "
+            "updated_wall=excluded.updated_wall",
             (
                 state.key,
                 json.dumps(state.root_identity, separators=(",", ":")),
                 state.listing_identity,
                 state.cursor,
                 state.active_ref,
+                state.listing_cookie,
                 state.updated_wall,
             ),
         )
@@ -2815,6 +3003,9 @@ def _externalized_scheduler_load_locked(
     root_identity: tuple[int, ...],
     listing_identity: str,
     refs: tuple[str, ...],
+    listing_cookie: int,
+    next_listing_cookie: int,
+    listing_complete: bool,
     now: float,
 ) -> _ExternalizedDiscoveryScheduler | None:
     connection = _externalized_scheduler_connection(runtime)
@@ -2822,7 +3013,8 @@ def _externalized_scheduler_load_locked(
         return None
     try:
         row = connection.execute(
-            "SELECT root_identity, listing_identity, cursor, active_ref, updated_wall "
+            "SELECT root_identity, listing_identity, cursor, active_ref, "
+            "listing_cookie, updated_wall "
             "FROM scheduler_cursors WHERE shape_key = ?",
             (key,),
         ).fetchone()
@@ -2833,11 +3025,13 @@ def _externalized_scheduler_load_locked(
         return None
     try:
         stored_root = tuple(int(item) for item in json.loads(row[0]))
-        updated_wall = float(row[4])
+        stored_cookie = int(row[4])
+        updated_wall = float(row[5])
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
     if (
         stored_root != root_identity
+        or stored_cookie != listing_cookie
         or str(row[1]) != listing_identity
         or time.time() - updated_wall > _EXTERNALIZED_SCHEDULER_TTL_SECONDS
     ):
@@ -2856,6 +3050,9 @@ def _externalized_scheduler_load_locked(
         refs=refs,
         cursor=int(row[2]),
         active_ref=row[3] if isinstance(row[3], str) else None,
+        listing_cookie=listing_cookie,
+        next_listing_cookie=next_listing_cookie,
+        listing_complete=listing_complete,
         cached_at=now,
         updated_wall=updated_wall,
     )
@@ -2892,6 +3089,8 @@ def _externalized_scheduler_ref_still_live_locked(
     state: _ExternalizedDiscoveryScheduler,
     ref: str,
 ) -> bool:
+    if not state.listing_identity:
+        return False
     runtime = _externalized_runtime_state(engine)
     connection = _externalized_scheduler_connection(runtime)
     if connection is None:
@@ -3363,33 +3562,114 @@ def _externalized_scheduler_shape_key(
 def _externalized_bounded_sorted_refs(
     root: Path,
     *,
+    listing_cookie: int,
     max_files: int,
     deadline: float | None,
-) -> tuple[tuple[str, ...], int, bool]:
-    """Select deterministic JSON refs without retaining an unbounded listing."""
+) -> tuple[tuple[str, ...], int, bool, int]:
+    """Read one bounded Linux directory-cookie slice without prefix rescans."""
+    if sys.platform != "linux":
+        raise _ExternalizedStateUnavailable(
+            "lossless bounded directory continuation is unavailable"
+        )
+    try:
+        import ctypes
+    except ImportError as exc:  # pragma: no cover - CPython always supplies it
+        raise _ExternalizedStateUnavailable(
+            "native directory continuation is unavailable"
+        ) from exc
+    if ctypes.sizeof(ctypes.c_long) != 8 or ctypes.sizeof(ctypes.c_ulong) != 8:
+        raise _ExternalizedStateUnavailable(
+            "native directory cookie ABI is unsupported"
+        )
+
+    class _LinuxDirent(ctypes.Structure):
+        _fields_ = [
+            ("d_ino", ctypes.c_ulong),
+            ("d_off", ctypes.c_long),
+            ("d_reclen", ctypes.c_ushort),
+            ("d_type", ctypes.c_ubyte),
+            ("d_name", ctypes.c_char * 256),
+        ]
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.fdopendir.argtypes = [ctypes.c_int]
+    libc.fdopendir.restype = ctypes.c_void_p
+    libc.readdir.argtypes = [ctypes.c_void_p]
+    libc.readdir.restype = ctypes.POINTER(_LinuxDirent)
+    libc.telldir.argtypes = [ctypes.c_void_p]
+    libc.telldir.restype = ctypes.c_long
+    libc.seekdir.argtypes = [ctypes.c_void_p, ctypes.c_long]
+    libc.seekdir.restype = None
+    libc.closedir.argtypes = [ctypes.c_void_p]
+    libc.closedir.restype = ctypes.c_int
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(root, flags)
+    opened_identity = _externalized_file_identity(os.fstat(descriptor))
+    directory = libc.fdopendir(descriptor)
+    if not directory:
+        error = ctypes.get_errno()
+        os.close(descriptor)
+        raise OSError(error, os.strerror(error), root)
+    # fdopendir owns descriptor after success.
     selected: list[str] = []
     entries_seen = 0
     complete = True
-    exhausted = False
-    with os.scandir(root) as entries:
-        iterator = iter(entries)
+    next_cookie = max(0, int(listing_cookie))
+    try:
+        if next_cookie:
+            ctypes.set_errno(0)
+            libc.seekdir(directory, next_cookie)
+            if ctypes.get_errno() or int(libc.telldir(directory)) != next_cookie:
+                raise _ExternalizedStateUnavailable(
+                    "persisted directory cookie cannot be restored"
+                )
         while entries_seen < max_files:
             if deadline is not None and time.monotonic() >= deadline:
                 complete = False
                 break
-            try:
-                entry = next(iterator)
-            except StopIteration:
-                exhausted = True
+            ctypes.set_errno(0)
+            entry = libc.readdir(directory)
+            if not entry:
+                error = ctypes.get_errno()
+                if error:
+                    raise OSError(error, os.strerror(error), root)
                 break
+            raw_name = bytes(entry.contents.d_name).split(b"\0", 1)[0]
+            if raw_name in {b".", b".."}:
+                continue
             entries_seen += 1
-            name = entry.name
+            name = os.fsdecode(raw_name)
+            try:
+                name.encode("utf-8")
+            except UnicodeEncodeError:
+                # Generated payload refs are UTF-8. An undecodable ambient
+                # filename consumes the bounded visit budget but is not a ref.
+                continue
             if not name.endswith(".json") or len(name) > _LCM_GREP_REF_MAX_CHARS:
                 continue
             bisect.insort(selected, name)
-    if not exhausted and entries_seen >= max_files:
-        complete = False
-    return tuple(selected), entries_seen, complete
+        cookie = int(libc.telldir(directory))
+        if cookie < 0:
+            error = ctypes.get_errno()
+            raise OSError(error or 5, os.strerror(error or 5), root)
+        next_cookie = cookie
+        if entries_seen >= max_files:
+            complete = False
+        final_identity = _externalized_file_identity(os.fstat(descriptor))
+        if final_identity != opened_identity:
+            raise _ExternalizedStateUnavailable(
+                "directory mutated during bounded listing"
+            )
+        return tuple(selected), entries_seen, complete, next_cookie
+    finally:
+        libc.closedir(directory)
 
 
 def _checkout_externalized_scheduler(
@@ -3398,6 +3678,9 @@ def _checkout_externalized_scheduler(
     key: str,
     root_identity: tuple[int, ...],
     refs: tuple[str, ...],
+    listing_cookie: int,
+    next_listing_cookie: int,
+    listing_complete: bool,
 ) -> _ExternalizedDiscoveryScheduler:
     cache = _externalized_scheduler_cache(engine)
     runtime = _externalized_runtime_state(engine)
@@ -3415,6 +3698,7 @@ def _checkout_externalized_scheduler(
         if not (
             isinstance(state, _ExternalizedDiscoveryScheduler)
             and state.root_identity == root_identity
+            and state.listing_cookie == listing_cookie
             and state.refs == refs
             and state.listing_identity == listing_identity
         ):
@@ -3424,6 +3708,9 @@ def _checkout_externalized_scheduler(
                 root_identity=root_identity,
                 listing_identity=listing_identity,
                 refs=refs,
+                listing_cookie=listing_cookie,
+                next_listing_cookie=next_listing_cookie,
+                listing_complete=listing_complete,
                 now=now,
             )
             if state is None:
@@ -3432,10 +3719,19 @@ def _checkout_externalized_scheduler(
                     root_identity=root_identity,
                     listing_identity=listing_identity,
                     refs=refs,
+                    listing_cookie=listing_cookie,
+                    next_listing_cookie=next_listing_cookie,
+                    listing_complete=listing_complete,
                     cached_at=now,
                 )
-        elif state.cursor >= len(state.refs) and state.active_ref is None:
-            # A fully acknowledged sweep starts a fresh deterministic cycle.
+        else:
+            state.next_listing_cookie = next_listing_cookie
+            state.listing_complete = listing_complete
+        if not state.refs and state.active_ref is None:
+            state.listing_cookie = (
+                0 if state.listing_complete else state.next_listing_cookie
+            )
+            state.listing_identity = ""
             state.cursor = 0
         state.cached_at = now
         if not _externalized_scheduler_persist_locked(
@@ -3501,9 +3797,17 @@ def _externalized_scheduler_advance(
             return False
         previous_cursor = state.cursor
         previous_active_ref = state.active_ref
+        previous_listing_identity = state.listing_identity
+        previous_listing_cookie = state.listing_cookie
         state.cursor = max(state.cursor, index + 1)
         if state.active_ref == ref:
             state.active_ref = None
+        if state.cursor >= len(state.refs) and state.active_ref is None:
+            state.listing_cookie = (
+                0 if state.listing_complete else state.next_listing_cookie
+            )
+            state.listing_identity = ""
+            state.cursor = 0
         state.cached_at = time.monotonic()
         persisted = _externalized_scheduler_persist_locked(
             runtime,
@@ -3513,6 +3817,8 @@ def _externalized_scheduler_advance(
         if not persisted:
             state.cursor = previous_cursor
             state.active_ref = previous_active_ref
+            state.listing_identity = previous_listing_identity
+            state.listing_cookie = previous_listing_cookie
         return persisted
 
 
@@ -3889,7 +4195,7 @@ def _search_externalized_payloads(
         try:
             root_identity = _externalized_file_identity(root.stat())
             with _externalized_continuation_lock(engine):
-                reserved = _externalized_scheduler_reserve_locked(
+                reserved, listing_cookie = _externalized_scheduler_reserve_locked(
                     runtime_state,
                     key=scheduler_key,
                     root_identity=root_identity,
@@ -3916,16 +4222,36 @@ def _search_externalized_payloads(
                 "continuation_memory_bytes": 0,
             }
         try:
-            refs, candidates_seen, listing_complete = (
+            refs, candidates_seen, listing_complete, next_listing_cookie = (
                 _externalized_bounded_sorted_refs(
                     root,
+                    listing_cookie=listing_cookie,
                     max_files=max_files,
                     deadline=deadline,
                 )
             )
-        except OSError:
-            refs = ()
-            listing_complete = False
+            if _externalized_file_identity(root.stat()) != root_identity:
+                raise _ExternalizedStateUnavailable(
+                    "directory mutated around bounded listing"
+                )
+        except (OSError, _ExternalizedStateUnavailable):
+            return [], [{"ref": "", "error": "private_state_unavailable"}], {
+                "files_scanned": 0,
+                "entries_scanned": candidates_seen,
+                "bytes_scanned": 0,
+                "matches": 0,
+                "scan_truncated": True,
+                "max_files": max_files,
+                "max_payload_chars": max_payload_chars,
+                "max_total_bytes": effective_total_bytes,
+                "max_persisted_output_markers": None,
+                "max_suffix_depth": _EXTERNALIZED_SUFFIX_MAX_DEPTH,
+                "persisted_output_markers_scanned": suffix_operation_budget.markers,
+                "byte_budget_exhausted": byte_operation_budget.exhausted,
+                "continuation_reused_bytes": 0,
+                "continuations_pending": 0,
+                "continuation_memory_bytes": 0,
+            }
         scan_truncated = not listing_complete
         try:
             scheduler = _checkout_externalized_scheduler(
@@ -3933,6 +4259,9 @@ def _search_externalized_payloads(
                 key=scheduler_key,
                 root_identity=root_identity,
                 refs=refs,
+                listing_cookie=listing_cookie,
+                next_listing_cookie=next_listing_cookie,
+                listing_complete=listing_complete,
             )
         except _ExternalizedStateUnavailable:
             return [], [{"ref": "", "error": "private_state_unavailable"}], {

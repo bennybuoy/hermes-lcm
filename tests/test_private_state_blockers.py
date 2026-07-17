@@ -505,6 +505,131 @@ def test_indexed_registry_reaping_is_capped_and_progresses_with_100k_rows(
         ).fetchone() is None
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux flock")
+def test_reaper_deadline_includes_contended_registry_acquisition(tmp_path):
+    import fcntl
+
+    state_root = tmp_path / "contended-owner-registry"
+    state_root.mkdir(mode=0o700)
+    lock_path = state_root / ".owner-registry.db.lock"
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def delayed_release() -> None:
+        time.sleep(0.30)
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+    release = threading.Thread(target=delayed_release)
+    release.start()
+    started = time.monotonic()
+    stats = tools_module._externalized_reap_dead_owners(state_root)
+    elapsed = time.monotonic() - started
+    release.join(timeout=2)
+    assert not release.is_alive()
+    assert elapsed < 0.20
+    assert stats["elapsed"] < 0.20
+    assert stats["rows_visited"] == 0
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="requires proc owner identity")
+def test_stale_reaper_cannot_delete_same_key_replacement(tmp_path, monkeypatch):
+    state_root = tmp_path / "owner-registry-aba"
+    state_root.mkdir(mode=0o700)
+    registry = tools_module._externalized_open_owner_registry(state_root)
+    old_nonce = "1" * 32
+    old_name = f"owner-99999999-1-{old_nonce}"
+    registry.execute(
+        "INSERT INTO owner_registry("
+        "owner_name, pid, process_start, nonce, phase, created_wall"
+        ") VALUES (?, ?, ?, ?, ?, ?)",
+        (old_name, 99999999, "1", old_nonce, "leased", time.time()),
+    )
+    old_id = int(registry.execute(
+        "SELECT owner_id FROM owner_registry WHERE owner_name = ?", (old_name,)
+    ).fetchone()[0])
+    registry.commit()
+    registry.close()
+    old_dir = state_root / old_name
+    old_dir.mkdir()
+    (old_dir / "owner.lease").write_text("", encoding="ascii")
+
+    selected = threading.Event()
+    release = threading.Event()
+
+    def barrier_remove(*args, **kwargs):
+        selected.set()
+        assert release.wait(timeout=5)
+        return True
+
+    monkeypatch.setattr(
+        tools_module, "_externalized_bounded_remove_private_tree", barrier_remove
+    )
+    outcomes: list[object] = []
+
+    def stale_reap() -> None:
+        try:
+            outcomes.append(tools_module._externalized_reap_dead_owners(state_root))
+        except BaseException as exc:  # noqa: BLE001 - asserted in parent
+            outcomes.append(exc)
+
+    thread = threading.Thread(target=stale_reap)
+    thread.start()
+    assert selected.wait(timeout=5)
+
+    current_pid = os.getpid()
+    current_start = tools_module._externalized_process_start_identity(current_pid)
+    assert current_start is not None
+    replacement_nonce = "2" * 32
+    replacement_name = f"owner-{current_pid}-{current_start}-{replacement_nonce}"
+    with sqlite3.connect(state_root / ".owner-registry.db") as competitor:
+        competitor.execute("DELETE FROM owner_registry WHERE owner_id = ?", (old_id,))
+        competitor.execute(
+            "INSERT INTO owner_registry("
+            "owner_id, owner_name, pid, process_start, nonce, phase, created_wall"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                old_id,
+                replacement_name,
+                current_pid,
+                current_start,
+                replacement_nonce,
+                "intended",
+                time.time(),
+            ),
+        )
+        competitor.commit()
+    release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert outcomes and not isinstance(outcomes[0], BaseException)
+
+    with sqlite3.connect(state_root / ".owner-registry.db") as check:
+        replacement = check.execute(
+            "SELECT owner_name, pid, process_start, nonce, phase "
+            "FROM owner_registry WHERE owner_id = ?",
+            (old_id,),
+        ).fetchone()
+        assert replacement == (
+            replacement_name,
+            current_pid,
+            current_start,
+            replacement_nonce,
+            "intended",
+        )
+        check.execute("DELETE FROM owner_registry WHERE owner_id = ?", (old_id,))
+        check.execute(
+            "INSERT INTO owner_registry("
+            "owner_name, pid, process_start, nonce, phase, created_wall"
+            ") VALUES (?, ?, ?, ?, ?, ?)",
+            ("malformed-next", -1, "bad", "3" * 32, "malformed", time.time()),
+        )
+        next_id = int(check.execute(
+            "SELECT owner_id FROM owner_registry WHERE owner_name = 'malformed-next'"
+        ).fetchone()[0])
+        assert next_id > old_id
+
+
 def test_shutdown_fences_checked_out_marker_continuation(tmp_path, monkeypatch):
     state_root = tmp_path / "marker-state"
     payload_path = tmp_path / "payloads" / "shutdown-race.json"
@@ -655,6 +780,77 @@ def test_no_ref_scheduler_resumes_evicted_query_shapes_from_private_disk(
             assert production_db.execute(
                 "SELECT 1 FROM sqlite_master WHERE name = 'scheduler_cursors'"
             ).fetchone() is None
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires durable directory cookies")
+def test_no_ref_listing_cookie_reaches_1500_files_across_mutation_and_eviction(
+    tmp_path, monkeypatch
+):
+    state_root = tmp_path / "listing-cookie-state"
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    for index in range(1_500):
+        (payload_dir / f"cookie-{index:04d}.json").write_text(
+            '{"session_id":"current","content":"ordinary haystack"}',
+            encoding="utf-8",
+        )
+    native_order = [entry.name for entry in os.scandir(payload_dir)]
+    target = native_order[-1]
+    (payload_dir / target).write_text(
+        '{"session_id":"current","content":"COOKIE-LAST-NEEDLE"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tools_module, "_EXTERNALIZED_MARKER_STATE_ROOT", state_root)
+    monkeypatch.setattr(tools_module, "_LCM_GREP_OPERATION_DEADLINE_SECONDS", 10.0)
+    engine = _engine(tmp_path)
+    entries_per_call: list[int] = []
+    try:
+        result = None
+        for attempt in range(80):
+            result = json.loads(tools_module.lcm_grep(
+                {
+                    "query": "COOKIE-LAST-NEEDLE",
+                    "content_scope": "externalized",
+                    "max_files": 50,
+                    "limit": 1,
+                },
+                engine=engine,
+            ))
+            entries_per_call.append(result["scan"]["entries_scanned"])
+            assert result["scan"]["entries_scanned"] <= 50
+            if result["total_results"]:
+                break
+            if attempt == 4:
+                (payload_dir / "cookie-inserted.json").write_text(
+                    '{"session_id":"current","content":"inserted"}',
+                    encoding="utf-8",
+                )
+                (payload_dir / native_order[10]).unlink()
+                (payload_dir / native_order[11]).write_text(
+                    '{"session_id":"current","content":"mutated"}',
+                    encoding="utf-8",
+                )
+            if attempt in {9, 19}:
+                runtime = tools_module._externalized_runtime_state(engine)
+                with runtime.lock:
+                    connection = runtime.scheduler_connection
+                    runtime.scheduler_connection = None
+                if connection is not None:
+                    connection.close()
+                engine._externalized_grep_schedulers.clear()
+        else:
+            pytest.fail("durable directory cookie never reached the final native entry")
+        assert result is not None
+        assert result["results"][0]["ref"] == target
+        assert len(entries_per_call) > 20
+        scheduler_db = next(state_root.rglob("scheduler.sqlite3"))
+        with sqlite3.connect(scheduler_db) as connection:
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(scheduler_cursors)")
+            }
+            assert "listing_cookie" in columns
     finally:
         engine.shutdown()
 

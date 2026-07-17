@@ -2473,44 +2473,19 @@ def test_externalized_enumeration_does_not_glob_or_sort_the_whole_directory(
         engine.shutdown()
 
 
-def test_externalized_scandir_counts_non_json_entries_at_the_hard_cap(
-    tmp_path, monkeypatch
+def test_externalized_native_listing_counts_non_json_entries_at_the_hard_cap(
+    tmp_path,
 ):
     payload_dir = tmp_path / "payloads"
     payload_dir.mkdir()
+    for index in range(21):
+        (payload_dir / f"junk-{index}.txt").write_text("junk", encoding="utf-8")
     engine = _engine(tmp_path, large_output_externalization_path=str(payload_dir))
-    seen = {"count": 0}
-
-    class _Entry:
-        def __init__(self, name):
-            self.name = name
-
-    class _Scandir:
-        def __init__(self):
-            self._names = iter([*(f"junk-{index}.txt" for index in range(20)), "hit.json"])
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            seen["count"] += 1
-            if seen["count"] > 3:
-                raise AssertionError("scandir advanced beyond the hard entry cap")
-            return _Entry(next(self._names))
-
-    monkeypatch.setattr(tools_module.os, "scandir", lambda _root: _Scandir())
     try:
         result = json.loads(tools_module.lcm_grep(
             {"query": "needle", "content_scope": "externalized", "max_files": 3},
             engine=engine,
         ))
-        assert seen["count"] == 3
         assert result["scan"]["entries_scanned"] == 3
         assert result["scan"]["files_scanned"] == 0
         assert result["scan"]["scan_truncated"] is True
