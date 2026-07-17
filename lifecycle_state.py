@@ -429,6 +429,70 @@ class LifecycleStateStore:
             ),
         )
 
+    @staticmethod
+    def extend_finalized_rollover_no_commit(
+        conn: sqlite3.Connection,
+        conversation_id: str,
+        *,
+        old_session_id: str,
+        current_session_id: str,
+        frontier_store_id: int,
+    ) -> None:
+        """Advance both winner and finalized boundaries under locked ownership."""
+        now = time.time()
+        cur = conn.execute(
+            """UPDATE lcm_lifecycle_state
+               SET current_frontier_store_id = MAX(current_frontier_store_id, ?),
+                   last_finalized_frontier_store_id = MAX(last_finalized_frontier_store_id, ?),
+                   updated_at = ?
+               WHERE conversation_id = ?
+                 AND current_session_id = ?
+                 AND last_finalized_session_id = ?""",
+            (
+                max(0, int(frontier_store_id or 0)),
+                max(0, int(frontier_store_id or 0)),
+                now,
+                conversation_id,
+                current_session_id,
+                old_session_id,
+            ),
+        )
+        if int(cur.rowcount or 0) != 1:
+            raise RuntimeError("lifecycle no longer authorizes finalized-session extension")
+
+    @staticmethod
+    def finalize_session_no_commit(
+        conn: sqlite3.Connection,
+        conversation_id: str,
+        *,
+        session_id: str,
+        frontier_store_id: int,
+    ) -> None:
+        """Finalize a current session on a caller-owned writer transaction."""
+        now = time.time()
+        cur = conn.execute(
+            """UPDATE lcm_lifecycle_state
+               SET current_session_id = NULL,
+                   last_finalized_session_id = ?,
+                   current_frontier_store_id = 0,
+                   last_finalized_frontier_store_id = MAX(
+                       last_finalized_frontier_store_id, ?
+                   ),
+                   last_finalized_at = ?,
+                   updated_at = ?
+               WHERE conversation_id = ? AND current_session_id = ?""",
+            (
+                session_id,
+                max(0, int(frontier_store_id or 0)),
+                now,
+                now,
+                conversation_id,
+                session_id,
+            ),
+        )
+        if int(cur.rowcount or 0) != 1:
+            raise RuntimeError("lifecycle no longer authorizes session finalization")
+
     def get_fragmentation_stats(self, state_db_path: str | Path | None = None) -> dict[str, Any]:
         """Return read-only lifecycle/session fragmentation diagnostics.
 

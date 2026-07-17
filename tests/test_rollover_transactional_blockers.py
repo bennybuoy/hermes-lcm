@@ -121,6 +121,86 @@ def _snapshot(db_path: Path) -> dict:
         conn.close()
 
 
+def _canonical_snapshot(db_path: Path) -> dict:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        active = conn.execute(
+            """SELECT generation, session_id, source_end_store_id
+               FROM lcm_active_frontiers WHERE conversation_id = ?
+               ORDER BY generation DESC LIMIT 1""",
+            (CONVERSATION,),
+        ).fetchone()
+        assert active is not None
+        items = conn.execute(
+            """SELECT kind, ref_id, source_start, source_end
+               FROM lcm_frontier_items
+               WHERE conversation_id = ? AND generation = ?
+               ORDER BY ordinal""",
+            (CONVERSATION, int(active[0])),
+        ).fetchall()
+        messages = conn.execute(
+            """SELECT store_id, session_id, role, content
+               FROM messages WHERE conversation_id = ? ORDER BY store_id""",
+            (CONVERSATION,),
+        ).fetchall()
+        lifecycle = conn.execute(
+            """SELECT current_session_id, last_finalized_session_id,
+                      current_frontier_store_id, last_finalized_frontier_store_id
+               FROM lcm_lifecycle_state WHERE conversation_id = ?""",
+            (CONVERSATION,),
+        ).fetchone()
+        generations = conn.execute(
+            """SELECT generation, session_id, source_end_store_id
+               FROM lcm_active_frontiers WHERE conversation_id = ?
+               ORDER BY generation""",
+            (CONVERSATION,),
+        ).fetchall()
+        generation_items = conn.execute(
+            """SELECT generation, ordinal, kind, ref_id, source_start, source_end
+               FROM lcm_frontier_items WHERE conversation_id = ?
+               ORDER BY generation, ordinal""",
+            (CONVERSATION,),
+        ).fetchall()
+        return {
+            "active": active,
+            "items": items,
+            "messages": messages,
+            "lifecycle": lifecycle,
+            "generations": generations,
+            "generation_items": generation_items,
+        }
+    finally:
+        conn.close()
+
+
+def _assert_raw_frontier_coverage(state: dict, contents: set[str]) -> None:
+    store_ids = {
+        int(store_id)
+        for store_id, session_id, _role, content in state["messages"]
+        if session_id == OLD and content in contents
+    }
+    raw_items = {
+        int(ref_id)
+        for kind, ref_id, source_start, source_end in state["items"]
+        if kind == "message"
+        and int(ref_id) == int(source_start) == int(source_end)
+    }
+    assert store_ids
+    assert store_ids <= raw_items
+    durable_old_ids = {
+        int(store_id)
+        for store_id, session_id, _role, _content in state["messages"]
+        if session_id == OLD and int(store_id) <= int(state["active"][2])
+    }
+    for store_id in durable_old_ids:
+        assert sum(
+            int(source_start) <= store_id <= int(source_end)
+            for _kind, _ref_id, source_start, source_end in state["items"]
+        ) == 1
+    assert int(state["active"][2]) == max(raw_items)
+    assert state["lifecycle"][2:] == (state["active"][2], state["active"][2])
+
+
 def _crash(tmp_path: Path, db_path: Path, phase: str, previous_messages: list[dict]):
     package_root = tmp_path / f"rollover-package-{phase}"
     package_root.mkdir(exist_ok=True)
@@ -186,7 +266,10 @@ def test_rollover_crash_exposes_exact_wholly_old_or_wholly_new_state_and_restart
         assert state["lifecycle"][1] == OLD
         assert state["lifecycle"][2] == state["active"][2]
         assert state["nodes"] == [(retained_id, NEW, 2)]
-        assert state["items"] == [("node", retained_id)]
+        assert state["items"] == [
+            ("node", retained_id),
+            ("message", state["active"][2]),
+        ]
         assert any(row[0] == OLD and row[2] == TAIL for row in state["messages"])
         assert all(row[0] != "ready" and row[0] != "preparing" for row in state["batches"])
         assert all(row[0] != pruned_id for row in state["nodes"])
@@ -440,7 +523,10 @@ def test_independent_engine_ingest_between_prepare_and_publish_is_exactly_once(
         assert state["lifecycle"][:2] == (NEW, OLD)
         assert state["messages"].count((OLD, "assistant", TAIL)) == 1
         assert state["nodes"] == [(retained_id, NEW, 2)]
-        assert state["items"] == [("node", retained_id)]
+        assert state["items"] == [
+            ("node", retained_id),
+            ("message", state["active"][2]),
+        ]
     finally:
         release.set()
         worker.join(5)
@@ -515,6 +601,287 @@ def test_independent_engine_stale_ingest_cannot_commit_after_rollover(tmp_path):
         ingest_engine.shutdown()
 
 
+@pytest.mark.parametrize("targets", [(NEW, NEW), ("rollover-target-a", "rollover-target-b")])
+@pytest.mark.parametrize("divergent", [False, True])
+def test_two_engines_past_generation_capture_reconcile_exact_tail_coverage(
+    tmp_path, monkeypatch, targets, divergent
+):
+    db_path = tmp_path / f"rollover-two-engine-{targets[0]}-{targets[1]}-{divergent}.db"
+    previous_messages, retained_id, _pruned_id = _seed(db_path)
+    initial = _canonical_snapshot(db_path)
+    engines = [LCMEngine(config=_config(db_path)), LCMEngine(config=_config(db_path))]
+    for engine in engines:
+        engine.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
+
+    tail_contents = ["DIVERGENT TAIL A", "DIVERGENT TAIL B"] if divergent else [TAIL, TAIL]
+    histories = [
+        previous_messages + ([{"role": "assistant", "content": tail_contents[index]}] if divergent else [])
+        for index in range(2)
+    ]
+    captured = threading.Barrier(2)
+    results: list[tuple[int, str]] = []
+    failures: list[BaseException] = []
+
+    for engine in engines:
+        original_prepare = engine._prepare_rollover_final_tail
+
+        def pause_after_generation_capture(*args, _prepare=original_prepare, **kwargs):
+            prepared = _prepare(*args, **kwargs)
+            captured.wait(timeout=5)
+            return prepared
+
+        monkeypatch.setattr(engine, "_prepare_rollover_final_tail", pause_after_generation_capture)
+
+    def run(index: int) -> None:
+        try:
+            moved = engines[index].rollover_session(
+                OLD,
+                targets[index],
+                previous_messages=histories[index],
+                carry_over_context=True,
+                platform="test",
+            )
+            results.append((moved, engines[index].current_session_id))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    workers = [threading.Thread(target=run, args=(index,)) for index in range(2)]
+    try:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(10)
+        assert all(not worker.is_alive() for worker in workers)
+        assert failures == []
+
+        state = _canonical_snapshot(db_path)
+        durable_owner = state["active"][1]
+        expected_advance = 2 if divergent else 1
+        assert state["active"][0] == initial["active"][0] + expected_advance
+        assert state["lifecycle"][:2] == (durable_owner, OLD)
+        assert {session for _moved, session in results} == {durable_owner}
+        assert sorted(moved for moved, _session in results) == [0, 1]
+        assert [row[1] for row in state["generations"][-expected_advance:]] == [durable_owner] * expected_advance
+        assert [
+            row for row in state["generation_items"]
+            if int(row[0]) <= int(initial["active"][0])
+        ] == initial["generation_items"]
+        assert any(item[:2] == ("node", retained_id) for item in state["items"])
+        expected_raw = {TAIL, *tail_contents} if divergent else {TAIL}
+        _assert_raw_frontier_coverage(state, expected_raw)
+        for content in expected_raw:
+            assert sum(row[3] == content for row in state["messages"]) == 1
+    finally:
+        for engine in engines:
+            engine.shutdown()
+
+
+def test_late_old_session_end_extends_winner_once_and_duplicate_replay_is_noop(tmp_path):
+    db_path = tmp_path / "rollover-late-session-end.db"
+    previous_messages, retained_id, _pruned_id = _seed(db_path)
+    engine = LCMEngine(config=_config(db_path))
+    engine.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
+    late_content = "UNIQUE LATE OLD SESSION END"
+    late_messages = previous_messages + [{"role": "assistant", "content": late_content}]
+    try:
+        engine.rollover_session(
+            OLD,
+            NEW,
+            previous_messages=previous_messages,
+            carry_over_context=True,
+            platform="test",
+        )
+        rolled = _canonical_snapshot(db_path)
+        engine.on_session_end(OLD, late_messages)
+        extended = _canonical_snapshot(db_path)
+
+        assert extended["active"][:2] == (rolled["active"][0] + 1, NEW)
+        assert extended["lifecycle"][:2] == (NEW, OLD)
+        assert any(item[:2] == ("node", retained_id) for item in extended["items"])
+        _assert_raw_frontier_coverage(extended, {TAIL, late_content})
+        assert sum(row[3] == late_content for row in extended["messages"]) == 1
+
+        immutable_generations = list(extended["generations"])
+        immutable_items = list(extended["items"])
+        engine.on_session_end(OLD, late_messages)
+        replayed = _canonical_snapshot(db_path)
+        assert replayed["generations"] == immutable_generations
+        assert replayed["items"] == immutable_items
+        assert sum(row[3] == late_content for row in replayed["messages"]) == 1
+    finally:
+        engine.shutdown()
+
+
+def test_simultaneous_late_end_and_competing_rollover_preserve_both_suffixes(tmp_path):
+    db_path = tmp_path / "rollover-late-end-versus-rollover.db"
+    previous_messages, retained_id, _pruned_id = _seed(db_path)
+    winner = LCMEngine(config=_config(db_path))
+    stale = LCMEngine(config=_config(db_path))
+    winner.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
+    stale.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
+    late_content = "SIMULTANEOUS LATE END"
+    rollover_content = "SIMULTANEOUS ROLLOVER SUFFIX"
+    failures: list[BaseException] = []
+    start = threading.Barrier(2)
+    try:
+        winner.rollover_session(
+            OLD,
+            NEW,
+            previous_messages=previous_messages,
+            carry_over_context=True,
+            platform="test",
+        )
+        rolled = _canonical_snapshot(db_path)
+
+        def late_end() -> None:
+            try:
+                start.wait(timeout=5)
+                winner.on_session_end(
+                    OLD,
+                    previous_messages + [{"role": "assistant", "content": late_content}],
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        def competing_rollover() -> None:
+            try:
+                start.wait(timeout=5)
+                stale.rollover_session(
+                    OLD,
+                    "rejected-competing-target",
+                    previous_messages=previous_messages
+                    + [{"role": "assistant", "content": rollover_content}],
+                    carry_over_context=True,
+                    platform="test",
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        workers = [threading.Thread(target=late_end), threading.Thread(target=competing_rollover)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(10)
+        assert all(not worker.is_alive() for worker in workers)
+        assert failures == []
+
+        state = _canonical_snapshot(db_path)
+        assert state["active"][:2] == (rolled["active"][0] + 2, NEW)
+        assert state["lifecycle"][:2] == (NEW, OLD)
+        assert any(item[:2] == ("node", retained_id) for item in state["items"])
+        expected = {TAIL, late_content, rollover_content}
+        _assert_raw_frontier_coverage(state, expected)
+        for content in expected:
+            assert sum(row[3] == content for row in state["messages"]) == 1
+    finally:
+        winner.shutdown()
+        stale.shutdown()
+
+
+def test_late_end_fails_closed_after_old_loses_finalized_ownership(tmp_path):
+    db_path = tmp_path / "rollover-late-end-ownership-lost.db"
+    previous_messages, _retained_id, _pruned_id = _seed(db_path)
+    engine = LCMEngine(config=_config(db_path))
+    engine.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
+    rejected = "REJECTED STALE FINALIZED OWNER"
+    try:
+        engine.rollover_session(OLD, NEW, previous_messages=previous_messages, platform="test")
+        engine.rollover_session(NEW, "newest-owner", previous_messages=[], platform="test")
+        resolved = engine._resolve_active_frontier_for_assembly()
+        assert resolved is not None
+        before = _canonical_snapshot(db_path)
+
+        with pytest.raises(RuntimeError, match="ownership changed"):
+            engine.on_session_end(
+                OLD,
+                previous_messages + [{"role": "assistant", "content": rejected}],
+            )
+
+        after = _canonical_snapshot(db_path)
+        assert after == before
+        assert all(row[3] != rejected for row in after["messages"])
+    finally:
+        engine.shutdown()
+
+
+LATE_END_PRECOMMIT_PHASES = (
+    "after_begin",
+    "after_revalidation",
+    "after_tail_ingest",
+    "after_frontier",
+    "after_lifecycle",
+)
+
+
+def _crash_late_end(tmp_path: Path, db_path: Path, phase: str, messages: list[dict]):
+    package_root = tmp_path / f"late-end-package-{phase}"
+    package_root.mkdir(exist_ok=True)
+    (package_root / "hermes_lcm").symlink_to(
+        Path(__file__).resolve().parents[1], target_is_directory=True
+    )
+    script = """
+import json
+import sys
+from hermes_lcm.config import LCMConfig
+from hermes_lcm.engine import LCMEngine
+
+engine = LCMEngine(config=LCMConfig(
+    database_path=sys.argv[1],
+    new_session_retain_depth=2,
+    async_background_compaction_worker_enabled=False,
+))
+engine.on_session_start(
+    "transactional-rollover-new",
+    conversation_id="transactional-rollover-conversation",
+    platform="test",
+)
+engine._rollover_publish_crash_hook = sys.argv[2]
+engine.on_session_end("transactional-rollover-old", json.loads(sys.argv[3]))
+raise SystemExit("crash hook did not fire")
+"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        value for value in (str(package_root), env.get("PYTHONPATH", "")) if value
+    )
+    return subprocess.run(
+        [sys.executable, "-c", script, str(db_path), phase, json.dumps(messages)],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize("phase", (*LATE_END_PRECOMMIT_PHASES, "after_commit"))
+def test_late_end_crash_is_wholly_pre_extension_or_post_extension(tmp_path, phase):
+    db_path = tmp_path / f"rollover-late-end-crash-{phase}.db"
+    previous_messages, retained_id, _pruned_id = _seed(db_path)
+    engine = LCMEngine(config=_config(db_path))
+    engine.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
+    engine.rollover_session(OLD, NEW, previous_messages=previous_messages, platform="test")
+    engine.shutdown()
+    before = _canonical_snapshot(db_path)
+    late_content = f"CRASH-SAFE LATE END {phase}"
+    crashed = _crash_late_end(
+        tmp_path,
+        db_path,
+        phase,
+        previous_messages + [{"role": "assistant", "content": late_content}],
+    )
+    assert crashed.returncode == 88, (crashed.stdout, crashed.stderr)
+    state = _canonical_snapshot(db_path)
+
+    if phase in LATE_END_PRECOMMIT_PHASES:
+        assert state == before
+    else:
+        assert state["active"][:2] == (before["active"][0] + 1, NEW)
+        assert state["lifecycle"][:2] == (NEW, OLD)
+        assert any(item[:2] == ("node", retained_id) for item in state["items"])
+        _assert_raw_frontier_coverage(state, {TAIL, late_content})
+        assert sum(row[3] == late_content for row in state["messages"]) == 1
+
+
 def _start_rollover_process(
     tmp_path: Path,
     db_path: Path,
@@ -549,9 +916,14 @@ engine.on_session_start(
     conversation_id="transactional-rollover-conversation",
     platform="test",
 )
-Path(sys.argv[3]).write_text("ready", encoding="utf-8")
-while not Path(sys.argv[4]).exists():
-    time.sleep(0.01)
+original_prepare = engine._prepare_rollover_final_tail
+def prepare_after_generation_capture(*args, **kwargs):
+    prepared = original_prepare(*args, **kwargs)
+    Path(sys.argv[3]).write_text("ready", encoding="utf-8")
+    while not Path(sys.argv[4]).exists():
+        time.sleep(0.01)
+    return prepared
+engine._prepare_rollover_final_tail = prepare_after_generation_capture
 moved = engine.rollover_session(
     "transactional-rollover-old",
     sys.argv[2],
@@ -585,13 +957,24 @@ engine.shutdown()
 
 
 @pytest.mark.parametrize("targets", [(NEW, NEW), ("rollover-target-a", "rollover-target-b")])
-def test_real_process_rollovers_publish_one_generation_and_one_owner(tmp_path, targets):
-    """Same-target retries no-op; different targets converge on one winner."""
-    db_path = tmp_path / f"rollover-process-race-{targets[0]}-{targets[1]}.db"
+@pytest.mark.parametrize("divergent", [False, True])
+def test_real_process_rollovers_reconcile_after_generation_capture(tmp_path, targets, divergent):
+    """Both processes capture one base; divergent suffixes extend its winner."""
+    db_path = tmp_path / f"rollover-process-race-{targets[0]}-{targets[1]}-{divergent}.db"
     previous_messages, retained_id, _pruned_id = _seed(db_path)
     initial_generation = int(_snapshot(db_path)["active"][0])
-    go_path = tmp_path / f"go-{targets[0]}-{targets[1]}"
-    ready_paths = [tmp_path / f"ready-{index}-{targets[index]}" for index in range(2)]
+    histories = [
+        previous_messages + (
+            [{"role": "assistant", "content": f"PROCESS DIVERGENT {index}"}]
+            if divergent
+            else []
+        )
+        for index in range(2)
+    ]
+    go_path = tmp_path / f"go-{targets[0]}-{targets[1]}-{divergent}"
+    ready_paths = [
+        tmp_path / f"ready-{index}-{targets[index]}-{divergent}" for index in range(2)
+    ]
     processes = [
         _start_rollover_process(
             tmp_path,
@@ -599,7 +982,7 @@ def test_real_process_rollovers_publish_one_generation_and_one_owner(tmp_path, t
             target=target,
             ready_path=ready_paths[index],
             go_path=go_path,
-            previous_messages=previous_messages,
+            previous_messages=histories[index],
         )
         for index, target in enumerate(targets)
     ]
@@ -616,11 +999,17 @@ def test_real_process_rollovers_publish_one_generation_and_one_owner(tmp_path, t
         state = _snapshot(db_path)
         durable_owner = state["active"][1]
         assert durable_owner in set(targets)
-        assert state["active"][0] == initial_generation + 1
+        assert state["active"][0] == initial_generation + (2 if divergent else 1)
         assert state["lifecycle"][:2] == (durable_owner, OLD)
-        assert state["messages"].count((OLD, "assistant", TAIL)) == 1
+        expected_contents = {TAIL}
+        if divergent:
+            expected_contents.update({"PROCESS DIVERGENT 0", "PROCESS DIVERGENT 1"})
+        for content in expected_contents:
+            assert state["messages"].count((OLD, "assistant", content)) == 1
         assert state["nodes"] == [(retained_id, durable_owner, 2)]
-        assert state["items"] == [("node", retained_id)]
+        canonical = _canonical_snapshot(db_path)
+        assert any(item[:2] == ("node", retained_id) for item in canonical["items"])
+        _assert_raw_frontier_coverage(canonical, expected_contents)
         assert {result["session"] for result in results} == {durable_owner}
         assert sorted(result["moved"] for result in results) == [0, 1]
     finally:
