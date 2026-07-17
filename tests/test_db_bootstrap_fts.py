@@ -505,7 +505,7 @@ def test_v8_migration_blocks_base_v7_unconditional_schema_upsert(
 
         check = sqlite3.connect(db_path)
         try:
-            assert db_bootstrap.get_schema_version(check) == 8
+            assert db_bootstrap.get_schema_version(check) == db_bootstrap.SCHEMA_VERSION
             focus_table = check.execute(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'lcm_focus_briefs'"
             ).fetchone()

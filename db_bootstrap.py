@@ -27,7 +27,7 @@ class SchemaVersionTooNewError(RuntimeError):
     """
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 # Bounded busy wait for foreground cutover so compress() cannot hang
 # indefinitely behind a concurrent writer (gateway host holds compression_locks).
@@ -96,9 +96,12 @@ def configure_connection(conn: sqlite3.Connection) -> None:
     - mmap_size=268435456 (256 MiB)        : memory-map reads so concurrent
                                               readers cache WAL pages in RAM.
     """
+    # Install the wait policy before journal-mode negotiation: concurrent
+    # process startups can otherwise fail immediately while one connection is
+    # publishing migration/DDL frames.
+    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=FULL")
-    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA wal_autocheckpoint=500")
     conn.execute("PRAGMA journal_size_limit=67108864")
     conn.execute("PRAGMA mmap_size=268435456")
@@ -289,6 +292,135 @@ def ensure_message_origin_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_msg_conversation_session ON messages(conversation_id, session_id, store_id)"
+    )
+
+
+def ensure_content_scan_checkpoint_schema(
+    conn: sqlite3.Connection, *, replace_legacy_triggers: bool = False
+) -> None:
+    """Install the v9 bounded-content paging schema.
+
+    This function is called only while ``run_versioned_migrations`` owns its
+    ``BEGIN IMMEDIATE`` transaction.  In particular, the DDL, triggers,
+    migration-step marker, and schema-version publication become visible in one
+    crash-atomic commit.  Legacy message revisions are deliberately created on
+    first expansion instead of scanning the entire messages table at startup.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_content_revisions (
+            store_id INTEGER PRIMARY KEY,
+            content_fingerprint TEXT NOT NULL,
+            content_chars INTEGER NOT NULL,
+            content_bytes INTEGER NOT NULL DEFAULT 0,
+            storage_version INTEGER NOT NULL DEFAULT 2
+        )
+        """
+    )
+    revision_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(lcm_content_revisions)").fetchall()
+    }
+    add_column_if_missing(
+        conn,
+        revision_columns,
+        "content_bytes",
+        "ALTER TABLE lcm_content_revisions ADD COLUMN content_bytes INTEGER NOT NULL DEFAULT 0",
+    )
+    add_column_if_missing(
+        conn,
+        revision_columns,
+        "storage_version",
+        "ALTER TABLE lcm_content_revisions ADD COLUMN storage_version INTEGER NOT NULL DEFAULT 1",
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_content_scan_checkpoints (
+            store_id INTEGER NOT NULL,
+            content_fingerprint TEXT NOT NULL,
+            char_offset INTEGER NOT NULL,
+            byte_offset INTEGER NOT NULL DEFAULT 0,
+            mode TEXT NOT NULL,
+            quote TEXT,
+            quote_backslashes INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (store_id, content_fingerprint, char_offset)
+        )
+        """
+    )
+    checkpoint_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(lcm_content_scan_checkpoints)").fetchall()
+    }
+    add_column_if_missing(
+        conn,
+        checkpoint_columns,
+        "byte_offset",
+        "ALTER TABLE lcm_content_scan_checkpoints ADD COLUMN byte_offset INTEGER NOT NULL DEFAULT 0",
+    )
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_lcm_content_scan_checkpoint_lookup
+           ON lcm_content_scan_checkpoints(
+               store_id, content_fingerprint, char_offset DESC
+           )"""
+    )
+
+    messages_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'"
+    ).fetchone()
+    if not messages_exists:
+        return
+
+    # Replace any pre-v9 unversioned triggers so all new revisions contain the
+    # immutable character/byte lengths used by incremental BLOB paging.
+    if replace_legacy_triggers:
+        for trigger_name in (
+            "lcm_content_revision_insert",
+            "lcm_content_revision_update",
+            "lcm_content_revision_delete",
+        ):
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS lcm_content_revision_insert
+        AFTER INSERT ON messages BEGIN
+            INSERT OR REPLACE INTO lcm_content_revisions
+                (store_id, content_fingerprint, content_chars, content_bytes, storage_version)
+            VALUES (
+                new.store_id,
+                lower(hex(randomblob(16))),
+                COALESCE(length(CAST(new.content AS TEXT)), 0),
+                COALESCE(length(CAST(new.content AS BLOB)), 0),
+                2
+            );
+            DELETE FROM lcm_content_scan_checkpoints WHERE store_id = new.store_id;
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS lcm_content_revision_update
+        AFTER UPDATE OF content ON messages BEGIN
+            INSERT OR REPLACE INTO lcm_content_revisions
+                (store_id, content_fingerprint, content_chars, content_bytes, storage_version)
+            VALUES (
+                new.store_id,
+                lower(hex(randomblob(16))),
+                COALESCE(length(CAST(new.content AS TEXT)), 0),
+                COALESCE(length(CAST(new.content AS BLOB)), 0),
+                2
+            );
+            DELETE FROM lcm_content_scan_checkpoints WHERE store_id = new.store_id;
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS lcm_content_revision_delete
+        AFTER DELETE ON messages BEGIN
+            DELETE FROM lcm_content_scan_checkpoints WHERE store_id = old.store_id;
+            DELETE FROM lcm_content_revisions WHERE store_id = old.store_id;
+        END
+        """
     )
 
 
@@ -968,6 +1100,13 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
         if current_version < 8:
             mark_migration_step_complete(conn, "v8_focus_and_resolved_policy_metadata")
             current_version = 8
+
+        ensure_content_scan_checkpoint_schema(
+            conn, replace_legacy_triggers=current_version < 9
+        )
+        if current_version < 9:
+            mark_migration_step_complete(conn, "v9_content_scan_checkpoints")
+            current_version = 9
 
         set_schema_version(conn, current_version)
         conn.commit()

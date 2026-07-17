@@ -279,7 +279,7 @@ def test_v7_fixture_migrates_to_v8_and_restarts_idempotently(tmp_path):
     )
     conn.commit()
     run_versioned_migrations(conn)
-    assert get_schema_version(conn) == SCHEMA_VERSION == 8
+    assert get_schema_version(conn) == SCHEMA_VERSION == 9
     assert conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_focus_briefs'"
     ).fetchone()
@@ -297,6 +297,6 @@ def test_v7_fixture_migrates_to_v8_and_restarts_idempotently(tmp_path):
 
     restarted = sqlite3.connect(path)
     run_versioned_migrations(restarted)
-    assert get_schema_version(restarted) == 8
+    assert get_schema_version(restarted) == SCHEMA_VERSION
     assert restarted.execute("PRAGMA quick_check").fetchone()[0] == "ok"
     restarted.close()

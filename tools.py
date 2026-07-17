@@ -127,6 +127,16 @@ _BOUNDARY_STANDALONE_CREDENTIAL_RE = re.compile(
     r")\Z",
     re.IGNORECASE,
 )
+_BOUNDARY_STANDALONE_START_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:"
+    r"sk-(?:proj-|svcacct-)?|"
+    r"(?:AKIA|ASIA)|"
+    r"gh[pousr]_|github_pat_|glpat-|AIza|sk_live_|xox[baprs]-|"
+    r"Bearer\s+"
+    r")",
+    re.IGNORECASE,
+)
+_BOUNDARY_STANDALONE_BODY_RE = re.compile(r"[A-Za-z0-9._~+/=-]")
 _BOUNDARY_ASSIGNMENT_START_RE = re.compile(
     r"(?<![A-Za-z0-9_-])"
     r"(?:api[_-]?key|api[_-]?token|access[_-]?token|secret[_-]?key|"
@@ -244,6 +254,7 @@ def _credential_mode_at_offset(
                     else None
                 )
                 assignment = _BOUNDARY_ASSIGNMENT_START_RE.match(data, index)
+                standalone = _BOUNDARY_STANDALONE_START_RE.match(data, index)
                 if pem_begin is not None:
                     mode = "pem"
                     index = pem_begin.end()
@@ -269,6 +280,14 @@ def _credential_mode_at_offset(
                     advance_chars = max(
                         advance_chars,
                         min(assignment.end(), requested_offset - cursor),
+                    )
+                    continue
+                if standalone is not None:
+                    mode = "standalone"
+                    index = standalone.end()
+                    advance_chars = max(
+                        advance_chars,
+                        min(standalone.end(), requested_offset - cursor),
                     )
                     continue
                 index += 1
@@ -314,6 +333,12 @@ def _credential_mode_at_offset(
                     continue
                 index += 1
                 continue
+            if mode == "standalone":
+                if _BOUNDARY_STANDALONE_BODY_RE.fullmatch(data[index]) is None:
+                    mode = "normal"
+                    continue
+                index += 1
+                continue
             if mode == "pem":
                 pem_end = (
                     _BOUNDARY_PRIVATE_KEY_END_RE.match(data, index)
@@ -353,6 +378,10 @@ def _credential_mode_at_offset(
             # safe page boundary, but the benign delimiter still belongs to
             # the caller's lossless output and must not be consumed here.
             mode = "normal"
+    elif mode == "standalone":
+        boundary_char = read_chunk(requested_offset, 1)
+        if boundary_char and _BOUNDARY_STANDALONE_BODY_RE.fullmatch(boundary_char[0]) is None:
+            mode = "normal"
     return {
         "complete": True,
         "offset": cursor,
@@ -391,7 +420,9 @@ def _scan_raw_credential_boundary(
         offset, max(0, int(checkpoint.get("offset", 0) or 0))
     )
     checkpoint_mode = str(checkpoint.get("mode") or "normal")
-    if checkpoint_mode not in {"normal", "quote", "escaped_quote", "token", "pem", "unknown"}:
+    if checkpoint_mode not in {
+        "normal", "quote", "escaped_quote", "token", "standalone", "pem", "unknown"
+    }:
         checkpoint_mode = "unknown"
     checkpoint_quote = checkpoint.get("quote")
     if checkpoint_quote not in {None, '"', "'"}:
@@ -409,45 +440,19 @@ def _scan_raw_credential_boundary(
             "checkpoint_quote_backslashes": checkpoint_backslashes,
         }
 
-    mode: str | None = None
-    quote: str | None = None
-    unsafe = False
+    mode: str | None = checkpoint_mode
+    quote: str | None = checkpoint_quote
+    quote_backslashes = checkpoint_backslashes
+    unsafe = checkpoint_mode != "normal"
     safe_prefix = ""
-
-    # An opener exactly at the cursor must be handled before the ordinary page
-    # slicer, otherwise a very long expression can pin pagination at its start.
-    forward_prefix = read_chunk(offset, 512)
-    assignment_at_cursor = _BOUNDARY_ASSIGNMENT_START_RE.match(forward_prefix)
-    pem_at_cursor = _BOUNDARY_PRIVATE_KEY_BEGIN_RE.match(forward_prefix)
-    if assignment_at_cursor is not None:
-        unsafe = True
-        if assignment_at_cursor.group("escaped_quote") is not None:
-            mode = "escaped_quote"
-            quote = assignment_at_cursor.group("escaped_quote")[-1]
-            forward_start = offset + assignment_at_cursor.end()
-            safe_prefix = forward_prefix[:assignment_at_cursor.end()]
-        elif assignment_at_cursor.group("quote") is not None:
-            mode = "quote"
-            quote = assignment_at_cursor.group("quote")
-            forward_start = offset + assignment_at_cursor.end()
-            safe_prefix = forward_prefix[:assignment_at_cursor.end()]
-        else:
-            mode = "token"
-            forward_start = offset + assignment_at_cursor.start("unquoted")
-            safe_prefix = forward_prefix[:assignment_at_cursor.start("unquoted")]
-    elif pem_at_cursor is not None:
-        unsafe = True
-        mode = "pem"
-        forward_start = offset + pem_at_cursor.end()
-    else:
-        forward_start = offset
+    forward_start = offset
 
     # Stream from the only universal proof boundary: the start of the row.
     # State stays bounded to a few scalars while SQLite returns bounded chunks;
     # no whole row is allocated.  Starting at a fixed lookbehind would make a
     # wholly benign deep offset indistinguishable from a credential body.
     chunks_used = 0
-    if not unsafe and offset > checkpoint_offset:
+    if offset > checkpoint_offset:
         state = _credential_mode_at_offset(
             read_chunk,
             checkpoint_offset,
@@ -474,16 +479,40 @@ def _scan_raw_credential_boundary(
         mode = str(state["mode"])
         quote = state["quote"]
         quote_backslashes = int(state["quote_backslashes"])
-        if mode != "normal":
+        unsafe = mode != "normal"
+
+    # Probe an opener at the requested cursor only after a deep cursor has been
+    # reached from its proven byte/lexer checkpoint. This prevents a nominally
+    # bounded probe from forcing a UTF-8 prefix traversal.
+    if not unsafe:
+        forward_prefix = read_chunk(offset, 512)
+        assignment_at_cursor = _BOUNDARY_ASSIGNMENT_START_RE.match(forward_prefix)
+        pem_at_cursor = _BOUNDARY_PRIVATE_KEY_BEGIN_RE.match(forward_prefix)
+        standalone_at_cursor = _BOUNDARY_STANDALONE_START_RE.match(forward_prefix)
+        if assignment_at_cursor is not None:
             unsafe = True
-            forward_start = offset
-    elif not unsafe:
-        mode = checkpoint_mode
-        quote = checkpoint_quote
-        quote_backslashes = checkpoint_backslashes
-        if mode != "normal":
+            if assignment_at_cursor.group("escaped_quote") is not None:
+                mode = "escaped_quote"
+                quote = assignment_at_cursor.group("escaped_quote")[-1]
+                forward_start = offset + assignment_at_cursor.end()
+                safe_prefix = forward_prefix[:assignment_at_cursor.end()]
+            elif assignment_at_cursor.group("quote") is not None:
+                mode = "quote"
+                quote = assignment_at_cursor.group("quote")
+                forward_start = offset + assignment_at_cursor.end()
+                safe_prefix = forward_prefix[:assignment_at_cursor.end()]
+            else:
+                mode = "token"
+                forward_start = offset + assignment_at_cursor.start("unquoted")
+                safe_prefix = forward_prefix[:assignment_at_cursor.start("unquoted")]
+        elif pem_at_cursor is not None:
             unsafe = True
-            forward_start = offset
+            mode = "pem"
+            forward_start = offset + pem_at_cursor.end()
+        elif standalone_at_cursor is not None:
+            unsafe = True
+            mode = "standalone"
+            forward_start = offset + standalone_at_cursor.end()
 
     if not unsafe:
         return {
@@ -529,6 +558,11 @@ def _scan_raw_credential_boundary(
                     cursor + index,
                     char,
                 ):
+                    terminator_end = overlap_chars + index
+                    break
+        elif mode == "standalone":
+            for index, char in enumerate(chunk):
+                if _BOUNDARY_STANDALONE_BODY_RE.fullmatch(char) is None:
                     terminator_end = overlap_chars + index
                     break
         elif mode == "quote":
@@ -708,6 +742,239 @@ def _externalized_literal_match(content: str, query: str) -> re.Match[str] | Non
     return re.search(re.escape(terms[0]), content, flags=re.IGNORECASE)
 
 
+def _externalized_prefix_authorization(
+    text: str,
+) -> tuple[dict[str, Any], set[str], str | None]:
+    """Parse pre-content top-level fields and reject duplicate keys."""
+    decoder = json.JSONDecoder()
+    fields: dict[str, Any] = {}
+    seen: set[str] = set()
+    index = 0
+    length = len(text)
+
+    def whitespace(pos: int) -> int:
+        while pos < length and text[pos] in " \t\n\r":
+            pos += 1
+        return pos
+
+    index = whitespace(index)
+    if index >= length or text[index] != "{":
+        return fields, seen, "invalid_payload"
+    index += 1
+    while True:
+        index = whitespace(index)
+        if index >= length or text[index] != '"':
+            return fields, seen, "invalid_payload"
+        try:
+            key, index = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            return fields, seen, "invalid_payload"
+        if not isinstance(key, str):
+            return fields, seen, "invalid_payload"
+        if key in seen:
+            return fields, seen, "ambiguous_metadata"
+        seen.add(key)
+        index = whitespace(index)
+        if index >= length or text[index] != ":":
+            return fields, seen, "invalid_payload"
+        index = whitespace(index + 1)
+        if key == "content":
+            if index >= length or text[index] != '"':
+                return fields, seen, "invalid_payload"
+            return fields, seen, None
+        try:
+            value, index = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            return fields, seen, "invalid_payload"
+        fields[key] = value
+        index = whitespace(index)
+        if index >= length or text[index] != ",":
+            return fields, seen, "invalid_payload"
+        index += 1
+
+
+def _stream_externalized_json_content(
+    handle,
+    *,
+    max_payload_chars: int,
+    max_bytes: int,
+    deadline: float | None,
+) -> tuple[str, int, bool]:
+    """Stream one JSON string and require content to be the final object field."""
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    pieces: list[str] = []
+    kept_chars = 0
+    bytes_read = 0
+    closed = False
+    escaped = False
+    unicode_digits = ""
+    pending_high_surrogate: int | None = None
+    suffix_closed = False
+
+    def check_deadline() -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("body_deadline")
+
+    def emit(character: str) -> None:
+        nonlocal kept_chars
+        if kept_chars < max_payload_chars:
+            pieces.append(character)
+            kept_chars += 1
+
+    def emit_codepoint(value: int) -> None:
+        nonlocal pending_high_surrogate
+        if 0xD800 <= value <= 0xDBFF:
+            if pending_high_surrogate is not None:
+                emit(chr(pending_high_surrogate))
+            pending_high_surrogate = value
+        elif 0xDC00 <= value <= 0xDFFF and pending_high_surrogate is not None:
+            emit(chr(0x10000 + ((pending_high_surrogate - 0xD800) << 10) + value - 0xDC00))
+            pending_high_surrogate = None
+        else:
+            if pending_high_surrogate is not None:
+                emit(chr(pending_high_surrogate))
+                pending_high_surrogate = None
+            emit(chr(value))
+
+    while bytes_read < max_bytes:
+        check_deadline()
+        raw = handle.read(min(16 * 1024, max_bytes - bytes_read))
+        if not raw:
+            break
+        bytes_read += len(raw)
+        decoded = decoder.decode(raw, final=False)
+        for index, character in enumerate(decoded):
+            if index % 4096 == 0:
+                check_deadline()
+            if closed:
+                if suffix_closed:
+                    if character not in " \t\n\r":
+                        raise ValueError("ambiguous_metadata")
+                elif character in " \t\n\r":
+                    pass
+                elif character == "}":
+                    suffix_closed = True
+                else:
+                    raise ValueError("ambiguous_metadata")
+            elif unicode_digits:
+                if character not in "0123456789abcdefABCDEF":
+                    raise ValueError("invalid_payload")
+                unicode_digits += character
+                if len(unicode_digits) == 5:
+                    emit_codepoint(int(unicode_digits[1:], 16))
+                    unicode_digits = ""
+                    escaped = False
+            elif escaped:
+                if character == "u":
+                    unicode_digits = "u"
+                else:
+                    escaped = False
+                    mapped = {
+                        '"': '"', "\\": "\\", "/": "/", "b": "\b",
+                        "f": "\f", "n": "\n", "r": "\r", "t": "\t",
+                    }.get(character)
+                    if mapped is None:
+                        raise ValueError("invalid_payload")
+                    emit(mapped)
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                if pending_high_surrogate is not None:
+                    emit(chr(pending_high_surrogate))
+                    pending_high_surrogate = None
+                closed = True
+            elif ord(character) < 0x20:
+                raise ValueError("invalid_payload")
+            else:
+                emit(character)
+        check_deadline()
+
+    if bytes_read < max_bytes:
+        final = decoder.decode(b"", final=True)
+        for character in final:
+            if suffix_closed:
+                if character not in " \t\n\r":
+                    raise ValueError("ambiguous_metadata")
+            elif character in " \t\n\r":
+                pass
+            elif character == "}":
+                suffix_closed = True
+            else:
+                raise ValueError("ambiguous_metadata")
+    if not closed or escaped or unicode_digits:
+        return "".join(pieces), bytes_read, False
+    # A trailing comma makes both ownership and content semantics overridable.
+    if not suffix_closed:
+        raise ValueError("ambiguous_metadata")
+    return "".join(pieces), bytes_read, True
+
+
+def _deadline_checked_literal_span(
+    content: str, query: str, *, deadline: float | None
+) -> tuple[int, int] | None:
+    terms = [
+        phrase or word
+        for phrase, word in re.findall(r'"([^"]+)"|(\S+)', query)
+        if phrase or word
+    ]
+    if not terms:
+        return None
+    first_span: tuple[int, int] | None = None
+    for term_index, term in enumerate(terms):
+        pattern = re.compile(re.escape(term), re.IGNORECASE)
+        overlap_chars = max(64, len(term) * 2)
+        cursor = 0
+        overlap = ""
+        found: tuple[int, int] | None = None
+        while cursor < len(content):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("body_deadline")
+            chunk = content[cursor:cursor + 32 * 1024]
+            candidate = overlap + chunk
+            match = pattern.search(candidate)
+            if match is not None and match.end() > len(overlap):
+                base = cursor - len(overlap)
+                found = (base + match.start(), base + match.end())
+                break
+            cursor += len(chunk)
+            overlap = candidate[-overlap_chars:]
+        if found is None:
+            return None
+        if term_index == 0:
+            first_span = found
+    return first_span
+
+
+def _deadline_checked_match_metadata(
+    content: str, start: int, end: int, *, deadline: float | None
+) -> tuple[int, int, int, int]:
+    line = 1
+    line_start = 0
+    byte_offset = 0
+    cursor = 0
+    while cursor < start:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("body_deadline")
+        piece = content[cursor:min(start, cursor + 4096)]
+        line += piece.count("\n")
+        newline = piece.rfind("\n")
+        if newline >= 0:
+            line_start = cursor + newline + 1
+        byte_offset += len(piece.encode("utf-8"))
+        cursor += len(piece)
+    line_end = end
+    while line_end < len(content):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("body_deadline")
+        block_end = min(len(content), line_end + 4096)
+        newline = content.find("\n", line_end, block_end)
+        if newline >= 0:
+            line_end = newline
+            break
+        line_end = block_end
+    return line, line_start, line_end, byte_offset
+
+
 def _regex_span_worker(query: str, content: str, connection) -> None:
     try:
         match = re.search(query, content, flags=re.IGNORECASE)
@@ -854,10 +1121,8 @@ def _search_externalized_payloads(
             diagnostics.append({"ref": path.name, "error": "not_a_file"})
             continue
         remaining = effective_total_bytes - bytes_scanned
-        read_limit = min(
-            remaining,
-            max(4_096, max_payload_chars * 6 + 4_096),
-        )
+        read_limit = remaining
+        read_phase = "metadata"
         try:
             with resolved.open("rb") as handle:
                 opened_stat = os.fstat(handle.fileno())
@@ -875,10 +1140,15 @@ def _search_externalized_payloads(
                     )
                 )
                 metadata_bytes = handle.tell()
-                payload_session_id = _inspect_top_level_json_string_fields_before_content(
-                    metadata_prefix
-                )[0].get("session_id", "")
-                if not payload_session_id:
+                metadata_fields, _seen_keys, metadata_error = (
+                    _externalized_prefix_authorization(metadata_prefix)
+                )
+                if metadata_error is not None:
+                    bytes_scanned += metadata_bytes
+                    diagnostics.append({"ref": path.name, "error": metadata_error})
+                    continue
+                payload_session_id = metadata_fields.get("session_id", "")
+                if not isinstance(payload_session_id, str) or not payload_session_id:
                     bytes_scanned += metadata_bytes
                     diagnostics.append({
                         "ref": path.name,
@@ -904,34 +1174,39 @@ def _search_externalized_payloads(
                         ),
                     })
                     continue
-                prefix_bytes = metadata_prefix.encode("utf-8")
-                tail_limit = max(0, read_limit - len(prefix_bytes))
-                raw_tail = handle.read(tail_limit)
-                raw = prefix_bytes + raw_tail
-                raw_truncated = opened_stat.st_size > len(raw)
+                read_phase = "body"
+                content, body_bytes, content_closed = _stream_externalized_json_content(
+                    handle,
+                    max_payload_chars=max_payload_chars,
+                    max_bytes=max(0, read_limit - metadata_bytes),
+                    deadline=deadline,
+                )
+                total_file_bytes = metadata_bytes + body_bytes
+                raw_truncated = opened_stat.st_size > total_file_bytes
+                if raw_truncated or not content_closed:
+                    bytes_scanned += total_file_bytes
+                    scan_truncated = True
+                    diagnostics.append({"ref": path.name, "error": "payload_truncated"})
+                    continue
         except TimeoutError:
             scan_truncated = True
-            diagnostics.append({"ref": path.name, "error": "metadata_deadline"})
+            diagnostics.append({
+                "ref": path.name,
+                "error": "metadata_deadline" if read_phase == "metadata" else "body_deadline",
+            })
             break
-        except (OSError, ValueError, UnicodeDecodeError):
+        except ValueError as exc:
+            error = str(exc)
+            diagnostics.append({
+                "ref": path.name,
+                "error": error if error in {"ambiguous_metadata", "invalid_payload"} else "invalid_payload",
+            })
+            continue
+        except (OSError, UnicodeDecodeError):
             diagnostics.append({"ref": path.name, "error": "unreadable"})
             continue
         files_scanned += 1
-        bytes_scanned += min(len(raw), read_limit)
-        prefix = raw.decode("utf-8", errors="replace")
-        content_key = re.search(r'"content"\s*:\s*', prefix)
-        if content_key is None:
-            diagnostics.append({"ref": path.name, "error": "content_not_in_prefix"})
-            continue
-        try:
-            content, content_closed = _decode_json_string_prefix(
-                prefix,
-                content_key.end(),
-                max_payload_chars,
-            )
-        except ValueError:
-            diagnostics.append({"ref": path.name, "error": "invalid_payload"})
-            continue
+        bytes_scanned += total_file_bytes
         if regex_mode:
             remaining_regex_time = regex_deadline - time.monotonic()
             if remaining_regex_time <= 0:
@@ -955,29 +1230,42 @@ def _search_externalized_payloads(
                 continue
             start, end = span
         else:
-            match = _externalized_literal_match(content, query)
-            if match is None:
+            try:
+                span = _deadline_checked_literal_span(
+                    content, query, deadline=deadline
+                )
+            except TimeoutError:
+                scan_truncated = True
+                diagnostics.append({"ref": path.name, "error": "body_deadline"})
+                break
+            if span is None:
                 continue
-            start, end = match.span()
-        line = content.count("\n", 0, start) + 1
-        line_start = content.rfind("\n", 0, start) + 1
-        line_end = content.find("\n", end)
-        if line_end < 0:
-            line_end = len(content)
+            start, end = span
+        try:
+            line, line_start, line_end, byte_offset = _deadline_checked_match_metadata(
+                content, start, end, deadline=deadline
+            )
+        except TimeoutError:
+            scan_truncated = True
+            diagnostics.append({"ref": path.name, "error": "body_deadline"})
+            break
         context_start = max(line_start, start - 120)
         context_end = min(line_end, end + 120)
         try:
-            created_match = re.search(r'"created_at"\s*:\s*([0-9.]+)', prefix)
-            created_at = (
-                float(created_match.group(1))
-                if created_match
-                else opened_stat.st_mtime
-            )
-        except (OSError, ValueError):
+            created_at = float(metadata_fields.get("created_at", opened_stat.st_mtime))
+        except (OSError, TypeError, ValueError):
             created_at = 0.0
+        if deadline is not None and time.monotonic() >= deadline:
+            scan_truncated = True
+            diagnostics.append({"ref": path.name, "error": "body_deadline"})
+            break
         matched_text = content[start:end]
         snippet = content[context_start:context_end]
         safe_snippet = redact_sensitive_text(snippet, engine._config)
+        if deadline is not None and time.monotonic() >= deadline:
+            scan_truncated = True
+            diagnostics.append({"ref": path.name, "error": "body_deadline"})
+            break
         safe_matched_text = (
             matched_text
             if matched_text in safe_snippet
@@ -989,10 +1277,10 @@ def _search_externalized_payloads(
             "session_id": payload_session_id,
             "line": line,
             "char_offset": start,
-            "byte_offset": len(content[:start].encode("utf-8")),
+            "byte_offset": byte_offset,
             "matched_text": safe_matched_text,
             "snippet": safe_snippet,
-            "payload_truncated": bool(raw_truncated or not content_closed),
+            "payload_truncated": len(content) >= max_payload_chars,
             "content_chars_scanned": len(content),
             "_sort_ts": created_at,
             "_sort_rank": 0.0,

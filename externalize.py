@@ -1020,10 +1020,12 @@ def externalize_ingest_payload(
         "role": role,
         "session_id": session_id,
         "field_path": field_path,
-        "content": content,
         "content_chars": len(content),
         "content_bytes": len(content.encode("utf-8")),
         "created_at": time.time(),
+        # Canonical externalized payloads put content last. Bounded readers can
+        # then reject any trailing top-level key as ambiguous metadata.
+        "content": content,
     }
     try:
         _write_externalized_payload(path, payload)
@@ -1143,7 +1145,6 @@ def maybe_externalize_payload(
         "tool_call_id": tool_call_id,
         "role": role,
         "session_id": session_id,
-        "content": content,
         "content_chars": len(content),
         "content_bytes": len(content.encode("utf-8")),
         "created_at": time.time(),
@@ -1151,6 +1152,7 @@ def maybe_externalize_payload(
     if metadata:
         payload.update(_safe_persisted_output_metadata(metadata))
         _merge_persisted_output_marker_metadata(payload, metadata)
+    payload["content"] = content
     try:
         _write_externalized_payload(path, payload)
     except OSError as exc:

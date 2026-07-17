@@ -73,7 +73,7 @@ def test_cli_status_is_json_first_and_works_without_gateway(tmp_path):
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["database_path"] == str(db)
-    assert payload["schema_version"] == 8
+    assert payload["schema_version"] == 9
     assert payload["counts"]["messages"] == 2
     assert payload["read_only"] is True
 
