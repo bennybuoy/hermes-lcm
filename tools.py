@@ -763,15 +763,163 @@ _EXTERNALIZED_CANONICAL_KEYS = frozenset({
 })
 _EXTERNALIZED_TRAILING_CANONICAL_KEYS = frozenset({
     "content_chars", "content_bytes", "created_at",
+    # ``41b43c8`` wrote the persisted-output block after ``content`` for
+    # raw/tool payloads.  Keep this list explicit: persisted_output_* is not a
+    # namespace extension point, and unknown lookalikes must remain rejected.
+    "persisted_output_source_path", "persisted_output_expected_chars",
+    "persisted_output_preview_prefix", "persisted_output_preview_sha256",
+    "persisted_output_redacted_preview_sha256", "persisted_output_file_size",
+    "persisted_output_file_mtime_ns", "persisted_output_file_ctime_ns",
+    "persisted_output_markers",
 })
 _EXTERNALIZED_SUFFIX_MAX_CHARS = 16 * 1024
+_EXTERNALIZED_CANONICAL_INTEGER_MAX = (1 << 63) - 1
+_EXTERNALIZED_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_EXTERNALIZED_PERSISTED_OUTPUT_KEYS = frozenset({
+    "persisted_output_source_path", "persisted_output_expected_chars",
+    "persisted_output_preview_prefix", "persisted_output_preview_sha256",
+    "persisted_output_redacted_preview_sha256", "persisted_output_file_size",
+    "persisted_output_file_mtime_ns", "persisted_output_file_ctime_ns",
+    "persisted_output_markers",
+})
+_EXTERNALIZED_PERSISTED_OUTPUT_MARKER_KEYS = frozenset({
+    "source_path", "expected_chars", "preview_prefix", "preview_sha256",
+    "redacted_preview_sha256", "file_size", "file_mtime_ns", "file_ctime_ns",
+})
+
+
+def _externalized_object_without_duplicate_keys(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    """Build one nested JSON object while preserving fail-closed duplicates."""
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("ambiguous_metadata")
+        value[key] = item
+    return value
+
+
+def _externalized_canonical_integer(value: Any) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= _EXTERNALIZED_CANONICAL_INTEGER_MAX
+    )
+
+
+def _validate_externalized_persisted_output_marker(marker: Any) -> tuple[Any, ...]:
+    if not isinstance(marker, dict):
+        raise ValueError("invalid_payload")
+    if not set(marker).issubset(_EXTERNALIZED_PERSISTED_OUTPUT_MARKER_KEYS):
+        raise ValueError("ambiguous_metadata")
+    if not {"source_path", "expected_chars"}.issubset(marker):
+        raise ValueError("invalid_payload")
+
+    source_path = marker["source_path"]
+    if not isinstance(source_path, str) or not source_path or "\x00" in source_path:
+        raise ValueError("invalid_payload")
+    if not _externalized_canonical_integer(marker["expected_chars"]):
+        raise ValueError("invalid_payload")
+    if "preview_prefix" in marker and (
+        not isinstance(marker["preview_prefix"], str)
+        or not marker["preview_prefix"]
+    ):
+        raise ValueError("invalid_payload")
+    for key in ("preview_sha256", "redacted_preview_sha256"):
+        if key in marker and (
+            not isinstance(marker[key], str)
+            or _EXTERNALIZED_SHA256_RE.fullmatch(marker[key]) is None
+        ):
+            raise ValueError("invalid_payload")
+    for key in ("file_size", "file_mtime_ns", "file_ctime_ns"):
+        if key in marker and not _externalized_canonical_integer(marker[key]):
+            raise ValueError("invalid_payload")
+    return tuple(
+        marker.get(key)
+        for key in sorted(_EXTERNALIZED_PERSISTED_OUTPUT_MARKER_KEYS)
+    )
+
+
+def _validate_externalized_metadata_field(key: str, value: Any) -> None:
+    if key in {"content_chars", "content_bytes"}:
+        if not _externalized_canonical_integer(value):
+            raise ValueError("invalid_payload")
+    elif key == "created_at":
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or value < 0
+        ):
+            raise ValueError("invalid_payload")
+    elif key == "persisted_output_source_path":
+        if not isinstance(value, str) or not value or "\x00" in value:
+            raise ValueError("invalid_payload")
+    elif key in {
+        "persisted_output_expected_chars", "persisted_output_file_size",
+        "persisted_output_file_mtime_ns", "persisted_output_file_ctime_ns",
+    }:
+        if not _externalized_canonical_integer(value):
+            raise ValueError("invalid_payload")
+    elif key == "persisted_output_preview_prefix":
+        if not isinstance(value, str) or not value:
+            raise ValueError("invalid_payload")
+    elif key in {
+        "persisted_output_preview_sha256",
+        "persisted_output_redacted_preview_sha256",
+    }:
+        if not isinstance(value, str) or _EXTERNALIZED_SHA256_RE.fullmatch(value) is None:
+            raise ValueError("invalid_payload")
+    elif key == "persisted_output_markers":
+        if not isinstance(value, list) or not value:
+            raise ValueError("invalid_payload")
+        identities = [
+            _validate_externalized_persisted_output_marker(marker)
+            for marker in value
+        ]
+        if len(set(identities)) != len(identities):
+            raise ValueError("invalid_payload")
+
+
+def _validate_externalized_metadata(fields: dict[str, Any]) -> None:
+    for key, value in fields.items():
+        _validate_externalized_metadata_field(key, value)
+
+    present = _EXTERNALIZED_PERSISTED_OUTPUT_KEYS.intersection(fields)
+    if not present:
+        return
+    required = {
+        "persisted_output_source_path",
+        "persisted_output_expected_chars",
+        "persisted_output_markers",
+    }
+    if not required.issubset(fields):
+        raise ValueError("invalid_payload")
+
+    first_marker = fields["persisted_output_markers"][0]
+    top_to_marker = {
+        "persisted_output_source_path": "source_path",
+        "persisted_output_expected_chars": "expected_chars",
+        "persisted_output_preview_prefix": "preview_prefix",
+        "persisted_output_preview_sha256": "preview_sha256",
+        "persisted_output_redacted_preview_sha256": "redacted_preview_sha256",
+        "persisted_output_file_size": "file_size",
+        "persisted_output_file_mtime_ns": "file_mtime_ns",
+        "persisted_output_file_ctime_ns": "file_ctime_ns",
+    }
+    for top_key, marker_key in top_to_marker.items():
+        if top_key in fields and first_marker.get(marker_key) != fields[top_key]:
+            raise ValueError("invalid_payload")
 
 
 def _externalized_prefix_authorization(
     text: str,
 ) -> tuple[dict[str, Any], set[str], str | None]:
     """Parse pre-content top-level fields and reject duplicate keys."""
-    decoder = json.JSONDecoder()
+    decoder = json.JSONDecoder(
+        object_pairs_hook=_externalized_object_without_duplicate_keys
+    )
     fields: dict[str, Any] = {}
     seen: set[str] = set()
     index = 0
@@ -811,8 +959,16 @@ def _externalized_prefix_authorization(
             return fields, seen, None
         try:
             value, index = decoder.raw_decode(text, index)
+            _validate_externalized_metadata_field(key, value)
         except json.JSONDecodeError:
             return fields, seen, "invalid_payload"
+        except ValueError as exc:
+            error = str(exc)
+            return (
+                fields,
+                seen,
+                error if error == "ambiguous_metadata" else "invalid_payload",
+            )
         fields[key] = value
         index = whitespace(index)
         if index >= length or text[index] != ",":
@@ -824,7 +980,9 @@ def _externalized_suffix_metadata(
     text: str, *, seen: set[str]
 ) -> dict[str, Any]:
     """Parse the bounded canonical metadata following an old-layout body."""
-    decoder = json.JSONDecoder()
+    decoder = json.JSONDecoder(
+        object_pairs_hook=_externalized_object_without_duplicate_keys
+    )
     fields: dict[str, Any] = {}
     index = 0
     length = len(text)
@@ -862,7 +1020,12 @@ def _externalized_suffix_metadata(
         index = whitespace(index + 1)
         try:
             value, index = decoder.raw_decode(text, index)
+            _validate_externalized_metadata_field(key, value)
         except json.JSONDecodeError as exc:
+            raise ValueError("invalid_payload") from exc
+        except ValueError as exc:
+            if str(exc) == "ambiguous_metadata":
+                raise
             raise ValueError("invalid_payload") from exc
         fields[key] = value
         index = whitespace(index)
@@ -878,19 +1041,6 @@ def _externalized_suffix_metadata(
             raise ValueError("ambiguous_metadata")
         break
 
-    for key in ("content_chars", "content_bytes"):
-        if key in fields and (
-            isinstance(fields[key], bool)
-            or not isinstance(fields[key], int)
-            or fields[key] < 0
-        ):
-            raise ValueError("invalid_payload")
-    if "created_at" in fields and (
-        isinstance(fields["created_at"], bool)
-        or not isinstance(fields["created_at"], (int, float))
-        or not math.isfinite(float(fields["created_at"]))
-    ):
-        raise ValueError("invalid_payload")
     return fields
 
 
@@ -1302,6 +1452,7 @@ def _search_externalized_payloads(
                     continue
                 final_metadata = dict(metadata_fields)
                 final_metadata.update(suffix_fields)
+                _validate_externalized_metadata(final_metadata)
                 payload_session_id = final_metadata.get("session_id", "")
                 if (
                     "session_id" not in seen_keys

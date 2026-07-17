@@ -770,3 +770,207 @@ def test_externalized_grep_accepts_old_canonical_trailing_metadata_losslessly(
         assert result["results"][0]["session_id"] == "current"
     finally:
         engine.shutdown()
+
+
+def _historical_persisted_output_payload(
+    *, kind: str, role: str, tool_call_id: str, content: str
+) -> dict:
+    """Exact raw/tool field order written by ``41b43c8:externalize.py``."""
+    preview_sha256 = "a" * 64
+    redacted_preview_sha256 = "b" * 64
+    marker = {
+        "source_path": "/tmp/hermes-results/historical-output.txt",
+        "expected_chars": len(content),
+        "preview_sha256": preview_sha256,
+        "redacted_preview_sha256": redacted_preview_sha256,
+        "file_size": len(content.encode("utf-8")),
+        "file_mtime_ns": 1_725_000_000_000_000_001,
+        "file_ctime_ns": 1_725_000_000_000_000_002,
+    }
+    return {
+        "kind": kind,
+        "tool_call_id": tool_call_id,
+        "role": role,
+        "session_id": "current",
+        "content": content,
+        "content_chars": len(content),
+        "content_bytes": len(content.encode("utf-8")),
+        "created_at": 1_725_000_000.25,
+        "persisted_output_source_path": marker["source_path"],
+        "persisted_output_expected_chars": marker["expected_chars"],
+        "persisted_output_preview_sha256": marker["preview_sha256"],
+        "persisted_output_redacted_preview_sha256": marker[
+            "redacted_preview_sha256"
+        ],
+        "persisted_output_file_size": marker["file_size"],
+        "persisted_output_file_mtime_ns": marker["file_mtime_ns"],
+        "persisted_output_file_ctime_ns": marker["file_ctime_ns"],
+        "persisted_output_markers": [marker],
+    }
+
+
+@pytest.mark.parametrize(
+    ("kind", "role", "tool_call_id", "needle"),
+    [
+        ("raw_payload", "assistant", "", "HISTORICAL-RAW-PERSISTED-NEEDLE"),
+        ("tool_result", "tool", "call-historical", "HISTORICAL-TOOL-PERSISTED-NEEDLE"),
+    ],
+    ids=["raw-payload", "tool-result"],
+)
+def test_externalized_grep_accepts_exact_historical_persisted_output_shapes(
+    tmp_path, kind, role, tool_call_id, needle
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    ref = f"{kind}.json"
+    content = f"prefix π🙂\n{needle}\nsuffix"
+    payload = _historical_persisted_output_payload(
+        kind=kind,
+        role=role,
+        tool_call_id=tool_call_id,
+        content=content,
+    )
+    (payload_dir / ref).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    engine = _engine(tmp_path)
+    try:
+        result = json.loads(tools_module.lcm_grep(
+            {
+                "query": needle,
+                "content_scope": "externalized",
+                "ref": ref,
+                "max_payload_chars": len(content) + 1,
+            },
+            engine=engine,
+        ))
+        assert result["diagnostics"] == []
+        assert result["total_results"] == 1
+        assert result["results"][0]["matched_text"] == needle
+        assert result["results"][0]["session_id"] == "current"
+        assert result["results"][0]["content_chars_scanned"] == len(content)
+    finally:
+        engine.shutdown()
+
+
+def test_externalized_grep_accepts_explicit_legacy_persisted_preview_shape(
+    tmp_path,
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    ref = "legacy-preview.json"
+    needle = "HISTORICAL-LEGACY-PREVIEW-NEEDLE"
+    content = f"prefix\n{needle}\nsuffix"
+    payload = _historical_persisted_output_payload(
+        kind="tool_result", role="tool", tool_call_id="legacy-preview", content=content
+    )
+    preview = content[:16]
+    payload.pop("persisted_output_preview_sha256")
+    payload["persisted_output_preview_prefix"] = preview
+    marker = payload["persisted_output_markers"][0]
+    marker.pop("preview_sha256")
+    marker["preview_prefix"] = preview
+    (payload_dir / ref).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    engine = _engine(tmp_path)
+    try:
+        result = json.loads(tools_module.lcm_grep(
+            {"query": needle, "content_scope": "externalized", "ref": ref},
+            engine=engine,
+        ))
+        assert result["diagnostics"] == []
+        assert result["total_results"] == 1
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "duplicate-persisted-key",
+        "duplicate-marker-key",
+        "unknown-persisted-key",
+        "unknown-marker-key",
+        "source-path-type",
+        "expected-chars-bool",
+        "expected-chars-too-large",
+        "digest-noncanonical",
+        "file-size-negative",
+        "marker-file-time-type",
+        "marker-not-list",
+        "marker-missing-required",
+        "marker-top-level-mismatch",
+        "suffix-budget",
+    ],
+)
+def test_externalized_grep_rejects_malicious_historical_persisted_metadata(
+    tmp_path, variant
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    ref = f"malicious-{variant}.json"
+    needle = "MALICIOUS-HISTORICAL-PERSISTED-NEEDLE"
+    payload = _historical_persisted_output_payload(
+        kind="tool_result", role="tool", tool_call_id="malicious", content=needle
+    )
+
+    if variant == "unknown-persisted-key":
+        payload["persisted_output_future_override"] = "foreign"
+    elif variant == "unknown-marker-key":
+        payload["persisted_output_markers"][0]["session_id"] = "foreign"
+    elif variant == "source-path-type":
+        payload["persisted_output_source_path"] = 7
+    elif variant == "expected-chars-bool":
+        payload["persisted_output_expected_chars"] = True
+    elif variant == "expected-chars-too-large":
+        payload["persisted_output_expected_chars"] = 1 << 63
+    elif variant == "digest-noncanonical":
+        payload["persisted_output_preview_sha256"] = "A" * 64
+    elif variant == "file-size-negative":
+        payload["persisted_output_file_size"] = -1
+    elif variant == "marker-file-time-type":
+        payload["persisted_output_markers"][0]["file_mtime_ns"] = "now"
+    elif variant == "marker-not-list":
+        payload["persisted_output_markers"] = {"source_path": "/tmp/override"}
+    elif variant == "marker-missing-required":
+        payload["persisted_output_markers"][0].pop("expected_chars")
+    elif variant == "marker-top-level-mismatch":
+        payload["persisted_output_markers"][0]["source_path"] = "/tmp/foreign"
+    elif variant == "suffix-budget":
+        payload["persisted_output_source_path"] = "/tmp/" + ("x" * 17_000)
+
+    serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    if variant == "duplicate-persisted-key":
+        target = '"persisted_output_expected_chars":' + str(len(needle))
+        serialized = serialized.replace(target, target + "," + target, 1)
+    elif variant == "duplicate-marker-key":
+        target = '"source_path":"/tmp/hermes-results/historical-output.txt"'
+        serialized = serialized.replace(target, target + "," + target, 1)
+    (payload_dir / ref).write_text(serialized, encoding="utf-8")
+
+    engine = _engine(tmp_path)
+    try:
+        result = json.loads(tools_module.lcm_grep(
+            {"query": needle, "content_scope": "externalized", "ref": ref},
+            engine=engine,
+        ))
+        assert result["results"] == []
+        assert result["diagnostics"] == [{
+            "ref": ref,
+            "error": (
+                "ambiguous_metadata"
+                if variant in {
+                    "duplicate-persisted-key",
+                    "duplicate-marker-key",
+                    "unknown-persisted-key",
+                    "unknown-marker-key",
+                    "suffix-budget",
+                }
+                else "invalid_payload"
+            ),
+        }]
+    finally:
+        engine.shutdown()
