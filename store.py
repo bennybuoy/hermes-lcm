@@ -564,6 +564,9 @@ class MessageStore:
         content_offset: int,
         max_content_chars: int,
         content_lookahead_chars: int,
+        boundary_scanner: Callable[
+            [Callable[[int, int], str], int, int], Dict[str, Any]
+        ] | None = None,
     ) -> Dict[str, Any]:
         """Authorize bounded ownership metadata before reading payload columns.
 
@@ -578,10 +581,6 @@ class MessageStore:
         bounded_offset = max(0, int(content_offset))
         visible_chars = max(1, int(max_content_chars))
         lookahead_chars = max(0, int(content_lookahead_chars))
-        window_start = max(0, bounded_offset - _EXPAND_CONTENT_LOOKBEHIND_CHARS)
-        window_chars = (
-            (bounded_offset - window_start) + visible_chars + lookahead_chars
-        )
         with self._write_lock:
             self._conn.execute(f"SAVEPOINT {savepoint}")
             try:
@@ -632,6 +631,93 @@ class MessageStore:
                             f"THEN substr(CAST({column} AS TEXT), 1, {_EXPAND_SCALAR_MAX_CHARS}) END"
                             for column in scalar_columns
                         )
+                        content_metadata = self._conn.execute(
+                            """SELECT COALESCE(length(CAST(content AS TEXT)), 0),
+                                      typeof(content)
+                               FROM messages
+                               WHERE store_id = ?
+                                 AND session_id = ?
+                                 AND COALESCE(length(CAST(session_id AS BLOB)), 0) = ?
+                                 AND COALESCE(length(CAST(session_id AS TEXT)), 0) = ?
+                               LIMIT 1""",
+                            (
+                                store_id,
+                                session_id,
+                                int(metadata[1]),
+                                int(metadata[2]),
+                            ),
+                        ).fetchone()
+                        if content_metadata is None:
+                            result = {"status": "changed"}
+                            self._conn.execute(f"RELEASE {savepoint}")
+                            return result
+                        total_content_chars = int(content_metadata[0] or 0)
+                        if content_metadata[1] not in {"text", "null"}:
+                            result = {"status": "invalid_payload"}
+                            self._conn.execute(f"RELEASE {savepoint}")
+                            return result
+
+                        boundary_scan: Dict[str, Any] = {}
+                        if boundary_scanner is not None and total_content_chars:
+                            def read_content_chunk(offset: int, chars: int) -> str:
+                                bounded_chunk_offset = min(
+                                    max(0, int(offset)), total_content_chars
+                                )
+                                bounded_chunk_chars = min(
+                                    max(0, int(chars)), 16 * 1024
+                                )
+                                if bounded_chunk_chars <= 0:
+                                    return ""
+                                chunk_row = self._conn.execute(
+                                    """SELECT CASE WHEN typeof(content) = 'text'
+                                                   THEN substr(CAST(content AS TEXT), ?, ?)
+                                              END
+                                       FROM messages
+                                       WHERE store_id = ?
+                                         AND session_id = ?
+                                         AND COALESCE(length(CAST(session_id AS BLOB)), 0) = ?
+                                         AND COALESCE(length(CAST(session_id AS TEXT)), 0) = ?
+                                       LIMIT 1""",
+                                    (
+                                        bounded_chunk_offset + 1,
+                                        bounded_chunk_chars,
+                                        store_id,
+                                        session_id,
+                                        int(metadata[1]),
+                                        int(metadata[2]),
+                                    ),
+                                ).fetchone()
+                                if chunk_row is None or not isinstance(chunk_row[0], str):
+                                    return ""
+                                return chunk_row[0]
+
+                            boundary_scan = boundary_scanner(
+                                read_content_chunk,
+                                total_content_chars,
+                                bounded_offset,
+                            )
+
+                        scan_offset = min(
+                            max(
+                                0,
+                                int(boundary_scan.get("safe_content_offset", bounded_offset)),
+                            ),
+                            total_content_chars,
+                        )
+                        window_start = max(
+                            0, scan_offset - _EXPAND_CONTENT_LOOKBEHIND_CHARS
+                        )
+                        window_chars = (
+                            (scan_offset - window_start)
+                            + visible_chars
+                            + lookahead_chars
+                        )
+                        if boundary_scan.get("boundary_pending"):
+                            # The returned cursor remains inside a conservatively
+                            # sensitive span.  Do not materialize body bytes; the
+                            # next request resumes the bounded chunk scanner.
+                            window_chars = 0
+
                         payload = self._conn.execute(
                             f"""SELECT
                                        CASE WHEN typeof(store_id) = 'integer' THEN store_id END,
@@ -679,6 +765,16 @@ class MessageStore:
                             item = self._row_to_dict(standard_row)
                             item["content_chars"] = int(payload[12] or 0)
                             item["content_window_offset"] = window_start
+                            item["requested_content_offset"] = bounded_offset
+                            if boundary_scan.get("boundary_redacted"):
+                                item["boundary_redacted"] = True
+                                item["boundary_pending"] = bool(
+                                    boundary_scan.get("boundary_pending")
+                                )
+                                item["boundary_next_content_offset"] = scan_offset
+                                item["boundary_safe_prefix"] = str(
+                                    boundary_scan.get("boundary_safe_prefix") or ""
+                                )[:512]
                             item["tool_calls_chars"] = int(payload[13] or 0)
                             item["tool_calls_omitted"] = (
                                 int(payload[13] or 0) > _EXPAND_TOOL_CALLS_MAX_CHARS

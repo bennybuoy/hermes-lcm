@@ -68,6 +68,14 @@ _LCM_GREP_REGEX_OPERATION_DEADLINE_SECONDS = 1.0
 _LCM_GREP_REGEX_MAX_PATTERN_CHARS = 2_000
 _LCM_GREP_QUERY_MAX_CHARS = 2_000
 _LCM_GREP_QUERY_MAX_TOKENS = 512
+_LCM_GREP_SCOPE_MAX_CHARS = 32
+_LCM_GREP_SESSION_ID_MAX_CHARS = 512
+_LCM_GREP_SOURCE_MAX_CHARS = 512
+_LCM_GREP_CONVERSATION_ID_MAX_CHARS = 512
+_LCM_GREP_REF_MAX_CHARS = 512
+_LCM_GREP_ROLE_MAX_CHARS = 128
+_LCM_GREP_SORT_MAX_CHARS = 32
+_LCM_GREP_TIMESTAMP_MAX_CHARS = 128
 _LCM_GREP_OPERATION_MAX_ROWS = 1_000
 _LCM_GREP_OPERATION_MAX_BYTES = 2 * 1024 * 1024
 _LCM_GREP_OPERATION_DEADLINE_SECONDS = 1.0
@@ -98,6 +106,8 @@ _CURRENT_SESSION_EXPAND_MAX_SOURCES = 200
 _CURRENT_SESSION_EXPAND_MAX_CHARS = 100_000
 _MANDATORY_REDACTION_LOOKAHEAD_CHARS = 8_192
 _MANDATORY_REDACTION_CHARS_PER_TOKEN = 16
+_EXPAND_BOUNDARY_SCAN_CHARS = 8_192
+_EXPAND_BOUNDARY_SCAN_MAX_CHUNKS = 256
 _BOUNDARY_PRIVATE_KEY_BEGIN_RE = re.compile(
     r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE
 )
@@ -114,6 +124,191 @@ _BOUNDARY_STANDALONE_CREDENTIAL_RE = re.compile(
     r")\Z",
     re.IGNORECASE,
 )
+_BOUNDARY_QUOTED_ASSIGNMENT_RE = re.compile(
+    r"(?:api[_-]?key|api[_-]?token|access[_-]?token|secret[_-]?key|"
+    r"client[_-]?secret|password|passwd|pwd|passphrase)"
+    r"\s*(?:\\?[\"'])?\s*[:=]\s*(?P<quote>[\"'])\Z",
+    re.IGNORECASE,
+)
+_BOUNDARY_PRIVATE_KEY_BEGIN_SUFFIX_RE = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----\Z", re.IGNORECASE
+)
+
+
+def _last_unescaped_quote(text: str) -> tuple[int, str] | None:
+    for index in range(len(text) - 1, -1, -1):
+        if text[index] not in {'"', "'"}:
+            continue
+        backslashes = 0
+        cursor = index - 1
+        while cursor >= 0 and text[cursor] == "\\":
+            backslashes += 1
+            cursor -= 1
+        if backslashes % 2 == 0:
+            return index, text[index]
+    return None
+
+
+def _first_unescaped_quote(text: str, quote: str | None = None) -> tuple[int, str] | None:
+    for index, char in enumerate(text):
+        if char not in {'"', "'"} or (quote is not None and char != quote):
+            continue
+        backslashes = 0
+        cursor = index - 1
+        while cursor >= 0 and text[cursor] == "\\":
+            backslashes += 1
+            cursor -= 1
+        if backslashes % 2 == 0:
+            return index, char
+    return None
+
+
+def _scan_raw_credential_boundary(
+    read_chunk,
+    total_chars: int,
+    requested_offset: int,
+) -> dict[str, Any]:
+    """Classify/skip a credential around one raw cursor using bounded chunks.
+
+    The scanner never accumulates the row.  If its bounded backward pass cannot
+    prove the cursor benign, it treats the left boundary as sensitive and scans
+    forward for a quote/PEM terminator.  A credential longer than one operation
+    advances only to another fail-closed scan cursor, so benign suffix data is
+    eventually reachable without ever exposing an intermediate body fragment.
+    """
+    total = max(0, int(total_chars))
+    offset = min(max(0, int(requested_offset)), total)
+    if offset >= total:
+        return {"safe_content_offset": offset}
+
+    mode: str | None = None
+    quote: str | None = None
+    unsafe = False
+    safe_prefix = ""
+
+    # An opener exactly at the cursor must be handled before the ordinary page
+    # slicer, otherwise a very long expression can pin pagination at its start.
+    forward_prefix = read_chunk(offset, 512)
+    assignment_at_cursor = re.match(
+        r"(?:api[_-]?key|api[_-]?token|access[_-]?token|secret[_-]?key|"
+        r"client[_-]?secret|password|passwd|pwd|passphrase)"
+        r"\s*(?:\\?[\"'])?\s*[:=]\s*(?:(?P<quote>[\"'])|"
+        r"(?P<unquoted>[^\s,\"'\]}]+))",
+        forward_prefix,
+        re.IGNORECASE,
+    )
+    pem_at_cursor = _BOUNDARY_PRIVATE_KEY_BEGIN_RE.match(forward_prefix)
+    if assignment_at_cursor is not None:
+        unsafe = True
+        if assignment_at_cursor.group("quote") is not None:
+            mode = "quote"
+            quote = assignment_at_cursor.group("quote")
+            forward_start = offset + assignment_at_cursor.end()
+            safe_prefix = forward_prefix[:assignment_at_cursor.end()]
+        else:
+            mode = "token"
+            forward_start = offset + assignment_at_cursor.start("unquoted")
+            safe_prefix = forward_prefix[:assignment_at_cursor.start("unquoted")]
+    elif pem_at_cursor is not None:
+        unsafe = True
+        mode = "pem"
+        forward_start = offset + pem_at_cursor.end()
+    else:
+        forward_start = offset
+
+    # Search backwards chunk-by-chunk for the nearest decisive quote or PEM
+    # marker. Small overlap preserves markers split across SQL substrings.
+    if not unsafe and offset > 0:
+        cursor = offset
+        overlap = ""
+        for _ in range(_EXPAND_BOUNDARY_SCAN_MAX_CHUNKS):
+            if cursor <= 0:
+                break
+            start = max(0, cursor - _EXPAND_BOUNDARY_SCAN_CHARS)
+            chunk = read_chunk(start, cursor - start)
+            combined = chunk + overlap
+            pem_begin = list(_BOUNDARY_PRIVATE_KEY_BEGIN_RE.finditer(combined))
+            pem_end = list(_BOUNDARY_PRIVATE_KEY_END_RE.finditer(combined))
+            nearest_pem_begin = pem_begin[-1].start() if pem_begin else -1
+            nearest_pem_end = pem_end[-1].start() if pem_end else -1
+            nearest_quote = _last_unescaped_quote(combined)
+            quote_index = nearest_quote[0] if nearest_quote is not None else -1
+            nearest_index = max(nearest_pem_begin, nearest_pem_end, quote_index)
+            if nearest_index >= 0:
+                if nearest_index == nearest_pem_begin:
+                    unsafe = True
+                    mode = "pem"
+                elif nearest_index == quote_index and nearest_quote is not None:
+                    prefix_start = max(0, nearest_index - 256)
+                    prefix = combined[prefix_start:nearest_index + 1]
+                    assignment = _BOUNDARY_QUOTED_ASSIGNMENT_RE.search(prefix)
+                    if assignment is not None:
+                        unsafe = True
+                        mode = "quote"
+                        quote = nearest_quote[1]
+                # A PEM end or a non-assignment quote is a safe left boundary.
+                break
+            if start == 0:
+                break
+            overlap = chunk[:128]
+            cursor = start
+        else:
+            # No bounded proof of a benign left boundary: fail closed.
+            unsafe = True
+            mode = "unknown"
+
+    if not unsafe:
+        return {"safe_content_offset": offset}
+
+    cursor = forward_start
+    overlap = ""
+    for _ in range(_EXPAND_BOUNDARY_SCAN_MAX_CHUNKS):
+        if cursor >= total:
+            return {
+                "safe_content_offset": total,
+                "boundary_redacted": True,
+                "boundary_pending": False,
+                "boundary_safe_prefix": "",
+            }
+        chunk = read_chunk(cursor, _EXPAND_BOUNDARY_SCAN_CHARS)
+        if not chunk:
+            break
+        combined = overlap + chunk
+        overlap_chars = len(overlap)
+        terminator_end: int | None = None
+        if mode == "pem":
+            match = _BOUNDARY_PRIVATE_KEY_END_RE.search(combined)
+            if match is not None:
+                terminator_end = match.end()
+        elif mode == "token":
+            match = re.search(r"[^A-Za-z0-9._~+/=-]", combined)
+            if match is not None:
+                terminator_end = match.start()
+        else:
+            found_quote = _first_unescaped_quote(combined, quote if mode == "quote" else None)
+            pem_end = _BOUNDARY_PRIVATE_KEY_END_RE.search(combined)
+            quote_end = found_quote[0] + 1 if found_quote is not None else None
+            pem_end_index = pem_end.end() if pem_end is not None else None
+            candidates = [value for value in (quote_end, pem_end_index) if value is not None]
+            if candidates:
+                terminator_end = min(candidates)
+        if terminator_end is not None:
+            safe_offset = cursor - overlap_chars + terminator_end
+            return {
+                "safe_content_offset": min(total, safe_offset),
+                "boundary_redacted": True,
+                "boundary_pending": False,
+                "boundary_safe_prefix": safe_prefix,
+            }
+        cursor += len(chunk)
+        overlap = chunk[-128:]
+
+    return {
+        "safe_content_offset": min(total, max(offset + 1, cursor)),
+        "boundary_redacted": True,
+        "boundary_pending": True,
+        "boundary_safe_prefix": safe_prefix,
+    }
 
 
 def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
@@ -572,6 +767,40 @@ def _parse_grep_role(value: Any) -> tuple[str | None, str | None]:
     return role, None
 
 
+def _parse_bounded_grep_text(
+    value: Any,
+    name: str,
+    *,
+    default: str = "",
+    max_chars: int,
+) -> tuple[str | None, str | None]:
+    if value is None:
+        return default, None
+    if not isinstance(value, str):
+        return None, f"{name} must be a string"
+    if len(value) > max_chars:
+        return None, f"{name} exceeds the {max_chars} character hard limit"
+    return value.strip(), None
+
+
+def _parse_bounded_grep_int(
+    value: Any,
+    name: str,
+    *,
+    default: int,
+) -> tuple[int | None, str | None]:
+    if value is None:
+        return default, None
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None, f"{name} must be an integer"
+    if isinstance(value, str) and len(value) > 32:
+        return None, f"{name} exceeds the numeric character hard limit"
+    try:
+        return int(value), None
+    except (TypeError, ValueError, OverflowError):
+        return None, f"{name} must be an integer"
+
+
 def _parse_strict_int(value: Any, name: str) -> tuple[int | None, str | None]:
     try:
         if isinstance(value, bool):
@@ -905,6 +1134,7 @@ def _expand_message_sources(
     content_offset: int = 0,
     hydrate_externalized_content: bool = False,
     allowed_session_id: str | None = None,
+    frozen_evidence: dict[str, dict[int, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     from .tokens import count_tokens
 
@@ -917,7 +1147,11 @@ def _expand_message_sources(
         source_limit = min(max(0, source_limit), remaining_source_count)
     content_offset = max(0, content_offset)
     source_ids = node.source_ids[source_offset:source_offset + source_limit]
-    stored_by_id = engine._store.get_batch(source_ids)
+    stored_by_id = (
+        frozen_evidence.get("messages", {})
+        if frozen_evidence is not None
+        else engine._store.get_batch(source_ids)
+    )
 
     messages: list[dict[str, Any]] = []
     budget_used = 0
@@ -951,7 +1185,7 @@ def _expand_message_sources(
         ref_payload = None
         ingest_refs = extract_ingest_externalized_refs(transcript_content)
         ref = ingest_refs[0] if ingest_refs else extract_externalized_ref(transcript_content)
-        if ref:
+        if ref and frozen_evidence is None:
             payload_allowed_sessions = (
                 {allowed_session_id}
                 if allowed_session_id is not None
@@ -970,6 +1204,15 @@ def _expand_message_sources(
         effective_content_offset = content_offset if source_index == source_offset else 0
         if not hydrate_externalized_content and _is_compact_externalized_marker(content, ref):
             sliced = _full_content_slice(content, effective_content_offset)
+        elif frozen_evidence is not None:
+            sliced = _slice_redacted_raw_page(
+                content,
+                content_offset=effective_content_offset,
+                max_tokens=remaining_tokens,
+                max_chars=_CURRENT_SESSION_EXPAND_MAX_CHARS,
+                source_content_chars=int(stored.get("content_chars") or len(content)),
+                allow_incomplete_tail=True,
+            )
         else:
             sliced = _slice_content_for_response(
                 content,
@@ -994,7 +1237,7 @@ def _expand_message_sources(
         }
         if content_source == "externalized_payload":
             expanded["transcript_content"] = transcript_content
-        if stored.get("role") == "tool":
+        if stored.get("role") == "tool" and frozen_evidence is None:
             if externalized is not None:
                 externalized_summary = dict(externalized)
                 externalized_summary.pop("content", None)
@@ -1066,6 +1309,7 @@ def _expand_child_nodes(
     source_offset: int = 0,
     source_limit: int | None = None,
     allowed_session_id: str | None = None,
+    frozen_evidence: dict[str, dict[int, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     from .tokens import count_tokens
 
@@ -1079,7 +1323,11 @@ def _expand_child_nodes(
     selected_source_ids = node.source_ids[source_offset:source_offset + source_limit]
     children: list[tuple[int, Any]] = []
     for relative_index, child_id in enumerate(selected_source_ids):
-        child = engine._dag.get_node(child_id)
+        child = (
+            frozen_evidence.get("nodes", {}).get(child_id)
+            if frozen_evidence is not None
+            else engine._dag.get_node(child_id)
+        )
         effective_session_id = allowed_session_id or engine.current_session_id
         if child is None or child.session_id != effective_session_id:
             continue
@@ -1167,6 +1415,7 @@ def _collect_descendant_evidence_blocks(
     source_path: list[dict[str, int]] | None = None,
     remaining_node_visits: list[int] | None = None,
     allowed_session_id: str | None = None,
+    frozen_evidence: dict[str, dict[int, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     if max_tokens <= 0 or node.source_type != "nodes":
         return []
@@ -1197,7 +1446,11 @@ def _collect_descendant_evidence_blocks(
 
         stack.append((current, current_path, current_visited, source_index + 1))
         child_id = current.source_ids[source_index]
-        child = engine._dag.get_node(child_id)
+        child = (
+            frozen_evidence.get("nodes", {}).get(child_id)
+            if frozen_evidence is not None
+            else engine._dag.get_node(child_id)
+        )
         effective_session_id = allowed_session_id or engine.current_session_id
         if child is None or child.session_id != effective_session_id:
             continue
@@ -1215,6 +1468,7 @@ def _collect_descendant_evidence_blocks(
                 max_tokens=remaining_tokens,
                 hydrate_externalized_content=hydrate_externalized_content,
                 allowed_session_id=effective_session_id,
+                frozen_evidence=frozen_evidence,
             )
             if messages or pagination.get("has_more"):
                 block = {
@@ -1237,6 +1491,7 @@ def _collect_descendant_evidence_blocks(
                 child,
                 max_tokens=remaining_tokens,
                 allowed_session_id=effective_session_id,
+                frozen_evidence=frozen_evidence,
             )
             if children or pagination.get("has_more"):
                 block = {
@@ -1263,6 +1518,7 @@ def _collect_context_blocks_for_node(
     *,
     hydrate_externalized_content: bool = False,
     allowed_session_id: str | None = None,
+    frozen_evidence: dict[str, dict[int, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     from .tokens import count_tokens
 
@@ -1299,6 +1555,7 @@ def _collect_context_blocks_for_node(
             max_tokens=remaining_tokens,
             hydrate_externalized_content=hydrate_externalized_content,
             allowed_session_id=allowed_session_id,
+            frozen_evidence=frozen_evidence,
         )
         if messages or pagination.get("has_more"):
             block = {
@@ -1314,6 +1571,7 @@ def _collect_context_blocks_for_node(
             node,
             max_tokens=remaining_tokens,
             allowed_session_id=allowed_session_id,
+            frozen_evidence=frozen_evidence,
         )
         if children or pagination.get("has_more"):
             blocks.append(
@@ -1334,6 +1592,7 @@ def _collect_context_blocks_for_node(
                     max_tokens=descendant_tokens,
                     hydrate_externalized_content=hydrate_externalized_content,
                     allowed_session_id=allowed_session_id,
+                    frozen_evidence=frozen_evidence,
                 )
             )
 
@@ -1547,19 +1806,21 @@ def _grep_safe_snippet(
             boundary_name = "private_key"
         else:
             quote_end = re.search(r"(?<!\\)[\"']", raw_window)
-            leading_token = re.match(r"[A-Za-z0-9_+./=-]+", raw_window)
             if quote_end is not None:
                 boundary_end = quote_end.end()
-            elif leading_token is not None and leading_token.end() >= 64:
-                boundary_end = leading_token.end()
-                while boundary_end < len(raw_window) and raw_window[boundary_end] in ",;]}":
-                    boundary_end += 1
             else:
                 boundary_end = len(raw_window)
+        entire_window_uncertain = boundary_end >= len(raw_window)
         raw_window = (
             f"[LCM sensitive redaction: name={boundary_name}; boundary-truncated]"
             + raw_window[boundary_end:]
         )
+        if entire_window_uncertain:
+            # Preserve match discoverability without copying any uncertain body
+            # bytes. The query is independently capped and mandatory-redacted.
+            safe_query = _grep_safe_text(query, max_chars=min(max_chars // 2, 128))
+            if safe_query:
+                raw_window += f" >>>{safe_query}<<<"
     protected, _truncated = _bounded_cross_session_text(
         raw_window,
         None,
@@ -1625,8 +1886,8 @@ def _authorize_node_provenance_bounded(
     allowed_session_ids: frozenset[str],
     *,
     deadline: float,
-) -> tuple[list[Any], dict[str, Any]]:
-    """Authorize candidates with shared hard caps, bulk reads, and fail-closed gaps."""
+) -> tuple[list[Any], dict[str, Any], dict[str, dict[int, Any]]]:
+    """Authorize and freeze one bounded closure from one SQLite read snapshot."""
     diagnostics: dict[str, Any] = {
         "authorization_truncated": len(candidates) > _CROSS_SESSION_AUTH_MAX_CANDIDATES,
         "authorization_timed_out": False,
@@ -1643,307 +1904,258 @@ def _authorize_node_provenance_bounded(
             "depth": _CROSS_SESSION_AUTH_MAX_DEPTH,
         },
     }
-    selected: list[Any] = []
-    selected_ids: set[int] = set()
+    selected_ids: list[int] = []
+    candidate_rank: dict[int, tuple[Any, Any]] = {}
     for candidate in candidates[:_CROSS_SESSION_AUTH_MAX_CANDIDATES]:
         node_id = int(candidate.node_id)
-        if node_id in selected_ids:
+        if node_id in candidate_rank:
             continue
-        selected_ids.add(node_id)
-        selected.append(candidate)
+        selected_ids.append(node_id)
+        candidate_rank[node_id] = (
+            getattr(candidate, "search_rank", None),
+            getattr(candidate, "search_directness", 0.0),
+        )
 
-    graph: dict[int, tuple[str, str, list[int]] | None] = {}
+    frozen_nodes: dict[int, Any] = {}
+    frozen_messages: dict[int, dict[str, Any]] = {}
     incomplete: set[int] = set()
-    queued: set[int] = set()
-    queue: list[tuple[int, int]] = []
-    for candidate in selected:
-        node_id = int(candidate.node_id)
-        graph[node_id] = (
-            str(candidate.session_id or ""),
-            str(candidate.source_type or ""),
-            [int(source_id) for source_id in candidate.source_ids],
-        )
-        queue.append((node_id, 0))
-        queued.add(node_id)
-
-    message_ids: set[int] = set()
-    expanded_nodes: set[int] = set()
-    authorization_materialized_bytes = 0
-    while queue:
-        if time.monotonic() >= deadline:
-            diagnostics["authorization_timed_out"] = True
-            break
-        node_id, depth = queue.pop(0)
-        if node_id in expanded_nodes:
-            continue
-        if depth > _CROSS_SESSION_AUTH_MAX_DEPTH:
-            diagnostics["authorization_truncated"] = True
-            incomplete.add(node_id)
-            continue
-        missing_ids = [node_id] if node_id not in graph else []
-        if missing_ids:
-            missing_set = {node_id}
-            for queued_id, _queued_depth in queue:
-                if len(missing_ids) >= _CROSS_SESSION_AUTH_QUERY_BATCH:
-                    break
-                if queued_id in graph or queued_id in missing_set:
-                    continue
-                missing_ids.append(queued_id)
-                missing_set.add(queued_id)
-        if missing_ids:
-            remaining_nodes = _CROSS_SESSION_AUTH_MAX_NODES - len(graph)
-            if remaining_nodes <= 0:
-                diagnostics["authorization_truncated"] = True
-                incomplete.add(node_id)
-                break
-            missing_ids = missing_ids[:remaining_nodes]
-            placeholders = ",".join("?" for _ in missing_ids)
-            cursor = engine._dag._conn.execute(
-                f"""SELECT
-                           CASE WHEN typeof(node_id) = 'integer' THEN node_id END,
-                           COALESCE(length(CAST(session_id AS BLOB)), 0),
-                           COALESCE(length(CAST(session_id AS TEXT)), 0),
-                           CASE WHEN typeof(session_id) = 'text'
-                                      AND COALESCE(length(CAST(session_id AS BLOB)), 0) <= ?
-                                      AND COALESCE(length(CAST(session_id AS TEXT)), 0) <= ?
-                                THEN substr(CAST(session_id AS TEXT), 1, ?) END,
-                           COALESCE(length(CAST(source_ids AS BLOB)), 0),
-                           CASE WHEN typeof(source_ids) = 'text'
-                                      AND COALESCE(length(CAST(source_ids AS BLOB)), 0) <= ?
-                                THEN substr(CAST(source_ids AS TEXT), 1, ?) END,
-                           COALESCE(length(CAST(source_type AS BLOB)), 0),
-                           COALESCE(length(CAST(source_type AS TEXT)), 0),
-                           CASE WHEN typeof(source_type) = 'text'
-                                      AND COALESCE(length(CAST(source_type AS BLOB)), 0) <= ?
-                                      AND COALESCE(length(CAST(source_type AS TEXT)), 0) <= ?
-                                THEN substr(CAST(source_type AS TEXT), 1, ?) END,
-                           typeof(session_id), typeof(source_ids), typeof(source_type)
-                    FROM summary_nodes WHERE node_id IN ({placeholders})
-                    LIMIT ?""",
-                [
-                    _CROSS_SESSION_AUTH_SESSION_ID_CHARS * 4,
-                    _CROSS_SESSION_AUTH_SESSION_ID_CHARS,
-                    _CROSS_SESSION_AUTH_SESSION_ID_CHARS,
-                    MAX_SOURCE_IDS_JSON_CHARS,
-                    MAX_SOURCE_IDS_JSON_CHARS + 1,
-                    _CROSS_SESSION_AUTH_SOURCE_TYPE_CHARS * 4,
-                    _CROSS_SESSION_AUTH_SOURCE_TYPE_CHARS,
-                    _CROSS_SESSION_AUTH_SOURCE_TYPE_CHARS,
-                    *missing_ids,
-                    len(missing_ids),
-                ],
-            )
-            found_ids: set[int] = set()
-            while time.monotonic() < deadline:
-                row = cursor.fetchone()
-                if row is None:
-                    break
-                row_bytes = sum(
-                    len(value.encode("utf-8", errors="surrogatepass"))
-                    for value in row
-                    if isinstance(value, str)
-                )
-                if (
-                    authorization_materialized_bytes + row_bytes
-                    > _CROSS_SESSION_AUTH_MAX_MATERIALIZED_BYTES
-                ):
-                    diagnostics["authorization_truncated"] = True
-                    break
-                authorization_materialized_bytes += row_bytes
-                if row[0] is None:
-                    diagnostics["authorization_truncated"] = True
-                    continue
-                found_id = int(row[0])
-                found_ids.add(found_id)
-                session_id_bytes = int(row[1] or 0)
-                session_id_chars = int(row[2] or 0)
-                bounded_session_id = row[3]
-                raw_source_ids_bytes = int(row[4] or 0)
-                raw_source_ids = row[5]
-                source_type_bytes = int(row[6] or 0)
-                source_type_chars = int(row[7] or 0)
-                bounded_source_type = row[8]
-                valid_provenance_scalars = (
-                    row[9:12] == ("text", "text", "text")
-                    and session_id_bytes <= _CROSS_SESSION_AUTH_SESSION_ID_CHARS * 4
-                    and session_id_chars <= _CROSS_SESSION_AUTH_SESSION_ID_CHARS
-                    and isinstance(bounded_session_id, str)
-                    and source_type_bytes <= _CROSS_SESSION_AUTH_SOURCE_TYPE_CHARS * 4
-                    and source_type_chars <= _CROSS_SESSION_AUTH_SOURCE_TYPE_CHARS
-                    and isinstance(bounded_source_type, str)
-                )
-                encoded_too_large = (
-                    raw_source_ids_bytes > MAX_SOURCE_IDS_JSON_CHARS
-                    or not isinstance(raw_source_ids, str)
-                    or not valid_provenance_scalars
-                )
-                edge_count = (
-                    raw_source_ids.strip().count(",") + 1
-                    if isinstance(raw_source_ids, str)
-                    and raw_source_ids.strip() not in {"", "[]"}
-                    else 0
-                )
-                remaining_edges = _CROSS_SESSION_AUTH_MAX_EDGES - int(
-                    diagnostics["authorization_edges_checked"]
-                )
-                if (
-                    encoded_too_large
-                    or edge_count > MAX_SOURCE_IDS_PER_NODE
-                    or edge_count > remaining_edges
-                ):
-                    source_ids = []
-                    incomplete.add(found_id)
-                    diagnostics["authorization_truncated"] = True
-                else:
-                    try:
-                        decoded = json.loads(raw_source_ids)
-                        if not isinstance(decoded, list):
-                            raise ValueError("source_ids is not a list")
-                        source_ids = [int(value) for value in decoded]
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        source_ids = []
-                        incomplete.add(found_id)
-                graph[found_id] = (
-                    str(bounded_session_id or ""),
-                    str(bounded_source_type or ""),
-                    source_ids,
-                )
-            for missing_id in set(missing_ids) - found_ids:
-                graph[missing_id] = None
-        record = graph.get(node_id)
-        expanded_nodes.add(node_id)
-        if record is None:
-            continue
-        session_id, source_type, source_ids = record
-        if not source_ids or session_id not in allowed_session_ids:
-            continue
-        remaining_edges = _CROSS_SESSION_AUTH_MAX_EDGES - int(
-            diagnostics["authorization_edges_checked"]
-        )
-        if len(source_ids) > remaining_edges:
-            diagnostics["authorization_truncated"] = True
-            incomplete.add(node_id)
-            source_ids = source_ids[:max(0, remaining_edges)]
-        diagnostics["authorization_edges_checked"] += len(source_ids)
-        if source_type == "messages":
-            message_ids.update(source_ids)
-        elif source_type == "nodes":
-            if depth >= _CROSS_SESSION_AUTH_MAX_DEPTH and source_ids:
-                diagnostics["authorization_truncated"] = True
-                incomplete.add(node_id)
-                continue
-            for child_id in source_ids:
-                if child_id not in queued:
-                    queue.append((child_id, depth + 1))
-                    queued.add(child_id)
-        else:
-            incomplete.add(node_id)
-
-    diagnostics["authorization_nodes_checked"] = len(expanded_nodes)
-    if len(message_ids) > _CROSS_SESSION_AUTH_MAX_MESSAGES:
-        diagnostics["authorization_truncated"] = True
-    bounded_message_ids = list(message_ids)[:_CROSS_SESSION_AUTH_MAX_MESSAGES]
     message_sessions: dict[int, str] = {}
-    for offset in range(0, len(bounded_message_ids), _CROSS_SESSION_AUTH_QUERY_BATCH):
-        if time.monotonic() >= deadline:
-            diagnostics["authorization_timed_out"] = True
-            break
-        batch = bounded_message_ids[offset:offset + _CROSS_SESSION_AUTH_QUERY_BATCH]
-        placeholders = ",".join("?" for _ in batch)
-        cursor = engine._store._conn.execute(
-            f"""SELECT
-                       CASE WHEN typeof(store_id) = 'integer' THEN store_id END,
-                       COALESCE(length(CAST(session_id AS BLOB)), 0),
-                       COALESCE(length(CAST(session_id AS TEXT)), 0),
-                       CASE WHEN typeof(session_id) = 'text'
-                                  AND COALESCE(length(CAST(session_id AS BLOB)), 0) <= ?
-                                  AND COALESCE(length(CAST(session_id AS TEXT)), 0) <= ?
-                            THEN substr(CAST(session_id AS TEXT), 1, ?) END,
-                       typeof(session_id)
-                FROM messages WHERE store_id IN ({placeholders}) LIMIT ?""",
-            [
-                _CROSS_SESSION_AUTH_SESSION_ID_CHARS * 4,
-                _CROSS_SESSION_AUTH_SESSION_ID_CHARS,
-                _CROSS_SESSION_AUTH_SESSION_ID_CHARS,
-                *batch,
-                len(batch),
-            ],
+    materialized_bytes = 0
+    savepoint = "lcm_cross_session_evidence_snapshot"
+    conn = engine._store._conn
+
+    def charge_row(row: tuple[Any, ...]) -> bool:
+        nonlocal materialized_bytes
+        row_bytes = sum(
+            len(value.encode("utf-8", errors="surrogatepass"))
+            for value in row
+            if isinstance(value, str)
         )
-        while time.monotonic() < deadline:
-            row = cursor.fetchone()
-            if row is None:
-                break
-            row_bytes = sum(
-                len(value.encode("utf-8", errors="surrogatepass"))
-                for value in row
-                if isinstance(value, str)
-            )
-            if (
-                authorization_materialized_bytes + row_bytes
-                > _CROSS_SESSION_AUTH_MAX_MATERIALIZED_BYTES
-            ):
-                diagnostics["authorization_truncated"] = True
-                break
-            authorization_materialized_bytes += row_bytes
-            if (
-                row[0] is None
-                or row[4] != "text"
-                or int(row[1] or 0) > _CROSS_SESSION_AUTH_SESSION_ID_CHARS * 4
-                or int(row[2] or 0) > _CROSS_SESSION_AUTH_SESSION_ID_CHARS
-                or not isinstance(row[3], str)
-            ):
-                diagnostics["authorization_truncated"] = True
-                continue
-            message_sessions[int(row[0])] = row[3]
-    diagnostics["authorization_messages_checked"] = len(message_sessions)
-
-    if diagnostics["authorization_timed_out"]:
-        return [], diagnostics
-
-    memo: dict[int, bool] = {}
-    visiting: set[int] = set()
-
-    def authorized(node_id: int, depth: int = 0) -> bool:
-        if time.monotonic() >= deadline:
-            diagnostics["authorization_timed_out"] = True
-            return False
-        if depth > _CROSS_SESSION_AUTH_MAX_DEPTH or node_id in incomplete:
+        if materialized_bytes + row_bytes > _CROSS_SESSION_AUTH_MAX_MATERIALIZED_BYTES:
             diagnostics["authorization_truncated"] = True
             return False
-        if node_id in memo:
-            return memo[node_id]
-        if node_id in visiting:
-            memo[node_id] = False
-            return False
-        record = graph.get(node_id)
-        if record is None:
-            memo[node_id] = False
-            return False
-        session_id, source_type, source_ids = record
-        if session_id not in allowed_session_ids or not source_ids:
-            memo[node_id] = False
-            return False
-        visiting.add(node_id)
-        if source_type == "messages":
-            result = all(
-                message_sessions.get(source_id) in allowed_session_ids
-                for source_id in source_ids
-            )
-        elif source_type == "nodes":
-            result = all(authorized(child_id, depth + 1) for child_id in source_ids)
-        else:
-            result = False
-        visiting.discard(node_id)
-        memo[node_id] = result
-        return result
+        materialized_bytes += row_bytes
+        return True
 
-    authorized_candidates = [
-        candidate for candidate in selected if authorized(int(candidate.node_id))
-    ]
-    diagnostics["authorization_candidates_checked"] = len(selected)
-    if diagnostics["authorization_timed_out"]:
-        return [], diagnostics
-    return authorized_candidates, diagnostics
+    with engine._store._write_lock:
+        snapshot_data_version = int(conn.execute("PRAGMA data_version").fetchone()[0])
+        conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            queue: list[tuple[int, int]] = [(node_id, 0) for node_id in selected_ids]
+            queued = set(selected_ids)
+            expanded: set[int] = set()
+            message_ids: set[int] = set()
+            projection = engine._dag._cross_session_candidate_projection()
+            guard = engine._dag._cross_session_candidate_guard()
+
+            while queue and len(frozen_nodes) < _CROSS_SESSION_AUTH_MAX_NODES:
+                if time.monotonic() >= deadline:
+                    diagnostics["authorization_timed_out"] = True
+                    break
+                batch_entries = queue[:_CROSS_SESSION_AUTH_QUERY_BATCH]
+                del queue[:len(batch_entries)]
+                batch_ids = [
+                    node_id for node_id, _depth in batch_entries
+                    if node_id not in frozen_nodes
+                ]
+                if batch_ids:
+                    remaining_nodes = _CROSS_SESSION_AUTH_MAX_NODES - len(frozen_nodes)
+                    batch_ids = batch_ids[:remaining_nodes]
+                    placeholders = ",".join("?" for _ in batch_ids)
+                    rows = conn.execute(
+                        f"SELECT {projection} FROM summary_nodes "
+                        f"WHERE node_id IN ({placeholders}) AND {guard} LIMIT ?",
+                        [*batch_ids, len(batch_ids)],
+                    )
+                    found: set[int] = set()
+                    while time.monotonic() < deadline:
+                        raw_row = rows.fetchone()
+                        if raw_row is None:
+                            break
+                        row = tuple(raw_row)
+                        if not charge_row(row):
+                            break
+                        node = engine._dag._cross_session_row_to_node(row)
+                        if node is None:
+                            continue
+                        found.add(int(node.node_id))
+                        frozen_nodes[int(node.node_id)] = node
+                    for missing_id in set(batch_ids) - found:
+                        incomplete.add(missing_id)
+                        diagnostics["authorization_truncated"] = True
+
+                for node_id, depth in batch_entries:
+                    if node_id in expanded:
+                        continue
+                    expanded.add(node_id)
+                    node = frozen_nodes.get(node_id)
+                    if node is None or node.session_id not in allowed_session_ids:
+                        incomplete.add(node_id)
+                        continue
+                    if depth > _CROSS_SESSION_AUTH_MAX_DEPTH or not node.source_ids:
+                        incomplete.add(node_id)
+                        diagnostics["authorization_truncated"] = True
+                        continue
+                    remaining_edges = _CROSS_SESSION_AUTH_MAX_EDGES - int(
+                        diagnostics["authorization_edges_checked"]
+                    )
+                    if len(node.source_ids) > remaining_edges:
+                        incomplete.add(node_id)
+                        diagnostics["authorization_truncated"] = True
+                        continue
+                    diagnostics["authorization_edges_checked"] += len(node.source_ids)
+                    if node.source_type == "messages":
+                        message_ids.update(int(value) for value in node.source_ids)
+                    elif node.source_type == "nodes":
+                        if depth >= _CROSS_SESSION_AUTH_MAX_DEPTH:
+                            incomplete.add(node_id)
+                            diagnostics["authorization_truncated"] = True
+                            continue
+                        for child_id in node.source_ids:
+                            child_id = int(child_id)
+                            if child_id not in queued:
+                                queue.append((child_id, depth + 1))
+                                queued.add(child_id)
+                    else:
+                        incomplete.add(node_id)
+
+            if queue:
+                diagnostics["authorization_truncated"] = True
+                incomplete.update(node_id for node_id, _depth in queue)
+            diagnostics["authorization_nodes_checked"] = len(expanded)
+
+            bounded_message_ids = list(message_ids)[:_CROSS_SESSION_AUTH_MAX_MESSAGES]
+            if len(message_ids) > len(bounded_message_ids):
+                diagnostics["authorization_truncated"] = True
+            for offset in range(0, len(bounded_message_ids), _CROSS_SESSION_AUTH_QUERY_BATCH):
+                if time.monotonic() >= deadline:
+                    diagnostics["authorization_timed_out"] = True
+                    break
+                batch = bounded_message_ids[offset:offset + _CROSS_SESSION_AUTH_QUERY_BATCH]
+                placeholders = ",".join("?" for _ in batch)
+                cursor = conn.execute(
+                    f"""SELECT
+                               CASE WHEN typeof(store_id) = 'integer' THEN store_id END,
+                               CASE WHEN typeof(session_id) = 'text'
+                                          AND length(CAST(session_id AS BLOB)) <= {_CROSS_SESSION_AUTH_SESSION_ID_CHARS * 4}
+                                          AND length(CAST(session_id AS TEXT)) <= {_CROSS_SESSION_AUTH_SESSION_ID_CHARS}
+                                    THEN substr(CAST(session_id AS TEXT), 1, {_CROSS_SESSION_AUTH_SESSION_ID_CHARS}) END,
+                               substr(CAST(source AS TEXT), 1, 512),
+                               substr(CAST(role AS TEXT), 1, 128),
+                               CASE WHEN typeof(content) = 'text'
+                                    THEN substr(CAST(content AS TEXT), 1, {_CURRENT_SESSION_EXPAND_MAX_CHARS}) END,
+                               substr(CAST(tool_call_id AS TEXT), 1, 512),
+                               substr(CAST(tool_name AS TEXT), 1, 512),
+                               CASE WHEN typeof(timestamp) IN ('integer', 'real') THEN timestamp END,
+                               CASE WHEN typeof(token_estimate) = 'integer' THEN token_estimate END,
+                               CASE WHEN typeof(pinned) = 'integer' THEN pinned END,
+                               substr(CAST(conversation_id AS TEXT), 1, 512),
+                               COALESCE(length(CAST(content AS TEXT)), 0),
+                               typeof(session_id), typeof(content)
+                        FROM messages WHERE store_id IN ({placeholders}) LIMIT ?""",
+                    [*batch, len(batch)],
+                )
+                while time.monotonic() < deadline:
+                    raw_row = cursor.fetchone()
+                    if raw_row is None:
+                        break
+                    row = tuple(raw_row)
+                    if not charge_row(row):
+                        break
+                    if (
+                        row[0] is None
+                        or not isinstance(row[1], str)
+                        or row[12] != "text"
+                        or row[13] not in {"text", "null"}
+                    ):
+                        diagnostics["authorization_truncated"] = True
+                        continue
+                    store_id = int(row[0])
+                    message_sessions[store_id] = row[1]
+                    frozen_messages[store_id] = {
+                        "store_id": store_id,
+                        "session_id": row[1],
+                        "source": row[2] or "",
+                        "role": row[3] or "unknown",
+                        "content": row[4] or "",
+                        "tool_call_id": row[5] or "",
+                        "tool_calls": None,
+                        "tool_name": row[6] or "",
+                        "timestamp": row[7] or 0,
+                        "token_estimate": row[8] or 0,
+                        "pinned": row[9] or 0,
+                        "conversation_id": row[10] or "",
+                        "content_chars": int(row[11] or 0),
+                    }
+            diagnostics["authorization_messages_checked"] = len(message_sessions)
+
+            memo: dict[int, bool] = {}
+            visiting: set[int] = set()
+
+            def authorized(node_id: int, depth: int = 0) -> bool:
+                if depth > _CROSS_SESSION_AUTH_MAX_DEPTH or node_id in incomplete:
+                    return False
+                if node_id in memo:
+                    return memo[node_id]
+                if node_id in visiting:
+                    memo[node_id] = False
+                    return False
+                node = frozen_nodes.get(node_id)
+                if (
+                    node is None
+                    or node.session_id not in allowed_session_ids
+                    or not node.source_ids
+                ):
+                    memo[node_id] = False
+                    return False
+                visiting.add(node_id)
+                if node.source_type == "messages":
+                    result = all(
+                        message_sessions.get(int(source_id)) in allowed_session_ids
+                        and int(source_id) in frozen_messages
+                        for source_id in node.source_ids
+                    )
+                elif node.source_type == "nodes":
+                    result = all(
+                        authorized(int(child_id), depth + 1)
+                        for child_id in node.source_ids
+                    )
+                else:
+                    result = False
+                visiting.discard(node_id)
+                memo[node_id] = result
+                return result
+
+            authorized_candidates: list[Any] = []
+            for node_id in selected_ids:
+                if not authorized(node_id):
+                    continue
+                node = frozen_nodes[node_id]
+                node.search_rank, node.search_directness = candidate_rank[node_id]
+                authorized_candidates.append(node)
+            diagnostics["authorization_candidates_checked"] = len(selected_ids)
+            if diagnostics["authorization_timed_out"]:
+                authorized_candidates = []
+                frozen_nodes = {}
+                frozen_messages = {}
+            conn.execute(f"RELEASE {savepoint}")
+            if int(conn.execute("PRAGMA data_version").fetchone()[0]) != snapshot_data_version:
+                # A writer committed while this connection held its read view.
+                # The frozen view is internally consistent, but deny this turn
+                # so authorization cannot race a concurrent ownership change.
+                diagnostics["authorization_truncated"] = True
+                diagnostics["authorization_concurrent_mutation"] = True
+                authorized_candidates = []
+                frozen_nodes = {}
+                frozen_messages = {}
+            return authorized_candidates, diagnostics, {
+                "nodes": frozen_nodes,
+                "messages": frozen_messages,
+            }
+        except Exception:
+            conn.execute(f"ROLLBACK TO {savepoint}")
+            conn.execute(f"RELEASE {savepoint}")
+            raise
 
 
 def _bound_cross_session_context(
@@ -2233,7 +2445,7 @@ def _cross_session_expand_query(
         owner_scoped_candidates = [
             node for node in candidates if node.session_id in allowed_session_ids
         ]
-        candidates, authorization = _authorize_node_provenance_bounded(
+        candidates, authorization, frozen_evidence = _authorize_node_provenance_bounded(
             engine,
             owner_scoped_candidates,
             allowed_session_ids,
@@ -2329,6 +2541,7 @@ def _cross_session_expand_query(
                     max_tokens=remaining,
                     hydrate_externalized_content=False,
                     allowed_session_id=session_id,
+                    frozen_evidence=frozen_evidence,
                 )
                 for block in blocks:
                     block["session_id"] = safe_session_id
@@ -2888,14 +3101,25 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
             ),
         })
 
-    content_scope = str(args.get("content_scope") or "database").strip().lower()
+    content_scope, metadata_error = _parse_bounded_grep_text(
+        args.get("content_scope"),
+        "content_scope",
+        default="database",
+        max_chars=_LCM_GREP_SCOPE_MAX_CHARS,
+    )
+    if metadata_error:
+        return json.dumps({"error": metadata_error})
+    content_scope = str(content_scope or "database").lower()
     if content_scope == "files":
         content_scope = "externalized"
     if content_scope not in {"database", "externalized", "all"}:
         return json.dumps({
             "error": "content_scope must be database, externalized, or all",
         })
-    regex_mode = bool(args.get("regex", False))
+    raw_regex_mode = args.get("regex", False)
+    if not isinstance(raw_regex_mode, bool):
+        return json.dumps({"error": "regex must be a boolean"})
+    regex_mode = raw_regex_mode
     if regex_mode:
         if len(query) > _LCM_GREP_REGEX_MAX_PATTERN_CHARS:
             return json.dumps({"error": "regex pattern exceeds 2000 character hard limit"})
@@ -2903,20 +3127,33 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
             re.compile(query)
         except re.error as exc:
             return json.dumps({"error": f"invalid regex: {exc}"})
-    ref = str(args.get("ref") or "").strip()
+    ref, metadata_error = _parse_bounded_grep_text(
+        args.get("ref"), "ref", max_chars=_LCM_GREP_REF_MAX_CHARS
+    )
+    if metadata_error:
+        return json.dumps({"error": metadata_error})
+    ref = ref or ""
     if ref and (Path(ref).name != ref or "/" in ref or "\\" in ref):
         return json.dumps({"error": "invalid externalized ref"})
     if ref and content_scope == "database":
         return json.dumps({"error": "ref requires externalized content_scope"})
 
-    requested_max_files = _parse_int_value(
+    requested_max_files, numeric_error = _parse_bounded_grep_int(
         args.get("max_files"),
-        _LCM_GREP_EXTERNALIZED_DEFAULT_FILES,
+        "max_files",
+        default=_LCM_GREP_EXTERNALIZED_DEFAULT_FILES,
     )
-    requested_max_payload_chars = _parse_int_value(
+    if numeric_error:
+        return json.dumps({"error": numeric_error})
+    requested_max_payload_chars, numeric_error = _parse_bounded_grep_int(
         args.get("max_payload_chars"),
-        _LCM_GREP_EXTERNALIZED_DEFAULT_CHARS,
+        "max_payload_chars",
+        default=_LCM_GREP_EXTERNALIZED_DEFAULT_CHARS,
     )
+    if numeric_error:
+        return json.dumps({"error": numeric_error})
+    assert requested_max_files is not None
+    assert requested_max_payload_chars is not None
     if requested_max_files <= 0 or requested_max_payload_chars <= 0:
         return json.dumps({"error": "externalized scan bounds must be positive"})
     max_files = min(requested_max_files, _LCM_GREP_EXTERNALIZED_MAX_FILES)
@@ -2926,24 +3163,82 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     )
 
     raw_limit_arg = args.get("limit", 10)
-    parsed_limit = _parse_int_value(raw_limit_arg, 10)
+    parsed_limit, numeric_error = _parse_bounded_grep_int(
+        raw_limit_arg, "limit", default=10
+    )
+    if numeric_error:
+        return json.dumps({"error": numeric_error})
+    assert parsed_limit is not None
     if parsed_limit <= 0:
         return json.dumps({"error": "limit must be a positive integer"})
     requested_limit = parsed_limit
     limit = min(requested_limit, _LCM_GREP_HARD_LIMIT_CAP)
-    sort = normalize_search_sort(args.get("sort"))
+    raw_sort, metadata_error = _parse_bounded_grep_text(
+        args.get("sort"),
+        "sort",
+        default="recency",
+        max_chars=_LCM_GREP_SORT_MAX_CHARS,
+    )
+    if metadata_error:
+        return json.dumps({"error": metadata_error})
+    sort = normalize_search_sort(raw_sort)
     source_limit = max(limit * 4, limit, 20)
 
-    requested_session_scope = str(args.get("session_scope", "current")).lower()
-    raw_session_id_arg = args.get("session_id")
-    explicit_session_id = (
-        str(raw_session_id_arg).strip() if raw_session_id_arg is not None else ""
+    requested_session_scope, metadata_error = _parse_bounded_grep_text(
+        args.get("session_scope"),
+        "session_scope",
+        default="current",
+        max_chars=_LCM_GREP_SCOPE_MAX_CHARS,
     )
-    source = str(args.get("source") or "").strip() or None
-    conversation_id = str(args.get("conversation_id") or "").strip() or None
-    role, role_error = _parse_grep_role(args.get("role"))
+    if metadata_error:
+        return json.dumps({"error": metadata_error})
+    requested_session_scope = str(requested_session_scope or "current").lower()
+    raw_session_id_arg = args.get("session_id")
+    explicit_session_id, metadata_error = _parse_bounded_grep_text(
+        raw_session_id_arg,
+        "session_id",
+        max_chars=_LCM_GREP_SESSION_ID_MAX_CHARS,
+    )
+    if metadata_error:
+        return json.dumps({"error": metadata_error})
+    explicit_session_id = explicit_session_id or ""
+    source, metadata_error = _parse_bounded_grep_text(
+        args.get("source"), "source", max_chars=_LCM_GREP_SOURCE_MAX_CHARS
+    )
+    if metadata_error:
+        return json.dumps({"error": metadata_error})
+    source = source or None
+    conversation_id, metadata_error = _parse_bounded_grep_text(
+        args.get("conversation_id"),
+        "conversation_id",
+        max_chars=_LCM_GREP_CONVERSATION_ID_MAX_CHARS,
+    )
+    if metadata_error:
+        return json.dumps({"error": metadata_error})
+    conversation_id = conversation_id or None
+    raw_role, metadata_error = _parse_bounded_grep_text(
+        args.get("role"), "role", max_chars=_LCM_GREP_ROLE_MAX_CHARS
+    )
+    if metadata_error:
+        return json.dumps({"error": metadata_error})
+    role, role_error = _parse_grep_role(raw_role or None)
     if role_error:
         return json.dumps({"error": role_error})
+    for timestamp_name in ("time_from", "time_to"):
+        timestamp_value = args.get(timestamp_name)
+        if isinstance(timestamp_value, str) and len(timestamp_value) > _LCM_GREP_TIMESTAMP_MAX_CHARS:
+            return json.dumps({
+                "error": (
+                    f"{timestamp_name} exceeds the "
+                    f"{_LCM_GREP_TIMESTAMP_MAX_CHARS} character hard limit"
+                )
+            })
+        if timestamp_value is not None and not isinstance(
+            timestamp_value, (str, int, float)
+        ):
+            return json.dumps({
+                "error": f"{timestamp_name} must be a Unix timestamp or timezone-aware ISO 8601 string"
+            })
     time_from, time_from_error = _parse_optional_timestamp(args.get("time_from"), "time_from")
     if time_from_error:
         return json.dumps({"error": time_from_error})
@@ -3024,7 +3319,23 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     externalized_scan: dict[str, Any] | None = None
     operation_rows_reserved = 0
     operation_rows_materialized = 0
-    operation_bytes_materialized = len(query.encode("utf-8", errors="surrogatepass"))
+    charged_input_text = (
+        query,
+        content_scope,
+        ref,
+        raw_sort or "",
+        requested_session_scope,
+        explicit_session_id,
+        source or "",
+        conversation_id or "",
+        role or "",
+        str(args.get("time_from") or ""),
+        str(args.get("time_to") or ""),
+    )
+    operation_bytes_materialized = sum(
+        len(value.encode("utf-8", errors="surrogatepass"))
+        for value in charged_input_text
+    )
     operation_budget_exhausted = False
 
     def reserve_discovery_rows(requested: int) -> int:
@@ -3573,6 +3884,7 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
             content_offset=content_offset,
             max_content_chars=_CURRENT_SESSION_EXPAND_MAX_CHARS,
             content_lookahead_chars=_MANDATORY_REDACTION_LOOKAHEAD_CHARS,
+            boundary_scanner=_scan_raw_credential_boundary,
         )
         status = loaded.get("status")
         if status == "not_found":
@@ -3595,7 +3907,30 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
         transcript_content = stored.get("content", "") or ""
         total_content_chars = max(0, int(stored.get("content_chars") or 0))
         window_offset = max(0, int(stored.get("content_window_offset") or 0))
-        if window_offset >= total_content_chars:
+        if stored.get("boundary_redacted"):
+            boundary_cursor = min(
+                total_content_chars,
+                max(0, int(stored.get("boundary_next_content_offset") or 0)),
+            )
+            boundary_pending = bool(stored.get("boundary_pending"))
+            boundary_placeholder = (
+                str(stored.get("boundary_safe_prefix") or "")
+                + "[LCM sensitive redaction: name=bounded_credential; "
+                "boundary-truncated]"
+            )
+            sliced = {
+                "content": boundary_placeholder,
+                "content_chars": total_content_chars,
+                "content_offset": min(content_offset, total_content_chars),
+                "content_returned_chars": len(boundary_placeholder),
+                "content_truncated": True,
+                "next_content_offset": (
+                    boundary_cursor if boundary_cursor < total_content_chars else 0
+                ),
+                "has_more": boundary_cursor < total_content_chars,
+                "content_boundary_scan_pending": boundary_pending,
+            }
+        elif window_offset >= total_content_chars:
             bounded_requested_offset = min(content_offset, total_content_chars)
             sliced = {
                 "content": "",
@@ -3636,24 +3971,6 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
                 local_has_more
                 and sliced["next_content_offset"] < total_content_chars
             )
-            if (
-                sliced["has_more"]
-                and int(sliced["next_content_offset"] or 0) <= content_offset
-            ):
-                # The bounded SQL window ended inside a credential whose safe
-                # terminator lies beyond the lookahead.  Returning the same raw
-                # cursor would loop forever, while advancing an unmarked cursor
-                # could expose the continuation. Surface one atomic redaction
-                # and disable continuation for this pathological field.
-                sliced["content"] = (
-                    "[LCM sensitive redaction: name=bounded_credential; "
-                    "boundary-truncated]"
-                )
-                sliced["content_returned_chars"] = len(sliced["content"])
-                sliced["content_truncated"] = True
-                sliced["next_content_offset"] = 0
-                sliced["has_more"] = False
-                sliced["content_continuation_disabled"] = True
         stored_session_id = stored.get("session_id", "")
         result: Dict[str, Any] = {
             "store_id": store_id,
@@ -3673,8 +3990,8 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
             "next_content_offset": sliced["next_content_offset"],
             "has_more": sliced["has_more"],
         }
-        if sliced.get("content_continuation_disabled"):
-            result["content_continuation_disabled"] = True
+        if sliced.get("content_boundary_scan_pending"):
+            result["content_boundary_scan_pending"] = True
         # Surface externalized-payload metadata when the row references one. Content
         # is not hydrated by default, mirroring the existing _expand_message_sources
         # default. Externalized lookup remains session-scoped (per the existing

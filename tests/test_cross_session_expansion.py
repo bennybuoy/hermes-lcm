@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 import time
 
@@ -165,6 +166,112 @@ def test_session_allowlist_is_authorization_boundary(tmp_path, monkeypatch):
         assert result["contributing_session_ids"] == ["allowed"]
         assert all(match["session_id"] != "denied" for match in result["matches"])
     finally:
+        engine.shutdown()
+
+
+def test_authorization_and_evidence_use_one_frozen_snapshot(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    node_id = _node(
+        engine,
+        "archive",
+        "archive snapshot result",
+        content="authorized snapshot evidence",
+    )
+    other = sqlite3.connect(str(engine._config.database_path), timeout=5)
+    original_authorize = lcm_tools._authorize_node_provenance_bounded
+    original_get_batch = engine._store.get_batch
+
+    def authorize_then_mutate(*args, **kwargs):
+        result = original_authorize(*args, **kwargs)
+        other.execute(
+            "UPDATE messages SET session_id='denied', content='UNAUTHORIZED-LATE-PAYLOAD'"
+        )
+        other.execute(
+            "UPDATE summary_nodes SET session_id='denied' WHERE node_id=?",
+            (node_id,),
+        )
+        other.commit()
+        return result
+
+    def reject_unrestricted_payload_getter(*args, **kwargs):
+        raise AssertionError("evidence used unrestricted getter after authorization")
+
+    monkeypatch.setattr(
+        lcm_tools, "_authorize_node_provenance_bounded", authorize_then_mutate
+    )
+    monkeypatch.setattr(engine._store, "get_batch", reject_unrestricted_payload_getter)
+    captured = {}
+
+    def synthesize(**kwargs):
+        captured["context"] = kwargs["context_blocks"]
+        return "snapshot answer"
+
+    monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", synthesize)
+    try:
+        result = json.loads(_invoke(
+            engine,
+            _args(query="", node_ids=[node_id], deadline_ms=1_000),
+            session_ids=["archive"],
+        ))
+        assert result["answer"] == "snapshot answer"
+        encoded = json.dumps(captured["context"])
+        assert "authorized snapshot evidence" in encoded
+        assert "UNAUTHORIZED-LATE-PAYLOAD" not in encoded
+        assert original_get_batch is not None
+    finally:
+        other.close()
+        engine.shutdown()
+
+
+def test_concurrent_ownership_mutation_during_snapshot_is_denied(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    node_id = _node(
+        engine,
+        "archive",
+        "archive concurrent snapshot",
+        content="snapshot payload must not race",
+    )
+    other = sqlite3.connect(str(engine._config.database_path), timeout=5)
+    original_convert = engine._dag._cross_session_row_to_node
+    mutated = False
+    conversions = 0
+
+    def mutate_during_snapshot(row, **kwargs):
+        nonlocal mutated, conversions
+        node = original_convert(row, **kwargs)
+        conversions += 1
+        if node is not None and conversions >= 2 and not mutated:
+            mutated = True
+            other.execute(
+                "UPDATE messages SET session_id='denied', content='LATE-UNAUTHORIZED'"
+            )
+            other.execute(
+                "UPDATE summary_nodes SET session_id='denied' WHERE node_id=?",
+                (node_id,),
+            )
+            other.commit()
+        return node
+
+    monkeypatch.setattr(engine._dag, "_cross_session_row_to_node", mutate_during_snapshot)
+    monkeypatch.setattr(
+        lcm_tools,
+        "_synthesize_expansion_answer",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("concurrent ownership mutation reached synthesis")
+        ),
+    )
+    try:
+        result = json.loads(_invoke(
+            engine,
+            _args(query="", node_ids=[node_id], deadline_ms=1_000),
+            session_ids=["archive"],
+        ))
+        assert mutated is True
+        assert result["node_ids"] == []
+        assert result["authorization_concurrent_mutation"] is True
+        assert "LATE-UNAUTHORIZED" not in json.dumps(result)
+    finally:
+        other.close()
         engine.shutdown()
 
 
@@ -849,6 +956,9 @@ def test_cross_session_lineage_is_length_guarded_before_python_materialization(
 
     monkeypatch.setattr(engine._dag, "_row_to_node", guarded_row_to_node)
     statements: list[str] = []
+    # Authorization and frozen evidence now intentionally share the message
+    # store connection's single SQLite read snapshot.
+    engine._store._conn.set_trace_callback(statements.append)
     engine._dag._conn.set_trace_callback(statements.append)
     try:
         result = json.loads(_invoke(
@@ -862,6 +972,7 @@ def test_cross_session_lineage_is_length_guarded_before_python_materialization(
         assert all("SELECT *" not in s and "SELECT N.*" not in s for s in selects)
         assert any("LENGTH(CAST" in s and "SUBSTR" in s for s in selects)
     finally:
+        engine._store._conn.set_trace_callback(None)
         engine._dag._conn.set_trace_callback(None)
         engine.shutdown()
 
@@ -907,7 +1018,9 @@ def test_descendant_authorization_guards_all_text_provenance_before_fetchall(
         ),
     )
     statements: list[str] = []
-    engine._dag._conn.set_trace_callback(statements.append)
+    # The guarded descendant projection is part of the same store-connection
+    # snapshot that freezes authorized message payloads.
+    engine._store._conn.set_trace_callback(statements.append)
     try:
         result = json.loads(_invoke(
             engine,
@@ -931,7 +1044,7 @@ def test_descendant_authorization_guards_all_text_provenance_before_fetchall(
             for statement in descendant_selects
         )
     finally:
-        engine._dag._conn.set_trace_callback(None)
+        engine._store._conn.set_trace_callback(None)
         engine.shutdown()
 
 

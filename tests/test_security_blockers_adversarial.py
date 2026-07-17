@@ -1278,6 +1278,95 @@ def test_grep_left_boundary_fail_closes_quoted_and_pem_credentials(
         engine.shutdown()
 
 
+@pytest.mark.parametrize(
+    ("query", "credential"),
+    [
+        (
+            "quoted-leading-token-window",
+            'password="' + ("A" * 96)
+            + (("\nswordfish password words") * 400)[:8_120]
+            + "\nquoted-leading-token-window\n"
+            + (("swordfish password words\n") * 800)
+            + '"',
+        ),
+        (
+            "pem-leading-token-window",
+            "-----BEGIN PRIVATE KEY-----\n"
+            + ("B" * 96)
+            + (("\nswordfish password words") * 400)[:8_120]
+            + "\npem-leading-token-window\n"
+            + (("swordfish password words\n") * 800)
+            + "-----END PRIVATE KEY-----",
+        ),
+    ],
+)
+def test_grep_long_leading_token_redacts_through_credential_terminator(
+    tmp_path, query, credential
+):
+    engine = _engine(tmp_path)
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": credential + "\nbenign suffix"}
+    )
+    try:
+        response = json.loads(tools_module.lcm_grep(
+            {"query": query, "session_scope": "current", "limit": 1},
+            engine=engine,
+        ))
+        assert response["results"][0]["store_id"] == store_id
+        snippet = response["results"][0]["snippet"]
+        assert "swordfish" not in snippet.casefold()
+        assert "password words" not in snippet.casefold()
+        assert "A" * 64 not in snippet
+        assert "B" * 64 not in snippet
+        assert "LCM sensitive redaction" in snippet
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["source", "conversation_id", "session_scope", "session_id", "content_scope", "ref", "role", "sort"],
+)
+def test_grep_rejects_oversized_metadata_before_discovery(tmp_path, monkeypatch, field):
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(
+        engine._store,
+        "search",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("oversized grep metadata reached discovery")
+        ),
+    )
+    args = {"query": "metadata-cap-canary", field: "x" * 20_000}
+    if field == "session_id":
+        args["session_scope"] = "session"
+    try:
+        response = json.loads(tools_module.lcm_grep(args, engine=engine))
+        assert "error" in response
+        assert "hard" in response["error"] or "limit" in response["error"]
+        assert "x" * 1_000 not in json.dumps(response)
+    finally:
+        engine.shutdown()
+
+
+def test_grep_charges_bounded_echo_metadata_to_operation_budget(tmp_path):
+    engine = _engine(tmp_path)
+    source = "source-" + ("s" * 400)
+    conversation_id = "conversation-" + ("c" * 400)
+    try:
+        response = json.loads(tools_module.lcm_grep(
+            {
+                "query": "no-such-budget-result",
+                "source": source,
+                "conversation_id": conversation_id,
+            },
+            engine=engine,
+        ))
+        minimum = len("no-such-budget-result".encode()) + len(source.encode()) + len(conversation_id.encode())
+        assert response["operation_budget"]["bytes_materialized"] >= minimum
+    finally:
+        engine.shutdown()
+
+
 @pytest.mark.parametrize("regex_mode", [False, True])
 def test_grep_rejects_oversized_query_before_any_discovery(tmp_path, monkeypatch, regex_mode):
     engine = _engine(tmp_path)
@@ -1453,6 +1542,48 @@ def test_authorized_store_expand_materializes_only_bounded_redacted_payload(tmp_
         assert "X" * 64 not in response_text
         assert "api_key=" not in response_text
         assert "LCM sensitive redaction" in response_text
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("credential_kind", ["quoted", "pem"])
+def test_store_expand_arbitrary_deep_offset_fail_closes_and_recovers_suffix(
+    tmp_path, credential_kind
+):
+    engine = _engine(tmp_path)
+    if credential_kind == "quoted":
+        credential = 'password="' + ("QUOTED-BODY-CANARY\n" * 8_000) + '"'
+    else:
+        credential = (
+            "-----BEGIN PRIVATE KEY-----\n"
+            + ("PEM-BODY-CANARY-0123456789\n" * 8_000)
+            + "-----END PRIVATE KEY-----"
+        )
+    suffix = "\nBENIGN-SUFFIX-RECOVERED"
+    content = "benign prefix\n" + credential + suffix
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": content}
+    )
+    offset = content.index("BODY-CANARY") + 20_000
+    pages = []
+    try:
+        for _ in range(80):
+            page = json.loads(tools_module.lcm_expand(
+                {"store_id": store_id, "content_offset": offset, "max_tokens": 64},
+                engine=engine,
+            ))
+            pages.append(page["content"])
+            encoded = json.dumps(page)
+            assert "QUOTED-BODY-CANARY" not in encoded
+            assert "PEM-BODY-CANARY" not in encoded
+            if not page["has_more"]:
+                break
+            assert page["next_content_offset"] > offset
+            offset = page["next_content_offset"]
+        else:
+            pytest.fail("bounded credential scan did not reach a terminal page")
+        assert "BENIGN-SUFFIX-RECOVERED" in "".join(pages)
+        assert pages and any("LCM sensitive redaction" in item for item in pages)
     finally:
         engine.shutdown()
 
