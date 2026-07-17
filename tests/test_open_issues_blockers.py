@@ -825,6 +825,15 @@ def _accumulate_historical_markers(payload: dict, count: int) -> None:
     payload["persisted_output_markers"] = markers
 
 
+def _move_persisted_metadata_before_content(payload: dict) -> dict:
+    """Reproduce the current writer's accumulated-marker field order."""
+    return {
+        key: value
+        for key, value in payload.items()
+        if key != "content"
+    } | {"content": payload["content"]}
+
+
 @pytest.mark.parametrize(
     ("kind", "role", "tool_call_id", "needle"),
     [
@@ -870,7 +879,9 @@ def test_externalized_grep_accepts_exact_historical_persisted_output_shapes(
         engine.shutdown()
 
 
-@pytest.mark.parametrize("marker_count", [100, 1_000], ids=["100", "1000"])
+@pytest.mark.parametrize(
+    "marker_count", [50, 1_000, 4_097], ids=["50", "1000", "4097"]
+)
 def test_externalized_grep_losslessly_streams_accumulated_historical_markers(
     tmp_path, marker_count
 ):
@@ -909,96 +920,87 @@ def test_externalized_grep_losslessly_streams_accumulated_historical_markers(
         assert result["results"][0]["matched_text"] == needle
         assert result["results"][0]["content_chars_scanned"] == len(content)
         assert result["scan"]["bytes_scanned"] == path.stat().st_size
-        assert result["scan"]["max_persisted_output_markers"] == 4_096
         assert result["scan"]["max_suffix_depth"] == 3
+        assert result["scan"]["persisted_output_markers_scanned"] == marker_count
     finally:
         engine.shutdown()
 
 
-def test_externalized_grep_marker_cap_is_retryable_not_ambiguous(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    "marker_count", [50, 1_000, 4_097], ids=["50", "1000", "4097"]
+)
+def test_externalized_grep_streams_current_precontent_accumulated_markers(
+    tmp_path, marker_count
 ):
     payload_dir = tmp_path / "payloads"
     payload_dir.mkdir()
-    ref = "historical-marker-cap.json"
-    needle = "HISTORICAL-MARKER-CAP-RETRY-NEEDLE"
+    ref = f"current-{marker_count}-markers.json"
+    needle = f"CURRENT-{marker_count}-MARKER-NEEDLE"
     payload = _historical_persisted_output_payload(
-        kind="tool_result", role="tool", tool_call_id="marker-cap", content=needle
+        kind="tool_result", role="tool", tool_call_id=ref, content=needle
     )
-    _accumulate_historical_markers(payload, 101)
-    (payload_dir / ref).write_text(
-        json.dumps(payload, separators=(",", ":")), encoding="utf-8"
+    _accumulate_historical_markers(payload, marker_count)
+    payload = _move_persisted_metadata_before_content(payload)
+    path = payload_dir / ref
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    assert payload["persisted_output_markers"][-1]["source_path"].endswith(
+        f"-{marker_count - 1:04d}.txt"
     )
     engine = _engine(tmp_path)
     try:
-        monkeypatch.setattr(tools_module, "_EXTERNALIZED_SUFFIX_MAX_MARKERS", 100)
-        bounded = json.loads(tools_module.lcm_grep(
+        result = json.loads(tools_module.lcm_grep(
             {"query": needle, "content_scope": "externalized", "ref": ref},
             engine=engine,
         ))
-        assert bounded["results"] == []
-        assert bounded["diagnostics"] == [{"ref": ref, "error": "payload_truncated"}]
-        assert bounded["scan"]["scan_truncated"] is True
-        assert bounded["scan"]["max_persisted_output_markers"] == 100
-
-        monkeypatch.setattr(tools_module, "_EXTERNALIZED_SUFFIX_MAX_MARKERS", 4_096)
-        retry = json.loads(tools_module.lcm_grep(
-            {"query": needle, "content_scope": "externalized", "ref": ref},
-            engine=engine,
-        ))
-        assert retry["diagnostics"] == []
-        assert retry["total_results"] == 1
+        assert result["diagnostics"] == []
+        assert result["total_results"] == 1
+        assert result["results"][0]["matched_text"] == needle
+        assert result["scan"]["bytes_scanned"] == path.stat().st_size
+        assert result["scan"]["persisted_output_markers_scanned"] == marker_count
     finally:
         engine.shutdown()
 
 
-def test_externalized_grep_marker_cap_is_operation_wide_and_ref_retryable(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("layout", ["pre-content", "post-content"])
+def test_externalized_grep_processes_substantially_more_than_4097_markers(
+    tmp_path, layout
 ):
     payload_dir = tmp_path / "payloads"
     payload_dir.mkdir()
-    needle = "HISTORICAL-OPERATION-WIDE-MARKER-CAP-NEEDLE"
-    refs = []
-    for index in range(2):
-        ref = f"operation-marker-cap-{index}.json"
-        payload = _historical_persisted_output_payload(
-            kind="tool_result",
-            role="tool",
-            tool_call_id=f"operation-cap-{index}",
-            content=needle,
-        )
-        _accumulate_historical_markers(payload, 60)
-        (payload_dir / ref).write_text(
-            json.dumps(payload, separators=(",", ":")), encoding="utf-8"
-        )
-        refs.append(ref)
-
+    marker_count = 12_000
+    ref = f"large-{layout}.json"
+    needle = f"LARGE-{layout}-MARKER-NEEDLE"
+    first = {"source_path": "/p/0", "expected_chars": len(needle)}
+    payload = {
+        "kind": "tool_result",
+        "tool_call_id": ref,
+        "role": "tool",
+        "session_id": "current",
+        "content": needle,
+        "persisted_output_source_path": first["source_path"],
+        "persisted_output_expected_chars": first["expected_chars"],
+        "persisted_output_markers": [first] + [
+            {"source_path": f"/p/{index}", "expected_chars": len(needle)}
+            for index in range(1, marker_count)
+        ],
+    }
+    if layout == "pre-content":
+        payload = _move_persisted_metadata_before_content(payload)
+    path = payload_dir / ref
+    path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    assert path.stat().st_size < tools_module._LCM_GREP_OPERATION_MAX_BYTES
     engine = _engine(tmp_path)
     try:
-        monkeypatch.setattr(tools_module, "_EXTERNALIZED_SUFFIX_MAX_MARKERS", 100)
-        bounded = json.loads(tools_module.lcm_grep(
-            {"query": needle, "content_scope": "externalized", "max_files": 2},
+        result = json.loads(tools_module.lcm_grep(
+            {"query": needle, "content_scope": "externalized", "ref": ref},
             engine=engine,
         ))
-        assert bounded["total_results"] == 1
-        assert len(bounded["diagnostics"]) == 1
-        assert bounded["diagnostics"][0]["ref"] in refs
-        assert bounded["diagnostics"][0]["error"] == "payload_truncated"
-        assert bounded["scan"]["scan_truncated"] is True
-        assert bounded["scan"]["persisted_output_markers_scanned"] == 100
-        truncated_ref = bounded["diagnostics"][0]["ref"]
-
-        retry = json.loads(tools_module.lcm_grep(
-            {
-                "query": needle,
-                "content_scope": "externalized",
-                "ref": truncated_ref,
-            },
-            engine=engine,
-        ))
-        assert retry["diagnostics"] == []
-        assert retry["total_results"] == 1
-        assert retry["scan"]["persisted_output_markers_scanned"] == 60
+        assert result["diagnostics"] == []
+        assert result["total_results"] == 1
+        assert result["scan"]["persisted_output_markers_scanned"] == marker_count
     finally:
         engine.shutdown()
 
@@ -1046,6 +1048,131 @@ def test_externalized_grep_suffix_byte_budget_is_retryable_and_eventual(
         engine.shutdown()
 
 
+def test_externalized_grep_charges_every_rejected_byte_under_shared_40kb_cap(
+    tmp_path, monkeypatch
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    variants = [
+        b'{"session_id":"current","content":"' + (b"A" * 24_000) + b'\xff"}',
+        b'{"session_id":"current","content":"x","unknown":' + (b"0" * 24_000),
+        b'{"session_id":"foreign","padding":"' + (b"F" * 24_000) + b'","content":"x"}',
+        b'{"session_id":"current","content":"x","created_at":' + (b"9" * 24_000),
+        b'{"session_id":"current","content":"x","session_id":"current"}'
+        + (b"Z" * 24_000),
+    ]
+    paths = []
+    for index, raw in enumerate(variants):
+        path = payload_dir / f"rejected-{index}.json"
+        path.write_bytes(raw)
+        paths.append(path.resolve())
+
+    real_open = tools_module.Path.open
+    transport_bytes_read = 0
+
+    class CountingReader:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __enter__(self):
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._handle.__exit__(*args)
+
+        def read(self, size=-1):
+            nonlocal transport_bytes_read
+            chunk = self._handle.read(size)
+            transport_bytes_read += len(chunk)
+            return chunk
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+    def counted_open(candidate, *args, **kwargs):
+        handle = real_open(candidate, *args, **kwargs)
+        if candidate.resolve() in paths and "b" in str(
+            args[0] if args else kwargs.get("mode", "r")
+        ):
+            return CountingReader(handle)
+        return handle
+
+    monkeypatch.setattr(tools_module.Path, "open", counted_open)
+    engine = _engine(tmp_path)
+    try:
+        _, diagnostics, scan = tools_module._search_externalized_payloads(
+            engine,
+            query="never-matches",
+            regex_mode=False,
+            allowed_session_ids=frozenset({"current"}),
+            ref="",
+            limit=10,
+            max_files=10,
+            max_payload_chars=1_000,
+            max_total_bytes=40_000,
+            deadline=time.monotonic() + 10,
+        )
+        assert diagnostics
+        assert scan["scan_truncated"] is True
+        assert scan["byte_budget_exhausted"] is True
+        assert scan["max_total_bytes"] == 40_000
+        assert transport_bytes_read == scan["bytes_scanned"] == 40_000
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("layout", ["pre-content", "post-content"])
+@pytest.mark.parametrize(
+    "variant",
+    ["duplicate-top", "unknown-top", "duplicate-marker", "unknown-marker"],
+)
+def test_externalized_grep_streaming_marker_metadata_rejects_ambiguity(
+    tmp_path, layout, variant
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    ref = f"{layout}-{variant}.json"
+    needle = "STREAMING-METADATA-REJECTION-NEEDLE"
+    payload = _historical_persisted_output_payload(
+        kind="tool_result", role="tool", tool_call_id=ref, content=needle
+    )
+    _accumulate_historical_markers(payload, 50)
+    if layout == "pre-content":
+        payload = _move_persisted_metadata_before_content(payload)
+    serialized = json.dumps(payload, separators=(",", ":"))
+    if variant == "duplicate-top":
+        target = '"persisted_output_expected_chars":' + str(len(needle))
+        serialized = serialized.replace(target, target + "," + target, 1)
+    elif variant == "unknown-top":
+        serialized = serialized.replace(
+            '"persisted_output_expected_chars":',
+            '"persisted_output_override":0,"persisted_output_expected_chars":',
+            1,
+        )
+    elif variant == "duplicate-marker":
+        target = '"source_path":"/tmp/hermes-results/historical-output.txt"'
+        serialized = serialized.replace(target, target + "," + target, 1)
+    else:
+        target = '"source_path":"/tmp/hermes-results/historical-output.txt"'
+        serialized = serialized.replace(target, target + ',"override":true', 1)
+    (payload_dir / ref).write_text(serialized, encoding="utf-8")
+
+    engine = _engine(tmp_path)
+    try:
+        result = json.loads(tools_module.lcm_grep(
+            {"query": needle, "content_scope": "externalized", "ref": ref},
+            engine=engine,
+        ))
+        assert result["results"] == []
+        assert result["diagnostics"] == [{
+            "ref": ref,
+            "error": "ambiguous_metadata",
+        }]
+    finally:
+        engine.shutdown()
+
+
 def test_externalized_grep_suffix_deadline_stops_between_bounded_chunks(
     tmp_path, monkeypatch
 ):
@@ -1064,6 +1191,7 @@ def test_externalized_grep_suffix_deadline_stops_between_bounded_chunks(
     virtual_now = 0.0
     deadline_mode = True
     largest_read = 0
+    transport_bytes_read = 0
 
     class DeadlineReader:
         def __init__(self, handle):
@@ -1077,9 +1205,10 @@ def test_externalized_grep_suffix_deadline_stops_between_bounded_chunks(
             return self._handle.__exit__(*args)
 
         def read(self, size=-1):
-            nonlocal virtual_now, largest_read
+            nonlocal virtual_now, largest_read, transport_bytes_read
             largest_read = max(largest_read, size)
             chunk = self._handle.read(size)
+            transport_bytes_read += len(chunk)
             if deadline_mode and size > 1 and chunk:
                 virtual_now += 0.3
             return chunk
@@ -1105,16 +1234,34 @@ def test_externalized_grep_suffix_deadline_stops_between_bounded_chunks(
         assert bounded["results"] == []
         assert bounded["diagnostics"] == [{"ref": ref, "error": "body_deadline"}]
         assert bounded["scan"]["scan_truncated"] is True
+        assert 0 < bounded["scan"]["bytes_scanned"] < path.stat().st_size
+        assert bounded["scan"]["bytes_scanned"] == transport_bytes_read
         assert largest_read <= 16 * 1024
+        assert bounded["scan"]["continuations_pending"] == 1
 
-        deadline_mode = False
-        virtual_now = 0.0
-        retry = json.loads(tools_module.lcm_grep(
-            {"query": needle, "content_scope": "externalized", "ref": ref},
-            engine=engine,
-        ))
+        retry = bounded
+        for attempt in range(1, 20):
+            virtual_now = 0.0
+            retry_bytes_before = transport_bytes_read
+            retry = json.loads(tools_module.lcm_grep(
+                {"query": needle, "content_scope": "externalized", "ref": ref},
+                engine=engine,
+            ))
+            assert retry["scan"]["bytes_scanned"] == (
+                transport_bytes_read - retry_bytes_before
+            )
+            assert retry["scan"]["continuation_reused_bytes"] > 0
+            if retry["total_results"] == 1:
+                break
+            assert retry["diagnostics"] == [{"ref": ref, "error": "body_deadline"}]
+            assert retry["scan"]["continuations_pending"] == 1
+        else:
+            pytest.fail("bounded retries did not make reusable per-file progress")
+
         assert retry["diagnostics"] == []
         assert retry["total_results"] == 1
+        assert retry["scan"]["continuations_pending"] == 0
+        assert transport_bytes_read == path.stat().st_size
     finally:
         engine.shutdown()
 

@@ -773,7 +773,6 @@ _EXTERNALIZED_TRAILING_CANONICAL_KEYS = frozenset({
     "persisted_output_file_mtime_ns", "persisted_output_file_ctime_ns",
     "persisted_output_markers",
 })
-_EXTERNALIZED_SUFFIX_MAX_MARKERS = 4_096
 _EXTERNALIZED_SUFFIX_MAX_DEPTH = 3
 _EXTERNALIZED_CANONICAL_INTEGER_MAX = (1 << 63) - 1
 _EXTERNALIZED_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -805,13 +804,13 @@ class _ExternalizedSuffixBudgetExceeded(Exception):
 
 
 class _ExternalizedSuffixOperationBudget:
-    """Shared marker accounting across every payload in one grep operation."""
+    """Shared diagnostic/CPU accounting bounded by the operation byte cap."""
 
     __slots__ = ("max_markers", "markers")
 
     def __init__(self, max_markers: int | None = None):
         self.max_markers = (
-            _EXTERNALIZED_SUFFIX_MAX_MARKERS
+            _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES
             if max_markers is None
             else max(0, int(max_markers))
         )
@@ -822,6 +821,113 @@ class _ExternalizedSuffixOperationBudget:
         if self.markers + count > self.max_markers:
             raise _ExternalizedSuffixBudgetExceeded
         self.markers += count
+
+
+class _ExternalizedByteOperationBudget:
+    """Charge transport bytes synchronously, including failed parse attempts."""
+
+    __slots__ = ("max_bytes", "bytes_read", "exhausted")
+
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max(0, int(max_bytes))
+        self.bytes_read = 0
+        self.exhausted = self.max_bytes == 0
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.max_bytes - self.bytes_read)
+
+    def read(self, handle, size: int = -1) -> bytes:
+        remaining = self.remaining
+        if remaining <= 0:
+            self.exhausted = True
+            return b""
+        requested = remaining if size < 0 else min(max(0, int(size)), remaining)
+        if requested <= 0:
+            return b""
+        try:
+            start_offset = handle.tell()
+        except (AttributeError, OSError, ValueError):
+            start_offset = None
+        try:
+            raw = handle.read(requested)
+        except BaseException:
+            # Defensive accounting for file-like implementations that advance
+            # before surfacing a transport exception.
+            if start_offset is not None:
+                try:
+                    advanced = max(0, int(handle.tell()) - int(start_offset))
+                except (AttributeError, OSError, TypeError, ValueError):
+                    advanced = 0
+                self.bytes_read += min(remaining, advanced)
+                if self.bytes_read >= self.max_bytes:
+                    self.exhausted = True
+            raise
+        # Charge before returning control to any decoder/parser so exceptions
+        # cannot bypass the operation ledger.
+        self.bytes_read += len(raw)
+        if self.bytes_read >= self.max_bytes:
+            self.exhausted = True
+        return raw
+
+
+class _ExternalizedBudgetedReader:
+    """File-like view whose reads share one operation byte budget."""
+
+    __slots__ = ("_handle", "_budget", "_capture")
+
+    def __init__(
+        self,
+        handle,
+        budget: _ExternalizedByteOperationBudget,
+        capture: bytearray | None = None,
+    ):
+        self._handle = handle
+        self._budget = budget
+        self._capture = capture
+
+    def read(self, size: int = -1) -> bytes:
+        raw = self._budget.read(self._handle, size)
+        if self._capture is not None:
+            self._capture.extend(raw)
+        return raw
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._handle, name)
+
+
+class _ExternalizedPrependReader:
+    """Replay bytes already charged/read while continuing from the file."""
+
+    __slots__ = ("_handle", "_prefix", "_index", "_logical_offset")
+
+    def __init__(self, handle, prefix: bytes):
+        self._handle = handle
+        self._prefix = prefix
+        self._index = 0
+        self._logical_offset = handle.tell() - len(prefix)
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            prefix = self._prefix[self._index:]
+            self._index = len(self._prefix)
+            raw = prefix + self._handle.read(-1)
+        else:
+            remaining_prefix = len(self._prefix) - self._index
+            prefix_size = min(max(0, size), remaining_prefix)
+            prefix = self._prefix[self._index:self._index + prefix_size]
+            self._index += prefix_size
+            raw = prefix
+            if len(raw) < size:
+                raw += self._handle.read(size - len(raw))
+        self._logical_offset += len(raw)
+        return raw
+
+    def tell(self) -> int:
+        return self._logical_offset
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._handle, name)
 
 
 def _externalized_object_without_duplicate_keys(
@@ -914,8 +1020,6 @@ def _validate_externalized_metadata_field(key: str, value: Any) -> None:
             return
         if not isinstance(value, list) or not value:
             raise ValueError("invalid_payload")
-        if len(value) > _EXTERNALIZED_SUFFIX_MAX_MARKERS:
-            raise ValueError("payload_truncated")
         identities = [
             _validate_externalized_persisted_output_marker(marker)
             for marker in value
@@ -1035,12 +1139,12 @@ def _externalized_marker_identity_digest(identity: tuple[Any, ...]) -> bytes:
 
 
 class _ExternalizedSuffixParser:
-    """Incrementally validate metadata following a canonical content string.
+    """Incrementally validate canonical metadata on either side of content.
 
-    Historical writers could append an ever-growing marker list after content.
-    The parser therefore discards every completed marker, retaining only a
-    fixed-size identity digest for duplicate detection and the first marker for
-    the canonical top-level consistency check.
+    Marker arrays may occur before content (current writer) or after content
+    (historical writer). The parser discards every completed marker, retaining
+    only a fixed-size identity digest for duplicate detection and the first
+    marker for the canonical top-level consistency check.
     """
 
     def __init__(
@@ -1048,6 +1152,7 @@ class _ExternalizedSuffixParser:
         *,
         seen: set[str],
         operation_budget: _ExternalizedSuffixOperationBudget | None = None,
+        prefix: bool = False,
     ):
         self.decoder = json.JSONDecoder(
             object_pairs_hook=_externalized_object_without_duplicate_keys
@@ -1056,7 +1161,8 @@ class _ExternalizedSuffixParser:
         self.fields: dict[str, Any] = {}
         self.buffer = ""
         self.index = 0
-        self.state = "start"
+        self.prefix = prefix
+        self.state = "root_start" if prefix else "start"
         self.current_key = ""
         self.marker_count = 0
         self.first_marker: dict[str, Any] | None = None
@@ -1064,8 +1170,8 @@ class _ExternalizedSuffixParser:
         self.operation_budget = (
             operation_budget or _ExternalizedSuffixOperationBudget()
         )
-        # The outer payload object is already open when suffix parsing starts.
-        self.lexical_depth = 1
+        # The outer object is already open when suffix parsing starts.
+        self.lexical_depth = 0 if prefix else 1
         self.lexical_in_string = False
         self.lexical_escaped = False
 
@@ -1107,6 +1213,12 @@ class _ExternalizedSuffixParser:
             # A number/literal may continue in the next transport chunk.
             return None
         if self.buffer[delimiter_index] not in delimiters:
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and self.buffer[delimiter_index] in ".eE+-0123456789"
+            ):
+                return None
             raise ValueError("invalid_payload")
         return value, end
 
@@ -1124,6 +1236,8 @@ class _ExternalizedSuffixParser:
     def _process(self, *, final: bool) -> None:
         while True:
             self.index = self._whitespace(self.index)
+            if self.state == "content":
+                break
             if self.state == "done":
                 if self.index < len(self.buffer):
                     raise ValueError("ambiguous_metadata")
@@ -1132,7 +1246,12 @@ class _ExternalizedSuffixParser:
                 break
 
             character = self.buffer[self.index]
-            if self.state == "start":
+            if self.state == "root_start":
+                if character != "{":
+                    raise ValueError("invalid_payload")
+                self.index += 1
+                self.state = "key"
+            elif self.state == "start":
                 if character == "}":
                     self.index += 1
                     self.state = "done"
@@ -1150,7 +1269,12 @@ class _ExternalizedSuffixParser:
                     break
                 if not isinstance(key, str):
                     raise ValueError("invalid_payload")
-                if key in self.seen or key not in _EXTERNALIZED_TRAILING_CANONICAL_KEYS:
+                allowed_keys = (
+                    _EXTERNALIZED_CANONICAL_KEYS
+                    if self.prefix
+                    else _EXTERNALIZED_TRAILING_CANONICAL_KEYS
+                )
+                if key in self.seen or key not in allowed_keys:
                     raise ValueError("ambiguous_metadata")
                 self.seen.add(key)
                 self.current_key = key
@@ -1160,11 +1284,17 @@ class _ExternalizedSuffixParser:
                 if character != ":":
                     raise ValueError("invalid_payload")
                 self.index += 1
-                self.state = (
-                    "marker_list_start"
-                    if self.current_key == "persisted_output_markers"
-                    else "value"
-                )
+                if self.current_key == "content":
+                    self.state = "content_start"
+                elif self.current_key == "persisted_output_markers":
+                    self.state = "marker_list_start"
+                else:
+                    self.state = "value"
+            elif self.state == "content_start":
+                if character != '"':
+                    raise ValueError("invalid_payload")
+                self.index += 1
+                self.state = "content"
             elif self.state == "value":
                 decoded = self._raw_decode_with_delimiter(self.index, ",}")
                 if decoded is None:
@@ -1243,6 +1373,10 @@ class _ExternalizedSuffixParser:
         self.buffer += text
         self._process(final=final)
 
+    @property
+    def content_ready(self) -> bool:
+        return self.state == "content"
+
 
 def _externalized_suffix_metadata(
     text: str, *, seen: set[str]
@@ -1251,6 +1385,70 @@ def _externalized_suffix_metadata(
     parser = _ExternalizedSuffixParser(seen=seen)
     parser.feed(text, final=True)
     return parser.fields
+
+
+def _stream_externalized_prefix_authorization(
+    handle,
+    *,
+    max_bytes: int,
+    deadline: float | None,
+    operation_budget: _ExternalizedSuffixOperationBudget,
+    allowed_session_ids: frozenset[str],
+) -> tuple[dict[str, Any], set[str], bool, bool, bytes]:
+    """Validate pre-content metadata without retaining accumulated arrays.
+
+    Returns fields, all seen top-level keys, whether the opening content quote
+    was consumed, whether the byte bound interrupted metadata parsing, and any
+    already-charged bytes following that quote. Reads remain one byte wide
+    until ownership is known; authorized metadata then uses bounded chunks and
+    replays any over-read bytes directly into the content stream.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    parser = _ExternalizedSuffixParser(
+        seen=set(),
+        operation_budget=operation_budget,
+        prefix=True,
+    )
+    bytes_read = 0
+    read_limit = max(0, int(max_bytes))
+    while bytes_read < read_limit and not parser.content_ready:
+        if (
+            bytes_read % _LCM_EXTERNAL_METADATA_DEADLINE_CHECK_BYTES == 0
+            and deadline is not None
+            and _external_metadata_now() >= deadline
+        ):
+            raise TimeoutError("metadata_deadline")
+        payload_session_id = parser.fields.get("session_id")
+        if isinstance(payload_session_id, str) and payload_session_id:
+            if payload_session_id not in allowed_session_ids:
+                return parser.fields, parser.seen, False, False, b""
+            read_size = min(16 * 1024, read_limit - bytes_read)
+        else:
+            read_size = 1
+        raw = handle.read(read_size)
+        if not raw:
+            break
+        bytes_read += len(raw)
+        try:
+            decoded = decoder.decode(raw, final=False)
+        except UnicodeDecodeError as exc:
+            raise ValueError("invalid_payload") from exc
+        if decoded:
+            parser.feed(decoded)
+    if parser.content_ready:
+        pending_bytes, _ = decoder.getstate()
+        replay = parser.buffer.encode("utf-8") + pending_bytes
+        parser.buffer = ""
+        return parser.fields, parser.seen, True, False, replay
+    truncated = bytes_read >= read_limit
+    if not truncated:
+        try:
+            final_text = decoder.decode(b"", final=True)
+        except UnicodeDecodeError as exc:
+            raise ValueError("invalid_payload") from exc
+        if final_text:
+            parser.feed(final_text)
+    return parser.fields, parser.seen, False, truncated, b""
 
 
 def _stream_externalized_json_content(
@@ -1501,6 +1699,42 @@ def _bounded_regex_span(
     return (int(payload[0]), int(payload[1])), ""
 
 
+_EXTERNALIZED_CONTINUATION_MAX_FILES = 4
+
+
+def _externalized_continuation_cache(
+    engine: "LCMEngine",
+) -> dict[str, tuple[tuple[int, ...], bytes]]:
+    cache = getattr(engine, "_externalized_grep_continuations", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(engine, "_externalized_grep_continuations", cache)
+    return cache
+
+
+def _externalized_file_identity(file_stat: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(file_stat.st_dev),
+        int(file_stat.st_ino),
+        int(file_stat.st_size),
+        int(file_stat.st_mtime_ns),
+        int(file_stat.st_ctime_ns),
+    )
+
+
+def _store_externalized_continuation(
+    engine: "LCMEngine",
+    key: str,
+    identity: tuple[int, ...],
+    payload_prefix: bytes,
+) -> None:
+    cache = _externalized_continuation_cache(engine)
+    cache.pop(key, None)
+    cache[key] = (identity, payload_prefix)
+    while len(cache) > _EXTERNALIZED_CONTINUATION_MAX_FILES:
+        cache.pop(next(iter(cache)))
+
+
 def _search_externalized_payloads(
     engine: "LCMEngine",
     *,
@@ -1517,13 +1751,18 @@ def _search_externalized_payloads(
     diagnostics: list[dict[str, str]] = []
     hits: list[dict[str, Any]] = []
     files_scanned = 0
-    bytes_scanned = 0
     scan_truncated = False
     effective_total_bytes = min(
         _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES,
         max(0, int(max_total_bytes)),
     )
-    suffix_operation_budget = _ExternalizedSuffixOperationBudget()
+    byte_operation_budget = _ExternalizedByteOperationBudget(effective_total_bytes)
+    continuation_reused_bytes = 0
+    # A marker consumes multiple transport bytes, so this byte-derived guard
+    # can never reject a payload that fits the shared read cap.
+    suffix_operation_budget = _ExternalizedSuffixOperationBudget(
+        max_markers=_LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES
+    )
     try:
         root = get_large_output_storage_dir(
             engine._config,
@@ -1539,9 +1778,12 @@ def _search_externalized_payloads(
             "max_files": max_files,
             "max_payload_chars": max_payload_chars,
             "max_total_bytes": effective_total_bytes,
-            "max_persisted_output_markers": _EXTERNALIZED_SUFFIX_MAX_MARKERS,
+            "max_persisted_output_markers": _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES,
             "max_suffix_depth": _EXTERNALIZED_SUFFIX_MAX_DEPTH,
             "persisted_output_markers_scanned": suffix_operation_budget.markers,
+            "byte_budget_exhausted": byte_operation_budget.exhausted,
+            "continuation_reused_bytes": 0,
+            "continuations_pending": 0,
         }
     if not root.exists() or not root.is_dir():
         if ref:
@@ -1554,9 +1796,12 @@ def _search_externalized_payloads(
             "max_files": max_files,
             "max_payload_chars": max_payload_chars,
             "max_total_bytes": effective_total_bytes,
-            "max_persisted_output_markers": _EXTERNALIZED_SUFFIX_MAX_MARKERS,
+            "max_persisted_output_markers": _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES,
             "max_suffix_depth": _EXTERNALIZED_SUFFIX_MAX_DEPTH,
             "persisted_output_markers_scanned": suffix_operation_budget.markers,
+            "byte_budget_exhausted": byte_operation_budget.exhausted,
+            "continuation_reused_bytes": 0,
+            "continuations_pending": 0,
         }
     regex_deadline = min(
         time.monotonic() + _LCM_GREP_REGEX_OPERATION_DEADLINE_SECONDS,
@@ -1565,6 +1810,7 @@ def _search_externalized_payloads(
     regex_timeouts = 0
     candidates_seen = 0
     paths: list[Path] = []
+    continuation_cache = _externalized_continuation_cache(engine)
     if ref:
         candidates_seen = 1
         paths.append(root / ref)
@@ -1591,7 +1837,7 @@ def _search_externalized_payloads(
         if deadline is not None and time.monotonic() >= deadline:
             scan_truncated = True
             break
-        if bytes_scanned >= effective_total_bytes:
+        if byte_operation_budget.remaining <= 0:
             scan_truncated = True
             break
         try:
@@ -1606,50 +1852,61 @@ def _search_externalized_payloads(
         if not resolved.is_file():
             diagnostics.append({"ref": path.name, "error": "not_a_file"})
             continue
-        remaining = effective_total_bytes - bytes_scanned
+        remaining = byte_operation_budget.remaining
         read_limit = remaining
         read_phase = "metadata"
+        continuation_key = str(resolved)
+        continuation_identity: tuple[int, ...] | None = None
+        cached_prefix = b""
+        captured_bytes = bytearray()
+        preserve_continuation = False
         try:
-            with resolved.open("rb") as handle:
-                opened_stat = os.fstat(handle.fileno())
+            with resolved.open("rb") as raw_handle:
+                opened_stat = os.fstat(raw_handle.fileno())
                 if not stat.S_ISREG(opened_stat.st_mode):
                     diagnostics.append({"ref": path.name, "error": "not_a_file"})
                     continue
-                metadata_prefix, content_key_seen, metadata_truncated = (
-                    _read_externalized_payload_metadata_prefix_from_handle(
+                continuation_identity = _externalized_file_identity(opened_stat)
+                cached_entry = continuation_cache.get(continuation_key)
+                if (
+                    cached_entry is not None
+                    and cached_entry[0] == continuation_identity
+                    and len(cached_entry[1]) <= opened_stat.st_size
+                ):
+                    cached_prefix = cached_entry[1]
+                    continuation_reused_bytes += len(cached_prefix)
+                    raw_handle.seek(len(cached_prefix))
+                else:
+                    continuation_cache.pop(continuation_key, None)
+                budgeted_handle = _ExternalizedBudgetedReader(
+                    raw_handle,
+                    byte_operation_budget,
+                    captured_bytes,
+                )
+                handle = _ExternalizedPrependReader(
+                    budgeted_handle, cached_prefix
+                )
+                # Continuation avoids transport rereads but does not enlarge
+                # the operation's logical per-file byte allowance.
+                read_limit = remaining
+                (
+                    metadata_fields,
+                    seen_keys,
+                    content_key_seen,
+                    metadata_truncated,
+                    replay_bytes,
+                ) = (
+                    _stream_externalized_prefix_authorization(
                         handle,
-                        max_bytes=min(
-                            read_limit,
-                            _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES,
-                        ),
+                        max_bytes=read_limit,
                         deadline=deadline,
+                        operation_budget=suffix_operation_budget,
+                        allowed_session_ids=allowed_session_ids,
                     )
                 )
-                metadata_bytes = handle.tell()
-                metadata_fields, seen_keys, metadata_error = (
-                    _externalized_prefix_authorization(metadata_prefix)
-                )
-                if metadata_error is not None:
-                    bytes_scanned += metadata_bytes
-                    if metadata_error == "payload_truncated":
-                        scan_truncated = True
-                    diagnostics.append({"ref": path.name, "error": metadata_error})
-                    continue
-                prefix_markers = metadata_fields.get("persisted_output_markers")
-                if isinstance(prefix_markers, list):
-                    try:
-                        suffix_operation_budget.charge(len(prefix_markers))
-                    except _ExternalizedSuffixBudgetExceeded:
-                        bytes_scanned += metadata_bytes
-                        scan_truncated = True
-                        diagnostics.append({
-                            "ref": path.name,
-                            "error": "payload_truncated",
-                        })
-                        continue
+                metadata_bytes = handle.tell() - len(replay_bytes)
                 payload_session_id = metadata_fields.get("session_id", "")
                 if not isinstance(payload_session_id, str) or not payload_session_id:
-                    bytes_scanned += metadata_bytes
                     diagnostics.append({
                         "ref": path.name,
                         "error": (
@@ -1660,11 +1917,11 @@ def _search_externalized_payloads(
                     })
                     continue
                 if payload_session_id not in allowed_session_ids:
-                    bytes_scanned += metadata_bytes
                     diagnostics.append({"ref": path.name, "error": "session_mismatch"})
                     continue
                 if not content_key_seen:
-                    bytes_scanned += metadata_bytes
+                    if metadata_truncated:
+                        scan_truncated = True
                     diagnostics.append({
                         "ref": path.name,
                         "error": (
@@ -1675,6 +1932,7 @@ def _search_externalized_payloads(
                     })
                     continue
                 read_phase = "body"
+                body_handle = _ExternalizedPrependReader(handle, replay_bytes)
                 (
                     content,
                     body_bytes,
@@ -1683,17 +1941,16 @@ def _search_externalized_payloads(
                     total_content_chars,
                     total_content_bytes,
                 ) = _stream_externalized_json_content(
-                    handle,
+                    body_handle,
                     max_payload_chars=max_payload_chars,
                     max_bytes=max(0, read_limit - metadata_bytes),
                     deadline=deadline,
                     seen_keys=seen_keys,
                     suffix_operation_budget=suffix_operation_budget,
                 )
-                total_file_bytes = metadata_bytes + body_bytes
+                total_file_bytes = body_handle.tell()
                 raw_truncated = opened_stat.st_size > total_file_bytes
                 if raw_truncated or not content_closed:
-                    bytes_scanned += total_file_bytes
                     scan_truncated = True
                     diagnostics.append({"ref": path.name, "error": "payload_truncated"})
                     continue
@@ -1706,14 +1963,12 @@ def _search_externalized_payloads(
                     or not isinstance(payload_session_id, str)
                     or not payload_session_id
                 ):
-                    bytes_scanned += total_file_bytes
                     diagnostics.append({
                         "ref": path.name,
                         "error": "session_metadata_unavailable",
                     })
                     continue
                 if payload_session_id not in allowed_session_ids:
-                    bytes_scanned += total_file_bytes
                     diagnostics.append({"ref": path.name, "error": "session_mismatch"})
                     continue
                 declared_chars = final_metadata.get("content_chars")
@@ -1733,12 +1988,19 @@ def _search_externalized_payloads(
                         or declared_bytes != total_content_bytes
                     )
                 ):
-                    bytes_scanned += total_file_bytes
                     diagnostics.append({"ref": path.name, "error": "invalid_payload"})
                     continue
                 metadata_fields = final_metadata
         except TimeoutError:
             scan_truncated = True
+            preserve_continuation = continuation_identity is not None
+            if preserve_continuation:
+                _store_externalized_continuation(
+                    engine,
+                    continuation_key,
+                    continuation_identity,
+                    cached_prefix + bytes(captured_bytes),
+                )
             diagnostics.append({
                 "ref": path.name,
                 "error": "metadata_deadline" if read_phase == "metadata" else "body_deadline",
@@ -1760,8 +2022,10 @@ def _search_externalized_payloads(
         except (OSError, UnicodeDecodeError):
             diagnostics.append({"ref": path.name, "error": "unreadable"})
             continue
+        finally:
+            if not preserve_continuation:
+                continuation_cache.pop(continuation_key, None)
         files_scanned += 1
-        bytes_scanned += total_file_bytes
         if regex_mode:
             remaining_regex_time = regex_deadline - time.monotonic()
             if remaining_regex_time <= 0:
@@ -1847,15 +2111,18 @@ def _search_externalized_payloads(
     return hits, diagnostics, {
         "files_scanned": files_scanned,
         "entries_scanned": candidates_seen,
-        "bytes_scanned": bytes_scanned,
+        "bytes_scanned": byte_operation_budget.bytes_read,
         "matches": len(hits),
         "scan_truncated": scan_truncated,
         "max_files": max_files,
         "max_payload_chars": max_payload_chars,
         "max_total_bytes": effective_total_bytes,
-        "max_persisted_output_markers": _EXTERNALIZED_SUFFIX_MAX_MARKERS,
+        "max_persisted_output_markers": _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES,
         "max_suffix_depth": _EXTERNALIZED_SUFFIX_MAX_DEPTH,
         "persisted_output_markers_scanned": suffix_operation_budget.markers,
+        "byte_budget_exhausted": byte_operation_budget.exhausted,
+        "continuation_reused_bytes": continuation_reused_bytes,
+        "continuations_pending": len(continuation_cache),
         "regex_file_deadline_ms": int(_LCM_GREP_REGEX_FILE_DEADLINE_SECONDS * 1000),
         "regex_operation_deadline_ms": int(_LCM_GREP_REGEX_OPERATION_DEADLINE_SECONDS * 1000),
         "regex_timeouts": regex_timeouts,
