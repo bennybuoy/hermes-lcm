@@ -776,6 +776,32 @@ _EXTERNALIZED_TRAILING_CANONICAL_KEYS = frozenset({
 _EXTERNALIZED_SUFFIX_MAX_DEPTH = 3
 _EXTERNALIZED_CANONICAL_INTEGER_MAX = (1 << 63) - 1
 _EXTERNALIZED_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_EXTERNALIZED_CANONICAL_STRING_MAX_CHARS = {
+    "kind": 128,
+    "tool_call_id": 512,
+    "role": 128,
+    "session_id": 512,
+    "field_path": 2_048,
+    "persisted_output_source_path": 4_096,
+    "persisted_output_preview_prefix": 8_192,
+    "persisted_output_preview_sha256": 64,
+    "persisted_output_redacted_preview_sha256": 64,
+}
+_EXTERNALIZED_MARKER_STRING_MAX_CHARS = {
+    "source_path": 4_096,
+    "preview_prefix": 8_192,
+    "preview_sha256": 64,
+    "redacted_preview_sha256": 64,
+}
+_EXTERNALIZED_CANONICAL_MARKERS_MAX = 100_000
+# JSON string escapes can consume twelve source characters for one decoded
+# non-BMP character (a surrogate pair). These are transport-buffer ceilings,
+# not alternate value limits; decoded values are checked against the exact
+# per-field maxima above.
+_EXTERNALIZED_JSON_STRING_ESCAPE_FACTOR = 12
+_EXTERNALIZED_CANONICAL_KEY_MAX_ENCODED_CHARS = 512
+_EXTERNALIZED_CANONICAL_NUMBER_MAX_ENCODED_CHARS = 64
+_EXTERNALIZED_CANONICAL_MARKER_MAX_ENCODED_CHARS = 192 * 1024
 _EXTERNALIZED_PERSISTED_OUTPUT_KEYS = frozenset({
     "persisted_output_source_path", "persisted_output_expected_chars",
     "persisted_output_preview_prefix", "persisted_output_preview_sha256",
@@ -810,7 +836,7 @@ class _ExternalizedSuffixOperationBudget:
 
     def __init__(self, max_markers: int | None = None):
         self.max_markers = (
-            _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES
+            _EXTERNALIZED_CANONICAL_MARKERS_MAX
             if max_markers is None
             else max(0, int(max_markers))
         )
@@ -959,19 +985,27 @@ def _validate_externalized_persisted_output_marker(marker: Any) -> tuple[Any, ..
         raise ValueError("invalid_payload")
 
     source_path = marker["source_path"]
-    if not isinstance(source_path, str) or not source_path or "\x00" in source_path:
+    if (
+        not isinstance(source_path, str)
+        or not source_path
+        or "\x00" in source_path
+        or len(source_path) > _EXTERNALIZED_MARKER_STRING_MAX_CHARS["source_path"]
+    ):
         raise ValueError("invalid_payload")
     if not _externalized_canonical_integer(marker["expected_chars"]):
         raise ValueError("invalid_payload")
     if "preview_prefix" in marker and (
         not isinstance(marker["preview_prefix"], str)
         or not marker["preview_prefix"]
+        or len(marker["preview_prefix"])
+        > _EXTERNALIZED_MARKER_STRING_MAX_CHARS["preview_prefix"]
     ):
         raise ValueError("invalid_payload")
     for key in ("preview_sha256", "redacted_preview_sha256"):
         if key in marker and (
             not isinstance(marker[key], str)
             or _EXTERNALIZED_SHA256_RE.fullmatch(marker[key]) is None
+            or len(marker[key]) > _EXTERNALIZED_MARKER_STRING_MAX_CHARS[key]
         ):
             raise ValueError("invalid_payload")
     for key in ("file_size", "file_mtime_ns", "file_ctime_ns"):
@@ -984,7 +1018,13 @@ def _validate_externalized_persisted_output_marker(marker: Any) -> tuple[Any, ..
 
 
 def _validate_externalized_metadata_field(key: str, value: Any) -> None:
-    if key in {"content_chars", "content_bytes"}:
+    if key in {"kind", "tool_call_id", "role", "session_id", "field_path"}:
+        if (
+            not isinstance(value, str)
+            or len(value) > _EXTERNALIZED_CANONICAL_STRING_MAX_CHARS[key]
+        ):
+            raise ValueError("invalid_payload")
+    elif key in {"content_chars", "content_bytes"}:
         if not _externalized_canonical_integer(value):
             raise ValueError("invalid_payload")
     elif key == "created_at":
@@ -993,10 +1033,16 @@ def _validate_externalized_metadata_field(key: str, value: Any) -> None:
             or not isinstance(value, (int, float))
             or not math.isfinite(float(value))
             or value < 0
+            or value > _EXTERNALIZED_CANONICAL_INTEGER_MAX
         ):
             raise ValueError("invalid_payload")
     elif key == "persisted_output_source_path":
-        if not isinstance(value, str) or not value or "\x00" in value:
+        if (
+            not isinstance(value, str)
+            or not value
+            or "\x00" in value
+            or len(value) > _EXTERNALIZED_CANONICAL_STRING_MAX_CHARS[key]
+        ):
             raise ValueError("invalid_payload")
     elif key in {
         "persisted_output_expected_chars", "persisted_output_file_size",
@@ -1005,20 +1051,36 @@ def _validate_externalized_metadata_field(key: str, value: Any) -> None:
         if not _externalized_canonical_integer(value):
             raise ValueError("invalid_payload")
     elif key == "persisted_output_preview_prefix":
-        if not isinstance(value, str) or not value:
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > _EXTERNALIZED_CANONICAL_STRING_MAX_CHARS[key]
+        ):
             raise ValueError("invalid_payload")
     elif key in {
         "persisted_output_preview_sha256",
         "persisted_output_redacted_preview_sha256",
     }:
-        if not isinstance(value, str) or _EXTERNALIZED_SHA256_RE.fullmatch(value) is None:
+        if (
+            not isinstance(value, str)
+            or len(value) > _EXTERNALIZED_CANONICAL_STRING_MAX_CHARS[key]
+            or _EXTERNALIZED_SHA256_RE.fullmatch(value) is None
+        ):
             raise ValueError("invalid_payload")
     elif key == "persisted_output_markers":
         if isinstance(value, _ExternalizedPersistedOutputMarkers):
-            if value.count <= 0 or not value.first_marker:
+            if (
+                value.count <= 0
+                or value.count > _EXTERNALIZED_CANONICAL_MARKERS_MAX
+                or not value.first_marker
+            ):
                 raise ValueError("invalid_payload")
             return
-        if not isinstance(value, list) or not value:
+        if (
+            not isinstance(value, list)
+            or not value
+            or len(value) > _EXTERNALIZED_CANONICAL_MARKERS_MAX
+        ):
             raise ValueError("invalid_payload")
         identities = [
             _validate_externalized_persisted_output_marker(marker)
@@ -1223,7 +1285,11 @@ class _ExternalizedSuffixParser:
         return value, end
 
     def _finish_marker_list(self) -> None:
-        if self.marker_count <= 0 or self.first_marker is None:
+        if (
+            self.marker_count <= 0
+            or self.marker_count > _EXTERNALIZED_CANONICAL_MARKERS_MAX
+            or self.first_marker is None
+        ):
             raise ValueError("invalid_payload")
         self.fields["persisted_output_markers"] = (
             _ExternalizedPersistedOutputMarkers(
@@ -1329,6 +1395,8 @@ class _ExternalizedSuffixParser:
                 digest = _externalized_marker_identity_digest(identity)
                 if digest in self.marker_identities:
                     raise ValueError("invalid_payload")
+                if self.marker_count >= _EXTERNALIZED_CANONICAL_MARKERS_MAX:
+                    raise ValueError("invalid_payload")
                 self.operation_budget.charge()
                 self.marker_count += 1
                 self.marker_identities.add(digest)
@@ -1368,10 +1436,37 @@ class _ExternalizedSuffixParser:
         ):
             raise ValueError("invalid_payload")
 
+    def _pending_encoded_limit(self) -> int | None:
+        """Return the fixed transport bound for the current incomplete token."""
+        if self.state == "key":
+            return _EXTERNALIZED_CANONICAL_KEY_MAX_ENCODED_CHARS
+        if self.state == "value":
+            max_chars = _EXTERNALIZED_CANONICAL_STRING_MAX_CHARS.get(
+                self.current_key
+            )
+            if max_chars is not None:
+                return (
+                    _EXTERNALIZED_JSON_STRING_ESCAPE_FACTOR * max_chars
+                    + 2
+                    + 4_096
+                )
+            return _EXTERNALIZED_CANONICAL_NUMBER_MAX_ENCODED_CHARS + 4_096
+        if self.state == "marker_or_end":
+            return _EXTERNALIZED_CANONICAL_MARKER_MAX_ENCODED_CHARS
+        if self.state in {
+            "root_start", "start", "colon", "content_start",
+            "marker_list_start", "marker_delimiter", "after_value", "done",
+        }:
+            return 4_096
+        return None
+
     def feed(self, text: str, *, final: bool = False) -> None:
         self._scan_depth(text)
         self.buffer += text
         self._process(final=final)
+        pending_limit = self._pending_encoded_limit()
+        if pending_limit is not None and len(self.buffer) > pending_limit:
+            raise ValueError("invalid_payload")
 
     @property
     def content_ready(self) -> bool:
@@ -1701,7 +1796,8 @@ def _bounded_regex_span(
 
 
 _EXTERNALIZED_CONTINUATION_MAX_FILES = 4
-_EXTERNALIZED_CONTINUATION_MAX_LOGICAL_BYTES = 16 * 1024 * 1024
+_EXTERNALIZED_CONTINUATION_TTL_SECONDS = 5 * 60.0
+_EXTERNALIZED_CONTINUATION_STATE_GUARD = threading.Lock()
 
 
 class _ExternalizedContentContinuation:
@@ -1869,7 +1965,7 @@ class _ExternalizedPayloadContinuation:
     __slots__ = (
         "identity", "allowed_session_ids", "max_payload_chars", "offset",
         "phase", "prefix_decoder", "prefix_parser", "content_state",
-        "metadata_fields",
+        "metadata_fields", "completed", "cached_at",
     )
 
     def __init__(
@@ -1893,6 +1989,8 @@ class _ExternalizedPayloadContinuation:
         )
         self.content_state: _ExternalizedContentContinuation | None = None
         self.metadata_fields: dict[str, Any] = {}
+        self.completed = False
+        self.cached_at = 0.0
 
     def compatible(
         self,
@@ -1985,6 +2083,11 @@ class _ExternalizedPayloadContinuation:
         operation_budget: _ExternalizedSuffixOperationBudget,
         deadline: float | None,
     ) -> bool:
+        # Completion freezes every parser/decoder field. Completed checkpoints
+        # are consequently safe for concurrent read-only matching, while every
+        # incomplete checkpoint is checked out of the cache before mutation.
+        if self.completed:
+            return True
         self.prefix_parser.operation_budget = operation_budget
         if self.content_state is not None:
             self.content_state.suffix_parser.operation_budget = operation_budget
@@ -2004,8 +2107,6 @@ class _ExternalizedPayloadContinuation:
                     )
             if byte_budget.remaining <= 0:
                 return False
-            if self.offset >= _EXTERNALIZED_CONTINUATION_MAX_LOGICAL_BYTES:
-                raise ValueError("payload_truncated")
             read_size = 16 * 1024
             if self.phase == "metadata":
                 payload_session_id = self.prefix_parser.fields.get("session_id")
@@ -2014,7 +2115,6 @@ class _ExternalizedPayloadContinuation:
             read_size = min(
                 read_size,
                 file_size - self.offset,
-                _EXTERNALIZED_CONTINUATION_MAX_LOGICAL_BYTES - self.offset,
             )
             raw = byte_budget.read(handle, read_size)
             if not raw:
@@ -2037,6 +2137,7 @@ class _ExternalizedPayloadContinuation:
             )
         assert self.content_state is not None
         self.content_state.finish(deadline=deadline)
+        self.completed = True
         return True
 
     def retained_bytes(self) -> int:
@@ -2054,11 +2155,72 @@ class _ExternalizedPayloadContinuation:
 def _externalized_continuation_cache(
     engine: "LCMEngine",
 ) -> dict[str, _ExternalizedPayloadContinuation]:
-    cache = getattr(engine, "_externalized_grep_continuations", None)
-    if not isinstance(cache, dict):
-        cache = {}
-        setattr(engine, "_externalized_grep_continuations", cache)
+    with _EXTERNALIZED_CONTINUATION_STATE_GUARD:
+        cache = getattr(engine, "_externalized_grep_continuations", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            setattr(engine, "_externalized_grep_continuations", cache)
+        lock = getattr(engine, "_externalized_grep_continuations_lock", None)
+        if not hasattr(lock, "acquire") or not hasattr(lock, "release"):
+            setattr(
+                engine,
+                "_externalized_grep_continuations_lock",
+                threading.RLock(),
+            )
     return cache
+
+
+def _externalized_continuation_lock(engine: "LCMEngine"):
+    _externalized_continuation_cache(engine)
+    return engine._externalized_grep_continuations_lock
+
+
+def _prune_externalized_continuations_locked(
+    cache: dict[str, _ExternalizedPayloadContinuation],
+    *,
+    now: float,
+) -> None:
+    expired = [
+        key
+        for key, continuation in cache.items()
+        if not isinstance(continuation, _ExternalizedPayloadContinuation)
+        or now - continuation.cached_at > _EXTERNALIZED_CONTINUATION_TTL_SECONDS
+    ]
+    for key in expired:
+        cache.pop(key, None)
+
+
+def _checkout_externalized_continuation(
+    engine: "LCMEngine",
+    key: str,
+    *,
+    identity: tuple[int, ...],
+    allowed_session_ids: frozenset[str],
+    max_payload_chars: int,
+    file_size: int,
+) -> _ExternalizedPayloadContinuation | None:
+    cache = _externalized_continuation_cache(engine)
+    with _externalized_continuation_lock(engine):
+        now = time.monotonic()
+        _prune_externalized_continuations_locked(cache, now=now)
+        continuation = cache.get(key)
+        if not (
+            isinstance(continuation, _ExternalizedPayloadContinuation)
+            and continuation.compatible(
+                identity=identity,
+                allowed_session_ids=allowed_session_ids,
+                max_payload_chars=max_payload_chars,
+            )
+            and continuation.offset <= file_size
+        ):
+            cache.pop(key, None)
+            return None
+        continuation.cached_at = now
+        if not continuation.completed:
+            # Exclusive checkout: no two callers can mutate one parser,
+            # decoder, offset, or operation-budget reference.
+            cache.pop(key, None)
+        return continuation
 
 
 def _externalized_file_identity(file_stat: os.stat_result) -> tuple[int, ...]:
@@ -2077,10 +2239,40 @@ def _store_externalized_continuation(
     continuation: _ExternalizedPayloadContinuation,
 ) -> None:
     cache = _externalized_continuation_cache(engine)
-    cache.pop(key, None)
-    cache[key] = continuation
-    while len(cache) > _EXTERNALIZED_CONTINUATION_MAX_FILES:
-        cache.pop(next(iter(cache)))
+    with _externalized_continuation_lock(engine):
+        now = time.monotonic()
+        _prune_externalized_continuations_locked(cache, now=now)
+        existing = cache.get(key)
+        if (
+            isinstance(existing, _ExternalizedPayloadContinuation)
+            and existing.compatible(
+                identity=continuation.identity,
+                allowed_session_ids=continuation.allowed_session_ids,
+                max_payload_chars=continuation.max_payload_chars,
+            )
+            and (
+                existing.completed and not continuation.completed
+                or existing.offset > continuation.offset
+            )
+        ):
+            existing.cached_at = now
+        else:
+            continuation.cached_at = now
+            cache.pop(key, None)
+            cache[key] = continuation
+        while len(cache) > _EXTERNALIZED_CONTINUATION_MAX_FILES:
+            cache.pop(next(iter(cache)))
+
+
+def _remove_externalized_continuation(
+    engine: "LCMEngine",
+    key: str,
+    continuation: _ExternalizedPayloadContinuation,
+) -> None:
+    cache = _externalized_continuation_cache(engine)
+    with _externalized_continuation_lock(engine):
+        if cache.get(key) is continuation:
+            cache.pop(key, None)
 
 
 def _externalized_continuation_memory_bytes(
@@ -2091,6 +2283,49 @@ def _externalized_continuation_memory_bytes(
         for continuation in cache.values()
         if isinstance(continuation, _ExternalizedPayloadContinuation)
     )
+
+
+def _externalized_continuation_stats(
+    engine: "LCMEngine",
+    *,
+    exclude: tuple[_ExternalizedPayloadContinuation, ...] = (),
+) -> tuple[int, int]:
+    cache = _externalized_continuation_cache(engine)
+    with _externalized_continuation_lock(engine):
+        _prune_externalized_continuations_locked(cache, now=time.monotonic())
+        excluded_ids = {id(continuation) for continuation in exclude}
+        visible = {
+            key: continuation
+            for key, continuation in cache.items()
+            if id(continuation) not in excluded_ids
+        }
+        return len(visible), _externalized_continuation_memory_bytes(visible)
+
+
+class _ExternalizedContinuationCompletion:
+    """Outer lcm_grep acknowledgement for one frozen parser checkpoint."""
+
+    __slots__ = ("engine", "key", "continuation")
+
+    def __init__(
+        self,
+        engine: "LCMEngine",
+        key: str,
+        continuation: _ExternalizedPayloadContinuation,
+    ):
+        self.engine = engine
+        self.key = key
+        self.continuation = continuation
+
+    def commit(self) -> None:
+        _remove_externalized_continuation(
+            self.engine, self.key, self.continuation
+        )
+
+    def preserve(self) -> None:
+        _store_externalized_continuation(
+            self.engine, self.key, self.continuation
+        )
 
 
 def _search_externalized_payloads(
@@ -2105,6 +2340,9 @@ def _search_externalized_payloads(
     max_payload_chars: int,
     max_total_bytes: int = _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES,
     deadline: float | None = None,
+    completion_acknowledgements: list[
+        _ExternalizedContinuationCompletion
+    ] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, Any]]:
     diagnostics: list[dict[str, str]] = []
     hits: list[dict[str, Any]] = []
@@ -2116,10 +2354,8 @@ def _search_externalized_payloads(
     )
     byte_operation_budget = _ExternalizedByteOperationBudget(effective_total_bytes)
     continuation_reused_bytes = 0
-    # A marker consumes multiple transport bytes, so this byte-derived guard
-    # can never reject a payload that fits the shared read cap.
     suffix_operation_budget = _ExternalizedSuffixOperationBudget(
-        max_markers=_LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES
+        max_markers=_EXTERNALIZED_CANONICAL_MARKERS_MAX
     )
     try:
         root = get_large_output_storage_dir(
@@ -2136,7 +2372,7 @@ def _search_externalized_payloads(
             "max_files": max_files,
             "max_payload_chars": max_payload_chars,
             "max_total_bytes": effective_total_bytes,
-            "max_persisted_output_markers": _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES,
+            "max_persisted_output_markers": _EXTERNALIZED_CANONICAL_MARKERS_MAX,
             "max_suffix_depth": _EXTERNALIZED_SUFFIX_MAX_DEPTH,
             "persisted_output_markers_scanned": suffix_operation_budget.markers,
             "byte_budget_exhausted": byte_operation_budget.exhausted,
@@ -2155,7 +2391,7 @@ def _search_externalized_payloads(
             "max_files": max_files,
             "max_payload_chars": max_payload_chars,
             "max_total_bytes": effective_total_bytes,
-            "max_persisted_output_markers": _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES,
+            "max_persisted_output_markers": _EXTERNALIZED_CANONICAL_MARKERS_MAX,
             "max_suffix_depth": _EXTERNALIZED_SUFFIX_MAX_DEPTH,
             "persisted_output_markers_scanned": suffix_operation_budget.markers,
             "byte_budget_exhausted": byte_operation_budget.exhausted,
@@ -2170,7 +2406,17 @@ def _search_externalized_payloads(
     regex_timeouts = 0
     candidates_seen = 0
     paths: list[Path] = []
-    continuation_cache = _externalized_continuation_cache(engine)
+    _externalized_continuation_cache(engine)
+
+    def acknowledge(
+        completion: _ExternalizedContinuationCompletion | None,
+    ) -> None:
+        if completion is None:
+            return
+        if completion_acknowledgements is None:
+            completion.commit()
+        else:
+            completion_acknowledgements.append(completion)
     if ref:
         candidates_seen = 1
         paths.append(root / ref)
@@ -2214,7 +2460,7 @@ def _search_externalized_payloads(
             continue
         continuation_key = str(resolved)
         continuation: _ExternalizedPayloadContinuation | None = None
-        preserve_continuation = False
+        completion: _ExternalizedContinuationCompletion | None = None
         try:
             with resolved.open("rb") as raw_handle:
                 opened_stat = os.fstat(raw_handle.fileno())
@@ -2222,20 +2468,16 @@ def _search_externalized_payloads(
                     diagnostics.append({"ref": path.name, "error": "not_a_file"})
                     continue
                 continuation_identity = _externalized_file_identity(opened_stat)
-                cached_entry = continuation_cache.get(continuation_key)
-                if (
-                    isinstance(cached_entry, _ExternalizedPayloadContinuation)
-                    and cached_entry.compatible(
-                        identity=continuation_identity,
-                        allowed_session_ids=allowed_session_ids,
-                        max_payload_chars=max_payload_chars,
-                    )
-                    and cached_entry.offset <= opened_stat.st_size
-                ):
-                    continuation = cached_entry
+                continuation = _checkout_externalized_continuation(
+                    engine,
+                    continuation_key,
+                    identity=continuation_identity,
+                    allowed_session_ids=allowed_session_ids,
+                    max_payload_chars=max_payload_chars,
+                    file_size=int(opened_stat.st_size),
+                )
+                if continuation is not None:
                     continuation_reused_bytes += continuation.offset
-                else:
-                    continuation_cache.pop(continuation_key, None)
                 if continuation is None:
                     continuation = _ExternalizedPayloadContinuation(
                         identity=continuation_identity,
@@ -2252,14 +2494,7 @@ def _search_externalized_payloads(
                 )
                 if not completed:
                     scan_truncated = True
-                    preserve_continuation = (
-                        continuation.offset
-                        < min(
-                            int(opened_stat.st_size),
-                            _EXTERNALIZED_CONTINUATION_MAX_LOGICAL_BYTES,
-                        )
-                    )
-                    if preserve_continuation:
+                    if continuation.offset < int(opened_stat.st_size):
                         _store_externalized_continuation(
                             engine,
                             continuation_key,
@@ -2326,10 +2561,22 @@ def _search_externalized_payloads(
                 content = content_state.content
                 total_content_chars = content_state.total_content_chars
                 total_content_bytes = content_state.total_content_bytes
+                # Freeze and publish the stat-bound completed checkpoint before
+                # any deadline-sensitive matching. Outer lcm_grep removes this
+                # exact object only after redaction and response construction.
+                _store_externalized_continuation(
+                    engine,
+                    continuation_key,
+                    continuation,
+                )
+                completion = _ExternalizedContinuationCompletion(
+                    engine,
+                    continuation_key,
+                    continuation,
+                )
         except TimeoutError:
             scan_truncated = True
-            preserve_continuation = continuation is not None
-            if preserve_continuation:
+            if continuation is not None:
                 _store_externalized_continuation(
                     engine,
                     continuation_key,
@@ -2362,9 +2609,6 @@ def _search_externalized_payloads(
         except (OSError, UnicodeDecodeError):
             diagnostics.append({"ref": path.name, "error": "unreadable"})
             continue
-        finally:
-            if not preserve_continuation:
-                continuation_cache.pop(continuation_key, None)
         files_scanned += 1
         if regex_mode:
             remaining_regex_time = regex_deadline - time.monotonic()
@@ -2386,6 +2630,7 @@ def _search_externalized_payloads(
                     regex_timeouts += 1
                 continue
             if span is None:
+                acknowledge(completion)
                 continue
             start, end = span
         else:
@@ -2398,6 +2643,7 @@ def _search_externalized_payloads(
                 diagnostics.append({"ref": path.name, "error": "body_deadline"})
                 break
             if span is None:
+                acknowledge(completion)
                 continue
             start, end = span
         try:
@@ -2445,9 +2691,24 @@ def _search_externalized_payloads(
             "_sort_rank": 0.0,
             "_sort_directness": 0.0,
         })
+        acknowledge(completion)
         if len(hits) >= limit:
             scan_truncated = scan_truncated or path_index + 1 < len(paths)
             break
+    acknowledged_continuations = (
+        tuple(
+            completion.continuation
+            for completion in completion_acknowledgements
+        )
+        if completion_acknowledgements is not None
+        else ()
+    )
+    continuations_pending, continuation_memory_bytes = (
+        _externalized_continuation_stats(
+            engine,
+            exclude=acknowledged_continuations,
+        )
+    )
     return hits, diagnostics, {
         "files_scanned": files_scanned,
         "entries_scanned": candidates_seen,
@@ -2457,15 +2718,13 @@ def _search_externalized_payloads(
         "max_files": max_files,
         "max_payload_chars": max_payload_chars,
         "max_total_bytes": effective_total_bytes,
-        "max_persisted_output_markers": _LCM_GREP_EXTERNALIZED_MAX_TOTAL_BYTES,
+        "max_persisted_output_markers": _EXTERNALIZED_CANONICAL_MARKERS_MAX,
         "max_suffix_depth": _EXTERNALIZED_SUFFIX_MAX_DEPTH,
         "persisted_output_markers_scanned": suffix_operation_budget.markers,
         "byte_budget_exhausted": byte_operation_budget.exhausted,
         "continuation_reused_bytes": continuation_reused_bytes,
-        "continuations_pending": len(continuation_cache),
-        "continuation_memory_bytes": _externalized_continuation_memory_bytes(
-            continuation_cache
-        ),
+        "continuations_pending": continuations_pending,
+        "continuation_memory_bytes": continuation_memory_bytes,
         "regex_file_deadline_ms": int(_LCM_GREP_REGEX_FILE_DEADLINE_SECONDS * 1000),
         "regex_operation_deadline_ms": int(_LCM_GREP_REGEX_OPERATION_DEADLINE_SECONDS * 1000),
         "regex_timeouts": regex_timeouts,
@@ -5158,6 +5417,9 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     results: list[Dict[str, Any]] = []
     externalized_diagnostics: list[dict[str, str]] = []
     externalized_scan: dict[str, Any] | None = None
+    externalized_completions: list[
+        _ExternalizedContinuationCompletion
+    ] = []
     operation_rows_reserved = 0
     operation_rows_materialized = 0
     charged_input_text = (
@@ -5446,6 +5708,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                     _LCM_GREP_OPERATION_MAX_BYTES - operation_bytes_materialized,
                 ),
                 deadline=operation_deadline,
+                completion_acknowledgements=externalized_completions,
             )
         )
         for hit in external_hits:
@@ -5561,7 +5824,14 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         protected_response["operation_budget"]["exhausted"] = True
         protected_response["operation_budget"]["response_truncated"] = True
         serialized = json.dumps(protected_response)
+    if time.monotonic() >= operation_deadline:
+        protected_response["operation_budget"]["exhausted"] = True
+        protected_response["operation_budget"]["deadline_exhausted"] = True
+        protected_response["results"] = []
+        serialized = json.dumps(protected_response)
     if len(serialized.encode("utf-8", errors="surrogatepass")) > _LCM_GREP_OPERATION_MAX_BYTES:
+        for completion in externalized_completions:
+            completion.preserve()
         return json.dumps({
             "error": "grep response metadata exceeds operation byte budget",
             "operation_budget": {
@@ -5569,6 +5839,30 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                 "exhausted": True,
             },
         })
+    completed_successfully = not protected_response["operation_budget"].get(
+        "exhausted", False
+    )
+    for completion in externalized_completions:
+        if completed_successfully:
+            completion.commit()
+        else:
+            completion.preserve()
+    if not completed_successfully and externalized_scan is not None:
+        pending_count, pending_memory = _externalized_continuation_stats(engine)
+        protected_response["scan"]["continuations_pending"] = pending_count
+        protected_response["scan"]["continuation_memory_bytes"] = pending_memory
+        serialized = json.dumps(protected_response)
+        if (
+            len(serialized.encode("utf-8", errors="surrogatepass"))
+            > _LCM_GREP_OPERATION_MAX_BYTES
+        ):
+            return json.dumps({
+                "error": "grep response metadata exceeds operation byte budget",
+                "operation_budget": {
+                    "bytes_limit": _LCM_GREP_OPERATION_MAX_BYTES,
+                    "exhausted": True,
+                },
+            })
     return serialized
 
 
