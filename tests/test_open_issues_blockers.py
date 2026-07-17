@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import multiprocessing
 import os
@@ -1048,6 +1049,232 @@ def test_externalized_grep_suffix_byte_budget_is_retryable_and_eventual(
         engine.shutdown()
 
 
+@pytest.mark.parametrize("marker_count", [7_000, 12_000])
+@pytest.mark.parametrize("layout", ["pre-content", "post-content"])
+def test_externalized_grep_exact_canonical_markers_progress_at_production_cap(
+    tmp_path, monkeypatch, marker_count, layout
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    ref = f"canonical-{marker_count}-{layout}.json"
+    needle = f"CANONICAL-{marker_count}-{layout}-NEEDLE"
+    payload = _historical_persisted_output_payload(
+        kind="tool_result", role="tool", tool_call_id=ref, content=needle
+    )
+    _accumulate_historical_markers(payload, marker_count)
+    if layout == "pre-content":
+        payload = _move_persisted_metadata_before_content(payload)
+    path = payload_dir / ref
+    path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    assert path.stat().st_size > tools_module._LCM_GREP_OPERATION_MAX_BYTES
+
+    real_open = tools_module.Path.open
+    transport_bytes_read = 0
+    read_ranges: list[tuple[int, int]] = []
+
+    class CountingReader:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __enter__(self):
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._handle.__exit__(*args)
+
+        def read(self, size=-1):
+            nonlocal transport_bytes_read
+            start = self._handle.tell()
+            chunk = self._handle.read(size)
+            transport_bytes_read += len(chunk)
+            if chunk:
+                read_ranges.append((start, start + len(chunk)))
+            return chunk
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+    def counted_open(candidate, *args, **kwargs):
+        handle = real_open(candidate, *args, **kwargs)
+        mode = str(args[0] if args else kwargs.get("mode", "r"))
+        if candidate.resolve() == path.resolve() and "b" in mode:
+            return CountingReader(handle)
+        return handle
+
+    monkeypatch.setattr(tools_module.Path, "open", counted_open)
+    engine = _engine(tmp_path)
+    try:
+        offsets = []
+        for attempt in range(1, 8):
+            bytes_before = transport_bytes_read
+            result = json.loads(tools_module.lcm_grep(
+                {"query": needle, "content_scope": "externalized", "ref": ref},
+                engine=engine,
+            ))
+            bytes_this_call = transport_bytes_read - bytes_before
+            assert result["scan"]["bytes_scanned"] == bytes_this_call
+            assert 0 < bytes_this_call <= tools_module._LCM_GREP_OPERATION_MAX_BYTES
+            if result["total_results"] == 1:
+                break
+            assert result["diagnostics"] == [{"ref": ref, "error": "payload_truncated"}]
+            assert result["scan"]["continuations_pending"] == 1
+            offsets.append(result["scan"]["continuation_reused_bytes"] + bytes_this_call)
+            assert offsets == sorted(set(offsets))
+            assert result["scan"]["continuation_memory_bytes"] < 1_500_000
+            continuation_cache = engine._externalized_grep_continuations
+            checkpoint = next(iter(continuation_cache.values()))
+            assert isinstance(
+                checkpoint, tools_module._ExternalizedPayloadContinuation
+            )
+            assert checkpoint.offset == offsets[-1]
+            assert checkpoint.retained_bytes() == result["scan"][
+                "continuation_memory_bytes"
+            ]
+            assert checkpoint.retained_bytes() < checkpoint.offset
+        else:
+            pytest.fail("production-cap retries did not complete the canonical payload")
+
+        assert result["diagnostics"] == []
+        assert result["total_results"] == 1
+        assert result["scan"]["continuations_pending"] == 0
+        assert 2 <= attempt <= 3
+        assert transport_bytes_read == path.stat().st_size
+        assert all(end <= next_start for (_, end), (next_start, _) in zip(
+            read_ranges, read_ranges[1:]
+        ))
+    finally:
+        engine.shutdown()
+
+
+def test_externalized_grep_file_mutation_invalidates_parser_continuation(
+    tmp_path,
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    ref = "mutated-continuation.json"
+    needle = "MUTATED-CONTINUATION-NEEDLE"
+    payload = _historical_persisted_output_payload(
+        kind="tool_result", role="tool", tool_call_id=ref, content=needle
+    )
+    _accumulate_historical_markers(payload, 1_000)
+    path = payload_dir / ref
+    path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    first_budget = path.stat().st_size // 2
+
+    engine = _engine(tmp_path)
+    try:
+        _, diagnostics, scan = tools_module._search_externalized_payloads(
+            engine,
+            query=needle,
+            regex_mode=False,
+            allowed_session_ids=frozenset({"current"}),
+            ref=ref,
+            limit=1,
+            max_files=1,
+            max_payload_chars=len(needle) + 1,
+            max_total_bytes=first_budget,
+            deadline=time.monotonic() + 10,
+        )
+        assert diagnostics == [{"ref": ref, "error": "payload_truncated"}]
+        assert scan["continuations_pending"] == 1
+
+        mutated = dict(payload)
+        mutated["session_id"] = "foreign"
+        path.write_text(
+            json.dumps(mutated, separators=(",", ":")), encoding="utf-8"
+        )
+        hits, diagnostics, scan = tools_module._search_externalized_payloads(
+            engine,
+            query=needle,
+            regex_mode=False,
+            allowed_session_ids=frozenset({"current"}),
+            ref=ref,
+            limit=1,
+            max_files=1,
+            max_payload_chars=len(needle) + 1,
+            max_total_bytes=tools_module._LCM_GREP_OPERATION_MAX_BYTES,
+            deadline=time.monotonic() + 10,
+        )
+        assert hits == []
+        assert diagnostics == [{"ref": ref, "error": "session_mismatch"}]
+        assert scan["continuation_reused_bytes"] == 0
+        assert scan["continuations_pending"] == 0
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("variant", "expected_error"),
+    [
+        ("malformed", "invalid_payload"),
+        ("duplicate-marker", "invalid_payload"),
+        ("unknown-key", "ambiguous_metadata"),
+        ("session-override", "ambiguous_metadata"),
+    ],
+)
+def test_externalized_grep_continuation_still_fails_closed_on_late_metadata(
+    tmp_path, variant, expected_error
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    ref = f"continued-{variant}.json"
+    needle = "CONTINUED-FAIL-CLOSED-NEEDLE"
+    payload = _historical_persisted_output_payload(
+        kind="tool_result", role="tool", tool_call_id=ref, content=needle
+    )
+    _accumulate_historical_markers(payload, 1_000)
+    if variant == "duplicate-marker":
+        payload["persisted_output_markers"].append(
+            dict(payload["persisted_output_markers"][0])
+        )
+    serialized = json.dumps(payload, separators=(",", ":"))
+    if variant == "malformed":
+        serialized = serialized[:-1]
+    elif variant == "unknown-key":
+        serialized = serialized[:-1] + ',"future_override":true}'
+    elif variant == "session-override":
+        serialized = serialized[:-1] + ',"session_id":"foreign"}'
+    path = payload_dir / ref
+    path.write_text(serialized, encoding="utf-8")
+
+    engine = _engine(tmp_path)
+    try:
+        _, diagnostics, scan = tools_module._search_externalized_payloads(
+            engine,
+            query=needle,
+            regex_mode=False,
+            allowed_session_ids=frozenset({"current"}),
+            ref=ref,
+            limit=1,
+            max_files=1,
+            max_payload_chars=len(needle) + 1,
+            max_total_bytes=path.stat().st_size // 2,
+            deadline=time.monotonic() + 10,
+        )
+        assert diagnostics == [{"ref": ref, "error": "payload_truncated"}]
+        assert scan["continuations_pending"] == 1
+
+        hits, diagnostics, scan = tools_module._search_externalized_payloads(
+            engine,
+            query=needle,
+            regex_mode=False,
+            allowed_session_ids=frozenset({"current"}),
+            ref=ref,
+            limit=1,
+            max_files=1,
+            max_payload_chars=len(needle) + 1,
+            max_total_bytes=tools_module._LCM_GREP_OPERATION_MAX_BYTES,
+            deadline=time.monotonic() + 10,
+        )
+        assert hits == []
+        assert diagnostics == [{"ref": ref, "error": expected_error}]
+        assert scan["continuation_reused_bytes"] > 0
+        assert scan["continuations_pending"] == 0
+    finally:
+        engine.shutdown()
+
+
 def test_externalized_grep_charges_every_rejected_byte_under_shared_40kb_cap(
     tmp_path, monkeypatch
 ):
@@ -1171,6 +1398,45 @@ def test_externalized_grep_streaming_marker_metadata_rejects_ambiguity(
         }]
     finally:
         engine.shutdown()
+
+
+def test_externalized_precontent_deadline_checks_unaligned_authorized_chunks(
+    monkeypatch,
+):
+    marker_count = 12_000
+    payload = {
+        "session_id": "current",
+        "persisted_output_source_path": "/p/0",
+        "persisted_output_expected_chars": 1,
+        "persisted_output_markers": [
+            {"source_path": f"/p/{index}", "expected_chars": 1}
+            for index in range(marker_count)
+        ],
+        "content": "x",
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    virtual_now = 0.0
+    bytes_read = 0
+
+    class DeadlineBytesIO(io.BytesIO):
+        def read(self, size=-1):
+            nonlocal virtual_now, bytes_read
+            chunk = super().read(size)
+            bytes_read += len(chunk)
+            if size > 1 and chunk:
+                virtual_now += 0.3
+            return chunk
+
+    monkeypatch.setattr(tools_module, "_external_metadata_now", lambda: virtual_now)
+    with pytest.raises(TimeoutError, match="metadata_deadline"):
+        tools_module._stream_externalized_prefix_authorization(
+            DeadlineBytesIO(raw),
+            max_bytes=len(raw),
+            deadline=1.0,
+            operation_budget=tools_module._ExternalizedSuffixOperationBudget(),
+            allowed_session_ids=frozenset({"current"}),
+        )
+    assert 0 < bytes_read < len(raw)
 
 
 def test_externalized_grep_suffix_deadline_stops_between_bounded_chunks(

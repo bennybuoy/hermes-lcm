@@ -1411,13 +1411,14 @@ def _stream_externalized_prefix_authorization(
     )
     bytes_read = 0
     read_limit = max(0, int(max_bytes))
+    next_deadline_check = 0
     while bytes_read < read_limit and not parser.content_ready:
-        if (
-            bytes_read % _LCM_EXTERNAL_METADATA_DEADLINE_CHECK_BYTES == 0
-            and deadline is not None
-            and _external_metadata_now() >= deadline
-        ):
-            raise TimeoutError("metadata_deadline")
+        if bytes_read >= next_deadline_check:
+            if deadline is not None and _external_metadata_now() >= deadline:
+                raise TimeoutError("metadata_deadline")
+            next_deadline_check = (
+                bytes_read + _LCM_EXTERNAL_METADATA_DEADLINE_CHECK_BYTES
+            )
         payload_session_id = parser.fields.get("session_id")
         if isinstance(payload_session_id, str) and payload_session_id:
             if payload_session_id not in allowed_session_ids:
@@ -1700,11 +1701,359 @@ def _bounded_regex_span(
 
 
 _EXTERNALIZED_CONTINUATION_MAX_FILES = 4
+_EXTERNALIZED_CONTINUATION_MAX_LOGICAL_BYTES = 16 * 1024 * 1024
+
+
+class _ExternalizedContentContinuation:
+    """Bounded, seek-safe state for content and trailing metadata parsing."""
+
+    __slots__ = (
+        "decoder", "max_payload_chars", "pieces", "kept_chars",
+        "closed", "escaped", "unicode_digits", "pending_high_surrogate",
+        "suffix_parser", "total_content_chars", "total_content_bytes",
+        "pending_text",
+    )
+
+    def __init__(
+        self,
+        *,
+        seen_keys: set[str],
+        max_payload_chars: int,
+        operation_budget: _ExternalizedSuffixOperationBudget,
+    ):
+        self.decoder = codecs.getincrementaldecoder("utf-8")("strict")
+        self.max_payload_chars = max(0, int(max_payload_chars))
+        self.pieces: list[str] = []
+        self.kept_chars = 0
+        self.closed = False
+        self.escaped = False
+        self.unicode_digits = ""
+        self.pending_high_surrogate: int | None = None
+        self.suffix_parser = _ExternalizedSuffixParser(
+            seen=seen_keys,
+            operation_budget=operation_budget,
+        )
+        self.total_content_chars = 0
+        self.total_content_bytes = 0
+        self.pending_text = ""
+
+    def _emit(self, character: str) -> None:
+        self.total_content_chars += 1
+        self.total_content_bytes += len(
+            character.encode("utf-8", errors="surrogatepass")
+        )
+        if self.kept_chars < self.max_payload_chars:
+            self.pieces.append(character)
+            self.kept_chars += 1
+
+    def _emit_codepoint(self, value: int) -> None:
+        if 0xD800 <= value <= 0xDBFF:
+            if self.pending_high_surrogate is not None:
+                self._emit(chr(self.pending_high_surrogate))
+            self.pending_high_surrogate = value
+        elif (
+            0xDC00 <= value <= 0xDFFF
+            and self.pending_high_surrogate is not None
+        ):
+            self._emit(chr(
+                0x10000
+                + ((self.pending_high_surrogate - 0xD800) << 10)
+                + value
+                - 0xDC00
+            ))
+            self.pending_high_surrogate = None
+        else:
+            if self.pending_high_surrogate is not None:
+                self._emit(chr(self.pending_high_surrogate))
+                self.pending_high_surrogate = None
+            self._emit(chr(value))
+
+    def _feed_segment(self, text: str) -> None:
+        suffix_piece: list[str] = []
+        for character in text:
+            if self.closed:
+                suffix_piece.append(character)
+            elif self.unicode_digits:
+                if character not in "0123456789abcdefABCDEF":
+                    raise ValueError("invalid_payload")
+                self.unicode_digits += character
+                if len(self.unicode_digits) == 5:
+                    self._emit_codepoint(int(self.unicode_digits[1:], 16))
+                    self.unicode_digits = ""
+                    self.escaped = False
+            elif self.escaped:
+                if character == "u":
+                    self.unicode_digits = "u"
+                else:
+                    self.escaped = False
+                    mapped = {
+                        '"': '"', "\\": "\\", "/": "/", "b": "\b",
+                        "f": "\f", "n": "\n", "r": "\r", "t": "\t",
+                    }.get(character)
+                    if mapped is None:
+                        raise ValueError("invalid_payload")
+                    self._emit(mapped)
+            elif character == "\\":
+                self.escaped = True
+            elif character == '"':
+                if self.pending_high_surrogate is not None:
+                    self._emit(chr(self.pending_high_surrogate))
+                    self.pending_high_surrogate = None
+                self.closed = True
+            elif ord(character) < 0x20:
+                raise ValueError("invalid_payload")
+            else:
+                self._emit(character)
+        if suffix_piece:
+            try:
+                self.suffix_parser.feed("".join(suffix_piece))
+            except _ExternalizedSuffixBudgetExceeded as exc:
+                raise ValueError("payload_truncated") from exc
+
+    def feed_text(self, text: str, *, deadline: float | None) -> None:
+        self.pending_text += text
+        while self.pending_text:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("body_deadline")
+            segment = self.pending_text[:4096]
+            self.pending_text = self.pending_text[len(segment):]
+            self._feed_segment(segment)
+
+    def feed_raw(self, raw: bytes, *, deadline: float | None) -> None:
+        try:
+            decoded = self.decoder.decode(raw, final=False)
+        except UnicodeDecodeError as exc:
+            raise ValueError("invalid_payload") from exc
+        if decoded:
+            self.feed_text(decoded, deadline=deadline)
+
+    def finish(self, *, deadline: float | None) -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("body_deadline")
+        try:
+            final_text = self.decoder.decode(b"", final=True)
+        except UnicodeDecodeError as exc:
+            raise ValueError("invalid_payload") from exc
+        if final_text:
+            self.feed_text(final_text, deadline=deadline)
+        if (
+            not self.closed
+            or self.escaped
+            or self.unicode_digits
+            or self.pending_text
+        ):
+            raise ValueError("invalid_payload")
+        self.suffix_parser.feed("", final=True)
+
+    @property
+    def content(self) -> str:
+        return "".join(self.pieces)
+
+    def retained_bytes(self) -> int:
+        decoder_pending, _ = self.decoder.getstate()
+        return (
+            len(decoder_pending)
+            + len(self.pending_text.encode("utf-8", errors="surrogatepass"))
+            + sum(
+                len(piece.encode("utf-8", errors="surrogatepass"))
+                for piece in self.pieces
+            )
+            + len(self.suffix_parser.buffer.encode("utf-8"))
+            + (32 * len(self.suffix_parser.marker_identities))
+        )
+
+
+class _ExternalizedPayloadContinuation:
+    """Stat-bound parser checkpoint that never retains or replays raw prefixes."""
+
+    __slots__ = (
+        "identity", "allowed_session_ids", "max_payload_chars", "offset",
+        "phase", "prefix_decoder", "prefix_parser", "content_state",
+        "metadata_fields",
+    )
+
+    def __init__(
+        self,
+        *,
+        identity: tuple[int, ...],
+        allowed_session_ids: frozenset[str],
+        max_payload_chars: int,
+        operation_budget: _ExternalizedSuffixOperationBudget,
+    ):
+        self.identity = identity
+        self.allowed_session_ids = allowed_session_ids
+        self.max_payload_chars = max(0, int(max_payload_chars))
+        self.offset = 0
+        self.phase = "metadata"
+        self.prefix_decoder = codecs.getincrementaldecoder("utf-8")("strict")
+        self.prefix_parser = _ExternalizedSuffixParser(
+            seen=set(),
+            operation_budget=operation_budget,
+            prefix=True,
+        )
+        self.content_state: _ExternalizedContentContinuation | None = None
+        self.metadata_fields: dict[str, Any] = {}
+
+    def compatible(
+        self,
+        *,
+        identity: tuple[int, ...],
+        allowed_session_ids: frozenset[str],
+        max_payload_chars: int,
+    ) -> bool:
+        return (
+            self.identity == identity
+            and self.allowed_session_ids == allowed_session_ids
+            and self.max_payload_chars == max(0, int(max_payload_chars))
+        )
+
+    def _authorize_or_transition(
+        self,
+        *,
+        operation_budget: _ExternalizedSuffixOperationBudget,
+        deadline: float | None,
+    ) -> None:
+        payload_session_id = self.prefix_parser.fields.get("session_id")
+        if isinstance(payload_session_id, str) and payload_session_id:
+            if payload_session_id not in self.allowed_session_ids:
+                raise ValueError("session_mismatch")
+        if not self.prefix_parser.content_ready:
+            return
+        if not isinstance(payload_session_id, str) or not payload_session_id:
+            raise ValueError("session_metadata_unavailable")
+        self.metadata_fields = dict(self.prefix_parser.fields)
+        buffered_text = self.prefix_parser.buffer
+        self.prefix_parser.buffer = ""
+        decoder_state = self.prefix_decoder.getstate()
+        content_state = _ExternalizedContentContinuation(
+            seen_keys=self.prefix_parser.seen,
+            max_payload_chars=self.max_payload_chars,
+            operation_budget=operation_budget,
+        )
+        content_state.decoder.setstate(decoder_state)
+        self.content_state = content_state
+        self.phase = "body"
+        if buffered_text:
+            content_state.feed_text(buffered_text, deadline=deadline)
+
+    def _feed_metadata(
+        self,
+        raw: bytes,
+        *,
+        operation_budget: _ExternalizedSuffixOperationBudget,
+        deadline: float | None,
+    ) -> None:
+        try:
+            decoded = self.prefix_decoder.decode(raw, final=False)
+        except UnicodeDecodeError as exc:
+            raise ValueError("invalid_payload") from exc
+        if decoded:
+            self.prefix_parser.feed(decoded)
+        self._authorize_or_transition(
+            operation_budget=operation_budget,
+            deadline=deadline,
+        )
+
+    def _finish_metadata(
+        self,
+        *,
+        operation_budget: _ExternalizedSuffixOperationBudget,
+        deadline: float | None,
+    ) -> None:
+        try:
+            final_text = self.prefix_decoder.decode(b"", final=True)
+        except UnicodeDecodeError as exc:
+            raise ValueError("invalid_payload") from exc
+        if final_text:
+            self.prefix_parser.feed(final_text)
+        self._authorize_or_transition(
+            operation_budget=operation_budget,
+            deadline=deadline,
+        )
+        if self.phase != "body":
+            payload_session_id = self.prefix_parser.fields.get("session_id")
+            if not isinstance(payload_session_id, str) or not payload_session_id:
+                raise ValueError("session_metadata_unavailable")
+            raise ValueError("content_not_in_prefix")
+
+    def resume(
+        self,
+        handle,
+        *,
+        file_size: int,
+        byte_budget: _ExternalizedByteOperationBudget,
+        operation_budget: _ExternalizedSuffixOperationBudget,
+        deadline: float | None,
+    ) -> bool:
+        self.prefix_parser.operation_budget = operation_budget
+        if self.content_state is not None:
+            self.content_state.suffix_parser.operation_budget = operation_budget
+        handle.seek(self.offset)
+        while self.offset < file_size:
+            if deadline is not None:
+                now = (
+                    _external_metadata_now()
+                    if self.phase == "metadata"
+                    else time.monotonic()
+                )
+                if now >= deadline:
+                    raise TimeoutError(
+                        "metadata_deadline"
+                        if self.phase == "metadata"
+                        else "body_deadline"
+                    )
+            if byte_budget.remaining <= 0:
+                return False
+            if self.offset >= _EXTERNALIZED_CONTINUATION_MAX_LOGICAL_BYTES:
+                raise ValueError("payload_truncated")
+            read_size = 16 * 1024
+            if self.phase == "metadata":
+                payload_session_id = self.prefix_parser.fields.get("session_id")
+                if not isinstance(payload_session_id, str) or not payload_session_id:
+                    read_size = 1
+            read_size = min(
+                read_size,
+                file_size - self.offset,
+                _EXTERNALIZED_CONTINUATION_MAX_LOGICAL_BYTES - self.offset,
+            )
+            raw = byte_budget.read(handle, read_size)
+            if not raw:
+                return False
+            self.offset += len(raw)
+            if self.phase == "metadata":
+                self._feed_metadata(
+                    raw,
+                    operation_budget=operation_budget,
+                    deadline=deadline,
+                )
+            else:
+                assert self.content_state is not None
+                self.content_state.feed_raw(raw, deadline=deadline)
+
+        if self.phase == "metadata":
+            self._finish_metadata(
+                operation_budget=operation_budget,
+                deadline=deadline,
+            )
+        assert self.content_state is not None
+        self.content_state.finish(deadline=deadline)
+        return True
+
+    def retained_bytes(self) -> int:
+        decoder_pending, _ = self.prefix_decoder.getstate()
+        retained = (
+            len(decoder_pending)
+            + len(self.prefix_parser.buffer.encode("utf-8"))
+            + (32 * len(self.prefix_parser.marker_identities))
+        )
+        if self.content_state is not None:
+            retained += self.content_state.retained_bytes()
+        return retained
 
 
 def _externalized_continuation_cache(
     engine: "LCMEngine",
-) -> dict[str, tuple[tuple[int, ...], bytes]]:
+) -> dict[str, _ExternalizedPayloadContinuation]:
     cache = getattr(engine, "_externalized_grep_continuations", None)
     if not isinstance(cache, dict):
         cache = {}
@@ -1725,14 +2074,23 @@ def _externalized_file_identity(file_stat: os.stat_result) -> tuple[int, ...]:
 def _store_externalized_continuation(
     engine: "LCMEngine",
     key: str,
-    identity: tuple[int, ...],
-    payload_prefix: bytes,
+    continuation: _ExternalizedPayloadContinuation,
 ) -> None:
     cache = _externalized_continuation_cache(engine)
     cache.pop(key, None)
-    cache[key] = (identity, payload_prefix)
+    cache[key] = continuation
     while len(cache) > _EXTERNALIZED_CONTINUATION_MAX_FILES:
         cache.pop(next(iter(cache)))
+
+
+def _externalized_continuation_memory_bytes(
+    cache: dict[str, _ExternalizedPayloadContinuation],
+) -> int:
+    return sum(
+        continuation.retained_bytes()
+        for continuation in cache.values()
+        if isinstance(continuation, _ExternalizedPayloadContinuation)
+    )
 
 
 def _search_externalized_payloads(
@@ -1784,6 +2142,7 @@ def _search_externalized_payloads(
             "byte_budget_exhausted": byte_operation_budget.exhausted,
             "continuation_reused_bytes": 0,
             "continuations_pending": 0,
+            "continuation_memory_bytes": 0,
         }
     if not root.exists() or not root.is_dir():
         if ref:
@@ -1802,6 +2161,7 @@ def _search_externalized_payloads(
             "byte_budget_exhausted": byte_operation_budget.exhausted,
             "continuation_reused_bytes": 0,
             "continuations_pending": 0,
+            "continuation_memory_bytes": 0,
         }
     regex_deadline = min(
         time.monotonic() + _LCM_GREP_REGEX_OPERATION_DEADLINE_SECONDS,
@@ -1852,13 +2212,8 @@ def _search_externalized_payloads(
         if not resolved.is_file():
             diagnostics.append({"ref": path.name, "error": "not_a_file"})
             continue
-        remaining = byte_operation_budget.remaining
-        read_limit = remaining
-        read_phase = "metadata"
         continuation_key = str(resolved)
-        continuation_identity: tuple[int, ...] | None = None
-        cached_prefix = b""
-        captured_bytes = bytearray()
+        continuation: _ExternalizedPayloadContinuation | None = None
         preserve_continuation = False
         try:
             with resolved.open("rb") as raw_handle:
@@ -1869,93 +2224,70 @@ def _search_externalized_payloads(
                 continuation_identity = _externalized_file_identity(opened_stat)
                 cached_entry = continuation_cache.get(continuation_key)
                 if (
-                    cached_entry is not None
-                    and cached_entry[0] == continuation_identity
-                    and len(cached_entry[1]) <= opened_stat.st_size
+                    isinstance(cached_entry, _ExternalizedPayloadContinuation)
+                    and cached_entry.compatible(
+                        identity=continuation_identity,
+                        allowed_session_ids=allowed_session_ids,
+                        max_payload_chars=max_payload_chars,
+                    )
+                    and cached_entry.offset <= opened_stat.st_size
                 ):
-                    cached_prefix = cached_entry[1]
-                    continuation_reused_bytes += len(cached_prefix)
-                    raw_handle.seek(len(cached_prefix))
+                    continuation = cached_entry
+                    continuation_reused_bytes += continuation.offset
                 else:
                     continuation_cache.pop(continuation_key, None)
-                budgeted_handle = _ExternalizedBudgetedReader(
-                    raw_handle,
-                    byte_operation_budget,
-                    captured_bytes,
-                )
-                handle = _ExternalizedPrependReader(
-                    budgeted_handle, cached_prefix
-                )
-                # Continuation avoids transport rereads but does not enlarge
-                # the operation's logical per-file byte allowance.
-                read_limit = remaining
-                (
-                    metadata_fields,
-                    seen_keys,
-                    content_key_seen,
-                    metadata_truncated,
-                    replay_bytes,
-                ) = (
-                    _stream_externalized_prefix_authorization(
-                        handle,
-                        max_bytes=read_limit,
-                        deadline=deadline,
-                        operation_budget=suffix_operation_budget,
+                if continuation is None:
+                    continuation = _ExternalizedPayloadContinuation(
+                        identity=continuation_identity,
                         allowed_session_ids=allowed_session_ids,
+                        max_payload_chars=max_payload_chars,
+                        operation_budget=suffix_operation_budget,
                     )
-                )
-                metadata_bytes = handle.tell() - len(replay_bytes)
-                payload_session_id = metadata_fields.get("session_id", "")
-                if not isinstance(payload_session_id, str) or not payload_session_id:
-                    diagnostics.append({
-                        "ref": path.name,
-                        "error": (
-                            "metadata_prefix_truncated"
-                            if metadata_truncated
-                            else "session_metadata_unavailable"
-                        ),
-                    })
-                    continue
-                if payload_session_id not in allowed_session_ids:
-                    diagnostics.append({"ref": path.name, "error": "session_mismatch"})
-                    continue
-                if not content_key_seen:
-                    if metadata_truncated:
-                        scan_truncated = True
-                    diagnostics.append({
-                        "ref": path.name,
-                        "error": (
-                            "metadata_prefix_truncated"
-                            if metadata_truncated
-                            else "content_not_in_prefix"
-                        ),
-                    })
-                    continue
-                read_phase = "body"
-                body_handle = _ExternalizedPrependReader(handle, replay_bytes)
-                (
-                    content,
-                    body_bytes,
-                    content_closed,
-                    suffix_fields,
-                    total_content_chars,
-                    total_content_bytes,
-                ) = _stream_externalized_json_content(
-                    body_handle,
-                    max_payload_chars=max_payload_chars,
-                    max_bytes=max(0, read_limit - metadata_bytes),
+                completed = continuation.resume(
+                    raw_handle,
+                    file_size=int(opened_stat.st_size),
+                    byte_budget=byte_operation_budget,
+                    operation_budget=suffix_operation_budget,
                     deadline=deadline,
-                    seen_keys=seen_keys,
-                    suffix_operation_budget=suffix_operation_budget,
                 )
-                total_file_bytes = body_handle.tell()
-                raw_truncated = opened_stat.st_size > total_file_bytes
-                if raw_truncated or not content_closed:
+                if not completed:
                     scan_truncated = True
-                    diagnostics.append({"ref": path.name, "error": "payload_truncated"})
+                    preserve_continuation = (
+                        continuation.offset
+                        < min(
+                            int(opened_stat.st_size),
+                            _EXTERNALIZED_CONTINUATION_MAX_LOGICAL_BYTES,
+                        )
+                    )
+                    if preserve_continuation:
+                        _store_externalized_continuation(
+                            engine,
+                            continuation_key,
+                            continuation,
+                        )
+                    payload_session_id = continuation.prefix_parser.fields.get(
+                        "session_id"
+                    )
+                    diagnostics.append({
+                        "ref": path.name,
+                        "error": (
+                            "metadata_prefix_truncated"
+                            if not isinstance(payload_session_id, str)
+                            or not payload_session_id
+                            else "payload_truncated"
+                        ),
+                    })
                     continue
-                final_metadata = dict(metadata_fields)
-                final_metadata.update(suffix_fields)
+                if (
+                    _externalized_file_identity(os.fstat(raw_handle.fileno()))
+                    != continuation_identity
+                ):
+                    raise ValueError("invalid_payload")
+                content_state = continuation.content_state
+                assert content_state is not None
+                seen_keys = continuation.prefix_parser.seen
+                final_metadata = dict(continuation.metadata_fields)
+                final_metadata.update(content_state.suffix_parser.fields)
                 _validate_externalized_metadata(final_metadata)
                 payload_session_id = final_metadata.get("session_id", "")
                 if (
@@ -1978,32 +2310,38 @@ def _search_externalized_payloads(
                     and (
                         isinstance(declared_chars, bool)
                         or not isinstance(declared_chars, int)
-                        or declared_chars != total_content_chars
+                        or declared_chars != content_state.total_content_chars
                     )
                 ) or (
                     declared_bytes is not None
                     and (
                         isinstance(declared_bytes, bool)
                         or not isinstance(declared_bytes, int)
-                        or declared_bytes != total_content_bytes
+                        or declared_bytes != content_state.total_content_bytes
                     )
                 ):
                     diagnostics.append({"ref": path.name, "error": "invalid_payload"})
                     continue
                 metadata_fields = final_metadata
+                content = content_state.content
+                total_content_chars = content_state.total_content_chars
+                total_content_bytes = content_state.total_content_bytes
         except TimeoutError:
             scan_truncated = True
-            preserve_continuation = continuation_identity is not None
+            preserve_continuation = continuation is not None
             if preserve_continuation:
                 _store_externalized_continuation(
                     engine,
                     continuation_key,
-                    continuation_identity,
-                    cached_prefix + bytes(captured_bytes),
+                    continuation,
                 )
             diagnostics.append({
                 "ref": path.name,
-                "error": "metadata_deadline" if read_phase == "metadata" else "body_deadline",
+                "error": (
+                    "metadata_deadline"
+                    if continuation is None or continuation.phase == "metadata"
+                    else "body_deadline"
+                ),
             })
             break
         except ValueError as exc:
@@ -2014,7 +2352,9 @@ def _search_externalized_payloads(
                 "ref": path.name,
                 "error": error
                 if error in {
-                    "ambiguous_metadata", "invalid_payload", "payload_truncated"
+                    "ambiguous_metadata", "invalid_payload", "payload_truncated",
+                    "session_mismatch", "session_metadata_unavailable",
+                    "content_not_in_prefix",
                 }
                 else "invalid_payload",
             })
@@ -2123,6 +2463,9 @@ def _search_externalized_payloads(
         "byte_budget_exhausted": byte_operation_budget.exhausted,
         "continuation_reused_bytes": continuation_reused_bytes,
         "continuations_pending": len(continuation_cache),
+        "continuation_memory_bytes": _externalized_continuation_memory_bytes(
+            continuation_cache
+        ),
         "regex_file_deadline_ms": int(_LCM_GREP_REGEX_FILE_DEADLINE_SECONDS * 1000),
         "regex_operation_deadline_ms": int(_LCM_GREP_REGEX_OPERATION_DEADLINE_SECONDS * 1000),
         "regex_timeouts": regex_timeouts,
@@ -6587,13 +6930,14 @@ def _read_externalized_payload_metadata_prefix_from_handle(
             return False
         return False
 
+    next_deadline_check = 0
     while len(prefix) < read_limit:
-        if (
-            len(prefix) % _LCM_EXTERNAL_METADATA_DEADLINE_CHECK_BYTES == 0
-            and deadline is not None
-            and _external_metadata_now() >= deadline
-        ):
-            raise TimeoutError("metadata_deadline")
+        if len(prefix) >= next_deadline_check:
+            if deadline is not None and _external_metadata_now() >= deadline:
+                raise TimeoutError("metadata_deadline")
+            next_deadline_check = (
+                len(prefix) + _LCM_EXTERNAL_METADATA_DEADLINE_CHECK_BYTES
+            )
         byte = handle.read(1)
         if not byte:
             break
