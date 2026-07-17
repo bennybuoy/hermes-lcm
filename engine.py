@@ -32,6 +32,10 @@ from .dag import (
     SummaryNode,
     decode_source_ids,
 )
+from .db_bootstrap import (
+    materialize_node_provenance_no_commit,
+    remove_node_proofs_for_node_session_no_commit,
+)
 from .policy import (
     DEFAULT_PREPARATION_RATIO,
     DEFAULT_TARGET_RATIO,
@@ -4189,11 +4193,18 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 """,
                 (conversation_id,),
             ).fetchone()
+            affected_roots = remove_node_proofs_for_node_session_no_commit(
+                conn, old_session_id
+            )
             cur = conn.execute(
                 "UPDATE summary_nodes SET session_id = ? WHERE session_id = ?",
                 (new_session_id, old_session_id),
             )
             moved = int(cur.rowcount or 0)
+            for root_node_id in affected_roots:
+                materialize_node_provenance_no_commit(
+                    conn, root_node_id, raise_on_failure=False
+                )
 
             if (
                 active is None
@@ -4725,11 +4736,15 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
 
             retain = int(self._config.new_session_retain_depth)
             if retain == 0:
+                remove_node_proofs_for_node_session_no_commit(conn, old_session_id)
                 conn.execute(
                     "DELETE FROM summary_nodes WHERE session_id = ?",
                     (old_session_id,),
                 )
             elif retain > 0:
+                remove_node_proofs_for_node_session_no_commit(
+                    conn, old_session_id, below_depth=retain
+                )
                 conn.execute(
                     "DELETE FROM summary_nodes WHERE session_id = ? AND depth < ?",
                     (old_session_id, retain),
@@ -4737,11 +4752,18 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             self._rollover_publication_boundary("after_prune")
 
             if carry_over_context:
+                affected_roots = remove_node_proofs_for_node_session_no_commit(
+                    conn, old_session_id
+                )
                 cur = conn.execute(
                     "UPDATE summary_nodes SET session_id = ? WHERE session_id = ?",
                     (new_session_id, old_session_id),
                 )
                 moved = max(0, int(cur.rowcount or 0))
+                for root_node_id in affected_roots:
+                    materialize_node_provenance_no_commit(
+                        conn, root_node_id, raise_on_failure=False
+                    )
             self._rollover_publication_boundary("after_reassign")
 
             items: list[dict[str, Any]] = []

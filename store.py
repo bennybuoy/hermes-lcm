@@ -22,6 +22,7 @@ from .db_bootstrap import (
     ExternalContentFtsSpec,
     add_column_if_missing,
     configure_connection,
+    remove_node_proofs_for_message_session_no_commit,
     refuse_schema_version_too_new,
     run_versioned_migrations,
 )
@@ -909,6 +910,9 @@ class MessageStore:
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
         with self._write_lock:
+            remove_node_proofs_for_message_session_no_commit(
+                self._conn, old_session_id
+            )
             cur = self._conn.execute(
                 "UPDATE messages SET session_id = ? WHERE session_id = ?",
                 (new_session_id, old_session_id),
@@ -919,6 +923,7 @@ class MessageStore:
     def delete_session_messages(self, session_id: str) -> int:
         """Delete all messages for a session. Returns count deleted."""
         with self._write_lock:
+            remove_node_proofs_for_message_session_no_commit(self._conn, session_id)
             cur = self._conn.execute(
                 "DELETE FROM messages WHERE session_id = ?",
                 (session_id,),

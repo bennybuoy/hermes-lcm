@@ -10,6 +10,7 @@ import time
 import pytest
 
 import hermes_lcm.tools as lcm_tools
+from hermes_lcm import db_bootstrap
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
@@ -235,17 +236,26 @@ def test_authorization_and_evidence_use_one_frozen_snapshot(tmp_path, monkeypatc
     other = sqlite3.connect(str(engine._config.database_path), timeout=5)
     original_authorize = lcm_tools._authorize_node_provenance_bounded
     original_get_batch = engine._store.get_batch
+    mutation_denied = []
 
     def authorize_then_mutate(*args, **kwargs):
         result = original_authorize(*args, **kwargs)
-        other.execute(
-            "UPDATE messages SET session_id='denied', content='UNAUTHORIZED-LATE-PAYLOAD'"
-        )
-        other.execute(
-            "UPDATE summary_nodes SET session_id='denied' WHERE node_id=?",
-            (node_id,),
-        )
-        other.commit()
+        for statement, params in (
+            (
+                "UPDATE messages SET session_id='denied', content='UNAUTHORIZED-LATE-PAYLOAD'",
+                (),
+            ),
+            (
+                "UPDATE summary_nodes SET session_id='denied' WHERE node_id=?",
+                (node_id,),
+            ),
+        ):
+            try:
+                other.execute(statement, params)
+                other.commit()
+            except sqlite3.IntegrityError as exc:
+                other.rollback()
+                mutation_denied.append(str(exc))
         return result
 
     def reject_unrestricted_payload_getter(*args, **kwargs):
@@ -272,6 +282,8 @@ def test_authorization_and_evidence_use_one_frozen_snapshot(tmp_path, monkeypatc
         encoded = json.dumps(captured["context"])
         assert "authorized snapshot evidence" in encoded
         assert "UNAUTHORIZED-LATE-PAYLOAD" not in encoded
+        assert len(mutation_denied) == 2
+        assert all("provenance dependency" in error for error in mutation_denied)
         assert original_get_batch is not None
     finally:
         other.close()
@@ -290,30 +302,29 @@ def test_concurrent_ownership_mutation_during_snapshot_is_denied(tmp_path, monke
     original_convert = engine._dag._cross_session_row_to_node
     mutated = False
     conversions = 0
+    mutation_denied = False
 
     def mutate_during_snapshot(row, **kwargs):
-        nonlocal mutated, conversions
+        nonlocal mutated, conversions, mutation_denied
         node = original_convert(row, **kwargs)
         conversions += 1
         if node is not None and conversions >= 2 and not mutated:
             mutated = True
-            other.execute(
-                "UPDATE messages SET session_id='denied', content='LATE-UNAUTHORIZED'"
-            )
-            other.execute(
-                "UPDATE summary_nodes SET session_id='denied' WHERE node_id=?",
-                (node_id,),
-            )
-            other.commit()
+            try:
+                other.execute(
+                    "UPDATE messages SET session_id='denied', content='LATE-UNAUTHORIZED'"
+                )
+                other.commit()
+            except sqlite3.IntegrityError as exc:
+                other.rollback()
+                mutation_denied = "provenance dependency" in str(exc)
         return node
 
     monkeypatch.setattr(engine._dag, "_cross_session_row_to_node", mutate_during_snapshot)
     monkeypatch.setattr(
         lcm_tools,
         "_synthesize_expansion_answer",
-        lambda **_kwargs: (_ for _ in ()).throw(
-            AssertionError("concurrent ownership mutation reached synthesis")
-        ),
+        lambda **_kwargs: "immutable snapshot answer",
     )
     try:
         result = json.loads(_invoke(
@@ -322,8 +333,9 @@ def test_concurrent_ownership_mutation_during_snapshot_is_denied(tmp_path, monke
             session_ids=["archive"],
         ))
         assert mutated is True
-        assert result["node_ids"] == []
-        assert result["authorization_concurrent_mutation"] is True
+        assert mutation_denied is True
+        assert result["answer"] == "immutable snapshot answer"
+        assert result["node_ids"] == [node_id]
         assert "LATE-UNAUTHORIZED" not in json.dumps(result)
     finally:
         other.close()
@@ -920,6 +932,7 @@ def test_1600_node_adversarial_provenance_is_bounded_deadline_aware_and_fail_clo
         source_type="messages",
         created_at=1,
     ))
+    add_started = time.monotonic()
     for index in range(1, 1600):
         child_id = engine._dag.add_node(SummaryNode(
             session_id="archive",
@@ -931,6 +944,31 @@ def test_1600_node_adversarial_provenance_is_bounded_deadline_aware_and_fail_clo
             source_type="nodes",
             created_at=index + 1,
         ))
+    assert time.monotonic() - add_started < 45.0
+    proof = engine._store._conn.execute(
+        """SELECT proof_complete, proof_status FROM lcm_node_provenance
+           WHERE node_id=?""",
+        (child_id,),
+    ).fetchone()
+    assert proof[0] == 0
+    assert "bound" in proof[1]
+    assert engine._store._conn.execute(
+        "SELECT COUNT(*) FROM lcm_node_provenance_node_dependencies"
+    ).fetchone()[0] < 5_000
+    engine._frontier.ensure_frontier("conversation", "current", source_end_store_id=0)
+    active = engine._frontier.get_active_frontier("conversation")
+    generation = int(active["generation"]) + 1
+    conn = engine._store._conn
+    conn.execute(
+        "INSERT INTO lcm_active_frontiers VALUES(?, ?, ?, ?, '', '', 1, 1)",
+        ("conversation", generation, "current", raw_id),
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="proof"):
+        conn.execute(
+            "INSERT INTO lcm_frontier_items VALUES(?, ?, 0, 'node', ?, ?, ?)",
+            ("conversation", generation, child_id, raw_id, raw_id),
+        )
+    conn.rollback()
     root = engine._dag.get_node(child_id)
     monkeypatch.setattr(engine._dag, "search_cross_session_candidates", lambda *args, **kwargs: [root] * 1600)
     get_node_calls = {"count": 0}
@@ -997,6 +1035,9 @@ def test_cross_session_lineage_is_length_guarded_before_python_materialization(
             created_at=2,
         ))
     poisoned_id = root_id if oversized_location == "explicit" else leaf_id
+    db_bootstrap.remove_node_proofs_for_node_ids_no_commit(
+        engine._dag._conn, (poisoned_id,)
+    )
     engine._dag._conn.execute(
         "UPDATE summary_nodes SET source_ids=? WHERE node_id=?",
         ("[" + ("1," * 1_000_000) + "1]", poisoned_id),
@@ -1060,6 +1101,9 @@ def test_descendant_authorization_guards_all_text_provenance_before_fetchall(
         source_type="nodes",
         created_at=2,
     ))
+    db_bootstrap.remove_node_proofs_for_node_ids_no_commit(
+        engine._dag._conn, (leaf_id,)
+    )
     engine._dag._conn.execute(
         f"UPDATE summary_nodes SET {poisoned_column}=? WHERE node_id=?",
         (("oversized-" + ("z" * 1_000_000)), leaf_id),

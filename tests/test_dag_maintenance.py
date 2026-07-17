@@ -13,6 +13,7 @@ import threading
 import pytest
 
 import hermes_lcm.maintenance as maintenance_module
+from hermes_lcm import db_bootstrap
 
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
@@ -391,6 +392,9 @@ def test_maintenance_lineage_aggregate_bytes_reject_before_next_blob_decode(
     leaf_raw = "[" + (" " * 60_000) + "1]"
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    db_bootstrap.remove_node_proofs_for_node_ids_no_commit(
+        conn, (parent, leaf_ids[0])
+    )
     conn.execute(
         "UPDATE summary_nodes SET source_ids=? WHERE node_id=?", (parent_raw, parent)
     )
@@ -447,6 +451,7 @@ def test_maintenance_source_inventory_batches_message_validation_and_rejects_fan
     assert "LENGTH(CAST(SESSION_ID AS BLOB))" in message_selects[0].upper()
 
     raw = "[" + ",".join(str(index) for index in range(7_000)) + "]"
+    db_bootstrap.remove_node_proofs_for_node_ids_no_commit(conn, (parent,))
     conn.execute("UPDATE summary_nodes SET source_ids=? WHERE node_id=?", (raw, parent))
     conn.commit()
     import hermes_lcm.maintenance as maintenance_module

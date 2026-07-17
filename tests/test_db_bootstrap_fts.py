@@ -395,13 +395,13 @@ def test_run_versioned_migrations_accepts_current_schema(tmp_path):
         conn.close()
 
 
-def test_fresh_database_is_schema_v13_with_durable_rollover_state(tmp_path):
+def test_fresh_database_is_schema_v14_with_durable_rollover_state(tmp_path):
     conn = sqlite3.connect(tmp_path / "fresh-v11.db")
     try:
         db_bootstrap.run_versioned_migrations(conn)
 
-        assert db_bootstrap.SCHEMA_VERSION == 13
-        assert db_bootstrap.get_schema_version(conn) == 13
+        assert db_bootstrap.SCHEMA_VERSION == 14
+        assert db_bootstrap.get_schema_version(conn) == 14
         lifecycle_columns = {
             row[1]: row
             for row in conn.execute(
@@ -452,7 +452,7 @@ def test_v9_rollover_carry_policy_migrates_to_v11_and_restarts_idempotently(tmp_
 
         db_bootstrap.run_versioned_migrations(conn)
 
-        assert db_bootstrap.get_schema_version(conn) == db_bootstrap.SCHEMA_VERSION == 13
+        assert db_bootstrap.get_schema_version(conn) == db_bootstrap.SCHEMA_VERSION == 14
         assert "rollover_carry_over_context" in {
             row[1]
             for row in conn.execute(
@@ -477,7 +477,7 @@ def test_v9_rollover_carry_policy_migrates_to_v11_and_restarts_idempotently(tmp_
     restarted = sqlite3.connect(db_path)
     try:
         db_bootstrap.run_versioned_migrations(restarted)
-        assert db_bootstrap.get_schema_version(restarted) == 13
+        assert db_bootstrap.get_schema_version(restarted) == 14
         assert restarted.execute("PRAGMA quick_check").fetchone() == ("ok",)
         assert restarted.execute(
             "SELECT COUNT(*) FROM lcm_lifecycle_state WHERE conversation_id = 'legacy-conversation'"
@@ -746,10 +746,10 @@ def test_v11_migration_blocks_concurrent_base_v9_schema_downgrade(
         assert not base_v9_thread.is_alive()
         assert "migration_error" not in outcomes
         assert "base_v9_error" not in outcomes
-        assert outcomes["base_v9_version"] == "13"
+        assert outcomes["base_v9_version"] == "14"
         check = sqlite3.connect(db_path)
         try:
-            assert db_bootstrap.get_schema_version(check) == 13
+            assert db_bootstrap.get_schema_version(check) == 14
             assert "rollover_carry_over_context" in {
                 row[1]
                 for row in check.execute(

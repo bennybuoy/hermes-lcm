@@ -328,7 +328,7 @@ db_bootstrap.run_versioned_migrations(conn)
         assert interrupted.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
         db_bootstrap.run_versioned_migrations(interrupted)
-        assert db_bootstrap.get_schema_version(interrupted) == 13
+        assert db_bootstrap.get_schema_version(interrupted) == 14
         assert interrupted.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_rollover_policies'"
         ).fetchone() == (1,)

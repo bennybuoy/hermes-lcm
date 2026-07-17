@@ -32,7 +32,7 @@ class SQLiteStartupBusyError(RuntimeError):
     """Raised when bounded SQLite startup lock waiting is exhausted."""
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 SQLITE_STARTUP_BACKOFF_INITIAL_SECONDS = 0.01
 SQLITE_STARTUP_BACKOFF_MAX_SECONDS = 0.25
@@ -52,6 +52,8 @@ REQUIRED_CORE_TABLES = (
     "lcm_session_end_receipts",
     "lcm_node_provenance",
     "lcm_node_provenance_sessions",
+    "lcm_node_provenance_node_dependencies",
+    "lcm_node_provenance_message_dependencies",
     "lcm_migration_state",
     "lcm_focus_briefs",
     "messages_fts",
@@ -610,10 +612,16 @@ def ensure_rollover_v13_tables(conn: sqlite3.Connection) -> None:
             node_id INTEGER PRIMARY KEY,
             proof_complete INTEGER NOT NULL DEFAULT 0
                 CHECK (proof_complete IN (0, 1)),
+            proof_version INTEGER NOT NULL DEFAULT 0
+                CHECK (proof_version >= 0),
+            proof_status TEXT NOT NULL DEFAULT 'unproved'
+                CHECK (length(CAST(proof_status AS BLOB)) BETWEEN 1 AND 256),
             closure_node_count INTEGER NOT NULL DEFAULT 0
                 CHECK (closure_node_count >= 0),
             closure_edge_count INTEGER NOT NULL DEFAULT 0
                 CHECK (closure_edge_count >= 0),
+            closure_message_count INTEGER NOT NULL DEFAULT 0
+                CHECK (closure_message_count >= 0),
             source_session_count INTEGER NOT NULL DEFAULT 0
                 CHECK (source_session_count >= 0),
             proved_at REAL NOT NULL
@@ -636,6 +644,207 @@ def ensure_rollover_v13_tables(conn: sqlite3.Connection) -> None:
            ON lcm_node_provenance_sessions(source_session_id, node_id)"""
     )
     _migration_crash_boundary("v13_after_proof_tables")
+
+
+def ensure_rollover_v14_tables(conn: sqlite3.Connection) -> None:
+    """Add exact dependency membership and durable proof diagnostics."""
+    ensure_rollover_v13_tables(conn)
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(lcm_node_provenance)")
+    }
+    add_column_if_missing(
+        conn,
+        columns,
+        "proof_version",
+        "ALTER TABLE lcm_node_provenance ADD COLUMN proof_version INTEGER NOT NULL DEFAULT 0 CHECK (proof_version >= 0)",
+    )
+    add_column_if_missing(
+        conn,
+        columns,
+        "proof_status",
+        "ALTER TABLE lcm_node_provenance ADD COLUMN proof_status TEXT NOT NULL DEFAULT 'unproved' CHECK (length(CAST(proof_status AS BLOB)) BETWEEN 1 AND 256)",
+    )
+    add_column_if_missing(
+        conn,
+        columns,
+        "closure_message_count",
+        "ALTER TABLE lcm_node_provenance ADD COLUMN closure_message_count INTEGER NOT NULL DEFAULT 0 CHECK (closure_message_count >= 0)",
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS lcm_node_provenance_node_dependencies (
+               root_node_id INTEGER NOT NULL,
+               dependency_node_id INTEGER NOT NULL,
+               PRIMARY KEY(root_node_id, dependency_node_id)
+           )"""
+    )
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_lcm_node_provenance_node_dependency
+           ON lcm_node_provenance_node_dependencies(
+               dependency_node_id, root_node_id
+           )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS lcm_node_provenance_message_dependencies (
+               root_node_id INTEGER NOT NULL,
+               dependency_store_id INTEGER NOT NULL,
+               PRIMARY KEY(root_node_id, dependency_store_id)
+           )"""
+    )
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_lcm_node_provenance_message_dependency
+           ON lcm_node_provenance_message_dependencies(
+               dependency_store_id, root_node_id
+           )"""
+    )
+
+
+def _proof_dependency_tables_ready(conn: sqlite3.Connection) -> bool:
+    return all(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        ).fetchone()
+        for name in (
+            "lcm_node_provenance",
+            "lcm_node_provenance_sessions",
+            "lcm_node_provenance_node_dependencies",
+            "lcm_node_provenance_message_dependencies",
+        )
+    )
+
+
+def _remove_provenance_roots_no_commit(
+    conn: sqlite3.Connection,
+    root_query: str,
+    params: Sequence[object] = (),
+) -> list[int]:
+    """Remove selected proofs child-first, preserving source-trigger safety."""
+    if not _proof_dependency_tables_ready(conn):
+        return []
+    conn.execute(
+        """CREATE TEMP TABLE IF NOT EXISTS lcm_provenance_roots_to_remove(
+               root_node_id INTEGER PRIMARY KEY
+           )"""
+    )
+    conn.execute("DELETE FROM temp.lcm_provenance_roots_to_remove")
+    conn.execute(
+        "INSERT OR IGNORE INTO temp.lcm_provenance_roots_to_remove " + root_query,
+        tuple(params),
+    )
+    roots = [
+        int(row[0]) for row in conn.execute(
+            "SELECT root_node_id FROM temp.lcm_provenance_roots_to_remove ORDER BY root_node_id"
+        )
+    ]
+    for table, column in (
+        ("lcm_node_provenance_sessions", "node_id"),
+        ("lcm_node_provenance_message_dependencies", "root_node_id"),
+        ("lcm_node_provenance_node_dependencies", "root_node_id"),
+        ("lcm_node_provenance", "node_id"),
+    ):
+        conn.execute(
+            f"""DELETE FROM {table} WHERE {column} IN (
+                    SELECT root_node_id FROM temp.lcm_provenance_roots_to_remove
+                )"""
+        )
+    conn.execute("DELETE FROM temp.lcm_provenance_roots_to_remove")
+    return roots
+
+
+def remove_node_proofs_for_node_ids_no_commit(
+    conn: sqlite3.Connection, node_ids: Iterable[int]
+) -> list[int]:
+    values = sorted({int(value) for value in node_ids if int(value) > 0})
+    if not values or not _proof_dependency_tables_ready(conn):
+        return []
+    placeholders = ",".join("?" for _ in values)
+    return _remove_provenance_roots_no_commit(
+        conn,
+        f"""SELECT DISTINCT root_node_id
+             FROM lcm_node_provenance_node_dependencies
+             WHERE dependency_node_id IN ({placeholders})""",
+        values,
+    )
+
+
+def remove_node_proofs_for_message_ids_no_commit(
+    conn: sqlite3.Connection, store_ids: Iterable[int]
+) -> list[int]:
+    values = sorted({int(value) for value in store_ids if int(value) > 0})
+    if not values or not _proof_dependency_tables_ready(conn):
+        return []
+    placeholders = ",".join("?" for _ in values)
+    return _remove_provenance_roots_no_commit(
+        conn,
+        f"""SELECT DISTINCT root_node_id
+             FROM lcm_node_provenance_message_dependencies
+             WHERE dependency_store_id IN ({placeholders})""",
+        values,
+    )
+
+
+def remove_node_proofs_for_node_session_no_commit(
+    conn: sqlite3.Connection, session_id: str, *, below_depth: int | None = None
+) -> list[int]:
+    depth_clause = "" if below_depth is None else " AND source.depth < ?"
+    params: tuple[object, ...] = (
+        (session_id,) if below_depth is None else (session_id, int(below_depth))
+    )
+    return _remove_provenance_roots_no_commit(
+        conn,
+        """SELECT DISTINCT dependency.root_node_id
+             FROM lcm_node_provenance_node_dependencies AS dependency
+             JOIN summary_nodes AS source
+               ON source.node_id=dependency.dependency_node_id
+             WHERE source.session_id=?""" + depth_clause,
+        params,
+    )
+
+
+def remove_node_proofs_for_message_session_no_commit(
+    conn: sqlite3.Connection, session_id: str
+) -> list[int]:
+    return _remove_provenance_roots_no_commit(
+        conn,
+        """SELECT DISTINCT dependency.root_node_id
+             FROM lcm_node_provenance_message_dependencies AS dependency
+             JOIN messages AS source
+               ON source.store_id=dependency.dependency_store_id
+             WHERE source.session_id=?""",
+        (session_id,),
+    )
+
+
+def _clear_root_proof_no_commit(conn: sqlite3.Connection, root: int) -> None:
+    if _proof_dependency_tables_ready(conn):
+        conn.execute(
+            "DELETE FROM lcm_node_provenance_message_dependencies WHERE root_node_id=?",
+            (root,),
+        )
+        conn.execute(
+            "DELETE FROM lcm_node_provenance_node_dependencies WHERE root_node_id=?",
+            (root,),
+        )
+    conn.execute("DELETE FROM lcm_node_provenance_sessions WHERE node_id=?", (root,))
+    conn.execute("DELETE FROM lcm_node_provenance WHERE node_id=?", (root,))
+
+
+def _proof_failure_status(exc: BaseException) -> str:
+    value = re.sub(r"[^a-z0-9]+", "_", str(exc).lower()).strip("_")
+    return (value or "provenance_error")[:256]
+
+
+def _record_incomplete_root_proof_no_commit(
+    conn: sqlite3.Connection, root: int, exc: BaseException
+) -> None:
+    _clear_root_proof_no_commit(conn, root)
+    conn.execute(
+        """INSERT INTO lcm_node_provenance(
+               node_id, proof_complete, proof_version, proof_status,
+               closure_node_count, closure_edge_count, closure_message_count,
+               source_session_count, proved_at
+           ) VALUES(?, 0, 14, ?, 0, 0, 0, 0, ?)""",
+        (root, _proof_failure_status(exc), time.time()),
+    )
 
 
 def _decode_bounded_node_sources(raw: object, *, encoded_bytes: int) -> list[int]:
@@ -672,6 +881,7 @@ def materialize_node_provenance_no_commit(
     max_edges: int = NODE_PROVENANCE_MAX_EDGES,
     max_depth: int = NODE_PROVENANCE_MAX_DEPTH,
     max_bytes: int = NODE_PROVENANCE_MAX_BYTES,
+    raise_on_failure: bool = True,
 ) -> bool:
     """Materialize an exact node-to-source-session proof under fixed bounds.
 
@@ -681,13 +891,15 @@ def materialize_node_provenance_no_commit(
     leaves no completeness row and therefore fails closed at frontier publish.
     """
     del conversation_id
-    ensure_rollover_v13_tables(conn)
+    if not _proof_dependency_tables_ready(conn):
+        ensure_rollover_v14_tables(conn)
     root = int(node_id or 0)
     if root <= 0:
         raise ValueError("node provenance requires a positive node id")
     stack: list[tuple[int, int]] = [(root, 0)]
     seen: set[int] = set()
     sessions: set[str] = set()
+    message_dependencies: set[int] = set()
     edges = 0
     encoded_total = 0
     try:
@@ -730,7 +942,18 @@ def materialize_node_provenance_no_commit(
                 raise ValueError("node provenance closure edge bound exceeded")
             source_type = str(row[1] or "")
             if source_type == "nodes":
-                stack.extend((source_id, depth + 1) for source_id in reversed(source_ids))
+                for source_id in reversed(source_ids):
+                    child_proof = conn.execute(
+                        """SELECT proof_complete, proof_status
+                           FROM lcm_node_provenance WHERE node_id=?""",
+                        (source_id,),
+                    ).fetchone()
+                    if child_proof is not None and int(child_proof[0] or 0) != 1:
+                        # Preserve the originating bounded diagnostic exactly;
+                        # repeatedly prefixing it would eventually truncate the
+                        # actionable reason on a long chain of unproved roots.
+                        raise ValueError(str(child_proof[1] or "dependency_unproved"))
+                    stack.append((source_id, depth + 1))
             elif source_type == "messages":
                 found: dict[int, str] = {}
                 for offset in range(0, len(source_ids), 400):
@@ -747,6 +970,7 @@ def materialize_node_provenance_no_commit(
                 if set(found) != set(source_ids):
                     raise ValueError("node provenance closure references a missing message")
                 sessions.update(found.values())
+                message_dependencies.update(found)
                 if len(sessions) > NODE_PROVENANCE_MAX_SESSIONS:
                     raise ValueError("node provenance session bound exceeded")
             else:
@@ -754,29 +978,53 @@ def materialize_node_provenance_no_commit(
             seen.add(current)
         if not seen or not sessions:
             raise ValueError("node provenance closure is empty")
-    except (sqlite3.Error, TypeError, ValueError, OverflowError):
-        conn.execute("DELETE FROM lcm_node_provenance_sessions WHERE node_id = ?", (root,))
-        conn.execute("DELETE FROM lcm_node_provenance WHERE node_id = ?", (root,))
-        raise
+    except (sqlite3.Error, TypeError, ValueError, OverflowError) as exc:
+        _record_incomplete_root_proof_no_commit(conn, root, exc)
+        if raise_on_failure:
+            raise
+        return False
 
-    conn.execute("DELETE FROM lcm_node_provenance_sessions WHERE node_id = ?", (root,))
+    _clear_root_proof_no_commit(conn, root)
     conn.executemany(
         """INSERT INTO lcm_node_provenance_sessions(node_id, source_session_id)
            VALUES(?, ?)""",
         [(root, session_id) for session_id in sorted(sessions)],
     )
+    conn.executemany(
+        """INSERT INTO lcm_node_provenance_node_dependencies(
+               root_node_id, dependency_node_id
+           ) VALUES(?, ?)""",
+        [(root, dependency) for dependency in sorted(seen)],
+    )
+    conn.executemany(
+        """INSERT INTO lcm_node_provenance_message_dependencies(
+               root_node_id, dependency_store_id
+           ) VALUES(?, ?)""",
+        [(root, dependency) for dependency in sorted(message_dependencies)],
+    )
     conn.execute(
         """INSERT INTO lcm_node_provenance(
-               node_id, proof_complete, closure_node_count, closure_edge_count,
+               node_id, proof_complete, proof_version, proof_status,
+               closure_node_count, closure_edge_count, closure_message_count,
                source_session_count, proved_at
-           ) VALUES(?, 1, ?, ?, ?, ?)
+           ) VALUES(?, 1, 14, 'complete', ?, ?, ?, ?, ?)
            ON CONFLICT(node_id) DO UPDATE SET
                proof_complete=1,
+               proof_version=14,
+               proof_status='complete',
                closure_node_count=excluded.closure_node_count,
                closure_edge_count=excluded.closure_edge_count,
+               closure_message_count=excluded.closure_message_count,
                source_session_count=excluded.source_session_count,
                proved_at=excluded.proved_at""",
-        (root, len(seen), edges, len(sessions), time.time()),
+        (
+            root,
+            len(seen),
+            edges,
+            len(message_dependencies),
+            len(sessions),
+            time.time(),
+        ),
     )
     return True
 
@@ -804,11 +1052,53 @@ def backfill_node_provenance_v13(conn: sqlite3.Connection) -> None:
     ]
     for candidate in candidates:
         try:
-            materialize_node_provenance_no_commit(conn, candidate)
+            materialize_node_provenance_no_commit(
+                conn, candidate, raise_on_failure=False
+            )
         except (sqlite3.Error, TypeError, ValueError, OverflowError):
-            # Absence of a complete proof is the durable fail-closed marker.
             continue
     _migration_crash_boundary("v13_after_provenance_backfill")
+
+
+def backfill_node_provenance_v14(conn: sqlite3.Connection) -> None:
+    """Prove every current frontier root before the optional newest-node tail."""
+    ensure_rollover_v14_tables(conn)
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='summary_nodes'"
+    ).fetchone():
+        _migration_crash_boundary("v14_after_active_provenance_backfill")
+        _migration_crash_boundary("v14_after_provenance_backfill")
+        return
+
+    active_roots = conn.execute(
+        """SELECT DISTINCT item.ref_id
+           FROM lcm_frontier_items AS item
+           JOIN lcm_active_frontiers AS frontier
+             ON frontier.conversation_id=item.conversation_id
+            AND frontier.generation=item.generation
+           WHERE item.kind='node'
+             AND NOT EXISTS (
+                 SELECT 1 FROM lcm_active_frontiers AS newer
+                 WHERE newer.conversation_id=frontier.conversation_id
+                   AND newer.generation>frontier.generation
+             )
+           ORDER BY item.ref_id"""
+    )
+    for row in active_roots:
+        materialize_node_provenance_no_commit(
+            conn, int(row[0]), raise_on_failure=False
+        )
+    _migration_crash_boundary("v14_after_active_provenance_backfill")
+
+    for row in conn.execute(
+        """SELECT node_id FROM summary_nodes
+           ORDER BY node_id DESC LIMIT ?""",
+        (NODE_PROVENANCE_MIGRATION_ROOTS,),
+    ):
+        materialize_node_provenance_no_commit(
+            conn, int(row[0]), raise_on_failure=False
+        )
+    _migration_crash_boundary("v14_after_provenance_backfill")
 
 
 def _drop_schema_v11_cutoff_triggers(conn: sqlite3.Connection) -> None:
@@ -1027,6 +1317,13 @@ def ensure_rollover_v12_triggers(conn: sqlite3.Connection) -> None:
     """Enforce historical session provenance against legacy frontier SQL."""
     ensure_rollover_v12_tables(conn)
     _drop_schema_v11_cutoff_triggers(conn)
+    source_tables_ready = all(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        for table in ("messages", "summary_nodes")
+    )
+    authentic_v12 = get_schema_version(conn) < 13
     for operation, reference in (("insert", "NEW"), ("update", "NEW")):
         conn.execute(
             f"""
@@ -1042,9 +1339,69 @@ def ensure_rollover_v12_triggers(conn: sqlite3.Connection) -> None:
             END
             """
         )
-        # Schema v13 installs indexed exact-proof item triggers before commit.
-        # Never recreate v12's recursive JSON/range trigger, even transiently.
-        conn.execute(f"DROP TRIGGER IF EXISTS lcm_protected_item_{operation}")
+        if authentic_v12 and source_tables_ready:
+            conn.execute(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS lcm_protected_item_{operation}
+                BEFORE {operation.upper()} ON lcm_frontier_items
+                WHEN EXISTS (
+                    SELECT 1 FROM lcm_protected_sessions AS p
+                    WHERE p.conversation_id = {reference}.conversation_id
+                      AND (
+                          ({reference}.kind = 'message' AND EXISTS (
+                              SELECT 1 FROM messages AS m
+                              WHERE m.store_id = {reference}.ref_id
+                                AND m.conversation_id = {reference}.conversation_id
+                                AND m.session_id = p.finalized_session_id
+                          ))
+                          OR ({reference}.kind = 'node' AND EXISTS (
+                              WITH RECURSIVE closure(
+                                  node_id, session_id, source_type, source_ids
+                              ) AS (
+                                  SELECT n.node_id, n.session_id,
+                                         n.source_type, n.source_ids
+                                  FROM summary_nodes AS n
+                                  WHERE n.node_id = {reference}.ref_id
+                                  UNION
+                                  SELECT child.node_id, child.session_id,
+                                         child.source_type, child.source_ids
+                                  FROM closure AS parent
+                                  JOIN json_each(parent.source_ids) AS edge
+                                    ON parent.source_type = 'nodes'
+                                  JOIN summary_nodes AS child
+                                    ON child.node_id = CAST(edge.value AS INTEGER)
+                              )
+                              SELECT 1 FROM closure AS c
+                              WHERE c.session_id = p.finalized_session_id
+                                 OR (
+                                     c.source_type = 'messages'
+                                     AND EXISTS (
+                                         SELECT 1
+                                         FROM json_each(c.source_ids) AS source
+                                         JOIN messages AS m
+                                           ON m.store_id = CAST(source.value AS INTEGER)
+                                         WHERE m.conversation_id = {reference}.conversation_id
+                                           AND m.session_id = p.finalized_session_id
+                                     )
+                                 )
+                          ))
+                          OR EXISTS (
+                              SELECT 1 FROM messages AS covered
+                              WHERE covered.conversation_id = {reference}.conversation_id
+                                AND covered.session_id = p.finalized_session_id
+                                AND covered.store_id BETWEEN {reference}.source_start
+                                                         AND {reference}.source_end
+                          )
+                      )
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'no-carry protected session blocks frontier item provenance');
+                END
+                """
+            )
+        else:
+            # Newer schemas replace recursive closure evaluation atomically.
+            conn.execute(f"DROP TRIGGER IF EXISTS lcm_protected_item_{operation}")
     _migration_crash_boundary("v12_after_provenance_triggers")
 
     # Compatibility for a schema-v9/v10 process that was already open during
@@ -1167,7 +1524,7 @@ def ensure_rollover_v12_triggers(conn: sqlite3.Connection) -> None:
 
 def ensure_rollover_v13_triggers(conn: sqlite3.Connection) -> None:
     """Use only indexed, precomputed proof lookups in frontier triggers."""
-    ensure_rollover_v13_tables(conn)
+    ensure_rollover_v14_tables(conn)
     source_tables_ready = all(
         conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
@@ -1188,7 +1545,15 @@ def ensure_rollover_v13_triggers(conn: sqlite3.Connection) -> None:
                         SELECT 1 FROM lcm_node_provenance AS proof
                         WHERE proof.node_id = {reference}.ref_id
                           AND proof.proof_complete = 1
+                          AND proof.proof_version = 14
+                          AND proof.proof_status = 'complete'
                           AND proof.source_session_count > 0
+                          AND EXISTS (
+                              SELECT 1
+                              FROM lcm_node_provenance_node_dependencies AS root_dependency
+                              WHERE root_dependency.root_node_id = proof.node_id
+                                AND root_dependency.dependency_node_id = proof.node_id
+                          )
                     )
                     OR EXISTS (
                         SELECT 1
@@ -1215,46 +1580,88 @@ def ensure_rollover_v13_triggers(conn: sqlite3.Connection) -> None:
             END
             """
         )
-    conn.execute("DROP TRIGGER IF EXISTS lcm_node_provenance_delete")
-    conn.execute("DROP TRIGGER IF EXISTS lcm_node_provenance_lineage_update")
-    conn.execute("DROP TRIGGER IF EXISTS lcm_node_provenance_session_update")
+    for name in (
+        "lcm_node_provenance_delete",
+        "lcm_node_provenance_lineage_update",
+        "lcm_node_provenance_session_update",
+        "lcm_node_dependency_update",
+        "lcm_node_dependency_delete",
+        "lcm_message_dependency_update",
+        "lcm_message_dependency_delete",
+    ):
+        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
     if source_tables_ready:
         conn.execute(
-            """CREATE TRIGGER lcm_node_provenance_delete
-               AFTER DELETE ON summary_nodes BEGIN
-                   DELETE FROM lcm_node_provenance_sessions WHERE node_id = OLD.node_id;
-                   DELETE FROM lcm_node_provenance WHERE node_id = OLD.node_id;
-               END"""
-        )
-        conn.execute(
-            """CREATE TRIGGER lcm_node_provenance_lineage_update
-               AFTER UPDATE OF source_ids, source_type ON summary_nodes BEGIN
-                   DELETE FROM lcm_node_provenance_sessions WHERE node_id = OLD.node_id;
-                   DELETE FROM lcm_node_provenance WHERE node_id = OLD.node_id;
-               END"""
-        )
-        conn.execute(
-            """CREATE TRIGGER lcm_node_provenance_session_update
-               AFTER UPDATE OF session_id ON summary_nodes
-               WHEN OLD.source_ids IS NEW.source_ids
-                AND OLD.source_type IS NEW.source_type
-                AND EXISTS (
-                    SELECT 1 FROM lcm_node_provenance
-                    WHERE node_id=NEW.node_id AND proof_complete=1
-                )
+            """CREATE TRIGGER lcm_node_dependency_update
+               BEFORE UPDATE OF node_id, session_id, source_ids, source_type
+               ON summary_nodes
+               WHEN EXISTS (
+                   SELECT 1
+                   FROM lcm_node_provenance_node_dependencies AS dependency
+                   JOIN lcm_node_provenance AS proof
+                     ON proof.node_id=dependency.root_node_id
+                   WHERE dependency.dependency_node_id=OLD.node_id
+                     AND proof.proof_complete=1
+                     AND proof.proof_version=14
+               )
                BEGIN
-                   INSERT OR IGNORE INTO lcm_node_provenance_sessions(
-                       node_id, source_session_id
-                   ) VALUES(NEW.node_id, NEW.session_id);
-                   UPDATE lcm_node_provenance
-                   SET source_session_count=(
-                       SELECT COUNT(*) FROM lcm_node_provenance_sessions
-                       WHERE node_id=NEW.node_id
-                   ), proved_at=strftime('%s','now')
-                   WHERE node_id=NEW.node_id;
+                   SELECT RAISE(ABORT, 'referenced provenance dependency node is immutable');
+               END"""
+        )
+        conn.execute(
+            """CREATE TRIGGER lcm_node_dependency_delete
+               BEFORE DELETE ON summary_nodes
+               WHEN EXISTS (
+                   SELECT 1
+                   FROM lcm_node_provenance_node_dependencies AS dependency
+                   JOIN lcm_node_provenance AS proof
+                     ON proof.node_id=dependency.root_node_id
+                   WHERE dependency.dependency_node_id=OLD.node_id
+                     AND proof.proof_complete=1
+                     AND proof.proof_version=14
+               )
+               BEGIN
+                   SELECT RAISE(ABORT, 'referenced provenance dependency node is immutable');
+               END"""
+        )
+        conn.execute(
+            """CREATE TRIGGER lcm_message_dependency_update
+               BEFORE UPDATE OF store_id, session_id, conversation_id ON messages
+               WHEN EXISTS (
+                   SELECT 1
+                   FROM lcm_node_provenance_message_dependencies AS dependency
+                   JOIN lcm_node_provenance AS proof
+                     ON proof.node_id=dependency.root_node_id
+                   WHERE dependency.dependency_store_id=OLD.store_id
+                     AND proof.proof_complete=1
+                     AND proof.proof_version=14
+               )
+               BEGIN
+                   SELECT RAISE(ABORT, 'referenced provenance dependency message is immutable');
+               END"""
+        )
+        conn.execute(
+            """CREATE TRIGGER lcm_message_dependency_delete
+               BEFORE DELETE ON messages
+               WHEN EXISTS (
+                   SELECT 1
+                   FROM lcm_node_provenance_message_dependencies AS dependency
+                   JOIN lcm_node_provenance AS proof
+                     ON proof.node_id=dependency.root_node_id
+                   WHERE dependency.dependency_store_id=OLD.store_id
+                     AND proof.proof_complete=1
+                     AND proof.proof_version=14
+               )
+               BEGIN
+                   SELECT RAISE(ABORT, 'referenced provenance dependency message is immutable');
                END"""
         )
     _migration_crash_boundary("v13_after_triggers")
+
+
+def ensure_rollover_v14_triggers(conn: sqlite3.Connection) -> None:
+    ensure_rollover_v13_triggers(conn)
+    _migration_crash_boundary("v14_after_triggers")
 def ensure_message_origin_columns(conn: sqlite3.Connection) -> None:
     table_row = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'"
@@ -2160,7 +2567,27 @@ def run_versioned_migrations(
             current_version = 13
         else:
             ensure_rollover_v13_tables(conn)
-            ensure_rollover_v13_triggers(conn)
+            if current_version < 14:
+                ensure_rollover_v13_triggers(conn)
+
+        migrating_to_v14 = current_version < 14
+        if migrating_to_v14:
+            ensure_rollover_v14_tables(conn)
+            _migration_crash_boundary("v14_after_dependency_tables")
+            _remove_provenance_roots_no_commit(
+                conn, "SELECT node_id FROM lcm_node_provenance"
+            )
+            _migration_crash_boundary("v14_after_legacy_proof_invalidation")
+            backfill_node_provenance_v14(conn)
+            ensure_rollover_v14_triggers(conn)
+            mark_migration_step_complete(
+                conn, "v14_exact_provenance_dependencies"
+            )
+            _migration_crash_boundary("v14_after_migration_step")
+            current_version = 14
+        else:
+            ensure_rollover_v14_tables(conn)
+            ensure_rollover_v14_triggers(conn)
 
         # Startup FTS inspection, repair, rebuild, and trigger installation are
         # part of the same cross-connection writer transaction as schema
@@ -2181,6 +2608,8 @@ def run_versioned_migrations(
             _migration_crash_boundary("v12_after_schema_version")
         if migrating_to_v13:
             _migration_crash_boundary("v13_after_schema_version")
+        if migrating_to_v14:
+            _migration_crash_boundary("v14_after_schema_version")
         conn.commit()
     except Exception:
         conn.rollback()

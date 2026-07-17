@@ -12,6 +12,8 @@ from .db_bootstrap import (
     check_external_content_fts_integrity,
     external_content_fts_needs_repair,
     inspect_lcm_schema_health,
+    remove_node_proofs_for_message_session_no_commit,
+    remove_node_proofs_for_node_session_no_commit,
     repair_external_content_fts,
 )
 from .diagnostics import (
@@ -1305,6 +1307,9 @@ def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[s
 
     try:
         conn.execute("BEGIN IMMEDIATE")
+        for session_id in params:
+            remove_node_proofs_for_message_session_no_commit(conn, str(session_id))
+            remove_node_proofs_for_node_session_no_commit(conn, str(session_id))
         msg_cur = conn.execute(f"DELETE FROM messages WHERE session_id IN ({placeholders})", params)
         node_cur = conn.execute(f"DELETE FROM summary_nodes WHERE session_id IN ({placeholders})", params)
         conn.execute(

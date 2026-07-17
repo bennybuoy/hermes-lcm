@@ -25,6 +25,8 @@ from .db_bootstrap import (
     add_column_if_missing,
     configure_connection,
     materialize_node_provenance_no_commit,
+    remove_node_proofs_for_node_ids_no_commit,
+    remove_node_proofs_for_node_session_no_commit,
     refuse_schema_version_too_new,
     run_versioned_migrations,
 )
@@ -292,7 +294,9 @@ class SummaryDAG:
         if conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'"
         ).fetchone():
-            materialize_node_provenance_no_commit(conn, node.node_id)
+            materialize_node_provenance_no_commit(
+                conn, node.node_id, raise_on_failure=False
+            )
         return node.node_id
 
     def add_node(self, node: SummaryNode) -> int:
@@ -316,6 +320,7 @@ class SummaryDAG:
         if not node_id:
             return False
         with self._db_lock:
+            remove_node_proofs_for_node_ids_no_commit(self._conn, (int(node_id),))
             cur = self._conn.execute(
                 "DELETE FROM summary_nodes WHERE node_id = ?",
                 (int(node_id),),
@@ -330,6 +335,9 @@ class SummaryDAG:
         to retain only high-level summaries across sessions.
         """
         with self._db_lock:
+            remove_node_proofs_for_node_session_no_commit(
+                self._conn, session_id, below_depth=min_depth
+            )
             cur = self._conn.execute(
                 """DELETE FROM summary_nodes
                    WHERE session_id = ? AND depth < ?""",
@@ -342,6 +350,7 @@ class SummaryDAG:
     def delete_session_nodes(self, session_id: str) -> int:
         """Delete all nodes for a session. Returns count deleted."""
         with self._db_lock:
+            remove_node_proofs_for_node_session_no_commit(self._conn, session_id)
             cur = self._conn.execute(
                 "DELETE FROM summary_nodes WHERE session_id = ?",
                 (session_id,),
@@ -357,11 +366,18 @@ class SummaryDAG:
         the fresh session while preserving node IDs and node-to-node links.
         """
         with self._db_lock:
+            affected_roots = remove_node_proofs_for_node_session_no_commit(
+                self._conn, old_session_id
+            )
             cur = self._conn.execute(
                 "UPDATE summary_nodes SET session_id = ? WHERE session_id = ?",
                 (new_session_id, old_session_id),
             )
             moved = cur.rowcount
+            for root_node_id in affected_roots:
+                materialize_node_provenance_no_commit(
+                    self._conn, root_node_id, raise_on_failure=False
+                )
             self._conn.commit()
         return moved
 

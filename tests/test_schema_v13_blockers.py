@@ -1,4 +1,4 @@
-"""Schema-v13 exact-provenance, durable-receipt, and migration regressions."""
+"""Schema-v13/v14 exact-provenance, durable-receipt, and migration regressions."""
 
 from __future__ import annotations
 
@@ -32,6 +32,15 @@ V13_MIGRATION_PHASES = (
     "v13_after_triggers",
     "v13_after_migration_step",
     "v13_after_schema_version",
+)
+V14_MIGRATION_PHASES = (
+    "v14_after_dependency_tables",
+    "v14_after_legacy_proof_invalidation",
+    "v14_after_active_provenance_backfill",
+    "v14_after_provenance_backfill",
+    "v14_after_triggers",
+    "v14_after_migration_step",
+    "v14_after_schema_version",
 )
 
 
@@ -78,8 +87,14 @@ def _drop_v13_to_populated_v12(path: Path) -> dict[str, object]:
         "lcm_node_provenance_delete",
         "lcm_node_provenance_lineage_update",
         "lcm_node_provenance_session_update",
+        "lcm_node_dependency_update",
+        "lcm_node_dependency_delete",
+        "lcm_message_dependency_update",
+        "lcm_message_dependency_delete",
     ):
         conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+    conn.execute("DROP TABLE IF EXISTS lcm_node_provenance_message_dependencies")
+    conn.execute("DROP TABLE IF EXISTS lcm_node_provenance_node_dependencies")
     conn.execute("DROP TABLE lcm_node_provenance_sessions")
     conn.execute("DROP TABLE lcm_node_provenance")
     conn.execute("DROP INDEX IF EXISTS idx_lcm_session_end_receipts_session")
@@ -96,6 +111,10 @@ def _drop_v13_to_populated_v12(path: Path) -> dict[str, object]:
     conn.execute(
         """DELETE FROM lcm_migration_state
            WHERE step_name='v13_exact_node_provenance_and_durable_receipts'"""
+    )
+    conn.execute(
+        """DELETE FROM lcm_migration_state
+           WHERE step_name='v14_exact_provenance_dependencies'"""
     )
     conn.execute("DROP TRIGGER IF EXISTS lcm_schema_version_monotonic")
     conn.execute("UPDATE metadata SET value='12' WHERE key='schema_version'")
@@ -121,6 +140,16 @@ def _drop_v13_to_populated_v12(path: Path) -> dict[str, object]:
            AND (name LIKE 'lcm_protected_%' OR name LIKE 'lcm_v12_%')
            ORDER BY name"""
     ).fetchall()
+    snapshot["table_sql"] = conn.execute(
+        """SELECT name, sql FROM sqlite_master WHERE type='table'
+           AND name NOT LIKE 'sqlite_%' ORDER BY name"""
+    ).fetchall()
+    protected_item_sql = " ".join(
+        str(sql or "") for name, sql in snapshot["triggers"]
+        if str(name).startswith("lcm_protected_item_")
+    ).lower()
+    assert "with recursive closure" in protected_item_sql
+    assert "json_each" in protected_item_sql
     conn.close()
     return snapshot
 
@@ -395,17 +424,209 @@ def test_migration_backfill_of_deep_and_oversized_legacy_lineage_is_bounded_and_
     conn.commit()
     monkeypatch.setattr(db_bootstrap, "NODE_PROVENANCE_MIGRATION_ROOTS", 2)
     db_bootstrap.run_versioned_migrations(conn)
-    assert db_bootstrap.get_schema_version(conn) == 13
+    assert db_bootstrap.get_schema_version(conn) == db_bootstrap.SCHEMA_VERSION
     assert conn.execute(
-        "SELECT node_id FROM lcm_node_provenance WHERE node_id IN (?, ?)",
+        """SELECT node_id, proof_complete FROM lcm_node_provenance
+           WHERE node_id IN (?, ?) ORDER BY node_id""",
         (deep_root, oversized),
-    ).fetchall() == []
+    ).fetchall() == [(deep_root, 0), (oversized, 0)]
+    statuses = conn.execute(
+        """SELECT proof_status FROM lcm_node_provenance
+           WHERE node_id IN (?, ?) ORDER BY node_id""",
+        (deep_root, oversized),
+    ).fetchall()
+    assert all(status and status[0] != "complete" for status in statuses)
     assert conn.execute("PRAGMA quick_check").fetchone() == ("ok",)
     conn.close()
 
 
-@pytest.mark.parametrize("phase", V13_MIGRATION_PHASES)
-def test_v13_process_kill_restores_all_populated_v12_state_and_triggers(tmp_path, phase):
+def test_v14_backfill_prioritizes_all_active_roots_and_records_individual_failures(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "active-first-backfill.db"
+    _drop_v13_to_populated_v12(db_path)
+    conn = sqlite3.connect(db_path)
+    source_id = int(conn.execute(
+        """INSERT INTO messages(
+               session_id, source, conversation_id, role, content, timestamp
+           ) VALUES(?, 'test', ?, 'user', 'active source', 10)""",
+        (B, CONVERSATION),
+    ).lastrowid)
+    active_root = int(conn.execute(
+        """INSERT INTO summary_nodes(
+               session_id, depth, summary, source_ids, source_type, created_at
+           ) VALUES(?, 0, 'old active root', ?, 'messages', 10)""",
+        (B, f"[{source_id}]"),
+    ).lastrowid)
+    generation = int(conn.execute(
+        "SELECT MAX(generation) FROM lcm_active_frontiers WHERE conversation_id=?",
+        (CONVERSATION,),
+    ).fetchone()[0]) + 1
+    conn.execute(
+        "INSERT INTO lcm_active_frontiers VALUES(?, ?, ?, ?, '', '', 10, 10)",
+        (CONVERSATION, generation, B, source_id),
+    )
+    conn.execute(
+        "INSERT INTO lcm_frontier_items VALUES(?, ?, 0, 'node', ?, ?, ?)",
+        (CONVERSATION, generation, active_root, source_id, source_id),
+    )
+    conn.executemany(
+        """INSERT INTO summary_nodes(
+               session_id, depth, summary, source_ids, source_type, created_at
+           ) VALUES(?, 0, ?, ?, 'messages', 20)""",
+        [(B, f"newer optional node {index}", f"[{source_id}]") for index in range(300)],
+    )
+    oversized = int(conn.execute(
+        """INSERT INTO summary_nodes(
+               session_id, depth, summary, source_ids, source_type, created_at
+           ) VALUES(?, 0, 'oversized active root', ?, 'messages', 30)""",
+        (B, "[" + (" " * 130_000) + str(source_id) + "]"),
+    ).lastrowid)
+    bad_conversation = "malformed-active-conversation"
+    conn.execute(
+        "INSERT INTO lcm_active_frontiers VALUES(?, 1, ?, ?, '', '', 30, 30)",
+        (bad_conversation, B, source_id),
+    )
+    conn.execute(
+        "INSERT INTO lcm_frontier_items VALUES(?, 1, 0, 'node', ?, ?, ?)",
+        (bad_conversation, oversized, source_id, source_id),
+    )
+    conn.commit()
+
+    monkeypatch.setattr(db_bootstrap, "NODE_PROVENANCE_MIGRATION_ROOTS", 2)
+    db_bootstrap.run_versioned_migrations(conn)
+    assert conn.execute(
+        """SELECT proof_complete, proof_status FROM lcm_node_provenance
+           WHERE node_id=?""",
+        (active_root,),
+    ).fetchone() == (1, "complete")
+    bad_status = conn.execute(
+        """SELECT proof_complete, proof_status FROM lcm_node_provenance
+           WHERE node_id=?""",
+        (oversized,),
+    ).fetchone()
+    assert bad_status[0] == 0
+    assert "bound" in bad_status[1]
+
+    conn.execute(
+        "INSERT INTO lcm_active_frontiers VALUES(?, ?, ?, ?, '', '', 40, 40)",
+        (CONVERSATION, generation + 1, B, source_id),
+    )
+    conn.execute(
+        "INSERT INTO lcm_frontier_items VALUES(?, ?, 0, 'node', ?, ?, ?)",
+        (CONVERSATION, generation + 1, active_root, source_id, source_id),
+    )
+    conn.execute(
+        "INSERT INTO lcm_active_frontiers VALUES(?, 2, ?, ?, '', '', 40, 40)",
+        (bad_conversation, B, source_id),
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="proof"):
+        conn.execute(
+            "INSERT INTO lcm_frontier_items VALUES(?, 2, 0, 'node', ?, ?, ?)",
+            (bad_conversation, oversized, source_id, source_id),
+        )
+    conn.rollback()
+    conn.close()
+
+
+def test_v14_dependency_guards_keep_ancestor_proof_exact_across_restart_and_interleaving(
+    tmp_path
+):
+    db_path = tmp_path / "dependency-guards.db"
+    engine = LCMEngine(config=_config(db_path))
+    engine.on_session_start(B, conversation_id=CONVERSATION, platform="test")
+    first = engine._store.append(B, {"role": "user", "content": "first"})
+    interleaved = engine._store.append(A, {"role": "user", "content": "other"})
+    last = engine._store.append(B, {"role": "assistant", "content": "last"})
+    assert [first, interleaved, last] == [1, 2, 3]
+    child = engine._dag.add_node(SummaryNode(
+        session_id=B, summary="child", source_ids=[first, last],
+        source_type="messages", created_at=1,
+    ))
+    ancestor = engine._dag.add_node(SummaryNode(
+        session_id=B, depth=1, summary="ancestor", source_ids=[child],
+        source_type="nodes", created_at=2,
+    ))
+    conn = engine._store._conn
+    assert conn.execute(
+        """SELECT dependency_node_id FROM lcm_node_provenance_node_dependencies
+           WHERE root_node_id=? ORDER BY dependency_node_id""",
+        (ancestor,),
+    ).fetchall() == [(child,), (ancestor,)]
+    assert conn.execute(
+        """SELECT dependency_store_id FROM lcm_node_provenance_message_dependencies
+           WHERE root_node_id=? ORDER BY dependency_store_id""",
+        (ancestor,),
+    ).fetchall() == [(first,), (last,)]
+
+    for statement, params in (
+        ("UPDATE messages SET session_id=? WHERE store_id=?", (A, first)),
+        ("UPDATE summary_nodes SET source_ids=? WHERE node_id=?", (f"[{interleaved}]", child)),
+        ("DELETE FROM summary_nodes WHERE node_id=?", (child,)),
+    ):
+        with pytest.raises(sqlite3.IntegrityError, match="provenance dependency"):
+            conn.execute(statement, params)
+        conn.rollback()
+    engine.shutdown()
+
+    restarted = LCMEngine(config=_config(db_path))
+    proof = restarted._store._conn.execute(
+        "SELECT proof_complete, proof_status FROM lcm_node_provenance WHERE node_id=?",
+        (ancestor,),
+    ).fetchone()
+    assert proof == (1, "complete")
+    restarted._frontier.ensure_frontier(
+        CONVERSATION, B, source_end_store_id=0
+    )
+    active = restarted._frontier.get_active_frontier(CONVERSATION)
+    generation = restarted._frontier.advance_frontier_generation_with_items(
+        CONVERSATION,
+        B,
+        last,
+        "",
+        "",
+        int(active["generation"]),
+        [{
+            "kind": "node",
+            "ref_id": ancestor,
+            "source_start": first,
+            "source_end": last,
+        }],
+    )
+    assert generation == int(active["generation"]) + 1
+    restarted.shutdown()
+
+
+def test_authorized_message_reassignment_and_node_deletion_invalidate_ancestor_proofs(
+    tmp_path
+):
+    db_path = tmp_path / "authorized-proof-removal.db"
+    engine = LCMEngine(config=_config(db_path))
+    engine.on_session_start(B, conversation_id=CONVERSATION, platform="test")
+    source = engine._store.append(B, {"role": "user", "content": "source"})
+    child = engine._dag.add_node(SummaryNode(
+        session_id=B, summary="child", source_ids=[source],
+        source_type="messages", created_at=1,
+    ))
+    ancestor = engine._dag.add_node(SummaryNode(
+        session_id=B, depth=1, summary="ancestor", source_ids=[child],
+        source_type="nodes", created_at=2,
+    ))
+    assert engine._store.reassign_session_messages(B, C) == 1
+    assert engine._store._conn.execute(
+        "SELECT 1 FROM lcm_node_provenance WHERE node_id=?", (ancestor,)
+    ).fetchone() is None
+    db_bootstrap.materialize_node_provenance_no_commit(engine._store._conn, ancestor)
+    engine._store._conn.commit()
+    assert engine._dag.delete_node(child) is True
+    assert engine._store._conn.execute(
+        "SELECT 1 FROM lcm_node_provenance WHERE node_id=?", (ancestor,)
+    ).fetchone() is None
+    engine.shutdown()
+
+
+@pytest.mark.parametrize("phase", V13_MIGRATION_PHASES + V14_MIGRATION_PHASES)
+def test_v13_v14_process_kill_restores_all_populated_v12_state_and_triggers(tmp_path, phase):
     db_path = tmp_path / f"kill-{phase}.db"
     snapshot = _drop_v13_to_populated_v12(db_path)
     script = """
@@ -435,9 +656,13 @@ db_bootstrap.run_versioned_migrations(conn)
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_node_provenance'"
     ).fetchone() is None
     for table, expected in snapshot.items():
-        if table == "triggers":
+        if table in {"triggers", "table_sql"}:
             continue
         assert conn.execute(f'SELECT * FROM "{table}"').fetchall() == expected
+    assert conn.execute(
+        """SELECT name, sql FROM sqlite_master WHERE type='table'
+           AND name NOT LIKE 'sqlite_%' ORDER BY name"""
+    ).fetchall() == snapshot["table_sql"]
     assert conn.execute(
         """SELECT name, sql FROM sqlite_master WHERE type='trigger'
            AND (name LIKE 'lcm_protected_%' OR name LIKE 'lcm_v12_%')
@@ -445,7 +670,7 @@ db_bootstrap.run_versioned_migrations(conn)
     ).fetchall() == snapshot["triggers"]
     assert conn.execute("PRAGMA quick_check").fetchone() == ("ok",)
     db_bootstrap.run_versioned_migrations(conn)
-    assert db_bootstrap.get_schema_version(conn) == 13
+    assert db_bootstrap.get_schema_version(conn) == db_bootstrap.SCHEMA_VERSION
     assert conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_node_provenance'"
     ).fetchone() == (1,)

@@ -52,7 +52,9 @@ def _drop_v12(conn: sqlite3.Connection, *, version: int) -> None:
         for row in conn.execute(
             """SELECT name FROM sqlite_master WHERE type='trigger'
                AND (name LIKE 'lcm_protected_%' OR name LIKE 'lcm_v12_%'
-                    OR name LIKE 'lcm_node_provenance%')"""
+                    OR name LIKE 'lcm_node_provenance%'
+                    OR name LIKE 'lcm_node_dependency_%'
+                    OR name LIKE 'lcm_message_dependency_%')"""
         )
     ]
     for name in trigger_names:
@@ -61,6 +63,8 @@ def _drop_v12(conn: sqlite3.Connection, *, version: int) -> None:
         "lcm_session_end_receipts",
         "lcm_rollover_heads",
         "lcm_protected_sessions",
+        "lcm_node_provenance_message_dependencies",
+        "lcm_node_provenance_node_dependencies",
         "lcm_node_provenance_sessions",
         "lcm_node_provenance",
     ):
@@ -72,6 +76,10 @@ def _drop_v12(conn: sqlite3.Connection, *, version: int) -> None:
     conn.execute(
         """DELETE FROM lcm_migration_state
            WHERE step_name='v13_exact_node_provenance_and_durable_receipts'"""
+    )
+    conn.execute(
+        """DELETE FROM lcm_migration_state
+           WHERE step_name='v14_exact_provenance_dependencies'"""
     )
     if version == 10:
         conn.execute("DROP TABLE IF EXISTS lcm_rollover_policies")
@@ -280,7 +288,7 @@ def test_v10_lifecycle_and_v11_policy_backfill_atomically(tmp_path, source_versi
         conn.execute("DROP TABLE lcm_rollover_policies")
     _drop_v12(conn, version=source_version)
     db_bootstrap.run_versioned_migrations(conn)
-    assert db_bootstrap.get_schema_version(conn) == 13
+    assert db_bootstrap.get_schema_version(conn) == 14
     assert conn.execute(
         """SELECT finalized_session_id FROM lcm_protected_sessions
            WHERE conversation_id=?""", (CONVERSATION,),
@@ -339,7 +347,7 @@ db_bootstrap.run_versioned_migrations(conn)
         assert snapshot["triggers"] == []
     db_bootstrap._MIGRATION_CRASH_PHASE = None
     db_bootstrap.run_versioned_migrations(conn)
-    assert db_bootstrap.get_schema_version(conn) == 13
+    assert db_bootstrap.get_schema_version(conn) == 14
     assert conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_rollover_heads'"
     ).fetchone() == (1,)
