@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -138,6 +139,198 @@ def test_externalized_marker_scan_fails_closed_when_private_root_is_unusable(
         engine.shutdown()
 
 
+def test_no_ref_search_fails_closed_before_listing_for_nine_alternating_shapes(
+    tmp_path, monkeypatch
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    payload = payload_dir / "explicit-still-works.json"
+    payload.write_text(
+        json.dumps({
+            "session_id": "current",
+            "content": "EXPLICIT-WORKS " + " ".join(
+                f"NO-REF-SHAPE-{index}" for index in range(9)
+            ),
+        }),
+        encoding="utf-8",
+    )
+    unusable = tmp_path / "state-root-is-a-file"
+    unusable.write_text("blocked", encoding="utf-8")
+    monkeypatch.setattr(tools_module, "_EXTERNALIZED_MARKER_STATE_ROOT", unusable)
+    real_scandir = tools_module.os.scandir
+    payload_listings = 0
+
+    def counted_scandir(path):
+        nonlocal payload_listings
+        if Path(path) == payload_dir:
+            payload_listings += 1
+        return real_scandir(path)
+
+    monkeypatch.setattr(tools_module.os, "scandir", counted_scandir)
+    engine = _engine(tmp_path)
+    try:
+        for round_index in range(2):
+            for shape_index in range(9):
+                result = json.loads(tools_module.lcm_grep(
+                    {
+                        "query": f"NO-REF-SHAPE-{shape_index}",
+                        "content_scope": "externalized",
+                        "max_files": 1 + ((shape_index + round_index) % 2),
+                        "limit": 1,
+                    },
+                    engine=engine,
+                ))
+                assert result["results"] == []
+                assert result["diagnostics"] == [
+                    {"ref": "", "error": "private_state_unavailable"}
+                ]
+                assert result["scan"]["files_scanned"] == 0
+        assert payload_listings == 0
+
+        explicit = json.loads(tools_module.lcm_grep(
+            {
+                "query": "EXPLICIT-WORKS",
+                "content_scope": "externalized",
+                "ref": payload.name,
+            },
+            engine=engine,
+        ))
+        assert explicit["total_results"] == 1
+        assert explicit["results"][0]["ref"] == payload.name
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="requires proc owner identity")
+@pytest.mark.parametrize(
+    "crash_phase",
+    ["before_mkdir", "after_mkdir", "before_lease", "after_lease"],
+)
+def test_registered_owner_intent_recovers_crash_at_every_creation_phase(
+    tmp_path, monkeypatch, crash_phase
+):
+    state_root = tmp_path / f"crash-{crash_phase}"
+    script = r'''
+import os
+from pathlib import Path
+import sys
+import hermes_lcm.tools as tools
+
+root = Path(sys.argv[1])
+phase = sys.argv[2]
+tools._EXTERNALIZED_MARKER_STATE_ROOT = root
+original_mkdir = Path.mkdir
+original_lease = tools._externalized_lock_new_lease
+
+def crash_mkdir(path, *args, **kwargs):
+    if path.name.startswith("owner-") and phase == "before_mkdir":
+        os._exit(81)
+    result = original_mkdir(path, *args, **kwargs)
+    if path.name.startswith("owner-") and phase == "after_mkdir":
+        os._exit(82)
+    return result
+
+def crash_lease(path):
+    if phase == "before_lease":
+        os._exit(83)
+    descriptor = original_lease(path)
+    if phase == "after_lease":
+        os._exit(84)
+    return descriptor
+
+Path.mkdir = crash_mkdir
+tools._externalized_lock_new_lease = crash_lease
+tools._ExternalizedPrivateRuntimeState().ensure_owner_dir()
+raise AssertionError("crash hook did not fire")
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(state_root), crash_phase],
+        env=_subprocess_package_env(tmp_path),
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == {
+        "before_mkdir": 81,
+        "after_mkdir": 82,
+        "before_lease": 83,
+        "after_lease": 84,
+    }[crash_phase], (completed.stdout, completed.stderr)
+
+    registry_path = state_root / ".owner-registry.db"
+    assert registry_path.is_file(), "intent must be durable before owner mkdir"
+    with sqlite3.connect(registry_path) as connection:
+        registered = connection.execute(
+            "SELECT owner_name, pid, process_start, nonce FROM owner_registry"
+        ).fetchall()
+    assert len(registered) == 1
+    owner_name, pid, process_start, nonce = registered[0]
+    assert owner_name == f"owner-{pid}-{process_start}-{nonce}"
+
+    monkeypatch.setattr(tools_module, "_EXTERNALIZED_MARKER_STATE_ROOT", state_root)
+    local = tools_module._ExternalizedPrivateRuntimeState()
+    local.ensure_owner_dir()
+    local.close_for_shutdown()
+    assert not (state_root / owner_name).exists()
+    with sqlite3.connect(registry_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM owner_registry").fetchone()[0] == 0
+
+
+def test_owner_registry_supports_concurrent_process_start_and_shutdown(tmp_path):
+    state_root = tmp_path / "concurrent-owner-registry"
+    script = r'''
+from pathlib import Path
+import sys
+import hermes_lcm.tools as tools
+tools._EXTERNALIZED_MARKER_STATE_ROOT = Path(sys.argv[1])
+runtime = tools._ExternalizedPrivateRuntimeState()
+owner_dir = runtime.ensure_owner_dir()
+print(owner_dir.name, flush=True)
+sys.stdin.read(1)
+runtime.close_for_shutdown()
+'''
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(state_root)],
+            env=_subprocess_package_env(tmp_path),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(12)
+    ]
+    owner_names = []
+    try:
+        for process in processes:
+            assert process.stdout is not None
+            owner_name = process.stdout.readline().strip()
+            assert owner_name, (
+                process.stderr.read() if process.stderr is not None else ""
+            )
+            owner_names.append(owner_name)
+        assert len(set(owner_names)) == len(processes)
+        with sqlite3.connect(state_root / ".owner-registry.db") as registry:
+            assert registry.execute(
+                "SELECT COUNT(*) FROM owner_registry"
+            ).fetchone()[0] == len(processes)
+        assert all((state_root / name / "owner.lease").is_file() for name in owner_names)
+    finally:
+        for process in processes:
+            if process.stdin is not None:
+                process.stdin.write("x")
+                process.stdin.flush()
+        for process in processes:
+            process.wait(timeout=20)
+            assert process.returncode == 0, (
+                process.stderr.read() if process.stderr is not None else ""
+            )
+    with sqlite3.connect(state_root / ".owner-registry.db") as registry:
+        assert registry.execute("SELECT COUNT(*) FROM owner_registry").fetchone()[0] == 0
+    assert list(state_root.glob("owner-*")) == []
+
+
 def _start_marker_owner(
     tmp_path: Path,
     state_root: Path,
@@ -201,6 +394,115 @@ def test_reaper_preserves_two_live_subprocess_owners_and_reaps_real_crash(
                 process.stdin.write("x")
                 process.stdin.flush()
             process.wait(timeout=10)
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="requires proc owner identity")
+def test_indexed_registry_reaping_is_capped_and_progresses_with_100k_rows(
+    tmp_path, monkeypatch
+):
+    state_root = tmp_path / "large-owner-registry"
+    state_root.mkdir(mode=0o700)
+    connection = tools_module._externalized_open_owner_registry(state_root)
+    current_pid = os.getpid()
+    current_start = tools_module._externalized_process_start_identity(current_pid)
+    assert current_start is not None
+    initial_dead: set[str] = set()
+    live_names: set[str] = set()
+    rows = []
+    now = time.time()
+    for index in range(100_000):
+        if index < 96 and index % 3 == 0:
+            nonce = f"{index:032x}"
+            name = f"owner-99999999-1-{nonce}"
+            initial_dead.add(name)
+            owner_dir = state_root / name
+            owner_dir.mkdir()
+            (owner_dir / "owner.lease").write_text("", encoding="ascii")
+            rows.append((name, 99999999, "1", nonce, "leased", now))
+        elif index < 96 and index % 3 == 1:
+            nonce = f"{index:032x}"
+            name = f"owner-{current_pid}-{current_start}-{nonce}"
+            live_names.add(name)
+            owner_dir = state_root / name
+            owner_dir.mkdir()
+            (owner_dir / "owner.lease").write_text("", encoding="ascii")
+            rows.append((name, current_pid, current_start, nonce, "leased", now))
+        else:
+            rows.append((
+                f"malformed-registry-row-{index}",
+                -1,
+                "bad",
+                "bad",
+                "malformed",
+                now,
+            ))
+    connection.executemany(
+        "INSERT INTO owner_registry("
+        "owner_name, pid, process_start, nonce, phase, created_wall"
+        ") VALUES (?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    connection.commit()
+    connection.close()
+
+    real_scandir = tools_module._EXTERNALIZED_PRIVATE_STATE_SCANDIR
+    root_scans = 0
+
+    def reject_root_scan(path):
+        nonlocal root_scans
+        if Path(path) == state_root:
+            root_scans += 1
+            raise AssertionError("shared root must never be scanned")
+        return real_scandir(path)
+
+    monkeypatch.setattr(
+        tools_module, "_EXTERNALIZED_PRIVATE_STATE_SCANDIR", reject_root_scan
+    )
+    remaining_counts = []
+    for _ in range(12):
+        stats = tools_module._externalized_reap_dead_owners(state_root)
+        assert stats["rows_visited"] <= tools_module._EXTERNALIZED_OWNER_REAP_MAX_ROWS
+        assert stats["entries_visited"] <= tools_module._EXTERNALIZED_OWNER_REAP_MAX_ENTRIES
+        assert stats["elapsed"] <= tools_module._EXTERNALIZED_OWNER_REAP_DEADLINE_SECONDS + 0.5
+        remaining_counts.append(sum(
+            (state_root / owner_name).exists() for owner_name in initial_dead
+        ))
+    assert root_scans == 0
+    assert remaining_counts == sorted(remaining_counts, reverse=True)
+    assert remaining_counts[-1] == 0
+    assert any(
+        later < earlier
+        for earlier, later in zip(remaining_counts, remaining_counts[1:])
+    )
+    assert all((state_root / owner_name).is_dir() for owner_name in live_names)
+
+    with sqlite3.connect(state_root / ".owner-registry.db") as registry:
+        registered_names = {
+            row[0] for row in registry.execute(
+                "SELECT owner_name FROM owner_registry WHERE owner_name IN ("
+                + ",".join("?" for _ in live_names)
+                + ")",
+                tuple(live_names),
+            )
+        }
+        assert registered_names == live_names
+        cursor = registry.execute(
+            "SELECT reap_cursor FROM registry_state WHERE singleton = 1"
+        ).fetchone()[0]
+        assert cursor > 0
+    registry = tools_module._externalized_open_owner_registry(state_root)
+    try:
+        assert registry.execute("PRAGMA temp_store").fetchone()[0] == 1
+        assert registry.execute("PRAGMA mmap_size").fetchone()[0] == 0
+        cache_pages = registry.execute("PRAGMA cache_size").fetchone()[0]
+        assert -64 <= cache_pages < 0
+    finally:
+        registry.close()
+
+    with sqlite3.connect(tmp_path / "private-state.db") as production_db:
+        assert production_db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'owner_registry'"
+        ).fetchone() is None
 
 
 def test_shutdown_fences_checked_out_marker_continuation(tmp_path, monkeypatch):

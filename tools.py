@@ -826,6 +826,11 @@ _EXTERNALIZED_MARKER_STATE_BATCH_BYTES = 32 * 1024
 _EXTERNALIZED_MARKER_STATE_CACHE_BYTES = 64 * 1024
 _EXTERNALIZED_MARKER_STATE_GUARD = threading.Lock()
 _EXTERNALIZED_PRIVATE_STATE_SCANDIR = os.scandir
+_EXTERNALIZED_OWNER_REGISTRY_NAME = ".owner-registry.db"
+_EXTERNALIZED_OWNER_REGISTRY_CACHE_BYTES = 64 * 1024
+_EXTERNALIZED_OWNER_REAP_MAX_ROWS = 32
+_EXTERNALIZED_OWNER_REAP_MAX_ENTRIES = 64
+_EXTERNALIZED_OWNER_REAP_DEADLINE_SECONDS = 0.050
 
 
 class _ExternalizedStateUnavailable(OSError):
@@ -935,36 +940,255 @@ def _externalized_state_root_candidates() -> tuple[Path, ...]:
     return tuple(unique)
 
 
-def _externalized_reap_dead_owners(root: Path) -> None:
-    """Delete only owners proven dead *and* proven to have released the lease."""
+def _externalized_open_owner_registry_unlocked(root: Path) -> sqlite3.Connection:
+    """Open the private, bounded-cache registry; never the production LCM DB."""
+    path = root / _EXTERNALIZED_OWNER_REGISTRY_NAME
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
     try:
-        entries = _EXTERNALIZED_PRIVATE_STATE_SCANDIR(root)
-    except OSError:
-        return
-    with entries:
-        for entry in entries:
-            if not entry.is_dir(follow_symlinks=False):
-                continue
-            if not _externalized_owner_provably_dead(entry.name):
-                # TTL and global-count pressure are intentionally irrelevant
-                # to a live or unprovable foreign owner.
-                continue
-            owner_dir = root / entry.name
-            lease_descriptor = _externalized_try_lock_lease(
-                owner_dir / "owner.lease"
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError("unsafe private-state owner registry")
+        getuid = getattr(os, "getuid", None)
+        if callable(getuid) and opened.st_uid != getuid():
+            raise PermissionError("private-state registry owner mismatch")
+        os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+
+    connection = sqlite3.connect(
+        str(path),
+        timeout=5.0,
+        check_same_thread=False,
+        cached_statements=8,
+    )
+    try:
+        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute("PRAGMA temp_store=FILE")
+        connection.execute("PRAGMA mmap_size=0")
+        connection.execute("PRAGMA cache_spill=OFF")
+        connection.execute(
+            f"PRAGMA cache_size=-{_EXTERNALIZED_OWNER_REGISTRY_CACHE_BYTES // 1024}"
+        )
+        existing_tables = {
+            str(row[0]) for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('owner_registry', 'registry_state')"
             )
-            if lease_descriptor is None:
+        }
+        if existing_tables != {"owner_registry", "registry_state"}:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS owner_registry ("
+                "owner_id INTEGER PRIMARY KEY, owner_name TEXT NOT NULL UNIQUE, "
+                "pid INTEGER NOT NULL, process_start TEXT NOT NULL, "
+                "nonce TEXT NOT NULL, phase TEXT NOT NULL, "
+                "created_wall REAL NOT NULL)"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS registry_state ("
+                "singleton INTEGER PRIMARY KEY CHECK(singleton = 1), "
+                "reap_cursor INTEGER NOT NULL)"
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO registry_state(singleton, reap_cursor) "
+                "VALUES (1, 0)"
+            )
+            connection.commit()
+        else:
+            connection.execute("PRAGMA synchronous=FULL")
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+def _externalized_open_owner_registry(root: Path) -> sqlite3.Connection:
+    """Serialize first-open/schema negotiation across concurrent processes."""
+    lock_path = root / f"{_EXTERNALIZED_OWNER_REGISTRY_NAME}.lock"
+    lock_flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        lock_flags |= os.O_NOFOLLOW
+    lock_descriptor = os.open(lock_path, lock_flags, 0o600)
+    try:
+        lock_stat = os.fstat(lock_descriptor)
+        if not stat.S_ISREG(lock_stat.st_mode):
+            raise OSError("unsafe private-state registry lock")
+        getuid = getattr(os, "getuid", None)
+        if callable(getuid) and lock_stat.st_uid != getuid():
+            raise PermissionError("private-state registry lock owner mismatch")
+        os.fchmod(lock_descriptor, 0o600)
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - owner leases also unavailable
+            return _externalized_open_owner_registry_unlocked(root)
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        try:
+            return _externalized_open_owner_registry_unlocked(root)
+        finally:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(lock_descriptor)
+
+
+def _externalized_bounded_remove_private_tree(
+    path: Path,
+    *,
+    budget: dict[str, int],
+    deadline: float,
+) -> bool:
+    """Make a capped, unsorted cleanup pass over one registered owner tree."""
+    if time.monotonic() >= deadline:
+        return False
+    try:
+        path_stat = path.lstat()
+    except FileNotFoundError:
+        return True
+    if not stat.S_ISDIR(path_stat.st_mode) or path.is_symlink():
+        return False
+    try:
+        with _EXTERNALIZED_PRIVATE_STATE_SCANDIR(path) as entries:
+            iterator = iter(entries)
+            while budget["entries"] < _EXTERNALIZED_OWNER_REAP_MAX_ENTRIES:
+                if time.monotonic() >= deadline:
+                    return False
+                try:
+                    entry = next(iterator)
+                except StopIteration:
+                    break
+                budget["entries"] += 1
+                child = path / entry.name
+                if entry.is_dir(follow_symlinks=False):
+                    if not _externalized_bounded_remove_private_tree(
+                        child, budget=budget, deadline=deadline
+                    ):
+                        return False
+                else:
+                    child.unlink(missing_ok=True)
+            else:
+                return False
+        path.rmdir()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+def _externalized_reap_dead_owners(root: Path) -> dict[str, Any]:
+    """Visit an indexed, persistent-cursor slice of registered owners only."""
+    connection = _externalized_open_owner_registry(root)
+    started = time.monotonic()
+    deadline = started + _EXTERNALIZED_OWNER_REAP_DEADLINE_SECONDS
+    stats: dict[str, Any] = {
+        "rows_visited": 0,
+        "entries_visited": 0,
+        "elapsed": 0.0,
+    }
+    connection.execute(
+        f"PRAGMA busy_timeout={int(_EXTERNALIZED_OWNER_REAP_DEADLINE_SECONDS * 1000)}"
+    )
+    budget = {"entries": 0}
+    try:
+        cursor_row = connection.execute(
+            "SELECT reap_cursor FROM registry_state WHERE singleton = 1"
+        ).fetchone()
+        cursor = int(cursor_row[0]) if cursor_row is not None else 0
+        rows = connection.execute(
+            "SELECT owner_id, owner_name FROM owner_registry "
+            "WHERE owner_id > ? ORDER BY owner_id LIMIT ?",
+            (cursor, _EXTERNALIZED_OWNER_REAP_MAX_ROWS),
+        ).fetchall()
+        if not rows:
+            if cursor:
+                try:
+                    remaining_ms = max(
+                        1, int((deadline - time.monotonic()) * 1000)
+                    )
+                    if time.monotonic() >= deadline:
+                        return stats
+                    connection.execute(f"PRAGMA busy_timeout={remaining_ms}")
+                    connection.execute(
+                        "UPDATE registry_state SET reap_cursor = 0 "
+                        "WHERE singleton = 1"
+                    )
+                    connection.commit()
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower():
+                        raise
+                    connection.rollback()
+            return stats
+
+        completed_cursor = cursor
+        delete_ids: list[int] = []
+        for raw_owner_id, raw_owner_name in rows:
+            if time.monotonic() >= deadline:
+                break
+            owner_id = int(raw_owner_id)
+            owner_name = str(raw_owner_name)
+            stats["rows_visited"] += 1
+            identity = _externalized_owner_identity(owner_name)
+            if identity is None:
+                # App-created owners always have a valid registered identity.
+                # Unknown legacy/malformed root entries are isolated: the
+                # shared root is never scanned to discover or adopt them.
+                delete_ids.append(owner_id)
+                completed_cursor = owner_id
                 continue
+            if not _externalized_owner_provably_dead(owner_name):
+                completed_cursor = owner_id
+                continue
+
+            owner_dir = root / owner_name
+            lease_path = owner_dir / "owner.lease"
+            lease_descriptor = None
+            if lease_path.exists():
+                lease_descriptor = _externalized_try_lock_lease(lease_path)
+                if lease_descriptor is None:
+                    completed_cursor = owner_id
+                    continue
             try:
-                _externalized_remove_private_tree(owner_dir)
-            except OSError:
-                logger.debug(
-                    "LCM could not reap dead private-state owner %s",
-                    owner_dir,
-                    exc_info=True,
+                removed = _externalized_bounded_remove_private_tree(
+                    owner_dir, budget=budget, deadline=deadline
                 )
             finally:
-                os.close(lease_descriptor)
+                if lease_descriptor is not None:
+                    os.close(lease_descriptor)
+            if not removed:
+                # Keep the cursor immediately before this row so a large dead
+                # owner is drained over repeated bounded initialization passes.
+                break
+            delete_ids.append(owner_id)
+            completed_cursor = owner_id
+
+        if time.monotonic() >= deadline:
+            return stats
+        remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+        connection.execute(f"PRAGMA busy_timeout={remaining_ms}")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if delete_ids:
+                connection.executemany(
+                    "DELETE FROM owner_registry WHERE owner_id = ?",
+                    ((owner_id,) for owner_id in delete_ids),
+                )
+            connection.execute(
+                "UPDATE registry_state SET reap_cursor = ? WHERE singleton = 1",
+                (completed_cursor,),
+            )
+            connection.commit()
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
+            connection.rollback()
+    finally:
+        stats["entries_visited"] = budget["entries"]
+        stats["elapsed"] = time.monotonic() - started
+        connection.close()
+    return stats
 
 
 def _externalized_remove_private_tree(path: Path) -> None:
@@ -995,7 +1219,7 @@ def _prepare_externalized_marker_state_root() -> Path:
                 root.chmod(0o700)
                 _externalized_reap_dead_owners(root)
                 return root
-            except (OSError, RuntimeError) as exc:
+            except (OSError, RuntimeError, sqlite3.Error) as exc:
                 last_error = exc
         raise _ExternalizedStateUnavailable(
             "no writable private temp/cache state root"
@@ -1007,7 +1231,7 @@ class _ExternalizedPrivateRuntimeState:
 
     __slots__ = (
         "lock", "closed", "generation", "active_checkouts", "owner_dir",
-        "lease_descriptor", "scheduler_connection",
+        "owner_name", "lease_descriptor", "scheduler_connection",
     )
 
     def __init__(self):
@@ -1018,6 +1242,7 @@ class _ExternalizedPrivateRuntimeState:
             int, tuple["_ExternalizedPayloadContinuation", int]
         ] = {}
         self.owner_dir: Path | None = None
+        self.owner_name: str | None = None
         self.lease_descriptor: int | None = None
         self.scheduler_connection: sqlite3.Connection | None = None
 
@@ -1032,21 +1257,60 @@ class _ExternalizedPrivateRuntimeState:
             # the random 128-bit nonce plus held lease and conservatively reap
             # only after the PID itself is certainly absent.
             start = _externalized_process_start_identity(os.getpid()) or "0"
-            owner_dir = root / (
-                f"owner-{os.getpid()}-{start}-{secrets.token_hex(16)}"
-            )
-            owner_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
+            nonce = secrets.token_hex(16)
+            owner_name = f"owner-{os.getpid()}-{start}-{nonce}"
+            owner_dir = root / owner_name
+            registry = _externalized_open_owner_registry(root)
+            registered = False
+            lease_descriptor: int | None = None
             try:
+                registry.execute(
+                    "INSERT INTO owner_registry("
+                    "owner_name, pid, process_start, nonce, phase, created_wall"
+                    ") VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        owner_name,
+                        os.getpid(),
+                        start,
+                        nonce,
+                        "intended",
+                        time.time(),
+                    ),
+                )
+                registry.commit()
+                registered = True
+                owner_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
                 lease_descriptor = _externalized_lock_new_lease(
                     owner_dir / "owner.lease"
                 )
             except BaseException:
+                removed = False
                 try:
                     _externalized_remove_private_tree(owner_dir)
+                    removed = True
+                except FileNotFoundError:
+                    removed = True
                 except OSError:
-                    pass
+                    removed = False
+                if registered and removed:
+                    try:
+                        registry.execute(
+                            "DELETE FROM owner_registry WHERE owner_name = ?",
+                            (owner_name,),
+                        )
+                        registry.commit()
+                    except sqlite3.Error:
+                        pass
+                if lease_descriptor is not None:
+                    try:
+                        os.close(lease_descriptor)
+                    except OSError:
+                        pass
                 raise
+            finally:
+                registry.close()
             self.owner_dir = owner_dir
+            self.owner_name = owner_name
             self.lease_descriptor = lease_descriptor
             return owner_dir
 
@@ -1107,12 +1371,18 @@ class _ExternalizedPrivateRuntimeState:
     def _close_owner(self) -> None:
         with self.lock:
             owner_dir = self.owner_dir
+            owner_name = self.owner_name
             lease_descriptor = self.lease_descriptor
             self.owner_dir = None
+            self.owner_name = None
             self.lease_descriptor = None
+        removed = owner_dir is None
         if owner_dir is not None:
             try:
                 _externalized_remove_private_tree(owner_dir)
+                removed = True
+            except FileNotFoundError:
+                removed = True
             except OSError:
                 logger.debug(
                     "LCM could not remove private-state owner %s",
@@ -1124,6 +1394,23 @@ class _ExternalizedPrivateRuntimeState:
                 os.close(lease_descriptor)
             except OSError:
                 pass
+        if removed and owner_dir is not None and owner_name is not None:
+            try:
+                registry = _externalized_open_owner_registry(owner_dir.parent)
+                try:
+                    registry.execute(
+                        "DELETE FROM owner_registry WHERE owner_name = ?",
+                        (owner_name,),
+                    )
+                    registry.commit()
+                finally:
+                    registry.close()
+            except (OSError, sqlite3.Error):
+                logger.debug(
+                    "LCM could not unregister private-state owner %s",
+                    owner_name,
+                    exc_info=True,
+                )
 
 
 def _externalized_runtime_state(engine: "LCMEngine") -> _ExternalizedPrivateRuntimeState:
@@ -2362,7 +2649,7 @@ def _externalized_scheduler_listing_identity(refs: tuple[str, ...]) -> str:
 def _externalized_scheduler_connection(
     runtime: _ExternalizedPrivateRuntimeState,
 ) -> sqlite3.Connection | None:
-    """Open the disposable scheduler DB, degrading to memory when unavailable."""
+    """Open the disposable scheduler DB; callers decide whether to fail closed."""
     with runtime.lock:
         if runtime.closed:
             return None
@@ -2409,6 +2696,50 @@ def _externalized_scheduler_connection(
         return connection
 
 
+def _externalized_scheduler_reserve_locked(
+    runtime: _ExternalizedPrivateRuntimeState,
+    *,
+    key: str,
+    root_identity: tuple[int, ...],
+) -> bool:
+    """Durably reserve one no-ref shape before payload candidate discovery."""
+    connection = _externalized_scheduler_connection(runtime)
+    if connection is None:
+        return False
+    try:
+        _externalized_scheduler_cleanup_disk_locked(
+            connection, protected_keys=frozenset({key})
+        )
+        exists = connection.execute(
+            "SELECT 1 FROM scheduler_cursors WHERE shape_key = ?", (key,)
+        ).fetchone()
+        if exists is None:
+            count = int(connection.execute(
+                "SELECT COUNT(*) FROM scheduler_cursors"
+            ).fetchone()[0])
+            if count >= _EXTERNALIZED_SCHEDULER_MAX_DISK_QUERIES:
+                return False
+            connection.execute(
+                "INSERT INTO scheduler_cursors("
+                "shape_key, root_identity, listing_identity, cursor, "
+                "active_ref, updated_wall) VALUES (?, ?, '', 0, NULL, ?)",
+                (
+                    key,
+                    json.dumps(root_identity, separators=(",", ":")),
+                    time.time(),
+                ),
+            )
+        connection.commit()
+        return True
+    except sqlite3.Error:
+        try:
+            connection.rollback()
+        except sqlite3.Error:
+            pass
+        logger.debug("LCM could not reserve scheduler cursor", exc_info=True)
+        return False
+
+
 def _externalized_scheduler_cleanup_disk_locked(
     connection: sqlite3.Connection,
     *,
@@ -2434,10 +2765,10 @@ def _externalized_scheduler_persist_locked(
     state: _ExternalizedDiscoveryScheduler,
     *,
     protected_keys: frozenset[str],
-) -> None:
+) -> bool:
     connection = _externalized_scheduler_connection(runtime)
     if connection is None:
-        return
+        return False
     try:
         _externalized_scheduler_cleanup_disk_locked(
             connection, protected_keys=protected_keys
@@ -2450,9 +2781,9 @@ def _externalized_scheduler_persist_locked(
                 "SELECT COUNT(*) FROM scheduler_cursors"
             ).fetchone()[0]
             # Never evict a non-expired/live shape to make room. A new shape
-            # beyond the cap simply uses the already-bounded memory scheduler.
+            # beyond the cap must fail closed; it cannot use memory fairness.
             if int(count) >= _EXTERNALIZED_SCHEDULER_MAX_DISK_QUERIES:
-                return
+                return False
         state.updated_wall = time.time()
         connection.execute(
             "INSERT INTO scheduler_cursors("
@@ -2471,8 +2802,10 @@ def _externalized_scheduler_persist_locked(
             ),
         )
         connection.commit()
+        return True
     except sqlite3.Error:
         logger.debug("LCM could not persist scheduler cursor", exc_info=True)
+        return False
 
 
 def _externalized_scheduler_load_locked(
@@ -2534,7 +2867,7 @@ def _externalized_scheduler_min_live_cursor_locked(
 ) -> tuple[int, int]:
     connection = _externalized_scheduler_connection(runtime)
     if connection is None:
-        return state.cursor, 1
+        raise _ExternalizedStateUnavailable("scheduler state is unavailable")
     try:
         row = connection.execute(
             "SELECT MIN(cursor), COUNT(*) FROM scheduler_cursors "
@@ -2545,8 +2878,10 @@ def _externalized_scheduler_min_live_cursor_locked(
                 time.time() - _EXTERNALIZED_SCHEDULER_FAIRNESS_SECONDS,
             ),
         ).fetchone()
-    except sqlite3.Error:
-        return state.cursor, 1
+    except sqlite3.Error as exc:
+        raise _ExternalizedStateUnavailable(
+            "scheduler fairness state is unreadable"
+        ) from exc
     if row is None or row[0] is None:
         return state.cursor, 1
     return int(row[0]), int(row[1])
@@ -3099,17 +3434,20 @@ def _checkout_externalized_scheduler(
                     refs=refs,
                     cached_at=now,
                 )
-            cache.pop(key, None)
-            cache[key] = state
         elif state.cursor >= len(state.refs) and state.active_ref is None:
             # A fully acknowledged sweep starts a fresh deterministic cycle.
             state.cursor = 0
         state.cached_at = now
-        _externalized_scheduler_persist_locked(
+        if not _externalized_scheduler_persist_locked(
             runtime,
             state,
             protected_keys=frozenset(cache),
-        )
+        ):
+            raise _ExternalizedStateUnavailable(
+                "scheduler cursor is not durable"
+            )
+        cache.pop(key, None)
+        cache[key] = state
         minimum_live_cursor, live_shape_count = (
             _externalized_scheduler_min_live_cursor_locked(runtime, state)
         )
@@ -3127,19 +3465,23 @@ def _externalized_scheduler_mark_active(
     key: str,
     state: _ExternalizedDiscoveryScheduler,
     ref: str,
-) -> None:
+) -> bool:
     cache = _externalized_scheduler_cache(engine)
     runtime = _externalized_runtime_state(engine)
     with _externalized_continuation_lock(engine):
         if runtime.closed or state.key != key or ref not in state.refs:
-            return
+            return False
+        previous_active_ref = state.active_ref
         state.active_ref = ref
         state.cached_at = time.monotonic()
-        _externalized_scheduler_persist_locked(
+        persisted = _externalized_scheduler_persist_locked(
             runtime,
             state,
             protected_keys=frozenset(cache) | {key},
         )
+        if not persisted:
+            state.active_ref = previous_active_ref
+        return persisted
 
 
 def _externalized_scheduler_advance(
@@ -3147,25 +3489,31 @@ def _externalized_scheduler_advance(
     key: str,
     state: _ExternalizedDiscoveryScheduler,
     ref: str,
-) -> None:
+) -> bool:
     cache = _externalized_scheduler_cache(engine)
     runtime = _externalized_runtime_state(engine)
     with _externalized_continuation_lock(engine):
         if runtime.closed or state.key != key:
-            return
+            return False
         try:
             index = state.refs.index(ref, state.cursor)
         except ValueError:
-            return
+            return False
+        previous_cursor = state.cursor
+        previous_active_ref = state.active_ref
         state.cursor = max(state.cursor, index + 1)
         if state.active_ref == ref:
             state.active_ref = None
         state.cached_at = time.monotonic()
-        _externalized_scheduler_persist_locked(
+        persisted = _externalized_scheduler_persist_locked(
             runtime,
             state,
             protected_keys=frozenset(cache) | {key},
         )
+        if not persisted:
+            state.cursor = previous_cursor
+            state.active_ref = previous_active_ref
+        return persisted
 
 
 def _prune_externalized_continuations_locked(
@@ -3529,20 +3877,6 @@ def _search_externalized_payloads(
         candidates_seen = 1
         paths.append(root / ref)
     else:
-        try:
-            refs, candidates_seen, listing_complete = (
-                _externalized_bounded_sorted_refs(
-                    root,
-                    max_files=max_files,
-                    deadline=deadline,
-                )
-            )
-            root_identity = _externalized_file_identity(root.stat())
-        except OSError:
-            refs = ()
-            listing_complete = False
-            root_identity = ()
-        scan_truncated = not listing_complete
         scheduler_key = _externalized_scheduler_shape_key(
             root=root,
             query=query,
@@ -3552,12 +3886,71 @@ def _search_externalized_payloads(
             max_files=max_files,
             max_payload_chars=max_payload_chars,
         )
-        scheduler = _checkout_externalized_scheduler(
-            engine,
-            key=scheduler_key,
-            root_identity=root_identity,
-            refs=refs,
-        )
+        try:
+            root_identity = _externalized_file_identity(root.stat())
+            with _externalized_continuation_lock(engine):
+                reserved = _externalized_scheduler_reserve_locked(
+                    runtime_state,
+                    key=scheduler_key,
+                    root_identity=root_identity,
+                )
+            if not reserved:
+                raise _ExternalizedStateUnavailable(
+                    "scheduler state cannot be reserved"
+                )
+        except (OSError, sqlite3.Error, _ExternalizedStateUnavailable):
+            return [], [{"ref": "", "error": "private_state_unavailable"}], {
+                "files_scanned": 0,
+                "bytes_scanned": 0,
+                "matches": 0,
+                "scan_truncated": False,
+                "max_files": max_files,
+                "max_payload_chars": max_payload_chars,
+                "max_total_bytes": effective_total_bytes,
+                "max_persisted_output_markers": None,
+                "max_suffix_depth": _EXTERNALIZED_SUFFIX_MAX_DEPTH,
+                "persisted_output_markers_scanned": suffix_operation_budget.markers,
+                "byte_budget_exhausted": byte_operation_budget.exhausted,
+                "continuation_reused_bytes": 0,
+                "continuations_pending": 0,
+                "continuation_memory_bytes": 0,
+            }
+        try:
+            refs, candidates_seen, listing_complete = (
+                _externalized_bounded_sorted_refs(
+                    root,
+                    max_files=max_files,
+                    deadline=deadline,
+                )
+            )
+        except OSError:
+            refs = ()
+            listing_complete = False
+        scan_truncated = not listing_complete
+        try:
+            scheduler = _checkout_externalized_scheduler(
+                engine,
+                key=scheduler_key,
+                root_identity=root_identity,
+                refs=refs,
+            )
+        except _ExternalizedStateUnavailable:
+            return [], [{"ref": "", "error": "private_state_unavailable"}], {
+                "files_scanned": 0,
+                "bytes_scanned": 0,
+                "matches": 0,
+                "scan_truncated": scan_truncated,
+                "max_files": max_files,
+                "max_payload_chars": max_payload_chars,
+                "max_total_bytes": effective_total_bytes,
+                "max_persisted_output_markers": None,
+                "max_suffix_depth": _EXTERNALIZED_SUFFIX_MAX_DEPTH,
+                "persisted_output_markers_scanned": suffix_operation_budget.markers,
+                "byte_budget_exhausted": byte_operation_budget.exhausted,
+                "continuation_reused_bytes": 0,
+                "continuations_pending": 0,
+                "continuation_memory_bytes": 0,
+            }
         start_index = scheduler.cursor
         if scheduler.active_ref is not None:
             try:
@@ -3614,9 +4007,12 @@ def _search_externalized_payloads(
                         )
                     continue
                 if scheduler is not None and scheduler_key is not None:
-                    _externalized_scheduler_mark_active(
+                    if not _externalized_scheduler_mark_active(
                         engine, scheduler_key, scheduler, path.name
-                    )
+                    ):
+                        raise _ExternalizedStateUnavailable(
+                            "scheduler active cursor is not durable"
+                        )
                 continuation_identity = _externalized_file_identity(opened_stat)
                 continuation = _checkout_externalized_continuation(
                     engine,
@@ -3790,6 +4186,16 @@ def _search_externalized_payloads(
                     engine, scheduler_key, scheduler, path.name
                 )
             continue
+        except _ExternalizedStateUnavailable:
+            if continuation is not None:
+                continuation.close()
+            if scheduler is None:
+                diagnostics.append({"ref": path.name, "error": "unreadable"})
+                continue
+            hits.clear()
+            diagnostics.append({"ref": "", "error": "private_state_unavailable"})
+            scan_truncated = True
+            break
         except (OSError, UnicodeDecodeError):
             if continuation is not None:
                 continuation.close()
