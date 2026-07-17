@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import sqlite3
 import time
@@ -1834,6 +1835,186 @@ def test_store_expand_sequential_benign_pages_cross_two_mib_losslessly(
         engine.shutdown()
 
 
+def test_store_expand_twenty_mb_deep_offset_is_per_call_bounded_and_resumable(
+    tmp_path,
+):
+    engine = _engine(tmp_path)
+    content = ("ordinary-20mb-record\n" * 1_000_001)[:20_000_000]
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": "placeholder"}
+    )
+    engine._store._conn.execute(
+        "UPDATE messages SET content=? WHERE store_id=?", (content, store_id)
+    )
+    engine._store._conn.commit()
+    statements = []
+    engine._store._conn.set_trace_callback(statements.append)
+    try:
+        page = json.loads(tools_module.lcm_expand(
+            {
+                "store_id": store_id,
+                "content_offset": 19_000_000,
+                "max_tokens": 64,
+            },
+            engine=engine,
+        ))
+        content_reads = [
+            statement for statement in statements
+            if "substr(cast(content" in statement.lower()
+        ]
+        assert len(content_reads) <= 140
+        assert page["content_boundary_scan_pending"] is True
+        assert page["content"] and "LCM sensitive redaction" in page["content"]
+        assert 0 < page["content_scan_checkpoint_offset"] < 19_000_000
+
+        engine._store._conn.set_trace_callback(None)
+        engine.shutdown()
+        engine = _engine(tmp_path)
+        statements.clear()
+        engine._store._conn.set_trace_callback(statements.append)
+        retry = json.loads(tools_module.lcm_expand(
+            {
+                "store_id": store_id,
+                "content_offset": 19_000_000,
+                "max_tokens": 64,
+            },
+            engine=engine,
+        ))
+        retry_reads = [
+            statement for statement in statements
+            if "substr(cast(content" in statement.lower()
+        ]
+        assert len(retry_reads) <= 140
+        assert retry["content_scan_checkpoint_offset"] > page["content_scan_checkpoint_offset"]
+    finally:
+        engine._store._conn.set_trace_callback(None)
+        engine.shutdown()
+
+
+def test_store_expand_twenty_mb_deadline_fails_closed_before_deep_scan(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    content = ("deadline-20mb-record\n" * 1_000_001)[:20_000_000]
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": "placeholder"}
+    )
+    engine._store._conn.execute(
+        "UPDATE messages SET content=? WHERE store_id=?", (content, store_id)
+    )
+    engine._store._conn.commit()
+    statements = []
+    engine._store._conn.set_trace_callback(statements.append)
+    monkeypatch.setattr(
+        tools_module, "_EXPAND_BOUNDARY_SCAN_DEADLINE_SECONDS", 0.0
+    )
+    try:
+        page = json.loads(tools_module.lcm_expand(
+            {"store_id": store_id, "content_offset": 19_000_000, "max_tokens": 64},
+            engine=engine,
+        ))
+        content_reads = [
+            statement for statement in statements
+            if "substr(cast(content" in statement.lower()
+        ]
+        assert len(content_reads) <= 3
+        assert page["content_boundary_scan_pending"] is True
+        assert page["content_scan_checkpoint_offset"] == 0
+        assert "LCM sensitive redaction" in page["content"]
+    finally:
+        engine._store._conn.set_trace_callback(None)
+        engine.shutdown()
+
+
+def test_store_expand_twenty_mb_sequential_pages_do_not_rescan_from_zero(tmp_path):
+    engine = _engine(tmp_path)
+    content = ("sequential-20mb-record\n" * 1_000_001)[:20_000_000]
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": "placeholder"}
+    )
+    engine._store._conn.execute(
+        "UPDATE messages SET content=? WHERE store_id=?", (content, store_id)
+    )
+    engine._store._conn.commit()
+    offset = 0
+    page_query_counts = []
+    try:
+        for _ in range(4):
+            statements = []
+            engine._store._conn.set_trace_callback(statements.append)
+            page = json.loads(tools_module.lcm_expand(
+                {
+                    "store_id": store_id,
+                    "content_offset": offset,
+                    "max_tokens": 65_536,
+                },
+                engine=engine,
+            ))
+            page_query_counts.append(sum(
+                "substr(cast(content" in statement.lower()
+                for statement in statements
+            ))
+            assert page["has_more"] is True
+            assert page["next_content_offset"] > offset
+            offset = page["next_content_offset"]
+        assert max(page_query_counts) <= 20
+        assert page_query_counts[-1] <= page_query_counts[1] + 2
+    finally:
+        engine._store._conn.set_trace_callback(None)
+        engine.shutdown()
+
+
+def test_store_expand_checkpoint_is_invalidated_after_same_length_rewrite(tmp_path):
+    engine = _engine(tmp_path)
+    original = ("ordinary-safe-line\n" * 20_000)[:300_000] + "ORIGINAL-SAFE-SUFFIX"
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": original}
+    )
+    try:
+        first = json.loads(tools_module.lcm_expand(
+            {"store_id": store_id, "content_offset": 250_000, "max_tokens": 64},
+            engine=engine,
+        ))
+        assert "ordinary-safe-line" in first["content"]
+        old_fingerprint = engine._store._conn.execute(
+            "SELECT content_fingerprint FROM lcm_content_revisions WHERE store_id=?",
+            (store_id,),
+        ).fetchone()[0]
+        old_checkpoint = engine._store._conn.execute(
+            """SELECT MAX(char_offset) FROM lcm_content_scan_checkpoints
+               WHERE store_id=? AND content_fingerprint=?""",
+            (store_id, old_fingerprint),
+        ).fetchone()[0]
+        assert old_checkpoint == 250_000
+
+        rewritten = (
+            'password="' + ("REWRITE-SECRET-CANARY" * 14_285) + '"\nSAFE'
+        )[:len(original)]
+        rewritten = rewritten.ljust(len(original), "Z")
+        engine._store._conn.execute(
+            "UPDATE messages SET content=? WHERE store_id=?",
+            (rewritten, store_id),
+        )
+        engine._store._conn.commit()
+        new_fingerprint = engine._store._conn.execute(
+            "SELECT content_fingerprint FROM lcm_content_revisions WHERE store_id=?",
+            (store_id,),
+        ).fetchone()[0]
+        assert new_fingerprint != old_fingerprint
+        assert engine._store._conn.execute(
+            "SELECT COUNT(*) FROM lcm_content_scan_checkpoints WHERE store_id=?",
+            (store_id,),
+        ).fetchone()[0] == 0
+        second = json.loads(tools_module.lcm_expand(
+            {"store_id": store_id, "content_offset": 250_000, "max_tokens": 64},
+            engine=engine,
+        ))
+        assert "REWRITE-SECRET-CANARY" not in json.dumps(second)
+        assert "LCM sensitive redaction" in second["content"]
+    finally:
+        engine.shutdown()
+
+
 def test_grep_combined_sources_never_exceed_operation_row_budget(
     tmp_path, monkeypatch
 ):
@@ -1898,6 +2079,45 @@ def test_grep_combined_sources_never_exceed_operation_row_budget(
         assert budget["rows_materialized"] <= budget["rows_limit"] == 1_000
         assert budget["rows_reserved"] <= budget["rows_limit"]
         assert budget["exhausted"] is True
+    finally:
+        engine.shutdown()
+
+
+def test_grep_external_entries_are_charged_before_discovery(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    charged = {"database": 0, "external": 0}
+
+    def database_hits(*_args, **kwargs):
+        charged["database"] += kwargs["max_candidate_rows"]
+        return []
+
+    def external_hits(*_args, **kwargs):
+        charged["external"] += kwargs["max_files"]
+        return [], [], {
+            "files_scanned": 0,
+            "entries_scanned": kwargs["max_files"],
+            "bytes_scanned": 0,
+            "matches": 0,
+            "scan_truncated": True,
+        }
+
+    monkeypatch.setattr(engine._store, "search", database_hits)
+    monkeypatch.setattr(tools_module, "_search_externalized_payloads", external_hits)
+    try:
+        response = json.loads(tools_module.lcm_grep(
+            {
+                "query": "charged-before-open",
+                "content_scope": "all",
+                "role": "user",
+                "limit": 200,
+                "max_files": 500,
+            },
+            engine=engine,
+        ))
+        assert charged["database"] + charged["external"] <= 1_000
+        assert charged == {"database": 500, "external": 500}
+        assert response["operation_budget"]["rows_reserved"] == 1_000
+        assert response["operation_budget"]["exhausted"] is True
     finally:
         engine.shutdown()
 
@@ -1985,6 +2205,54 @@ def test_externalized_grep_authorizes_metadata_before_foreign_payload_read(
         assert 0 < bytes_read <= content_byte_offset
     finally:
         engine.shutdown()
+
+
+def test_externalized_metadata_reader_is_chunk_linear_and_deadline_bounded(
+    monkeypatch,
+):
+    padding = "M" * 15_900
+    payload = json.dumps({
+        "padding": padding,
+        "session_id": "current",
+        "content": "BODY-MUST-NOT-BE-READ-BEFORE-AUTHORIZATION",
+    }).encode("utf-8")
+    body_offset = payload.index(b"BODY-MUST-NOT-BE-READ")
+
+    class CountedReader(io.BytesIO):
+        def __init__(self, value):
+            super().__init__(value)
+            self.read_calls = 0
+
+        def read(self, size=-1):
+            self.read_calls += 1
+            assert size == 1
+            return super().read(size)
+
+    reader = CountedReader(payload)
+    started = time.perf_counter()
+    prefix, content_seen, truncated = (
+        tools_module._read_externalized_payload_metadata_prefix_from_handle(
+            reader,
+            deadline=time.monotonic() + 1.0,
+        )
+    )
+    elapsed = time.perf_counter() - started
+    assert content_seen is True
+    assert truncated is False
+    assert '"session_id": "current"' in prefix
+    assert reader.tell() <= body_offset
+    assert reader.read_calls <= body_offset
+    assert elapsed < 0.5
+
+    expired_reader = CountedReader(payload)
+    ticks = iter([0.0, 0.1, 0.6, 0.7])
+    monkeypatch.setattr(tools_module, "_external_metadata_now", lambda: next(ticks))
+    with pytest.raises(TimeoutError):
+        tools_module._read_externalized_payload_metadata_prefix_from_handle(
+            expired_reader,
+            deadline=0.5,
+        )
+    assert expired_reader.read_calls <= 512
 
 
 def test_store_expand_metadata_and_payload_reads_share_one_snapshot(tmp_path):

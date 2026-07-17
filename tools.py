@@ -108,7 +108,9 @@ _CURRENT_SESSION_EXPAND_MAX_CHARS = 100_000
 _MANDATORY_REDACTION_LOOKAHEAD_CHARS = 8_192
 _MANDATORY_REDACTION_CHARS_PER_TOKEN = 16
 _EXPAND_BOUNDARY_SCAN_CHARS = 8_192
-_EXPAND_BOUNDARY_SCAN_MAX_CHUNKS = 256
+_EXPAND_BOUNDARY_SCAN_MAX_CHUNKS = 128
+_EXPAND_BOUNDARY_SCAN_DEADLINE_SECONDS = 0.25
+_expand_scan_now = time.monotonic
 _BOUNDARY_PRIVATE_KEY_BEGIN_RE = re.compile(
     r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE
 )
@@ -185,22 +187,46 @@ def _credential_mode_at_offset(
     read_chunk,
     scan_start: int,
     requested_offset: int,
-) -> tuple[str, str | None]:
+    *,
+    initial_mode: str = "normal",
+    initial_quote: str | None = None,
+    initial_quote_backslashes: int = 0,
+    max_chunks: int = _EXPAND_BOUNDARY_SCAN_MAX_CHUNKS,
+    deadline: float = float("inf"),
+) -> dict[str, Any]:
     """Stream credential syntax from a proven boundary to one raw offset."""
-    mode = "normal" if scan_start == 0 else "unknown"
-    quote: str | None = None
-    quote_backslashes = 0
+    mode = initial_mode
+    quote = initial_quote
+    quote_backslashes = max(0, int(initial_quote_backslashes))
     cursor = scan_start
+    chunks_used = 0
 
     while cursor < requested_offset:
+        if chunks_used >= max_chunks or _expand_scan_now() >= deadline:
+            return {
+                "complete": False,
+                "offset": cursor,
+                "mode": mode,
+                "quote": quote,
+                "quote_backslashes": quote_backslashes,
+                "chunks_used": chunks_used,
+            }
         primary_chars = min(
             _EXPAND_BOUNDARY_SCAN_CHARS, requested_offset - cursor
         )
         # Normal-mode openers can straddle a chunk edge. The bounded lookahead
         # is inspected but never advances the state beyond requested_offset.
         data = read_chunk(cursor, primary_chars + 512)
+        chunks_used += 1
         if not data:
-            return "unknown", None
+            return {
+                "complete": False,
+                "offset": cursor,
+                "mode": mode,
+                "quote": quote,
+                "quote_backslashes": quote_backslashes,
+                "chunks_used": chunks_used,
+            }
         primary_chars = min(primary_chars, len(data))
         advance_chars = primary_chars
         index = 0
@@ -308,7 +334,14 @@ def _credential_mode_at_offset(
                 continue
         cursor += advance_chars
         if advance_chars <= 0:
-            return "unknown", None
+            return {
+                "complete": False,
+                "offset": cursor,
+                "mode": mode,
+                "quote": quote,
+                "quote_backslashes": quote_backslashes,
+                "chunks_used": chunks_used,
+            }
     if mode == "token":
         boundary_char = read_chunk(requested_offset, 1)
         if boundary_char and _is_unquoted_terminator(
@@ -320,13 +353,23 @@ def _credential_mode_at_offset(
             # safe page boundary, but the benign delimiter still belongs to
             # the caller's lossless output and must not be consumed here.
             mode = "normal"
-    return mode, quote
+    return {
+        "complete": True,
+        "offset": cursor,
+        "mode": mode,
+        "quote": quote,
+        "quote_backslashes": quote_backslashes,
+        "chunks_used": chunks_used,
+    }
 
 
 def _scan_raw_credential_boundary(
     read_chunk,
     total_chars: int,
     requested_offset: int,
+    *,
+    checkpoint: dict[str, Any] | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """Classify/skip a credential around one raw cursor using bounded chunks.
 
@@ -338,8 +381,33 @@ def _scan_raw_credential_boundary(
     """
     total = max(0, int(total_chars))
     offset = min(max(0, int(requested_offset)), total)
+    scan_deadline = (
+        float(deadline)
+        if deadline is not None
+        else _expand_scan_now() + _EXPAND_BOUNDARY_SCAN_DEADLINE_SECONDS
+    )
+    checkpoint = checkpoint or {}
+    checkpoint_offset = min(
+        offset, max(0, int(checkpoint.get("offset", 0) or 0))
+    )
+    checkpoint_mode = str(checkpoint.get("mode") or "normal")
+    if checkpoint_mode not in {"normal", "quote", "escaped_quote", "token", "pem", "unknown"}:
+        checkpoint_mode = "unknown"
+    checkpoint_quote = checkpoint.get("quote")
+    if checkpoint_quote not in {None, '"', "'"}:
+        checkpoint_quote = None
+        checkpoint_mode = "unknown"
+    checkpoint_backslashes = max(
+        0, int(checkpoint.get("quote_backslashes", 0) or 0)
+    )
     if offset >= total:
-        return {"safe_content_offset": offset}
+        return {
+            "safe_content_offset": offset,
+            "checkpoint_offset": offset,
+            "checkpoint_mode": checkpoint_mode,
+            "checkpoint_quote": checkpoint_quote,
+            "checkpoint_quote_backslashes": checkpoint_backslashes,
+        }
 
     mode: str | None = None
     quote: str | None = None
@@ -378,27 +446,71 @@ def _scan_raw_credential_boundary(
     # State stays bounded to a few scalars while SQLite returns bounded chunks;
     # no whole row is allocated.  Starting at a fixed lookbehind would make a
     # wholly benign deep offset indistinguishable from a credential body.
-    if not unsafe and offset > 0:
-        mode, quote = _credential_mode_at_offset(
-            read_chunk, 0, offset
+    chunks_used = 0
+    if not unsafe and offset > checkpoint_offset:
+        state = _credential_mode_at_offset(
+            read_chunk,
+            checkpoint_offset,
+            offset,
+            initial_mode=checkpoint_mode,
+            initial_quote=checkpoint_quote,
+            initial_quote_backslashes=checkpoint_backslashes,
+            max_chunks=_EXPAND_BOUNDARY_SCAN_MAX_CHUNKS,
+            deadline=scan_deadline,
         )
+        chunks_used = int(state["chunks_used"])
+        if not state["complete"]:
+            progress = min(total, max(checkpoint_offset, int(state["offset"])))
+            return {
+                "safe_content_offset": progress,
+                "boundary_redacted": True,
+                "boundary_pending": True,
+                "boundary_safe_prefix": "",
+                "checkpoint_offset": progress,
+                "checkpoint_mode": state["mode"],
+                "checkpoint_quote": state["quote"],
+                "checkpoint_quote_backslashes": state["quote_backslashes"],
+            }
+        mode = str(state["mode"])
+        quote = state["quote"]
+        quote_backslashes = int(state["quote_backslashes"])
+        if mode != "normal":
+            unsafe = True
+            forward_start = offset
+    elif not unsafe:
+        mode = checkpoint_mode
+        quote = checkpoint_quote
+        quote_backslashes = checkpoint_backslashes
         if mode != "normal":
             unsafe = True
             forward_start = offset
 
     if not unsafe:
-        return {"safe_content_offset": offset}
+        return {
+            "safe_content_offset": offset,
+            "checkpoint_offset": offset,
+            "checkpoint_mode": "normal",
+            "checkpoint_quote": None,
+            "checkpoint_quote_backslashes": 0,
+        }
 
     cursor = forward_start
     overlap = ""
-    quote_backslashes = 0
-    for _ in range(_EXPAND_BOUNDARY_SCAN_MAX_CHUNKS):
+    quote_backslashes = locals().get("quote_backslashes", 0)
+    remaining_chunks = max(0, _EXPAND_BOUNDARY_SCAN_MAX_CHUNKS - chunks_used)
+    for _ in range(remaining_chunks):
+        if _expand_scan_now() >= scan_deadline:
+            break
         if cursor >= total:
             return {
                 "safe_content_offset": total,
                 "boundary_redacted": True,
                 "boundary_pending": False,
                 "boundary_safe_prefix": "",
+                "checkpoint_offset": total,
+                "checkpoint_mode": "normal",
+                "checkpoint_quote": None,
+                "checkpoint_quote_backslashes": 0,
             }
         chunk = read_chunk(cursor, _EXPAND_BOUNDARY_SCAN_CHARS)
         if not chunk:
@@ -466,6 +578,10 @@ def _scan_raw_credential_boundary(
                 "boundary_redacted": True,
                 "boundary_pending": False,
                 "boundary_safe_prefix": safe_prefix,
+                "checkpoint_offset": min(total, safe_offset),
+                "checkpoint_mode": "normal",
+                "checkpoint_quote": None,
+                "checkpoint_quote_backslashes": 0,
             }
         cursor += len(chunk)
         overlap = chunk[-128:]
@@ -474,7 +590,14 @@ def _scan_raw_credential_boundary(
         "safe_content_offset": min(total, max(offset + 1, cursor)),
         "boundary_redacted": True,
         "boundary_pending": True,
-        "boundary_safe_prefix": safe_prefix,
+        # Do not expose even the assignment name until the scanner has proved
+        # a terminator in the same bounded operation. A continuation checkpoint
+        # deliberately carries lexical state, not potentially sensitive text.
+        "boundary_safe_prefix": "",
+        "checkpoint_offset": min(total, max(offset + 1, cursor)),
+        "checkpoint_mode": mode or "unknown",
+        "checkpoint_quote": quote,
+        "checkpoint_quote_backslashes": quote_backslashes,
     }
 
 
@@ -748,6 +871,7 @@ def _search_externalized_payloads(
                             read_limit,
                             _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES,
                         ),
+                        deadline=deadline,
                     )
                 )
                 metadata_bytes = handle.tell()
@@ -785,6 +909,10 @@ def _search_externalized_payloads(
                 raw_tail = handle.read(tail_limit)
                 raw = prefix_bytes + raw_tail
                 raw_truncated = opened_stat.st_size > len(raw)
+        except TimeoutError:
+            scan_truncated = True
+            diagnostics.append({"ref": path.name, "error": "metadata_deadline"})
+            break
         except (OSError, ValueError, UnicodeDecodeError):
             diagnostics.append({"ref": path.name, "error": "unreadable"})
             continue
@@ -1033,6 +1161,8 @@ _LCM_INSPECT_DEFAULT_LIMIT = 20
 _LCM_INSPECT_HARD_LIMIT_CAP = 200
 _LCM_INSPECT_REF_SCAN_MESSAGE_LIMIT = 10_000
 _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES = 16_384
+_LCM_EXTERNAL_METADATA_DEADLINE_CHECK_BYTES = 256
+_external_metadata_now = time.monotonic
 _LCM_INSPECT_LINEAGE_MAX_ROWS = 10_000
 _LCM_INSPECT_LINEAGE_MAX_EDGES = 40_000
 _LCM_INSPECT_LINEAGE_MAX_BYTES = 4 * 1024 * 1024
@@ -3607,6 +3737,10 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
             operation_budget_exhausted = True
             return 0
         operation_rows_reserved += allowed
+        if allowed < max(0, int(requested)) or (
+            operation_rows_reserved >= _LCM_GREP_OPERATION_MAX_ROWS
+        ):
+            operation_budget_exhausted = True
         return allowed
 
     def charge_materialized(value: Any) -> bool:
@@ -3645,7 +3779,9 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     # complete operation row budget and then append an unreserved file batch.
     external_rows_reserved = 0
     if content_scope in {"externalized", "all"}:
-        external_rows_reserved = reserve_discovery_rows(min(limit, max_files))
+        external_rows_reserved = reserve_discovery_rows(1 if ref else max_files)
+        if operation_rows_reserved >= _LCM_GREP_OPERATION_MAX_ROWS:
+            operation_budget_exhausted = True
 
     if content_scope in {"database", "all"} and not regex_mode:
       try:
@@ -3847,7 +3983,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                 ),
                 ref=ref,
                 limit=min(limit, external_rows_reserved),
-                max_files=max_files,
+                max_files=min(max_files, external_rows_reserved),
                 max_payload_chars=max_payload_chars,
                 max_total_bytes=max(
                     0,
@@ -4158,6 +4294,9 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
             max_content_chars=_CURRENT_SESSION_EXPAND_MAX_CHARS,
             content_lookahead_chars=_MANDATORY_REDACTION_LOOKAHEAD_CHARS,
             boundary_scanner=_scan_raw_credential_boundary,
+            boundary_scan_deadline=(
+                _expand_scan_now() + _EXPAND_BOUNDARY_SCAN_DEADLINE_SECONDS
+            ),
         )
         status = loaded.get("status")
         if status == "not_found":
@@ -4265,6 +4404,9 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
         }
         if sliced.get("content_boundary_scan_pending"):
             result["content_boundary_scan_pending"] = True
+            result["content_scan_checkpoint_offset"] = int(
+                stored.get("boundary_checkpoint_offset") or 0
+            )
         # Surface externalized-payload metadata when the row references one. Content
         # is not hydrated by default, mirroring the existing _expand_message_sources
         # default. Externalized lookup remains session-scoped (per the existing
@@ -5170,18 +5312,156 @@ def _read_externalized_payload_metadata_prefix_from_handle(
     handle,
     *,
     max_bytes: int = _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES,
+    deadline: float | None = None,
 ) -> tuple[str, bool, bool]:
-    """Read identity fields from an already-open payload without its body."""
+    """Lex metadata once, stopping before the first content body byte.
+
+    A one-byte transport read is intentional here: authorization depends on a
+    field inside the JSON envelope, and reading a larger block could pull an
+    unauthorized ``content`` body into Python before that decision. Lexical
+    work is nevertheless O(n): each decoded character advances one compact
+    state machine exactly once, with no repeated JSON-prefix reparsing.
+    """
     read_limit = min(
         _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES,
         max(0, int(max_bytes)),
     )
     if read_limit <= 0:
         return "", False, True
+    if deadline is not None and _external_metadata_now() >= deadline:
+        raise TimeoutError("metadata_deadline")
     prefix = bytearray()
     text_parts: list[str] = []
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    phase = "start"
+    key_raw: list[str] = []
+    current_key = ""
+    escaped = False
+    container_stack: list[str] = []
+    complex_in_string = False
+    complex_escaped = False
+    content_key_seen = False
+
+    def consume(char: str) -> bool:
+        nonlocal phase, current_key, escaped
+        nonlocal complex_in_string, complex_escaped, content_key_seen
+        if phase == "start":
+            if char in " \t\n\r":
+                return False
+            phase = "key_or_end" if char == "{" else "invalid"
+            return False
+        if phase == "key_or_end":
+            if char in " \t\n\r":
+                return False
+            if char == '"':
+                key_raw.clear()
+                escaped = False
+                phase = "key_string"
+            elif char == "}":
+                phase = "done"
+            else:
+                phase = "invalid"
+            return False
+        if phase == "key_string":
+            if escaped:
+                key_raw.append(char)
+                escaped = False
+            elif char == "\\":
+                key_raw.append(char)
+                escaped = True
+            elif char == '"':
+                try:
+                    current_key = json.loads('"' + "".join(key_raw) + '"')
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    phase = "invalid"
+                    return False
+                phase = "colon"
+            else:
+                key_raw.append(char)
+            return False
+        if phase == "colon":
+            if char in " \t\n\r":
+                return False
+            phase = "value_start" if char == ":" else "invalid"
+            return False
+        if phase == "value_start":
+            if char in " \t\n\r":
+                return False
+            if current_key == "content":
+                content_key_seen = char == '"'
+                phase = "content" if content_key_seen else "invalid"
+                return content_key_seen
+            if char == '"':
+                escaped = False
+                phase = "value_string"
+            elif char in "[{":
+                container_stack[:] = [char]
+                complex_in_string = False
+                complex_escaped = False
+                phase = "value_complex"
+            elif char in "-0123456789tfn":
+                phase = "value_scalar"
+            else:
+                phase = "invalid"
+            return False
+        if phase == "value_string":
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                phase = "after_value"
+            return False
+        if phase == "value_scalar":
+            if char == ",":
+                phase = "key_or_end"
+            elif char == "}":
+                phase = "done"
+            elif char in " \t\n\r":
+                phase = "after_value"
+            return False
+        if phase == "value_complex":
+            if complex_in_string:
+                if complex_escaped:
+                    complex_escaped = False
+                elif char == "\\":
+                    complex_escaped = True
+                elif char == '"':
+                    complex_in_string = False
+                return False
+            if char == '"':
+                complex_in_string = True
+            elif char in "[{":
+                container_stack.append(char)
+            elif char in "]}":
+                if not container_stack:
+                    phase = "invalid"
+                else:
+                    opener = container_stack.pop()
+                    if (opener, char) not in {("[", "]"), ("{", "}")}:
+                        phase = "invalid"
+                    elif not container_stack:
+                        phase = "after_value"
+            return False
+        if phase == "after_value":
+            if char in " \t\n\r":
+                return False
+            if char == ",":
+                phase = "key_or_end"
+            elif char == "}":
+                phase = "done"
+            else:
+                phase = "invalid"
+            return False
+        return False
+
     while len(prefix) < read_limit:
+        if (
+            len(prefix) % _LCM_EXTERNAL_METADATA_DEADLINE_CHECK_BYTES == 0
+            and deadline is not None
+            and _external_metadata_now() >= deadline
+        ):
+            raise TimeoutError("metadata_deadline")
         byte = handle.read(1)
         if not byte:
             break
@@ -5192,12 +5472,9 @@ def _read_externalized_payload_metadata_prefix_from_handle(
             raise ValueError("invalid_payload") from exc
         if decoded:
             text_parts.append(decoded)
-        prefix_text = "".join(text_parts)
-        _, content_key_seen = _inspect_top_level_json_string_fields_before_content(
-            prefix_text
-        )
-        if content_key_seen:
-            return prefix_text, True, False
+            for char in decoded:
+                if consume(char):
+                    return "".join(text_parts), True, False
     # The bound itself is not exceeded merely to distinguish exact EOF. A
     # prefix that fills it without reaching content is conservatively treated
     # as truncated.
@@ -5209,7 +5486,7 @@ def _read_externalized_payload_metadata_prefix_from_handle(
             raise ValueError("invalid_payload") from exc
         if final_text:
             text_parts.append(final_text)
-    return "".join(text_parts), False, prefix_truncated
+    return "".join(text_parts), content_key_seen, prefix_truncated
 
 
 def _read_externalized_payload_metadata_prefix(

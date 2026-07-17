@@ -355,6 +355,7 @@ class MessageStore:
         run_versioned_migrations(self._conn)
         self._ensure_source_column()
         self._ensure_conversation_id_column()
+        self._ensure_content_scan_state()
         self._conn.commit()
 
     def _ensure_source_column(self) -> None:
@@ -379,6 +380,71 @@ class MessageStore:
         )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_msg_conversation_session ON messages(conversation_id, session_id, store_id)"
+        )
+
+    def _ensure_content_scan_state(self) -> None:
+        """Install rewrite-invalidated, persistent raw paging checkpoints."""
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS lcm_content_revisions (
+                store_id INTEGER PRIMARY KEY,
+                content_fingerprint TEXT NOT NULL,
+                content_chars INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS lcm_content_scan_checkpoints (
+                store_id INTEGER NOT NULL,
+                content_fingerprint TEXT NOT NULL,
+                char_offset INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                quote TEXT,
+                quote_backslashes INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (store_id, content_fingerprint, char_offset)
+            );
+            CREATE INDEX IF NOT EXISTS idx_lcm_content_scan_checkpoint_lookup
+                ON lcm_content_scan_checkpoints(
+                    store_id, content_fingerprint, char_offset DESC
+                );
+
+            CREATE TRIGGER IF NOT EXISTS lcm_content_revision_insert
+                AFTER INSERT ON messages BEGIN
+                INSERT OR REPLACE INTO lcm_content_revisions
+                    (store_id, content_fingerprint, content_chars)
+                VALUES (
+                    new.store_id,
+                    lower(hex(randomblob(16))),
+                    COALESCE(length(CAST(new.content AS TEXT)), 0)
+                );
+                DELETE FROM lcm_content_scan_checkpoints
+                    WHERE store_id = new.store_id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS lcm_content_revision_update
+                AFTER UPDATE OF content ON messages BEGIN
+                INSERT OR REPLACE INTO lcm_content_revisions
+                    (store_id, content_fingerprint, content_chars)
+                VALUES (
+                    new.store_id,
+                    lower(hex(randomblob(16))),
+                    COALESCE(length(CAST(new.content AS TEXT)), 0)
+                );
+                DELETE FROM lcm_content_scan_checkpoints
+                    WHERE store_id = new.store_id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS lcm_content_revision_delete
+                AFTER DELETE ON messages BEGIN
+                DELETE FROM lcm_content_scan_checkpoints
+                    WHERE store_id = old.store_id;
+                DELETE FROM lcm_content_revisions
+                    WHERE store_id = old.store_id;
+            END;
+            """
+        )
+        self._conn.execute(
+            """INSERT INTO lcm_content_revisions
+                   (store_id, content_fingerprint, content_chars)
+               SELECT store_id, lower(hex(randomblob(16))),
+                      COALESCE(length(CAST(content AS TEXT)), 0)
+               FROM messages
+               WHERE store_id NOT IN (SELECT store_id FROM lcm_content_revisions)"""
         )
 
     # -- Write operations ---------------------------------------------------
@@ -565,8 +631,9 @@ class MessageStore:
         max_content_chars: int,
         content_lookahead_chars: int,
         boundary_scanner: Callable[
-            [Callable[[int, int], str], int, int], Dict[str, Any]
+            ..., Dict[str, Any]
         ] | None = None,
+        boundary_scan_deadline: float | None = None,
     ) -> Dict[str, Any]:
         """Authorize bounded ownership metadata before reading payload columns.
 
@@ -632,13 +699,15 @@ class MessageStore:
                             for column in scalar_columns
                         )
                         content_metadata = self._conn.execute(
-                            """SELECT COALESCE(length(CAST(content AS TEXT)), 0),
-                                      typeof(content)
-                               FROM messages
-                               WHERE store_id = ?
-                                 AND session_id = ?
-                                 AND COALESCE(length(CAST(session_id AS BLOB)), 0) = ?
-                                 AND COALESCE(length(CAST(session_id AS TEXT)), 0) = ?
+                            """SELECT r.content_chars, typeof(m.content),
+                                      r.content_fingerprint
+                               FROM messages AS m
+                               JOIN lcm_content_revisions AS r
+                                 ON r.store_id = m.store_id
+                               WHERE m.store_id = ?
+                                 AND m.session_id = ?
+                                 AND COALESCE(length(CAST(m.session_id AS BLOB)), 0) = ?
+                                 AND COALESCE(length(CAST(m.session_id AS TEXT)), 0) = ?
                                LIMIT 1""",
                             (
                                 store_id,
@@ -659,6 +728,32 @@ class MessageStore:
 
                         boundary_scan: Dict[str, Any] = {}
                         if boundary_scanner is not None and total_content_chars:
+                            checkpoint_row = self._conn.execute(
+                                """SELECT char_offset, mode, quote, quote_backslashes
+                                   FROM lcm_content_scan_checkpoints
+                                   WHERE store_id = ?
+                                     AND content_fingerprint = ?
+                                     AND char_offset <= ?
+                                   ORDER BY char_offset DESC
+                                   LIMIT 1""",
+                                (
+                                    store_id,
+                                    content_metadata[2],
+                                    bounded_offset,
+                                ),
+                            ).fetchone()
+                            checkpoint = {
+                                "offset": int(checkpoint_row[0]),
+                                "mode": checkpoint_row[1],
+                                "quote": checkpoint_row[2],
+                                "quote_backslashes": int(checkpoint_row[3] or 0),
+                            } if checkpoint_row is not None else {
+                                "offset": 0,
+                                "mode": "normal",
+                                "quote": None,
+                                "quote_backslashes": 0,
+                            }
+
                             def read_content_chunk(offset: int, chars: int) -> str:
                                 bounded_chunk_offset = min(
                                     max(0, int(offset)), total_content_chars
@@ -695,7 +790,46 @@ class MessageStore:
                                 read_content_chunk,
                                 total_content_chars,
                                 bounded_offset,
+                                checkpoint=checkpoint,
+                                deadline=boundary_scan_deadline,
                             )
+                            checkpoint_offset = min(
+                                total_content_chars,
+                                max(0, int(boundary_scan.get(
+                                    "checkpoint_offset", checkpoint["offset"]
+                                ))),
+                            )
+                            checkpoint_mode = str(
+                                boundary_scan.get("checkpoint_mode") or "unknown"
+                            )
+                            checkpoint_quote = boundary_scan.get("checkpoint_quote")
+                            checkpoint_backslashes = max(0, int(
+                                boundary_scan.get(
+                                    "checkpoint_quote_backslashes", 0
+                                ) or 0
+                            ))
+                            try:
+                                self._conn.execute(
+                                    """INSERT OR REPLACE INTO lcm_content_scan_checkpoints
+                                           (store_id, content_fingerprint, char_offset,
+                                            mode, quote, quote_backslashes)
+                                       VALUES (?, ?, ?, ?, ?, ?)""",
+                                    (
+                                        store_id,
+                                        content_metadata[2],
+                                        checkpoint_offset,
+                                        checkpoint_mode,
+                                        checkpoint_quote,
+                                        checkpoint_backslashes,
+                                    ),
+                                )
+                            except sqlite3.OperationalError as exc:
+                                # A sibling writer can advance the row after the
+                                # authorization snapshot. The old checkpoint is
+                                # then unnecessary and must never turn a safe
+                                # read into a failed expansion.
+                                if "locked" not in str(exc).lower():
+                                    raise
 
                         scan_offset = min(
                             max(
@@ -775,6 +909,9 @@ class MessageStore:
                                 item["boundary_safe_prefix"] = str(
                                     boundary_scan.get("boundary_safe_prefix") or ""
                                 )[:512]
+                                item["boundary_checkpoint_offset"] = int(
+                                    boundary_scan.get("checkpoint_offset", scan_offset)
+                                )
                             item["tool_calls_chars"] = int(payload[13] or 0)
                             item["tool_calls_omitted"] = (
                                 int(payload[13] or 0) > _EXPAND_TOOL_CALLS_MAX_CHARS
