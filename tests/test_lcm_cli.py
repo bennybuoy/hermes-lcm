@@ -74,7 +74,7 @@ def test_cli_status_is_json_first_and_works_without_gateway(tmp_path):
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["database_path"] == str(db)
-    assert payload["schema_version"] == SCHEMA_VERSION == 10
+    assert payload["schema_version"] == SCHEMA_VERSION == 11
     assert payload["supported_schema_version"] == SCHEMA_VERSION
     assert payload["counts"]["messages"] == 2
     assert payload["read_only"] is True
@@ -88,7 +88,21 @@ def test_cli_reads_legacy_v9_without_migrating_it(tmp_path):
         "ALTER TABLE lcm_lifecycle_state DROP COLUMN rollover_carry_over_context"
     )
     conn.execute(
+        "ALTER TABLE lcm_lifecycle_state DROP COLUMN binding_generation"
+    )
+    conn.execute(
         "DELETE FROM lcm_migration_state WHERE step_name = 'v10_rollover_carry_policy'"
+    )
+    for trigger in (
+        "lcm_no_carry_frontier_insert",
+        "lcm_no_carry_frontier_update",
+        "lcm_no_carry_item_insert",
+        "lcm_no_carry_item_update",
+    ):
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    conn.execute("DROP TABLE IF EXISTS lcm_rollover_policies")
+    conn.execute(
+        "DELETE FROM lcm_migration_state WHERE step_name = 'v11_no_carry_frontier_policy'"
     )
     conn.execute(
         "UPDATE metadata SET value = '9' WHERE key = 'schema_version'"
@@ -101,7 +115,7 @@ def test_cli_reads_legacy_v9_without_migrating_it(tmp_path):
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["schema_version"] == 9
-    assert payload["supported_schema_version"] == SCHEMA_VERSION == 10
+    assert payload["supported_schema_version"] == SCHEMA_VERSION == 11
     check = sqlite3.connect(db)
     try:
         assert check.execute(
@@ -113,8 +127,17 @@ def test_cli_reads_legacy_v9_without_migrating_it(tmp_path):
                 "PRAGMA table_info(lcm_lifecycle_state)"
             ).fetchall()
         }
+        assert "binding_generation" not in {
+            row[1]
+            for row in check.execute(
+                "PRAGMA table_info(lcm_lifecycle_state)"
+            ).fetchall()
+        }
         assert check.execute(
             "SELECT 1 FROM lcm_migration_state WHERE step_name = 'v10_rollover_carry_policy'"
+        ).fetchone() is None
+        assert check.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_rollover_policies'"
         ).fetchone() is None
     finally:
         check.close()

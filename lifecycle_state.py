@@ -52,6 +52,7 @@ class LifecycleState:
     last_rollover_at: float | None
     last_reset_at: float | None
     rollover_carry_over_context: bool | None
+    binding_generation: int
     updated_at: float
 
 
@@ -134,6 +135,7 @@ class LifecycleStateStore:
                 if row["rollover_carry_over_context"] is None
                 else bool(row["rollover_carry_over_context"])
             ),
+            binding_generation=int(row["binding_generation"] or 0),
             updated_at=float(row["updated_at"] or 0.0),
         )
 
@@ -178,8 +180,55 @@ class LifecycleStateStore:
         *,
         conversation_id: str | None = None,
     ) -> LifecycleState:
+        # Capture the canonical owner/generation before reading lifecycle. The
+        # conditional write below requires this exact snapshot still to be the
+        # active tip, so a rollover that wins after this read makes the bind a
+        # harmless no-op instead of letting stale startup state steal ownership.
+        observed_generation = 0
+        observed_frontier_session = ""
+        if conversation_id:
+            frontier = self._conn.execute(
+                """SELECT generation, session_id FROM lcm_active_frontiers
+                   WHERE conversation_id = ?
+                   ORDER BY generation DESC LIMIT 1""",
+                (conversation_id,),
+            ).fetchone()
+            if frontier is not None:
+                observed_generation = int(frontier[0] or 0)
+                observed_frontier_session = str(frontier[1] or "")
         existing = self.get_by_conversation(conversation_id) if conversation_id else self.get_by_session(session_id)
         conversation_id = conversation_id or (existing.conversation_id if existing else session_id)
+        policy = self._conn.execute(
+            """SELECT finalized_session_id, current_session_id,
+                      finalized_cutoff_store_id
+               FROM lcm_rollover_policies
+               WHERE conversation_id = ? AND carry_over_context = 0""",
+            (conversation_id,),
+        ).fetchone()
+        if existing is None and policy is not None:
+            # Lifecycle cleanup/rewrite must not erase the independent winner.
+            # Rehydrate the canonical binding from policy before considering
+            # the requested session.
+            now = time.time()
+            self._conn.execute(
+                """INSERT INTO lcm_lifecycle_state(
+                       conversation_id, current_session_id,
+                       last_finalized_session_id,
+                       last_finalized_frontier_store_id,
+                       current_bound_at, last_finalized_at,
+                       rollover_carry_over_context, binding_generation,
+                       updated_at
+                   ) VALUES(?, ?, ?, ?, ?, ?, 0, 1, ?)
+                   ON CONFLICT(conversation_id) DO NOTHING""",
+                (
+                    conversation_id, str(policy[1]), str(policy[0]),
+                    int(policy[2] or 0), now, now, now,
+                ),
+            )
+            self._conn.commit()
+            restored = self.get_by_conversation(conversation_id)
+            assert restored is not None
+            return restored
         now = time.time()
         current_frontier = 0
         current_bound_at = now
@@ -196,6 +245,8 @@ class LifecycleStateStore:
 
         if existing is not None:
             if existing.current_session_id == session_id:
+                return existing
+            if policy is not None and str(policy[0] or "") == session_id:
                 return existing
             current_frontier = (
                 existing.current_frontier_store_id if existing.current_session_id == session_id else 0
@@ -224,59 +275,64 @@ class LifecycleStateStore:
             )
             last_reset_at = existing.last_reset_at
 
-        self._conn.execute(
-            """
-            INSERT INTO lcm_lifecycle_state(
-                conversation_id,
-                current_session_id,
-                last_finalized_session_id,
-                current_frontier_store_id,
-                last_finalized_frontier_store_id,
-                debt_kind,
-                debt_size_estimate,
-                current_bound_at,
-                last_finalized_at,
-                debt_updated_at,
-                last_maintenance_attempt_at,
-                last_rollover_at,
-                last_reset_at,
-                rollover_carry_over_context,
-                updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(conversation_id) DO UPDATE SET
-                current_session_id = excluded.current_session_id,
-                last_finalized_session_id = excluded.last_finalized_session_id,
-                current_frontier_store_id = excluded.current_frontier_store_id,
-                last_finalized_frontier_store_id = excluded.last_finalized_frontier_store_id,
-                debt_kind = excluded.debt_kind,
-                debt_size_estimate = excluded.debt_size_estimate,
-                current_bound_at = excluded.current_bound_at,
-                last_finalized_at = excluded.last_finalized_at,
-                debt_updated_at = excluded.debt_updated_at,
-                last_maintenance_attempt_at = excluded.last_maintenance_attempt_at,
-                last_rollover_at = excluded.last_rollover_at,
-                last_reset_at = excluded.last_reset_at,
-                rollover_carry_over_context = excluded.rollover_carry_over_context,
-                updated_at = excluded.updated_at
-            """,
-            (
-                conversation_id,
-                session_id,
-                last_finalized_session_id,
-                current_frontier,
-                last_finalized_frontier,
-                debt_kind,
-                debt_size_estimate,
-                current_bound_at,
-                last_finalized_at,
-                debt_updated_at,
-                last_maintenance_attempt_at,
-                last_rollover_at,
-                last_reset_at,
-                rollover_carry_over_context,
-                now,
-            ),
-        )
+        if existing is None:
+            self._conn.execute(
+                """INSERT INTO lcm_lifecycle_state(
+                       conversation_id, current_session_id,
+                       last_finalized_session_id, current_frontier_store_id,
+                       last_finalized_frontier_store_id, debt_kind,
+                       debt_size_estimate, current_bound_at, last_finalized_at,
+                       debt_updated_at, last_maintenance_attempt_at,
+                       last_rollover_at, last_reset_at,
+                       rollover_carry_over_context, binding_generation, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                   ON CONFLICT(conversation_id) DO NOTHING""",
+                (
+                    conversation_id, session_id, last_finalized_session_id,
+                    current_frontier, last_finalized_frontier, debt_kind,
+                    debt_size_estimate, current_bound_at, last_finalized_at,
+                    debt_updated_at, last_maintenance_attempt_at,
+                    last_rollover_at, last_reset_at,
+                    rollover_carry_over_context, now,
+                ),
+            )
+        else:
+            # Preserve finalized metadata and the winning carry policy. Only
+            # ownership fields change, and only while both observed owner and
+            # active generation still match.
+            self._conn.execute(
+                """UPDATE lcm_lifecycle_state
+                   SET current_session_id = ?, current_frontier_store_id = 0,
+                       current_bound_at = ?, last_rollover_at = ?,
+                       binding_generation = binding_generation + 1,
+                       updated_at = ?
+                   WHERE conversation_id = ?
+                     AND current_session_id IS ?
+                     AND binding_generation = ?
+                     AND (
+                         (? = 0 AND NOT EXISTS (
+                             SELECT 1 FROM lcm_active_frontiers
+                             WHERE conversation_id = ?
+                         ))
+                         OR EXISTS (
+                             SELECT 1 FROM lcm_active_frontiers AS f
+                             WHERE f.conversation_id = ?
+                               AND f.generation = ? AND f.session_id = ?
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM lcm_active_frontiers AS newer
+                                   WHERE newer.conversation_id = f.conversation_id
+                                     AND newer.generation > f.generation
+                               )
+                         )
+                     )""",
+                (
+                    session_id, now, now, now, conversation_id,
+                    existing.current_session_id, existing.binding_generation,
+                    observed_generation,
+                    conversation_id, conversation_id, observed_generation,
+                    observed_frontier_session,
+                ),
+            )
         self._conn.commit()
         state = self.get_by_conversation(conversation_id)
         assert state is not None
@@ -310,6 +366,7 @@ class LifecycleStateStore:
                 current_frontier_store_id = ?,
                 last_finalized_frontier_store_id = ?,
                 rollover_carry_over_context = NULL,
+                binding_generation = binding_generation + 1,
                 debt_kind = debt_kind,
                 debt_size_estimate = debt_size_estimate,
                 last_finalized_at = ?,
@@ -364,9 +421,9 @@ class LifecycleStateStore:
                 last_finalized_at,
                 last_rollover_at,
                 last_reset_at,
-                rollover_carry_over_context,
+                rollover_carry_over_context, binding_generation,
                 updated_at
-            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 1, ?)
             ON CONFLICT(conversation_id) DO UPDATE SET
                 current_session_id = excluded.current_session_id,
                 last_finalized_session_id = excluded.last_finalized_session_id,
@@ -377,6 +434,7 @@ class LifecycleStateStore:
                 last_rollover_at = excluded.last_rollover_at,
                 last_reset_at = excluded.last_reset_at,
                 rollover_carry_over_context = excluded.rollover_carry_over_context,
+                binding_generation = lcm_lifecycle_state.binding_generation + 1,
                 updated_at = excluded.updated_at
             """,
             (
@@ -407,6 +465,7 @@ class LifecycleStateStore:
         current_frontier_store_id: int,
         finalized_frontier_store_id: int,
         carry_over_context: bool,
+        frozen_generation: int = 0,
     ) -> None:
         """Publish the rollover lifecycle row on a caller-owned transaction."""
         now = time.time()
@@ -416,8 +475,9 @@ class LifecycleStateStore:
                 conversation_id, current_session_id, last_finalized_session_id,
                 current_frontier_store_id, last_finalized_frontier_store_id,
                 current_bound_at, last_finalized_at, last_rollover_at,
-                last_reset_at, rollover_carry_over_context, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                last_reset_at, rollover_carry_over_context,
+                binding_generation, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
             ON CONFLICT(conversation_id) DO UPDATE SET
                 current_session_id = excluded.current_session_id,
                 last_finalized_session_id = excluded.last_finalized_session_id,
@@ -431,6 +491,7 @@ class LifecycleStateStore:
                 last_rollover_at = excluded.last_rollover_at,
                 last_reset_at = excluded.last_reset_at,
                 rollover_carry_over_context = excluded.rollover_carry_over_context,
+                binding_generation = lcm_lifecycle_state.binding_generation + 1,
                 debt_kind = NULL,
                 debt_size_estimate = 0,
                 debt_updated_at = excluded.updated_at,
@@ -445,6 +506,86 @@ class LifecycleStateStore:
                 now, now, now, now, 1 if carry_over_context else 0, now,
             ),
         )
+        if not carry_over_context:
+            LifecycleStateStore.record_no_carry_policy_no_commit(
+                conn,
+                conversation_id,
+                old_session_id=old_session_id,
+                new_session_id=new_session_id,
+                finalized_cutoff_store_id=finalized_frontier_store_id,
+                frozen_generation=frozen_generation,
+            )
+
+    @staticmethod
+    def record_no_carry_policy_no_commit(
+        conn: sqlite3.Connection,
+        conversation_id: str,
+        *,
+        old_session_id: str,
+        new_session_id: str,
+        finalized_cutoff_store_id: int,
+        frozen_generation: int,
+    ) -> None:
+        """Publish the lifecycle-independent no-carry cutoff policy."""
+        now = time.time()
+        conn.execute(
+            """INSERT INTO lcm_rollover_policies(
+                   conversation_id, finalized_session_id, current_session_id,
+                   finalized_cutoff_store_id, frozen_generation,
+                   carry_over_context, created_at, updated_at
+               ) VALUES(?, ?, ?, ?, ?, 0, ?, ?)
+               ON CONFLICT(conversation_id) DO UPDATE SET
+                   finalized_session_id = excluded.finalized_session_id,
+                   current_session_id = excluded.current_session_id,
+                   finalized_cutoff_store_id = MAX(
+                       lcm_rollover_policies.finalized_cutoff_store_id,
+                       excluded.finalized_cutoff_store_id
+                   ),
+                   frozen_generation = MAX(
+                       lcm_rollover_policies.frozen_generation,
+                       excluded.frozen_generation
+                   ),
+                   carry_over_context = 0,
+                   updated_at = excluded.updated_at""",
+            (
+                conversation_id, old_session_id, new_session_id,
+                max(0, int(finalized_cutoff_store_id or 0)),
+                max(0, int(frozen_generation or 0)), now, now,
+            ),
+        )
+
+    @staticmethod
+    def extend_no_carry_finalized_boundary_no_commit(
+        conn: sqlite3.Connection,
+        conversation_id: str,
+        *,
+        old_session_id: str,
+        current_session_id: str,
+        frontier_store_id: int,
+    ) -> None:
+        """Advance durable old-session coverage without changing frontier."""
+        now = time.time()
+        boundary = max(0, int(frontier_store_id or 0))
+        lifecycle = conn.execute(
+            """UPDATE lcm_lifecycle_state
+               SET last_finalized_frontier_store_id = MAX(
+                       last_finalized_frontier_store_id, ?
+                   ), updated_at = ?
+               WHERE conversation_id = ? AND current_session_id = ?
+                 AND last_finalized_session_id = ?
+                 AND rollover_carry_over_context = 0""",
+            (boundary, now, conversation_id, current_session_id, old_session_id),
+        )
+        policy = conn.execute(
+            """UPDATE lcm_rollover_policies
+               SET finalized_cutoff_store_id = MAX(finalized_cutoff_store_id, ?),
+                   updated_at = ?
+               WHERE conversation_id = ? AND finalized_session_id = ?
+                 AND current_session_id = ? AND carry_over_context = 0""",
+            (boundary, now, conversation_id, old_session_id, current_session_id),
+        )
+        if int(lifecycle.rowcount or 0) != 1 or int(policy.rowcount or 0) != 1:
+            raise RuntimeError("lifecycle no longer authorizes no-carry storage extension")
 
     @staticmethod
     def extend_finalized_rollover_no_commit(
@@ -494,6 +635,7 @@ class LifecycleStateStore:
                    last_finalized_session_id = ?,
                    current_frontier_store_id = 0,
                    rollover_carry_over_context = NULL,
+                   binding_generation = binding_generation + 1,
                    last_finalized_frontier_store_id = MAX(
                        last_finalized_frontier_store_id, ?
                    ),
@@ -1018,7 +1160,7 @@ class LifecycleStateStore:
                        debt_size_estimate, current_bound_at, last_finalized_at,
                        debt_updated_at, last_maintenance_attempt_at,
                        last_rollover_at, last_reset_at,
-                       rollover_carry_over_context, updated_at
+                       rollover_carry_over_context, binding_generation, updated_at
                 FROM lcm_lifecycle_state WHERE conversation_id = ?
                 """,
                 (conversation_id,),
@@ -1042,7 +1184,8 @@ class LifecycleStateStore:
                 rollover_carry_over_context=(
                     None if row[13] is None else bool(row[13])
                 ),
-                updated_at=float(row[14] or 0.0),
+                binding_generation=int(row[14] or 0),
+                updated_at=float(row[15] or 0.0),
             )
         with self._lock:
             state = self.get_by_conversation(conversation_id)

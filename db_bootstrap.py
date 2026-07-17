@@ -31,7 +31,7 @@ class SQLiteStartupBusyError(RuntimeError):
     """Raised when bounded SQLite startup lock waiting is exhausted."""
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 SQLITE_STARTUP_BACKOFF_INITIAL_SECONDS = 0.01
 SQLITE_STARTUP_BACKOFF_MAX_SECONDS = 0.25
@@ -46,11 +46,22 @@ REQUIRED_CORE_TABLES = (
     "metadata",
     "summary_nodes",
     "lcm_lifecycle_state",
+    "lcm_rollover_policies",
     "lcm_migration_state",
     "lcm_focus_briefs",
     "messages_fts",
     "nodes_fts",
 )
+
+# Test-only subprocess crash injection. Production callers never set this;
+# tests assign a phase name in the child process and verify SQLite rolls the
+# whole versioned migration back after an abrupt exit.
+_MIGRATION_CRASH_PHASE: str | None = None
+
+
+def _migration_crash_boundary(phase: str) -> None:
+    if _MIGRATION_CRASH_PHASE == phase:
+        os._exit(88)  # noqa: PLW1510 - deliberate migration crash injection
 
 
 class ExternalContentFtsSpec:
@@ -287,6 +298,7 @@ def ensure_lifecycle_state_table(conn: sqlite3.Connection) -> None:
             last_reset_at REAL,
             rollover_carry_over_context INTEGER
                 CHECK (rollover_carry_over_context IN (0, 1)),
+            binding_generation INTEGER NOT NULL DEFAULT 0,
             updated_at REAL NOT NULL DEFAULT (strftime('%s','now'))
         )
         """
@@ -333,8 +345,123 @@ def ensure_lifecycle_state_columns(conn: sqlite3.Connection) -> None:
         "ALTER TABLE lcm_lifecycle_state ADD COLUMN rollover_carry_over_context INTEGER "
         "CHECK (rollover_carry_over_context IN (0, 1))",
     )
+    add_column_if_missing(
+        conn, columns, "binding_generation",
+        "ALTER TABLE lcm_lifecycle_state ADD COLUMN binding_generation "
+        "INTEGER NOT NULL DEFAULT 0",
+    )
 
 
+def ensure_rollover_policy_table(conn: sqlite3.Connection) -> None:
+    """Create the lifecycle-independent schema-v11 no-carry cutoff ledger."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_rollover_policies (
+            conversation_id TEXT PRIMARY KEY,
+            finalized_session_id TEXT NOT NULL,
+            current_session_id TEXT NOT NULL,
+            finalized_cutoff_store_id INTEGER NOT NULL DEFAULT 0
+                CHECK (finalized_cutoff_store_id >= 0),
+            frozen_generation INTEGER NOT NULL DEFAULT 0
+                CHECK (frozen_generation >= 0),
+            carry_over_context INTEGER NOT NULL DEFAULT 0
+                CHECK (carry_over_context IN (0, 1)),
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_lcm_rollover_policy_finalized_session
+           ON lcm_rollover_policies(finalized_session_id)"""
+    )
+
+
+def ensure_rollover_policy_triggers(conn: sqlite3.Connection) -> None:
+    """Install DB-level cutoff enforcement that schema-v9 SQL cannot bypass.
+
+    The active-frontier trigger rejects attempts to restore the finalized
+    owner or publish a positive boundary at/below the frozen cutoff. The item
+    trigger is the range-level guard: even a frontier ending after the cutoff
+    cannot include an item whose covered range starts at/before it.
+    """
+    ensure_rollover_policy_table(conn)
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS lcm_no_carry_frontier_insert
+        BEFORE INSERT ON lcm_active_frontiers
+        WHEN EXISTS (
+            SELECT 1 FROM lcm_rollover_policies AS p
+            WHERE p.conversation_id = NEW.conversation_id
+              AND p.carry_over_context = 0
+              AND NEW.generation > p.frozen_generation
+              AND (
+                  NEW.session_id = p.finalized_session_id
+                  OR (
+                      NEW.source_end_store_id > 0
+                      AND NEW.source_end_store_id <= p.finalized_cutoff_store_id
+                  )
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'no-carry finalized cutoff blocks frontier publication');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS lcm_no_carry_frontier_update
+        BEFORE UPDATE OF session_id, source_end_store_id ON lcm_active_frontiers
+        WHEN EXISTS (
+            SELECT 1 FROM lcm_rollover_policies AS p
+            WHERE p.conversation_id = NEW.conversation_id
+              AND p.carry_over_context = 0
+              AND NEW.generation >= p.frozen_generation
+              AND (
+                  NEW.session_id = p.finalized_session_id
+                  OR (
+                      NEW.source_end_store_id > 0
+                      AND NEW.source_end_store_id <= p.finalized_cutoff_store_id
+                  )
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'no-carry finalized cutoff blocks frontier publication');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS lcm_no_carry_item_insert
+        BEFORE INSERT ON lcm_frontier_items
+        WHEN EXISTS (
+            SELECT 1 FROM lcm_rollover_policies AS p
+            WHERE p.conversation_id = NEW.conversation_id
+              AND p.carry_over_context = 0
+              AND NEW.generation >= p.frozen_generation
+              AND NEW.source_start <= p.finalized_cutoff_store_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'no-carry finalized cutoff blocks frontier item');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS lcm_no_carry_item_update
+        BEFORE UPDATE OF source_start, source_end ON lcm_frontier_items
+        WHEN EXISTS (
+            SELECT 1 FROM lcm_rollover_policies AS p
+            WHERE p.conversation_id = NEW.conversation_id
+              AND p.carry_over_context = 0
+              AND NEW.generation >= p.frozen_generation
+              AND NEW.source_start <= p.finalized_cutoff_store_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'no-carry finalized cutoff blocks frontier item');
+        END
+        """
+    )
 def ensure_message_origin_columns(conn: sqlite3.Connection) -> None:
     table_row = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'"
@@ -1188,6 +1315,23 @@ def run_versioned_migrations(
             mark_migration_step_complete(conn, "v10_rollover_carry_policy")
             current_version = 10
 
+        migrating_to_v11 = current_version < 11
+        if migrating_to_v11:
+            # The v10 lifecycle policy column and every v11 object remain
+            # inside this same writer transaction. Abrupt exits at any phase
+            # therefore recover as wholly v10, never as a partial v11 schema.
+            _migration_crash_boundary("v11_after_column")
+            ensure_rollover_policy_table(conn)
+            _migration_crash_boundary("v11_after_table")
+            ensure_rollover_policy_triggers(conn)
+            _migration_crash_boundary("v11_after_trigger")
+            mark_migration_step_complete(conn, "v11_no_carry_frontier_policy")
+            _migration_crash_boundary("v11_after_migration_step")
+            current_version = 11
+        else:
+            ensure_rollover_policy_table(conn)
+            ensure_rollover_policy_triggers(conn)
+
         # Startup FTS inspection, repair, rebuild, and trigger installation are
         # part of the same cross-connection writer transaction as schema
         # migration.  A concurrent opener therefore cannot observe v10, release
@@ -1201,6 +1345,8 @@ def run_versioned_migrations(
             )
 
         set_schema_version(conn, current_version)
+        if migrating_to_v11:
+            _migration_crash_boundary("v11_after_schema_version")
         conn.commit()
     except Exception:
         conn.rollback()

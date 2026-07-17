@@ -810,13 +810,58 @@ def test_reconverged_suffix_is_matched_and_not_duplicated_by_competing_rollover(
         competing.shutdown()
 
 
+def test_reconverged_duplicate_union_appends_only_host_multiplicity_deficit(tmp_path):
+    db_path = tmp_path / "rollover-reconverged-duplicate-union.db"
+    previous_messages, _retained_id, _pruned_id = _seed(db_path)
+    prefix = previous_messages[:1]
+    winner_history = prefix + [
+        {"role": "assistant", "content": "B"},
+        {"role": "assistant", "content": "A"},
+    ]
+    competitor_history = prefix + [
+        {"role": "assistant", "content": "A"},
+        {"role": "assistant", "content": "B"},
+        {"role": "assistant", "content": "A"},
+    ]
+    winner = LCMEngine(config=_config(db_path))
+    competitor = LCMEngine(config=_config(db_path))
+    winner.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
+    competitor.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
+    try:
+        winner.rollover_session(OLD, NEW, previous_messages=winner_history, platform="test")
+        competitor.rollover_session(
+            OLD,
+            "duplicate-losing-target",
+            previous_messages=competitor_history,
+            platform="test",
+        )
+        first = _canonical_snapshot(db_path)
+        contents = [row[3] for row in first["messages"]]
+        assert contents.count("B") == 1
+        assert contents.count("A") == 2
+
+        competitor.on_session_end(OLD, competitor_history)
+        assert _canonical_snapshot(db_path) == first
+    finally:
+        winner.shutdown()
+        competitor.shutdown()
+
+
 def test_ordered_occurrence_reconciliation_preserves_multiplicity_and_scales_linearly():
     reconcile = LCMEngine._ordered_unmatched_retained_indices
+    assert reconcile(
+        ["P", "A", "B", "A"],
+        ["P", "B", "A"],
+    ) == [3]
     assert reconcile(
         ["P", "A", "S", "A", "T", "S"],
         ["P", "B", "S", "C", "T", "S"],
     ) == [1, 3]
     assert reconcile(["R", "R", "R"], ["R", "R"]) == [2]
+    assert reconcile(
+        ["P", "A", "B", "A", "C", "B", "A"],
+        ["P", "B", "A", "C", "A"],
+    ) == [5, 6]
 
     size = 100_000
     host = ["adversarial-repeat"] * size
@@ -857,14 +902,15 @@ def test_duplicate_late_end_with_ignored_host_row_is_exact_noop(tmp_path, monkey
         engine.shutdown()
 
 
-def test_no_carry_winner_rejects_competing_and_late_old_tails_without_repopulation(tmp_path):
+def test_no_carry_winner_stores_competing_and_late_old_tails_without_repopulation(tmp_path):
     db_path = tmp_path / "rollover-no-carry-winner.db"
     previous_messages, _retained_id, _pruned_id = _seed(db_path)
     winner = LCMEngine(config=_config(db_path))
     competing = LCMEngine(config=_config(db_path))
     winner.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
     competing.on_session_start(OLD, conversation_id=CONVERSATION, platform="test")
-    rejected = {"role": "assistant", "content": "REJECTED OLD TAIL"}
+    competing_tail = {"role": "assistant", "content": "STORED COMPETING OLD TAIL"}
+    late_tail = {"role": "assistant", "content": "STORED LATE OLD TAIL"}
     try:
         winner.rollover_session(
             OLD,
@@ -876,28 +922,40 @@ def test_no_carry_winner_rejects_competing_and_late_old_tails_without_repopulati
         competing.rollover_session(
             OLD,
             "losing-target",
-            previous_messages=previous_messages + [rejected],
+            previous_messages=previous_messages + [competing_tail],
             carry_over_context=True,
             platform="test",
         )
         before_late_end = _canonical_snapshot(db_path)
         assert before_late_end["active"][1:] == (NEW, 0)
         assert before_late_end["items"] == []
-        assert all(row[3] != rejected["content"] for row in before_late_end["messages"])
+        assert sum(row[3] == competing_tail["content"] for row in before_late_end["messages"]) == 1
+        competing_boundary = max(row[0] for row in before_late_end["messages"])
+        assert before_late_end["lifecycle"][3] == competing_boundary
         conn = sqlite3.connect(str(db_path))
         try:
             policy = conn.execute(
-                "SELECT rollover_carry_over_context FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                """SELECT finalized_session_id, current_session_id,
+                          finalized_cutoff_store_id, carry_over_context
+                   FROM lcm_rollover_policies WHERE conversation_id = ?""",
                 (CONVERSATION,),
             ).fetchone()
         finally:
             conn.close()
-        assert policy == (0,)
+        assert policy == (OLD, NEW, competing_boundary, 0)
 
-        with pytest.raises(RuntimeError, match="carry-over policy"):
-            winner.on_session_end(OLD, previous_messages + [rejected])
+        late_history = previous_messages + [competing_tail, late_tail]
+        winner.on_session_end(OLD, late_history)
         after_late_end = _canonical_snapshot(db_path)
-        assert after_late_end == before_late_end
+        assert after_late_end["active"] == before_late_end["active"]
+        assert after_late_end["items"] == []
+        assert sum(row[3] == competing_tail["content"] for row in after_late_end["messages"]) == 1
+        assert sum(row[3] == late_tail["content"] for row in after_late_end["messages"]) == 1
+        late_boundary = max(row[0] for row in after_late_end["messages"])
+        assert after_late_end["lifecycle"][3] == late_boundary
+
+        winner.on_session_end(OLD, late_history)
+        assert _canonical_snapshot(db_path) == after_late_end
     finally:
         winner.shutdown()
         competing.shutdown()
@@ -954,7 +1012,7 @@ def test_two_engine_stale_generation_race_obeys_no_carry_winner(tmp_path, monkey
         state = _canonical_snapshot(db_path)
         assert state["active"][1:] == (NEW, 0)
         assert state["items"] == []
-        assert all(row[3] != "STALE RACE TAIL" for row in state["messages"])
+        assert sum(row[3] == "STALE RACE TAIL" for row in state["messages"]) == 1
     finally:
         release_stale.set()
         worker.join(5)

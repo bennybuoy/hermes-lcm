@@ -261,17 +261,30 @@ Below that pressure, simpler existing behavior is preserved. Until Hermes core
 supplies the explicit signal contract, cache state remains `unknown` and LCM
 uses the normal bounded route strategy.
 
-### Schema v10 deployment and rollback
+### Schema v11 deployment and rollback
 
-Schema v10 adds the nullable `rollover_carry_over_context` lifecycle field. It
-records the carry-over decision that won an atomic rollover so a late session
-end cannot reinterpret the policy. Existing schema v9 rows migrate with `NULL`,
-which preserves the legacy compatibility behavior; newly published rollovers
-store an explicit boolean. The migration and schema-version publication occur
-under one SQLite writer transaction and are safe to retry after interruption.
+Schema v11 adds the lifecycle `binding_generation` CAS column, the independent
+`lcm_rollover_policies` cutoff ledger, and database triggers on active-frontier
+generations and items. A
+no-carry rollover keeps late or competing old-session messages losslessly in
+raw storage and advances the finalized durable cutoff, but those rows never
+repopulate the current canonical frontier. The triggers enforce that cutoff
+even for an already-running schema-v9 publisher: old processes may append raw
+messages, but cannot publish the finalized owner or any frontier item whose
+source range begins at or before the cutoff. The policy survives lifecycle-row
+rewrites. Table creation, trigger installation, migration-step recording, and
+schema-version publication are one crash-atomic SQLite writer transaction.
 
-The read-only `hermes-lcm status` command reports `schema_version: 10` together
-with `supported_schema_version: 10`. It does not migrate older databases and
+Schema v10 added the nullable `rollover_carry_over_context` lifecycle field. It
+records the carry-over decision that won an atomic rollover so application
+code can route late session-end storage correctly. Existing schema v9 rows
+migrate with `NULL`, which preserves the legacy compatibility behavior; newly
+published rollovers store an explicit boolean.
+
+The read-only `hermes-lcm status` command reports `schema_version: 11` together
+with `supported_schema_version: 11` and a rollover-policy row count. `frontier
+show` includes the conversation's durable policy when present, and `doctor`
+checks for cutoff violations. The CLI does not migrate older databases and
 refuses databases newer than the installed build.
 
 Schema v8 previously added immutable `lcm_focus_briefs` records and the

@@ -14,7 +14,7 @@ import re
 import sqlite3
 import threading
 import time
-from collections import defaultdict, deque
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -3134,27 +3134,20 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
         host_identities: Sequence[Any],
         durable_identities: Sequence[Any],
     ) -> list[int]:
-        """Return host occurrences not represented by one ordered durable match.
+        """Return host multiplicity deficits in original host order.
 
-        Durable occurrence positions are queued once, then consumed while the
-        host sequence is scanned from left to right.  This recognizes shared
-        suffixes after divergent branches, preserves repeated-value
-        multiplicity, and stays O(host + durable) in time and space.
+        Durable order is not evidence that a repeated identity belongs to one
+        particular host branch. Each durable occurrence covers one equal host
+        occurrence; only occurrences beyond that durable count are appended.
+        This is replay-idempotent and O(host + durable) time with O(unique)
+        memory, including reconverged and interleaved duplicate values.
         """
-        positions: dict[Any, deque[int]] = defaultdict(deque)
-        for durable_index, identity in enumerate(durable_identities):
-            positions[identity].append(durable_index)
-
+        durable_counts = Counter(durable_identities)
+        covered_counts: Counter[Any] = Counter()
         unmatched: list[int] = []
-        last_position = -1
         for host_index, identity in enumerate(host_identities):
-            candidates = positions.get(identity)
-            if candidates is not None:
-                while candidates and candidates[0] <= last_position:
-                    candidates.popleft()
-            if candidates:
-                last_position = candidates.popleft()
-            else:
+            covered_counts[identity] += 1
+            if covered_counts[identity] > durable_counts[identity]:
                 unmatched.append(host_index)
         return unmatched
 
@@ -3489,15 +3482,6 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     raise RuntimeError(
                         "late session-end rejected after durable lifecycle ownership changed"
                     )
-                if (
-                    extends_rollover
-                    and lifecycle[4] is not None
-                    and not bool(lifecycle[4])
-                ):
-                    raise RuntimeError(
-                        "late session-end rejected by rollover carry-over policy"
-                    )
-
                 appended_ids = self._revalidate_and_append_old_session_tail_no_commit(
                     conn,
                     conversation_id=conversation_id,
@@ -3511,24 +3495,64 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 self._rollover_publication_boundary("after_tail_ingest")
 
                 if extends_rollover:
-                    self._extend_completed_rollover_no_commit(
-                        conn,
-                        conversation_id=conversation_id,
-                        old_session_id=session_id,
-                        winner_session_id=current_session_id,
-                        active=active,
-                        read_budget=read_budget,
-                        batch_reason="late_finalized_session_suffix",
-                    )
+                    if lifecycle[4] is not None and not bool(lifecycle[4]):
+                        finalized_boundary = self._durable_session_boundary_no_commit(
+                            conn,
+                            conversation_id=conversation_id,
+                            session_id=session_id,
+                            floor=int(lifecycle[3] or 0),
+                        )
+                        self._lifecycle.extend_no_carry_finalized_boundary_no_commit(
+                            conn,
+                            conversation_id,
+                            old_session_id=session_id,
+                            current_session_id=current_session_id,
+                            frontier_store_id=finalized_boundary,
+                        )
+                        self._rollover_publication_boundary("after_lifecycle")
+                    else:
+                        self._extend_completed_rollover_no_commit(
+                            conn,
+                            conversation_id=conversation_id,
+                            old_session_id=session_id,
+                            winner_session_id=current_session_id,
+                            active=active,
+                            read_budget=read_budget,
+                            batch_reason="late_finalized_session_suffix",
+                        )
                 elif finalizes_current:
                     frontier_store_id = int(lifecycle[2] or 0)
                     if active is not None and active_session_id == session_id:
                         frontier_store_id = max(frontier_store_id, int(active[2] or 0))
+                    frontier_store_id = self._durable_session_boundary_no_commit(
+                        conn,
+                        conversation_id=conversation_id,
+                        session_id=session_id,
+                        floor=frontier_store_id,
+                    )
                     self._lifecycle.finalize_session_no_commit(
                         conn,
                         conversation_id,
                         session_id=session_id,
                         frontier_store_id=frontier_store_id,
+                    )
+                    self._rollover_publication_boundary("after_lifecycle")
+                elif extends_finalized:
+                    frontier_store_id = self._durable_session_boundary_no_commit(
+                        conn,
+                        conversation_id=conversation_id,
+                        session_id=session_id,
+                        floor=int(lifecycle[3] or 0),
+                    )
+                    conn.execute(
+                        """UPDATE lcm_lifecycle_state
+                           SET last_finalized_frontier_store_id = MAX(
+                                   last_finalized_frontier_store_id, ?
+                               ), updated_at = ?
+                           WHERE conversation_id = ?
+                             AND current_session_id IS NULL
+                             AND last_finalized_session_id = ?""",
+                        (frontier_store_id, time.time(), conversation_id, session_id),
                     )
                     self._rollover_publication_boundary("after_lifecycle")
 
@@ -4262,6 +4286,22 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             conversation_id=conversation_id,
         )
 
+    @staticmethod
+    def _durable_session_boundary_no_commit(
+        conn: sqlite3.Connection,
+        *,
+        conversation_id: str,
+        session_id: str,
+        floor: int = 0,
+    ) -> int:
+        """Return the durable raw boundary for one conversation/session."""
+        row = conn.execute(
+            """SELECT MAX(store_id) FROM messages
+               WHERE conversation_id = ? AND session_id = ?""",
+            (conversation_id, session_id),
+        ).fetchone()
+        return max(int(floor or 0), int(row[0] or 0) if row else 0)
+
     def _extend_completed_rollover_no_commit(
         self,
         conn: sqlite3.Connection,
@@ -4388,12 +4428,6 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             ):
                 completed_session_id = active_session_id
             if completed_session_id:
-                if not winner_carry_over:
-                    outcome = (
-                        "idempotent" if completed_session_id == new_session_id else "competing"
-                    )
-                    result = (0, outcome, completed_session_id)
-                    return result if return_outcome else 0
                 self._revalidate_and_append_old_session_tail_no_commit(
                     conn,
                     conversation_id=conversation_id,
@@ -4405,15 +4439,30 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 )
                 self._rollover_publication_boundary("after_revalidation")
                 self._rollover_publication_boundary("after_tail_ingest")
-                self._extend_completed_rollover_no_commit(
-                    conn,
-                    conversation_id=conversation_id,
-                    old_session_id=old_session_id,
-                    winner_session_id=completed_session_id,
-                    active=active,
-                    read_budget=read_budget,
-                    batch_reason="rollover_suffix_adopted",
-                )
+                if winner_carry_over:
+                    self._extend_completed_rollover_no_commit(
+                        conn,
+                        conversation_id=conversation_id,
+                        old_session_id=old_session_id,
+                        winner_session_id=completed_session_id,
+                        active=active,
+                        read_budget=read_budget,
+                        batch_reason="rollover_suffix_adopted",
+                    )
+                else:
+                    finalized_boundary = self._durable_session_boundary_no_commit(
+                        conn,
+                        conversation_id=conversation_id,
+                        session_id=old_session_id,
+                    )
+                    self._lifecycle.extend_no_carry_finalized_boundary_no_commit(
+                        conn,
+                        conversation_id,
+                        old_session_id=old_session_id,
+                        current_session_id=completed_session_id,
+                        frontier_store_id=finalized_boundary,
+                    )
+                    self._rollover_publication_boundary("after_lifecycle")
                 outcome = (
                     "idempotent" if completed_session_id == new_session_id else "competing"
                 )
@@ -4440,6 +4489,12 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
             self._rollover_publication_boundary("after_tail_ingest")
             base_generation = int(active[0]) if active else 0
             old_frontier = int(active[2] or 0) if active else 0
+            finalized_boundary = self._durable_session_boundary_no_commit(
+                conn,
+                conversation_id=conversation_id,
+                session_id=old_session_id,
+                floor=old_frontier,
+            )
 
             retain = int(self._config.new_session_retain_depth)
             if retain == 0:
@@ -4526,8 +4581,9 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                 old_session_id=old_session_id,
                 new_session_id=new_session_id,
                 current_frontier_store_id=new_frontier,
-                finalized_frontier_store_id=max(old_frontier, new_frontier),
+                finalized_frontier_store_id=max(finalized_boundary, new_frontier),
                 carry_over_context=carry_over_context,
+                frozen_generation=new_generation,
             )
             self._rollover_publication_boundary("after_lifecycle")
 

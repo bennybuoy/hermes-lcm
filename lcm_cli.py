@@ -289,6 +289,7 @@ def _status(conn: sqlite3.Connection, path: Path, _args: argparse.Namespace) -> 
             "frontier_generations": _count(conn, "lcm_active_frontiers"),
             "frontier_items": _count(conn, "lcm_frontier_items"),
             "prepared_batches": _count(conn, "lcm_prepared_batches"),
+            "rollover_policies": _count(conn, "lcm_rollover_policies"),
         },
     }
 
@@ -450,6 +451,13 @@ def _frontier(conn: sqlite3.Connection, args: argparse.Namespace) -> dict[str, A
     ).fetchall()
     payload["items_truncated"] = len(item_rows) > _FRONTIER_ITEMS_LIMIT
     payload["items"] = [dict(item) for item in item_rows[:_FRONTIER_ITEMS_LIMIT]]
+    payload["rollover_policy"] = None
+    if _table_exists(conn, "lcm_rollover_policies"):
+        policy = conn.execute(
+            "SELECT * FROM lcm_rollover_policies WHERE conversation_id = ?",
+            (payload["conversation_id"],),
+        ).fetchone()
+        payload["rollover_policy"] = dict(policy) if policy is not None else None
     return payload
 
 
@@ -494,6 +502,7 @@ def _doctor(conn: sqlite3.Connection, path: Path, _args: argparse.Namespace) -> 
     foreign = conn.execute("PRAGMA foreign_key_check").fetchmany(100)
     itemless = 0
     missing_nodes = 0
+    no_carry_policy_violations = 0
     if _table_exists(conn, "lcm_active_frontiers") and _table_exists(conn, "lcm_frontier_items"):
         itemless = int(conn.execute(
             """
@@ -513,6 +522,28 @@ def _doctor(conn: sqlite3.Connection, path: Path, _args: argparse.Namespace) -> 
                 )
                 """
             ).fetchone()[0])
+    if (
+        _table_exists(conn, "lcm_rollover_policies")
+        and _table_exists(conn, "lcm_active_frontiers")
+        and _table_exists(conn, "lcm_frontier_items")
+    ):
+        no_carry_policy_violations = int(conn.execute(
+            """SELECT COUNT(*) FROM lcm_rollover_policies AS p
+               WHERE p.carry_over_context = 0 AND (
+                   EXISTS (
+                       SELECT 1 FROM lcm_active_frontiers AS f
+                       WHERE f.conversation_id = p.conversation_id
+                         AND f.generation > p.frozen_generation
+                         AND f.session_id = p.finalized_session_id
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM lcm_frontier_items AS i
+                       WHERE i.conversation_id = p.conversation_id
+                         AND i.generation >= p.frozen_generation
+                         AND i.source_start <= p.finalized_cutoff_store_id
+                   )
+               )"""
+        ).fetchone()[0])
     ok = quick == [("ok",)] or [row[0] for row in quick] == ["ok"]
     return {
         "database_path": str(path),
@@ -521,7 +552,11 @@ def _doctor(conn: sqlite3.Connection, path: Path, _args: argparse.Namespace) -> 
         "foreign_key_violations": [list(row) for row in foreign],
         "itemless_positive_frontiers": itemless,
         "missing_frontier_nodes": missing_nodes,
-        "status": "pass" if ok and not foreign and not itemless and not missing_nodes else "fail",
+        "no_carry_policy_violations": no_carry_policy_violations,
+        "status": "pass" if (
+            ok and not foreign and not itemless and not missing_nodes
+            and not no_carry_policy_violations
+        ) else "fail",
     }
 
 
