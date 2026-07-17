@@ -8,6 +8,7 @@ import logging
 import multiprocessing
 import os
 import re
+import stat
 import threading
 import time
 from datetime import datetime
@@ -129,9 +130,41 @@ _BOUNDARY_ASSIGNMENT_START_RE = re.compile(
     r"(?:api[_-]?key|api[_-]?token|access[_-]?token|secret[_-]?key|"
     r"client[_-]?secret|password|passwd|pwd|passphrase)"
     r"(?![A-Za-z0-9_-])\s*(?:\\?[\"'])?\s*[:=]\s*"
-    r"(?:(?P<quote>[\"'])|(?P<unquoted>[^\s,\"'\]}]))",
+    r"(?:(?P<escaped_quote>\\[\"'])|(?P<quote>[\"'])|"
+    r"(?P<unquoted>[^\r\n,;\"'\]}]))",
     re.IGNORECASE,
 )
+
+_BOUNDARY_UNQUOTED_TERMINATORS = frozenset("\r\n,;}]")
+_BOUNDARY_ESCAPED_QUOTE_TERMINATORS = frozenset("\r\n,}]")
+
+
+def _is_unquoted_terminator(read_chunk, absolute_offset: int, char: str) -> bool:
+    """Recognize only record structure, including the legacy ``::`` fence."""
+    if char in _BOUNDARY_UNQUOTED_TERMINATORS:
+        return True
+    return char == ":" and read_chunk(absolute_offset, 2).startswith("::")
+
+
+def _escaped_quote_has_safe_terminator(
+    read_chunk,
+    after_quote_offset: int,
+    total_chars: int,
+    *,
+    allow_eof: bool = False,
+) -> bool:
+    """Require JSON/record structure after a raw ``\"`` value delimiter."""
+    following = read_chunk(after_quote_offset, 128)
+    index = 0
+    while index < len(following) and following[index] in " \t":
+        index += 1
+    if index < len(following):
+        return following[index] in _BOUNDARY_ESCAPED_QUOTE_TERMINATORS
+    return (
+        allow_eof
+        and after_quote_offset >= total_chars
+        and not following
+    )
 
 
 def _first_unescaped_quote(text: str, quote: str | None = None) -> tuple[int, str] | None:
@@ -158,9 +191,6 @@ def _credential_mode_at_offset(
     quote: str | None = None
     quote_backslashes = 0
     cursor = scan_start
-    token_chars = frozenset(
-        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._~+/=-"
-    )
 
     while cursor < requested_offset:
         primary_chars = min(
@@ -197,7 +227,12 @@ def _credential_mode_at_offset(
                     )
                     continue
                 if assignment is not None:
-                    if assignment.group("quote") is not None:
+                    if assignment.group("escaped_quote") is not None:
+                        mode = "escaped_quote"
+                        quote = assignment.group("escaped_quote")[-1]
+                        quote_backslashes = 0
+                        index = assignment.end()
+                    elif assignment.group("quote") is not None:
                         mode = "quote"
                         quote = assignment.group("quote")
                         quote_backslashes = 0
@@ -223,8 +258,31 @@ def _credential_mode_at_offset(
                     quote_backslashes = 0
                 index += 1
                 continue
+            if mode == "escaped_quote":
+                char = data[index]
+                if char == "\\":
+                    quote_backslashes += 1
+                else:
+                    if (
+                        char == quote
+                        and quote_backslashes == 1
+                        and _escaped_quote_has_safe_terminator(
+                            read_chunk,
+                            cursor + index + 1,
+                            requested_offset,
+                        )
+                    ):
+                        mode = "normal"
+                        quote = None
+                    quote_backslashes = 0
+                index += 1
+                continue
             if mode == "token":
-                if data[index] not in token_chars:
+                if _is_unquoted_terminator(
+                    read_chunk,
+                    cursor + index,
+                    data[index],
+                ):
                     mode = "normal"
                     # Reprocess the delimiter: it may begin another expression.
                     continue
@@ -253,7 +311,11 @@ def _credential_mode_at_offset(
             return "unknown", None
     if mode == "token":
         boundary_char = read_chunk(requested_offset, 1)
-        if boundary_char and boundary_char[0] not in token_chars:
+        if boundary_char and _is_unquoted_terminator(
+            read_chunk,
+            requested_offset,
+            boundary_char[0],
+        ):
             # The requested cursor is exactly on the token terminator. It is a
             # safe page boundary, but the benign delimiter still belongs to
             # the caller's lossless output and must not be consumed here.
@@ -268,11 +330,11 @@ def _scan_raw_credential_boundary(
 ) -> dict[str, Any]:
     """Classify/skip a credential around one raw cursor using bounded chunks.
 
-    The scanner never accumulates the row.  If its bounded backward pass cannot
-    prove the cursor benign, it treats the left boundary as sensitive and scans
-    forward for a quote/PEM terminator.  A credential longer than one operation
-    advances only to another fail-closed scan cursor, so benign suffix data is
-    eventually reachable without ever exposing an intermediate body fragment.
+    The scanner never accumulates the row. It streams compact syntax state from
+    the row's proof boundary, then scans forward from an unsafe cursor for a
+    conservative terminator. A credential longer than one operation advances
+    only to another fail-closed scan cursor, so benign suffix data is eventually
+    reachable without ever exposing an intermediate body fragment.
     """
     total = max(0, int(total_chars))
     offset = min(max(0, int(requested_offset)), total)
@@ -287,18 +349,16 @@ def _scan_raw_credential_boundary(
     # An opener exactly at the cursor must be handled before the ordinary page
     # slicer, otherwise a very long expression can pin pagination at its start.
     forward_prefix = read_chunk(offset, 512)
-    assignment_at_cursor = re.match(
-        r"(?:api[_-]?key|api[_-]?token|access[_-]?token|secret[_-]?key|"
-        r"client[_-]?secret|password|passwd|pwd|passphrase)"
-        r"\s*(?:\\?[\"'])?\s*[:=]\s*(?:(?P<quote>[\"'])|"
-        r"(?P<unquoted>[^\s,\"'\]}]+))",
-        forward_prefix,
-        re.IGNORECASE,
-    )
+    assignment_at_cursor = _BOUNDARY_ASSIGNMENT_START_RE.match(forward_prefix)
     pem_at_cursor = _BOUNDARY_PRIVATE_KEY_BEGIN_RE.match(forward_prefix)
     if assignment_at_cursor is not None:
         unsafe = True
-        if assignment_at_cursor.group("quote") is not None:
+        if assignment_at_cursor.group("escaped_quote") is not None:
+            mode = "escaped_quote"
+            quote = assignment_at_cursor.group("escaped_quote")[-1]
+            forward_start = offset + assignment_at_cursor.end()
+            safe_prefix = forward_prefix[:assignment_at_cursor.end()]
+        elif assignment_at_cursor.group("quote") is not None:
             mode = "quote"
             quote = assignment_at_cursor.group("quote")
             forward_start = offset + assignment_at_cursor.end()
@@ -314,17 +374,13 @@ def _scan_raw_credential_boundary(
     else:
         forward_start = offset
 
-    # Establish a bounded, proven scan origin and stream forward to the
-    # requested offset. Ordinary quote characters are data in normal mode and
-    # cannot manufacture a safe boundary. Reaching the start of the row is a
-    # proof boundary; exhausting the backward budget is not.
+    # Stream from the only universal proof boundary: the start of the row.
+    # State stays bounded to a few scalars while SQLite returns bounded chunks;
+    # no whole row is allocated.  Starting at a fixed lookbehind would make a
+    # wholly benign deep offset indistinguishable from a credential body.
     if not unsafe and offset > 0:
-        backward_budget = (
-            _EXPAND_BOUNDARY_SCAN_CHARS * _EXPAND_BOUNDARY_SCAN_MAX_CHUNKS
-        )
-        scan_start = max(0, offset - backward_budget)
         mode, quote = _credential_mode_at_offset(
-            read_chunk, scan_start, offset
+            read_chunk, 0, offset
         )
         if mode != "normal":
             unsafe = True
@@ -336,9 +392,6 @@ def _scan_raw_credential_boundary(
     cursor = forward_start
     overlap = ""
     quote_backslashes = 0
-    token_chars = frozenset(
-        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._~+/=-"
-    )
     for _ in range(_EXPAND_BOUNDARY_SCAN_MAX_CHUNKS):
         if cursor >= total:
             return {
@@ -359,7 +412,11 @@ def _scan_raw_credential_boundary(
                 terminator_end = match.end()
         elif mode == "token":
             for index, char in enumerate(chunk):
-                if char not in token_chars:
+                if _is_unquoted_terminator(
+                    read_chunk,
+                    cursor + index,
+                    char,
+                ):
                     terminator_end = overlap_chars + index
                     break
         elif mode == "quote":
@@ -368,6 +425,24 @@ def _scan_raw_credential_boundary(
                     quote_backslashes += 1
                     continue
                 if char == quote and quote_backslashes % 2 == 0:
+                    terminator_end = overlap_chars + index + 1
+                    break
+                quote_backslashes = 0
+        elif mode == "escaped_quote":
+            for index, char in enumerate(chunk):
+                if char == "\\":
+                    quote_backslashes += 1
+                    continue
+                if (
+                    char == quote
+                    and quote_backslashes == 1
+                    and _escaped_quote_has_safe_terminator(
+                        read_chunk,
+                        cursor + index + 1,
+                        total,
+                        allow_eof=True,
+                    )
+                ):
                     terminator_end = overlap_chars + index + 1
                     break
                 quote_backslashes = 0
@@ -496,17 +571,6 @@ def _decode_json_string_prefix(text: str, start: int, max_chars: int) -> tuple[s
     return "".join(output), closed
 
 
-def _json_prefix_field(text: str, field: str) -> str:
-    match = re.search(rf'"{re.escape(field)}"\s*:\s*("(?:\\.|[^"\\])*")', text)
-    if not match:
-        return ""
-    try:
-        value = json.loads(match.group(1))
-    except (ValueError, json.JSONDecodeError):
-        return ""
-    return value if isinstance(value, str) else ""
-
-
 def _externalized_literal_match(content: str, query: str) -> re.Match[str] | None:
     terms = [
         phrase or word
@@ -575,7 +639,7 @@ def _search_externalized_payloads(
     *,
     query: str,
     regex_mode: bool,
-    session_id: str | None,
+    allowed_session_ids: frozenset[str],
     ref: str,
     limit: int,
     max_files: int,
@@ -667,21 +731,66 @@ def _search_externalized_payloads(
             diagnostics.append({"ref": path.name, "error": "not_a_file"})
             continue
         remaining = effective_total_bytes - bytes_scanned
-        read_limit = min(remaining, max(4_096, max_payload_chars * 6 + 4_096))
+        read_limit = min(
+            remaining,
+            max(4_096, max_payload_chars * 6 + 4_096),
+        )
         try:
             with resolved.open("rb") as handle:
-                raw = handle.read(read_limit + 1)
-        except OSError:
+                opened_stat = os.fstat(handle.fileno())
+                if not stat.S_ISREG(opened_stat.st_mode):
+                    diagnostics.append({"ref": path.name, "error": "not_a_file"})
+                    continue
+                metadata_prefix, content_key_seen, metadata_truncated = (
+                    _read_externalized_payload_metadata_prefix_from_handle(
+                        handle,
+                        max_bytes=min(
+                            read_limit,
+                            _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES,
+                        ),
+                    )
+                )
+                metadata_bytes = handle.tell()
+                payload_session_id = _inspect_top_level_json_string_fields_before_content(
+                    metadata_prefix
+                )[0].get("session_id", "")
+                if not payload_session_id:
+                    bytes_scanned += metadata_bytes
+                    diagnostics.append({
+                        "ref": path.name,
+                        "error": (
+                            "metadata_prefix_truncated"
+                            if metadata_truncated
+                            else "session_metadata_unavailable"
+                        ),
+                    })
+                    continue
+                if payload_session_id not in allowed_session_ids:
+                    bytes_scanned += metadata_bytes
+                    diagnostics.append({"ref": path.name, "error": "session_mismatch"})
+                    continue
+                if not content_key_seen:
+                    bytes_scanned += metadata_bytes
+                    diagnostics.append({
+                        "ref": path.name,
+                        "error": (
+                            "metadata_prefix_truncated"
+                            if metadata_truncated
+                            else "content_not_in_prefix"
+                        ),
+                    })
+                    continue
+                prefix_bytes = metadata_prefix.encode("utf-8")
+                tail_limit = max(0, read_limit - len(prefix_bytes))
+                raw_tail = handle.read(tail_limit)
+                raw = prefix_bytes + raw_tail
+                raw_truncated = opened_stat.st_size > len(raw)
+        except (OSError, ValueError, UnicodeDecodeError):
             diagnostics.append({"ref": path.name, "error": "unreadable"})
             continue
         files_scanned += 1
         bytes_scanned += min(len(raw), read_limit)
-        raw_truncated = len(raw) > read_limit
-        prefix = raw[:read_limit].decode("utf-8", errors="replace")
-        payload_session_id = _json_prefix_field(prefix, "session_id")
-        if session_id is not None and payload_session_id != session_id:
-            diagnostics.append({"ref": path.name, "error": "session_mismatch"})
-            continue
+        prefix = raw.decode("utf-8", errors="replace")
         content_key = re.search(r'"content"\s*:\s*', prefix)
         if content_key is None:
             diagnostics.append({"ref": path.name, "error": "content_not_in_prefix"})
@@ -731,7 +840,11 @@ def _search_externalized_payloads(
         context_end = min(line_end, end + 120)
         try:
             created_match = re.search(r'"created_at"\s*:\s*([0-9.]+)', prefix)
-            created_at = float(created_match.group(1)) if created_match else resolved.stat().st_mtime
+            created_at = (
+                float(created_match.group(1))
+                if created_match
+                else opened_stat.st_mtime
+            )
         except (OSError, ValueError):
             created_at = 0.0
         matched_text = content[start:end]
@@ -1884,29 +1997,13 @@ def _grep_safe_snippet(
     if not raw_window:
         return ""
     if left_boundary_truncated:
-        # The SQL match window intentionally starts near the query.  A newline
-        # or space is not a safe terminator when the left edge is inside a
-        # quoted assignment or PEM body, so fail closed through an explicit
-        # quote/private-key terminator.  Preserve the historical unquoted-token
-        # case only when the leading run is long enough to be unambiguously a
-        # single token; otherwise uncertainty redacts the complete window.
-        boundary_end = None
         boundary_name = "left_boundary_credential"
-        # A truncated left edge does not reveal the assignment opener. Neither
-        # quote type is therefore a safe boundary: an apostrophe inside a
-        # double-quoted value (or vice versa) is secret data. If an opener is
-        # present in this bounded window, track its exact delimiter and escape
-        # parity; otherwise redact the complete uncertain window.
-        assignment = _BOUNDARY_ASSIGNMENT_START_RE.search(raw_window)
-        if assignment is not None and assignment.group("quote") is not None:
-            opener_quote = assignment.group("quote")
-            quote_end = _first_unescaped_quote(
-                raw_window[assignment.end():], opener_quote
-            )
-            if quote_end is not None:
-                boundary_end = assignment.end() + quote_end[0] + 1
-        if boundary_end is None:
-            boundary_end = len(raw_window)
+        # The outer state is unknown. Assignment-like text in the window may
+        # itself be secret body data, so it cannot replace that state or prove
+        # a terminator (including same-key decoys). The bounded record/window
+        # boundary is the only proof available here; redact through it and add
+        # an independently protected query marker for result discoverability.
+        boundary_end = len(raw_window)
         entire_window_uncertain = boundary_end >= len(raw_window)
         raw_window = (
             f"[LCM sensitive redaction: name={boundary_name}; boundary-truncated]"
@@ -3518,6 +3615,9 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         if time.monotonic() >= operation_deadline:
             operation_budget_exhausted = True
             return False
+        if operation_rows_materialized >= _LCM_GREP_OPERATION_MAX_ROWS:
+            operation_budget_exhausted = True
+            return False
         try:
             encoded = json.dumps(
                 value,
@@ -3536,7 +3636,16 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
             return False
         operation_rows_materialized += 1
         operation_bytes_materialized += len(encoded)
+        if operation_rows_materialized >= _LCM_GREP_OPERATION_MAX_ROWS:
+            operation_budget_exhausted = True
         return True
+
+    # External hits are materialized candidates too. Reserve their maximum
+    # cardinality before database discovery so mixed searches cannot spend the
+    # complete operation row budget and then append an unreserved file batch.
+    external_rows_reserved = 0
+    if content_scope in {"externalized", "all"}:
+        external_rows_reserved = reserve_discovery_rows(min(limit, max_files))
 
     if content_scope in {"database", "all"} and not regex_mode:
       try:
@@ -3721,6 +3830,8 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
 
     if (
         content_scope in {"externalized", "all"}
+        and external_rows_reserved > 0
+        and operation_rows_materialized < _LCM_GREP_OPERATION_MAX_ROWS
         and time.monotonic() < operation_deadline
         and operation_bytes_materialized < _LCM_GREP_OPERATION_MAX_BYTES
     ):
@@ -3729,9 +3840,13 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                 engine,
                 query=query,
                 regex_mode=regex_mode,
-                session_id=search_session_id,
+                allowed_session_ids=(
+                    allowed_cross_session_ids
+                    if allowed_cross_session_ids is not None
+                    else frozenset({str(search_session_id or "")})
+                ),
                 ref=ref,
-                limit=limit,
+                limit=min(limit, external_rows_reserved),
                 max_files=max_files,
                 max_payload_chars=max_payload_chars,
                 max_total_bytes=max(
@@ -5051,34 +5166,42 @@ def _inspect_top_level_json_string_fields_before_content(text: str) -> tuple[dic
         return fields, False
 
 
-def _read_externalized_payload_metadata_prefix(path: Path) -> tuple[str, bool, bool]:
-    """Read bounded JSON metadata before the externalized payload body.
-
-    Returns ``(prefix_text, content_string_seen, prefix_truncated)``. The content
-    string body is intentionally not consumed; ``lcm_inspect`` reports bounded
-    metadata only and leaves full JSON/body validation to explicit expansion.
-    """
+def _read_externalized_payload_metadata_prefix_from_handle(
+    handle,
+    *,
+    max_bytes: int = _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES,
+) -> tuple[str, bool, bool]:
+    """Read identity fields from an already-open payload without its body."""
+    read_limit = min(
+        _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES,
+        max(0, int(max_bytes)),
+    )
+    if read_limit <= 0:
+        return "", False, True
     prefix = bytearray()
     text_parts: list[str] = []
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
-    prefix_truncated = False
-    with path.open("rb") as handle:
-        while len(prefix) < _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES:
-            byte = handle.read(1)
-            if not byte:
-                break
-            prefix.extend(byte)
-            try:
-                decoded = decoder.decode(byte, final=False)
-            except UnicodeDecodeError as exc:
-                raise ValueError("invalid_payload") from exc
-            if decoded:
-                text_parts.append(decoded)
-            prefix_text = "".join(text_parts)
-            _, content_key_seen = _inspect_top_level_json_string_fields_before_content(prefix_text)
-            if content_key_seen:
-                return prefix_text, True, False
-        prefix_truncated = len(prefix) >= _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES and bool(handle.read(1))
+    while len(prefix) < read_limit:
+        byte = handle.read(1)
+        if not byte:
+            break
+        prefix.extend(byte)
+        try:
+            decoded = decoder.decode(byte, final=False)
+        except UnicodeDecodeError as exc:
+            raise ValueError("invalid_payload") from exc
+        if decoded:
+            text_parts.append(decoded)
+        prefix_text = "".join(text_parts)
+        _, content_key_seen = _inspect_top_level_json_string_fields_before_content(
+            prefix_text
+        )
+        if content_key_seen:
+            return prefix_text, True, False
+    # The bound itself is not exceeded merely to distinguish exact EOF. A
+    # prefix that fills it without reaching content is conservatively treated
+    # as truncated.
+    prefix_truncated = len(prefix) >= read_limit
     if not prefix_truncated:
         try:
             final_text = decoder.decode(b"", final=True)
@@ -5087,6 +5210,24 @@ def _read_externalized_payload_metadata_prefix(path: Path) -> tuple[str, bool, b
         if final_text:
             text_parts.append(final_text)
     return "".join(text_parts), False, prefix_truncated
+
+
+def _read_externalized_payload_metadata_prefix(
+    path: Path,
+    *,
+    max_bytes: int = _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES,
+) -> tuple[str, bool, bool]:
+    """Read bounded JSON metadata before the externalized payload body.
+
+    Returns ``(prefix_text, content_string_seen, prefix_truncated)``. The content
+    string body is intentionally not consumed; ``lcm_inspect`` reports bounded
+    metadata only and leaves full JSON/body validation to explicit expansion.
+    """
+    with path.open("rb") as handle:
+        return _read_externalized_payload_metadata_prefix_from_handle(
+            handle,
+            max_bytes=max_bytes,
+        )
 
 
 def _inspect_externalized_payload_metadata(engine: "LCMEngine", ref: str, session_id: str) -> dict[str, Any]:

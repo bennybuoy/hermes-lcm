@@ -1327,6 +1327,48 @@ def test_grep_truncated_quoted_window_ignores_opposite_quote_type(
 
 
 @pytest.mark.parametrize(
+    "nested_decoy",
+    ["api_key='inner-decoy'", "password='same-key-decoy'"],
+)
+def test_grep_truncated_outer_credential_ignores_nested_assignment_decoys(
+    tmp_path, nested_decoy
+):
+    engine = _engine(tmp_path)
+    query = "nested-assignment-window-canary"
+    leak_canary = "STILL-OUTER-SECRET"
+    content = (
+        'password="'
+        + ("A" * 20_000)
+        + nested_decoy
+        + " "
+        + leak_canary
+        + " "
+        + query
+        + '"\nBENIGN-AFTER-OUTER-CREDENTIAL'
+    )
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": "placeholder"}
+    )
+    engine._store._conn.execute(
+        "UPDATE messages SET content=? WHERE store_id=?", (content, store_id)
+    )
+    engine._store._conn.commit()
+    try:
+        response_text = tools_module.lcm_grep(
+            {"query": query, "session_scope": "current", "limit": 1},
+            engine=engine,
+        )
+        response = json.loads(response_text)
+        assert response["results"][0]["store_id"] == store_id
+        assert leak_canary not in response_text
+        assert "inner-decoy" not in response_text
+        assert "same-key-decoy" not in response_text
+        assert "LCM sensitive redaction" in response_text
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize(
     ("query", "credential"),
     [
         (
@@ -1682,6 +1724,265 @@ def test_store_expand_arbitrary_offset_detects_deep_assignment_and_recovers_suff
             pytest.fail("bounded assignment scan did not reach the benign suffix")
         assert "BENIGN-DEEP-OFFSET-SUFFIX" in "".join(pages)
         assert any("LCM sensitive redaction" in item for item in pages)
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("credential", "leak_canary"),
+    [
+        (
+            r'{\"password\":\"'
+            + ("J" * 24_000)
+            + "JSON-ESCAPED-LEAK-CANARY"
+            + r'\"}',
+            "JSON-ESCAPED-LEAK-CANARY",
+        ),
+        (
+            "password="
+            + ("U" * 24_000)
+            + "!punctuation:still-secret?UNQUOTED-PUNCTUATION-LEAK-CANARY",
+            "UNQUOTED-PUNCTUATION-LEAK-CANARY",
+        ),
+    ],
+    ids=["json-escaped", "unquoted-punctuation"],
+)
+def test_store_expand_deep_offset_handles_escaped_json_and_punctuation(
+    tmp_path, credential, leak_canary
+):
+    engine = _engine(tmp_path)
+    suffix = "\nBENIGN-CONSERVATIVE-TERMINATOR-SUFFIX"
+    content = "benign prefix\n" + credential + suffix
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": "placeholder"}
+    )
+    engine._store._conn.execute(
+        "UPDATE messages SET content=? WHERE store_id=?", (content, store_id)
+    )
+    engine._store._conn.commit()
+    offset = content.index(leak_canary)
+    assert offset > 20_000
+    pages = []
+    try:
+        for _ in range(80):
+            page = json.loads(tools_module.lcm_expand(
+                {"store_id": store_id, "content_offset": offset, "max_tokens": 64},
+                engine=engine,
+            ))
+            pages.append(page["content"])
+            assert page["store_id"] == store_id
+            assert leak_canary not in json.dumps(page)
+            if not page["has_more"]:
+                break
+            assert page["next_content_offset"] > offset
+            offset = page["next_content_offset"]
+        else:
+            pytest.fail("deep-offset credential scan did not reach a safe suffix")
+        assert "BENIGN-CONSERVATIVE-TERMINATOR-SUFFIX" in "".join(pages)
+        assert any("LCM sensitive redaction" in item for item in pages)
+    finally:
+        engine.shutdown()
+
+
+def test_store_expand_sequential_benign_pages_cross_two_mib_losslessly(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    unit = "ordinary benign paging record 0123456789\n"
+    content = (unit * ((2_400_000 // len(unit)) + 1)) + "BENIGN-TAIL-CANARY"
+    assert len(content) > 2_300_000
+    store_id = engine._store.append(
+        "current", {"role": "user", "content": "placeholder"}
+    )
+    engine._store._conn.execute(
+        "UPDATE messages SET content=? WHERE store_id=?", (content, store_id)
+    )
+    engine._store._conn.commit()
+    original_row_to_dict = engine._store._row_to_dict
+
+    def bounded_row_to_dict(row):
+        assert all(
+            not isinstance(value, str) or len(value) < 150_000 for value in row
+        ), "whole benign row was materialized during paging"
+        return original_row_to_dict(row)
+
+    monkeypatch.setattr(engine._store, "_row_to_dict", bounded_row_to_dict)
+    offset = 0
+    recovered = []
+    try:
+        for _ in range(80):
+            page = json.loads(tools_module.lcm_expand(
+                {
+                    "store_id": store_id,
+                    "content_offset": offset,
+                    "max_tokens": 65_536,
+                },
+                engine=engine,
+            ))
+            assert page["store_id"] == store_id
+            assert "LCM sensitive redaction" not in page["content"]
+            recovered.append(page["content"])
+            if not page["has_more"]:
+                break
+            assert page["next_content_offset"] > offset
+            offset = page["next_content_offset"]
+        else:
+            pytest.fail("benign paging did not reach EOF")
+        assert "".join(recovered) == content
+        assert recovered[-1].endswith("BENIGN-TAIL-CANARY")
+    finally:
+        engine.shutdown()
+
+
+def test_grep_combined_sources_never_exceed_operation_row_budget(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+
+    def database_hits(*_args, **_kwargs):
+        return [
+            {
+                "store_id": index + 1,
+                "session_id": "current",
+                "source": "test",
+                "conversation_id": "conversation",
+                "role": "user",
+                "timestamp": float(index),
+                "snippet": "row-budget-canary",
+                "_grep_window_start": 1,
+            }
+            for index in range(800)
+        ]
+
+    def external_hits(*_args, **_kwargs):
+        hits = [
+            {
+                "type": "externalized",
+                "ref": f"payload-{index}.json",
+                "session_id": "current",
+                "line": 1,
+                "char_offset": 0,
+                "byte_offset": 0,
+                "matched_text": "row-budget-canary",
+                "snippet": "row-budget-canary",
+                "payload_truncated": False,
+                "content_chars_scanned": 20,
+                "_sort_ts": 0.0,
+                "_sort_rank": 0.0,
+                "_sort_directness": 0.0,
+            }
+            for index in range(600)
+        ]
+        return hits, [], {
+            "files_scanned": 600,
+            "entries_scanned": 600,
+            "bytes_scanned": 1,
+            "matches": 600,
+            "scan_truncated": False,
+        }
+
+    monkeypatch.setattr(engine._store, "search", database_hits)
+    monkeypatch.setattr(tools_module, "_search_externalized_payloads", external_hits)
+    try:
+        response = json.loads(tools_module.lcm_grep(
+            {
+                "query": "row-budget-canary",
+                "content_scope": "all",
+                "role": "user",
+                "limit": 200,
+            },
+            engine=engine,
+        ))
+        budget = response["operation_budget"]
+        assert response["results"]
+        assert budget["rows_materialized"] <= budget["rows_limit"] == 1_000
+        assert budget["rows_reserved"] <= budget["rows_limit"]
+        assert budget["exhausted"] is True
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("session_first", [True, False])
+def test_externalized_grep_authorizes_metadata_before_foreign_payload_read(
+    tmp_path, monkeypatch, session_first
+):
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir()
+    foreign_path = payload_dir / f"foreign-{session_first}.json"
+    foreign_canary = "FOREIGN-PAYLOAD-BODY-MUST-NOT-BE-READ"
+    payload = (
+        {
+            "kind": "ingest_payload",
+            "session_id": "foreign-session",
+            "content": foreign_canary,
+        }
+        if session_first
+        else {
+            "content": foreign_canary,
+            "session_id": "foreign-session",
+        }
+    )
+    foreign_path.write_text(
+        json.dumps(payload, indent=2),
+        encoding="utf-8",
+    )
+    content_byte_offset = foreign_path.read_bytes().index(foreign_canary.encode())
+    engine = _engine(
+        tmp_path, large_output_externalization_path=str(payload_dir)
+    )
+    original_open = tools_module.Path.open
+    bytes_read = 0
+
+    class GuardedForeignReader:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __enter__(self):
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._handle.__exit__(*args)
+
+        def read(self, size=-1):
+            nonlocal bytes_read
+            if size < 0 or size > 1:
+                raise AssertionError("foreign payload body read before authorization")
+            chunk = self._handle.read(size)
+            bytes_read += len(chunk)
+            if bytes_read > content_byte_offset:
+                raise AssertionError("foreign content bytes were read before authorization")
+            return chunk
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+    def guarded_open(path, *args, **kwargs):
+        handle = original_open(path, *args, **kwargs)
+        if path.resolve() == foreign_path.resolve() and "b" in str(args[0] if args else kwargs.get("mode", "r")):
+            return GuardedForeignReader(handle)
+        return handle
+
+    monkeypatch.setattr(tools_module.Path, "open", guarded_open)
+    try:
+        response = json.loads(tools_module.lcm_grep(
+            {
+                "query": "MUST-NOT-BE-READ",
+                "content_scope": "externalized",
+                "ref": foreign_path.name,
+            },
+            engine=engine,
+        ))
+        assert response["results"] == []
+        assert response["diagnostics"] == [{
+            "ref": foreign_path.name,
+            "error": (
+                "session_mismatch"
+                if session_first
+                else "session_metadata_unavailable"
+            ),
+        }]
+        assert 0 < bytes_read <= content_byte_offset
     finally:
         engine.shutdown()
 
