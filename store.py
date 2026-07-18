@@ -987,6 +987,100 @@ class MessageStore:
         ).fetchone()
         return self._row_to_dict(row) if row else None
 
+    def resolve_authoritative_frontier_messages(
+        self,
+        store_ids: List[int],
+        *,
+        conversation_id: str,
+        legacy_session_id: str,
+    ) -> tuple[Dict[int, Dict[str, Any]], Optional[int]]:
+        """Resolve raw frontier refs without widening conversation scope.
+
+        Current rows are authorized by exact ``conversation_id`` first.  A
+        row created by an older caller that omitted ``conversation_id`` is
+        accepted only when its value is exactly blank and its ``session_id``
+        exactly matches the frontier session.  All ownership checks complete
+        in one read snapshot before any payload column is selected, so a mixed
+        valid/invalid frontier fails closed without materializing partial raw
+        content.
+
+        Returns ``(messages_by_store_id, missing_store_id)``.  The mapping is
+        populated only when every requested row is authorized.
+        """
+        if not store_ids:
+            return {}, None
+        exact_conversation_id = str(conversation_id or "")
+        exact_legacy_session_id = str(legacy_session_id or "")
+        if not exact_conversation_id or not exact_legacy_session_id:
+            return {}, int(store_ids[0])
+
+        savepoint = "lcm_authoritative_frontier_raw_snapshot"
+        with self._write_lock:
+            savepoint_started = False
+            try:
+                self._conn.execute(f"SAVEPOINT {savepoint}")
+                savepoint_started = True
+                authorized_scopes: Dict[int, str] = {}
+                ordered_store_ids: List[int] = []
+                for raw_store_id in store_ids:
+                    store_id = int(raw_store_id)
+                    if store_id in authorized_scopes:
+                        continue
+                    exact = self._conn.execute(
+                        """SELECT 1 FROM messages
+                           WHERE store_id = ? AND conversation_id = ?
+                           LIMIT 1""",
+                        (store_id, exact_conversation_id),
+                    ).fetchone()
+                    if exact is not None:
+                        authorized_scopes[store_id] = exact_conversation_id
+                        ordered_store_ids.append(store_id)
+                        continue
+                    legacy = self._conn.execute(
+                        """SELECT 1 FROM messages
+                           WHERE store_id = ? AND conversation_id = ''
+                             AND session_id = ?
+                           LIMIT 1""",
+                        (store_id, exact_legacy_session_id),
+                    ).fetchone()
+                    if legacy is None:
+                        self._conn.execute(f"ROLLBACK TO {savepoint}")
+                        self._conn.execute(f"RELEASE {savepoint}")
+                        return {}, store_id
+                    authorized_scopes[store_id] = ""
+                    ordered_store_ids.append(store_id)
+
+                resolved: Dict[int, Dict[str, Any]] = {}
+                for store_id in ordered_store_ids:
+                    scoped_conversation_id = authorized_scopes[store_id]
+                    if scoped_conversation_id:
+                        row = self._conn.execute(
+                            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+                                WHERE store_id = ? AND conversation_id = ?
+                                LIMIT 1""",
+                            (store_id, scoped_conversation_id),
+                        ).fetchone()
+                    else:
+                        row = self._conn.execute(
+                            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+                                WHERE store_id = ? AND conversation_id = ''
+                                  AND session_id = ?
+                                LIMIT 1""",
+                            (store_id, exact_legacy_session_id),
+                        ).fetchone()
+                    if row is None:
+                        self._conn.execute(f"ROLLBACK TO {savepoint}")
+                        self._conn.execute(f"RELEASE {savepoint}")
+                        return {}, store_id
+                    resolved[store_id] = self._row_to_dict(row)
+                self._conn.execute(f"RELEASE {savepoint}")
+                return resolved, None
+            except Exception:
+                if savepoint_started:
+                    self._conn.execute(f"ROLLBACK TO {savepoint}")
+                    self._conn.execute(f"RELEASE {savepoint}")
+                raise
+
     def get_for_expansion(
         self,
         store_id: int,

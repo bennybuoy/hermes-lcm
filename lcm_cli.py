@@ -294,6 +294,9 @@ def _status(conn: sqlite3.Connection, path: Path, _args: argparse.Namespace) -> 
             "session_end_receipts": _count(conn, "lcm_session_end_receipts"),
             "node_provenance_proofs": _count(conn, "lcm_node_provenance"),
             "node_provenance_sessions": _count(conn, "lcm_node_provenance_sessions"),
+            "provenance_migration_diagnostics": _count(
+                conn, "lcm_provenance_migration_diagnostics"
+            ),
         },
     }
 
@@ -517,6 +520,8 @@ def _doctor(conn: sqlite3.Connection, path: Path, _args: argparse.Namespace) -> 
     protected_session_violations = 0
     missing_node_proofs = 0
     rollover_head_inconsistencies = 0
+    provenance_migration_diagnostics: list[dict[str, Any]] = []
+    provenance_migration_diagnostic_count = 0
     if _table_exists(conn, "lcm_active_frontiers") and _table_exists(conn, "lcm_frontier_items"):
         itemless = int(conn.execute(
             """
@@ -537,14 +542,31 @@ def _doctor(conn: sqlite3.Connection, path: Path, _args: argparse.Namespace) -> 
                 """
             ).fetchone()[0])
         if _table_exists(conn, "lcm_node_provenance"):
-            missing_node_proofs = int(conn.execute(
-                """SELECT COUNT(*) FROM lcm_frontier_items i
-                   WHERE i.kind='node' AND NOT EXISTS (
-                     SELECT 1 FROM lcm_node_provenance p
-                     WHERE p.node_id=i.ref_id AND p.proof_complete=1
-                       AND p.source_session_count > 0
-                   )"""
-            ).fetchone()[0])
+            missing_node_proofs = int(
+                conn.execute(
+                    """SELECT COUNT(*) FROM lcm_frontier_items i
+                       WHERE i.kind='node' AND NOT EXISTS (
+                         SELECT 1 FROM lcm_node_provenance p
+                         WHERE p.node_id=i.ref_id AND p.proof_complete=1
+                           AND p.proof_version=?
+                           AND p.proof_status='complete'
+                           AND p.closure_message_count>0
+                           AND p.source_session_count > 0
+                       )""",
+                    (SCHEMA_VERSION,),
+                ).fetchone()[0]
+            )
+    if _table_exists(conn, "lcm_provenance_migration_diagnostics"):
+        provenance_migration_diagnostic_count = int(conn.execute(
+            "SELECT COUNT(*) FROM lcm_provenance_migration_diagnostics"
+        ).fetchone()[0])
+        provenance_migration_diagnostics = [
+            dict(row) for row in conn.execute(
+                """SELECT diagnostic_id, ref_text, ref_bytes, reason, observed_at
+                   FROM lcm_provenance_migration_diagnostics
+                   ORDER BY diagnostic_id LIMIT 200"""
+            ).fetchall()
+        ]
     if (
         _table_exists(conn, "lcm_protected_sessions")
         and _table_exists(conn, "lcm_active_frontiers")
@@ -577,7 +599,7 @@ def _doctor(conn: sqlite3.Connection, path: Path, _args: argparse.Namespace) -> 
                            )
                          )
                    )
-               )"""
+               ))"""
         ).fetchone()[0])
     if _table_exists(conn, "lcm_rollover_heads") and _table_exists(conn, "lcm_active_frontiers"):
         rollover_head_inconsistencies = int(conn.execute(
@@ -603,6 +625,8 @@ def _doctor(conn: sqlite3.Connection, path: Path, _args: argparse.Namespace) -> 
         "itemless_positive_frontiers": itemless,
         "missing_frontier_nodes": missing_nodes,
         "missing_frontier_node_proofs": missing_node_proofs,
+        "provenance_migration_diagnostic_count": provenance_migration_diagnostic_count,
+        "provenance_migration_diagnostics": provenance_migration_diagnostics,
         "protected_session_violations": protected_session_violations,
         "rollover_head_inconsistencies": rollover_head_inconsistencies,
         "status": "pass" if (

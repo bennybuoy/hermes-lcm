@@ -24,6 +24,7 @@ from hermes_lcm.db_bootstrap import (
 from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.frontier import PREPARED_PAYLOAD_VERSION, FrontierStore
+from hermes_lcm.store import MessageStore
 from hermes_lcm.tokens import count_messages_tokens, count_tokens
 
 
@@ -1019,6 +1020,16 @@ class TestIssue4FrontierItems:
         self, tmp_path
     ):
         db_path = tmp_path / "rollback-race.db"
+        message_store = MessageStore(db_path)
+        first_ref, second_ref = message_store.append_batch(
+            "rollback-race-session",
+            [
+                {"role": "user", "content": "target generation item"},
+                {"role": "assistant", "content": "newer generation item"},
+            ],
+            conversation_id="rollback-race-conversation",
+        )
+        message_store.close()
         frontier = FrontierStore(str(db_path))
         writer = sqlite3.connect(
             str(db_path), timeout=5.0, check_same_thread=False
@@ -1034,16 +1045,16 @@ class TestIssue4FrontierItems:
             target_generation = frontier.advance_frontier_generation_with_items(
                 conversation_id,
                 session_id,
-                10,
+                first_ref,
                 "policy",
                 "route",
                 base_generation,
                 [
                     {
-                        "kind": "node",
-                        "ref_id": 10,
-                        "source_start": 1,
-                        "source_end": 10,
+                        "kind": "message",
+                        "ref_id": first_ref,
+                        "source_start": first_ref,
+                        "source_end": first_ref,
                     }
                 ],
             )
@@ -1067,7 +1078,7 @@ class TestIssue4FrontierItems:
                     conversation_id,
                     newer_generation,
                     session_id,
-                    20,
+                    second_ref,
                     "policy",
                     "route",
                     now,
@@ -1079,9 +1090,15 @@ class TestIssue4FrontierItems:
                 INSERT INTO lcm_frontier_items
                     (conversation_id, generation, ordinal, kind,
                      ref_id, source_start, source_end)
-                VALUES (?, ?, 0, 'node', 20, 11, 20)
+                VALUES (?, ?, 0, 'message', ?, ?, ?)
                 """,
-                (conversation_id, newer_generation),
+                (
+                    conversation_id,
+                    newer_generation,
+                    second_ref,
+                    second_ref,
+                    second_ref,
+                ),
             )
 
             outcome: dict[str, Any] = {}

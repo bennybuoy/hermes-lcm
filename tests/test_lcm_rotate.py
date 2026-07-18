@@ -5,6 +5,8 @@ import os
 import re
 from pathlib import Path
 
+import pytest
+
 from hermes_lcm.command import handle_lcm_command
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
@@ -33,6 +35,36 @@ def _seed_messages(engine: LCMEngine, count: int) -> None:
             source="test",
         )
     engine._store._conn.commit()
+
+
+def _publish_raw_frontier(engine: LCMEngine, store_ids: list[int]) -> int:
+    conversation_id = engine._conversation_id
+    session_id = engine._session_id
+    base_generation = engine._frontier.ensure_frontier(
+        conversation_id,
+        session_id,
+        source_end_store_id=0,
+    )
+    items = [
+        {
+            "kind": "message",
+            "ref_id": store_id,
+            "source_start": store_id,
+            "source_end": store_id,
+        }
+        for store_id in store_ids
+    ]
+    generation = engine._frontier.advance_frontier_generation_with_items(
+        conversation_id,
+        session_id,
+        max(store_ids),
+        "",
+        "",
+        base_generation,
+        items,
+    )
+    assert generation == base_generation + 1
+    return generation
 
 
 def _extract_field(result: str, key: str) -> str:
@@ -470,6 +502,129 @@ def test_rotate_apply_does_not_corrupt_source_lineage_on_next_compress(tmp_path,
         f"({summary_node.source_ids}) contains no rows at or below the "
         f"rotate frontier ({rotate_frontier}). Source lineage is severed."
     )
+
+
+def test_authoritative_frontier_accepts_legacy_blank_conversation_in_same_session(
+    tmp_path,
+):
+    engine = _build_engine(tmp_path)
+    try:
+        store_id = engine._store.append(
+            "live-session",
+            {"role": "user", "content": "same-session legacy raw"},
+            source="legacy-test",
+        )
+        _publish_raw_frontier(engine, [store_id])
+
+        assembled = engine._assemble_context(None, [])
+
+        assert [message.get("content") for message in assembled] == [
+            "same-session legacy raw"
+        ]
+        row = engine._store.get(store_id)
+        assert row is not None and row["conversation_id"] == ""
+    finally:
+        engine.shutdown()
+
+
+def test_authoritative_frontier_rejects_legacy_blank_from_different_session(
+    tmp_path,
+):
+    engine = _build_engine(tmp_path)
+    try:
+        store_id = engine._store.append(
+            "different-session",
+            {"role": "user", "content": "must not cross session"},
+            source="legacy-test",
+        )
+        generation = _publish_raw_frontier(engine, [store_id])
+
+        with pytest.raises(
+            RuntimeError,
+            match=rf"frontier generation {generation} references missing raw message {store_id}",
+        ):
+            engine._assemble_context(None, [])
+    finally:
+        engine.shutdown()
+
+
+def test_authoritative_frontier_rejects_nonblank_other_conversation(tmp_path):
+    engine = _build_engine(tmp_path)
+    try:
+        store_id = engine._store.append(
+            "live-session",
+            {"role": "user", "content": "must not cross conversation"},
+            source="scoped-test",
+            conversation_id="other-conversation",
+        )
+        generation = _publish_raw_frontier(engine, [store_id])
+
+        with pytest.raises(
+            RuntimeError,
+            match=rf"frontier generation {generation} references missing raw message {store_id}",
+        ):
+            engine._assemble_context(None, [])
+    finally:
+        engine.shutdown()
+
+
+def test_authoritative_frontier_mixed_valid_and_malicious_raw_items_fail_closed(
+    tmp_path, monkeypatch
+):
+    engine = _build_engine(tmp_path)
+    try:
+        valid_id = engine._store.append(
+            "live-session",
+            {"role": "user", "content": "valid current-conversation raw"},
+            source="scoped-test",
+            conversation_id="live-session",
+        )
+        malicious_id = engine._store.append(
+            "live-session",
+            {"role": "assistant", "content": "other-conversation secret"},
+            source="scoped-test",
+            conversation_id="other-conversation",
+        )
+        generation = _publish_raw_frontier(engine, [valid_id, malicious_id])
+        converted: list[int] = []
+        original_to_openai_msg = engine._store.to_openai_msg
+
+        def record_conversion(stored):
+            converted.append(int(stored["store_id"]))
+            return original_to_openai_msg(stored)
+
+        monkeypatch.setattr(engine._store, "to_openai_msg", record_conversion)
+
+        with pytest.raises(
+            RuntimeError,
+            match=rf"frontier generation {generation} references missing raw message {malicious_id}",
+        ):
+            engine._assemble_context(None, [])
+        assert converted == []
+    finally:
+        engine.shutdown()
+
+
+def test_authoritative_frontier_legacy_blank_same_session_survives_restart(tmp_path):
+    first = _build_engine(tmp_path)
+    store_id = first._store.append(
+        "live-session",
+        {"role": "user", "content": "legacy raw after restart"},
+        source="legacy-test",
+    )
+    _publish_raw_frontier(first, [store_id])
+    first.shutdown()
+
+    restarted = _build_engine(tmp_path)
+    try:
+        assembled = restarted._assemble_context(None, [])
+        assert [message.get("content") for message in assembled] == [
+            "legacy raw after restart"
+        ]
+        row = restarted._store.get(store_id)
+        assert row is not None and row["conversation_id"] == ""
+    finally:
+        restarted.shutdown()
 
 
 def test_rotate_backup_path_falls_back_to_db_sibling_when_hermes_home_unset(tmp_path):

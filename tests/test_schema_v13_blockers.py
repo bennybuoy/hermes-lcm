@@ -1,8 +1,9 @@
-"""Schema-v13/v14 exact-provenance, durable-receipt, and migration regressions."""
+"""Schema-v13/v14/v15 provenance, receipt, and migration regressions."""
 
 from __future__ import annotations
 
 import sqlite3
+import json
 import os
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from hermes_lcm import db_bootstrap
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
+from hermes_lcm.frontier import FrontierStore
 from hermes_lcm.lifecycle_state import LifecycleStateStore
 
 
@@ -41,6 +43,15 @@ V14_MIGRATION_PHASES = (
     "v14_after_triggers",
     "v14_after_migration_step",
     "v14_after_schema_version",
+)
+V15_MIGRATION_PHASES = (
+    "v15_after_diagnostic_table",
+    "v15_after_diagnostic_index",
+    "v15_after_ddl",
+    "v15_after_provenance_backfill",
+    "v15_after_triggers",
+    "v15_after_migration_step",
+    "v15_after_schema_version",
 )
 
 
@@ -253,6 +264,120 @@ def test_old_or_incomplete_node_proof_fails_closed_without_recursive_trigger_sql
     ).lower()
     assert "recursive" not in trigger_sql
     assert "json_each" not in trigger_sql
+    engine.shutdown()
+
+
+def test_exact_proof_requires_terminal_messages_and_rejects_cycles_directly(tmp_path):
+    db_path = tmp_path / "adversarial-proof-closure.db"
+    engine = LCMEngine(config=_config(db_path))
+    engine.on_session_start(A, conversation_id=CONVERSATION, platform="test")
+    source_id = engine._store.append(
+        A, {"role": "user", "content": "terminal source"}, source="test",
+        conversation_id=CONVERSATION,
+    )
+    conn = engine._store._conn
+
+    def insert_node(source_type: str, source_ids: str, summary: str) -> int:
+        return int(conn.execute(
+            """INSERT INTO summary_nodes(
+                   session_id, depth, summary, source_ids, source_type, created_at
+               ) VALUES(?, 0, ?, ?, ?, 1)""",
+            (A, summary, source_ids, source_type),
+        ).lastrowid)
+
+    empty_messages = insert_node("messages", "[]", "empty messages")
+    empty_nodes = insert_node("nodes", "[]", "empty nodes")
+    missing = insert_node("nodes", "[999999999]", "missing dependency")
+    malformed = insert_node("nodes", "not-json", "malformed dependency")
+    self_cycle = insert_node("nodes", "[]", "self cycle")
+    conn.execute(
+        "UPDATE summary_nodes SET source_ids=? WHERE node_id=?",
+        (f"[{self_cycle}]", self_cycle),
+    )
+    cycle_left = insert_node("nodes", "[]", "cycle left")
+    cycle_right = insert_node("nodes", f"[{cycle_left}]", "cycle right")
+    conn.execute(
+        "UPDATE summary_nodes SET source_ids=? WHERE node_id=?",
+        (f"[{cycle_right}]", cycle_left),
+    )
+
+    invalid_roots = (
+        empty_messages,
+        empty_nodes,
+        missing,
+        malformed,
+        self_cycle,
+        cycle_left,
+    )
+    for root in invalid_roots:
+        assert db_bootstrap.materialize_node_provenance_no_commit(
+            conn, root, raise_on_failure=False
+        ) is False
+        proof = conn.execute(
+            """SELECT proof_complete, proof_status, closure_message_count
+               FROM lcm_node_provenance WHERE node_id=?""",
+            (root,),
+        ).fetchone()
+        assert proof is not None
+        assert proof[0] == 0
+        assert proof[1] != "complete"
+        assert proof[2] == 0
+
+    leaf = insert_node("messages", f"[{source_id}]", "shared leaf")
+    left = insert_node("nodes", f"[{leaf}]", "shared left")
+    right = insert_node("nodes", f"[{leaf}]", "shared right")
+    shared_root = insert_node("nodes", f"[{left}, {right}]", "shared root")
+    assert db_bootstrap.materialize_node_provenance_no_commit(
+        conn, shared_root
+    ) is True
+    assert conn.execute(
+        """SELECT proof_complete, proof_status, closure_message_count
+           FROM lcm_node_provenance WHERE node_id=?""",
+        (shared_root,),
+    ).fetchone() == (1, "complete", 1)
+    conn.commit()
+    engine.shutdown()
+
+
+def test_materialized_cycle_is_rejected_by_frontier_trigger(tmp_path):
+    db_path = tmp_path / "cycle-frontier-rejection.db"
+    engine = LCMEngine(config=_config(db_path))
+    engine.on_session_start(A, conversation_id=CONVERSATION, platform="test")
+    source_id = engine._store.append(
+        A, {"role": "user", "content": "range anchor"}, source="test",
+        conversation_id=CONVERSATION,
+    )
+    conn = engine._store._conn
+    cycle = int(conn.execute(
+        """INSERT INTO summary_nodes(
+               session_id, depth, summary, source_ids, source_type, created_at
+           ) VALUES(?, 0, 'cycle', '[]', 'nodes', 1)""",
+        (A,),
+    ).lastrowid)
+    conn.execute(
+        "UPDATE summary_nodes SET source_ids=? WHERE node_id=?",
+        (f"[{cycle}]", cycle),
+    )
+    assert db_bootstrap.materialize_node_provenance_no_commit(
+        conn, cycle, raise_on_failure=False
+    ) is False
+    conn.commit()
+
+    engine._frontier.ensure_frontier(CONVERSATION, A, source_end_store_id=0)
+    base_generation = int(
+        engine._frontier.get_active_frontier(CONVERSATION)["generation"]
+    )
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO lcm_active_frontiers VALUES(?, ?, ?, ?, '', '', 1, 1)",
+        (CONVERSATION, base_generation + 1, A, source_id),
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="proof"):
+        conn.execute(
+            "INSERT INTO lcm_frontier_items VALUES(?, ?, 0, 'node', ?, ?, ?)",
+            (CONVERSATION, base_generation + 1, cycle, source_id, source_id),
+        )
+    conn.rollback()
     engine.shutdown()
 
 
@@ -529,6 +654,316 @@ def test_v14_backfill_prioritizes_all_active_roots_and_records_individual_failur
     conn.close()
 
 
+def test_active_root_backfill_has_one_aggregate_transaction_budget(tmp_path, monkeypatch):
+    db_path = tmp_path / "aggregate-active-root-budget.db"
+    _drop_v13_to_populated_v12(db_path)
+    conn = sqlite3.connect(db_path)
+    source_id = int(conn.execute(
+        "SELECT MIN(store_id) FROM messages"
+    ).fetchone()[0])
+    root_ids = []
+    for index in range(1200):
+        root_id = int(conn.execute(
+            """INSERT INTO summary_nodes(
+                   session_id, depth, summary, source_ids, source_type, created_at
+               ) VALUES(?, 0, ?, ?, 'messages', 10)""",
+            (B, f"active root {index}", f"[{source_id}]"),
+        ).lastrowid)
+        root_ids.append(root_id)
+    conn.executemany(
+        "INSERT INTO lcm_active_frontiers VALUES(?, 1, ?, ?, '', '', 10, 10)",
+        [(f"budget-conversation-{index}", B, source_id) for index in range(len(root_ids))],
+    )
+    conn.executemany(
+        "INSERT INTO lcm_frontier_items VALUES(?, 1, 0, 'node', ?, ?, ?)",
+        [
+            (f"budget-conversation-{index}", root_id, source_id, source_id)
+            for index, root_id in enumerate(root_ids)
+        ],
+    )
+    conn.commit()
+
+    monkeypatch.setattr(db_bootstrap, "NODE_PROVENANCE_MIGRATION_ROOTS", 4)
+    original = db_bootstrap.materialize_node_provenance_no_commit
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(db_bootstrap, "materialize_node_provenance_no_commit", counted)
+    started = time.monotonic()
+    db_bootstrap.run_versioned_migrations(conn)
+    elapsed = time.monotonic() - started
+    assert db_bootstrap.get_schema_version(conn) == db_bootstrap.SCHEMA_VERSION
+    assert calls <= 16, "active roots received independent per-root traversal budgets"
+    assert elapsed < 5.0
+    quiet_root = root_ids[-1]
+    quiet_conversation = f"budget-conversation-{len(root_ids) - 1}"
+    assert conn.execute(
+        """SELECT proof_complete, proof_status FROM lcm_node_provenance
+           WHERE node_id=?""",
+        (quiet_root,),
+    ).fetchone() == (0, "migration_pending")
+    assert conn.execute("PRAGMA quick_check").fetchone() == ("ok",)
+    conn.close()
+
+    frontier = FrontierStore(str(db_path))
+    generation = frontier.advance_frontier_generation_with_items(
+        quiet_conversation,
+        B,
+        source_id,
+        "",
+        "",
+        1,
+        [{
+            "kind": "node",
+            "ref_id": quiet_root,
+            "source_start": source_id,
+            "source_end": source_id,
+        }],
+    )
+    assert generation == 2
+    assert frontier.conn.execute(
+        """SELECT proof_complete, proof_status, proof_version
+           FROM lcm_node_provenance WHERE node_id=?""",
+        (quiet_root,),
+    ).fetchone() == (1, "complete", db_bootstrap.NODE_PROVENANCE_PROOF_VERSION)
+    frontier.close()
+
+
+@pytest.mark.parametrize(
+    ("budget_name", "budget_value", "status_fragment"),
+    [
+        ("NODE_PROVENANCE_MIGRATION_DEPENDENCIES", 1, "dependency_budget"),
+        ("NODE_PROVENANCE_MIGRATION_BYTES", 1, "byte_budget"),
+    ],
+)
+def test_active_root_backfill_enforces_aggregate_dependency_and_byte_budgets(
+    tmp_path, monkeypatch, budget_name, budget_value, status_fragment
+):
+    db_path = tmp_path / f"aggregate-{budget_name}.db"
+    _drop_v13_to_populated_v12(db_path)
+    conn = sqlite3.connect(db_path)
+    source_id = int(conn.execute("SELECT MIN(store_id) FROM messages").fetchone()[0])
+    active_root = int(conn.execute(
+        """INSERT INTO summary_nodes(
+               session_id, depth, summary, source_ids, source_type, created_at
+           ) VALUES(?, 0, 'budget-limited active root', ?, 'messages', 10)""",
+        (B, f"[{source_id}]"),
+    ).lastrowid)
+    conn.execute(
+        "INSERT INTO lcm_active_frontiers VALUES('budget-limit', 1, ?, ?, '', '', 10, 10)",
+        (B, source_id),
+    )
+    conn.execute(
+        "INSERT INTO lcm_frontier_items VALUES('budget-limit', 1, 0, 'node', ?, ?, ?)",
+        (active_root, source_id, source_id),
+    )
+    conn.commit()
+    monkeypatch.setattr(db_bootstrap, budget_name, budget_value)
+
+    db_bootstrap.run_versioned_migrations(conn)
+    proof = conn.execute(
+        """SELECT proof_complete, proof_status
+           FROM lcm_node_provenance WHERE node_id=?""",
+        (active_root,),
+    ).fetchone()
+    assert proof is not None and proof[0] == 0
+    assert status_fragment in proof[1]
+    assert db_bootstrap.get_schema_version(conn) == 15
+    conn.close()
+
+
+def test_active_root_backfill_deadline_exhaustion_is_fail_closed_and_migrates(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "aggregate-deadline.db"
+    _drop_v13_to_populated_v12(db_path)
+    conn = sqlite3.connect(db_path)
+    monkeypatch.setattr(
+        db_bootstrap, "NODE_PROVENANCE_MIGRATION_DEADLINE_SECONDS", 0.0
+    )
+    started = time.monotonic()
+
+    db_bootstrap.run_versioned_migrations(conn)
+    assert time.monotonic() - started < 1.0
+    assert db_bootstrap.get_schema_version(conn) == 15
+    assert conn.execute(
+        """SELECT COUNT(*) FROM lcm_node_provenance
+           WHERE proof_complete=1 AND proof_version=?""",
+        (db_bootstrap.NODE_PROVENANCE_PROOF_VERSION,),
+    ).fetchone() == (0,)
+    conn.close()
+
+
+def test_malformed_active_ref_ids_are_isolated_and_visible_to_cli(tmp_path):
+    db_path = tmp_path / "malformed-active-ref-diagnostics.db"
+    _drop_v13_to_populated_v12(db_path)
+    conn = sqlite3.connect(db_path)
+    source_id = int(conn.execute(
+        "SELECT MIN(store_id) FROM messages"
+    ).fetchone()[0])
+    valid_root = int(conn.execute(
+        """INSERT INTO summary_nodes(
+               session_id, depth, summary, source_ids, source_type, created_at
+           ) VALUES(?, 0, 'valid peer root', ?, 'messages', 10)""",
+        (B, f"[{source_id}]"),
+    ).lastrowid)
+    rows = (
+        ("valid-ref-conversation", valid_root),
+        ("text-ref-conversation", "bad-ref"),
+        ("zero-ref-conversation", 0),
+        ("negative-ref-conversation", -7),
+    )
+    conn.executemany(
+        "INSERT INTO lcm_active_frontiers VALUES(?, 1, ?, ?, '', '', 10, 10)",
+        [(conversation_id, B, source_id) for conversation_id, _ref_id in rows],
+    )
+    conn.executemany(
+        "INSERT INTO lcm_frontier_items VALUES(?, 1, 0, 'node', ?, ?, ?)",
+        [
+            (conversation_id, ref_id, source_id, source_id)
+            for conversation_id, ref_id in rows
+        ],
+    )
+    conn.commit()
+
+    db_bootstrap.run_versioned_migrations(conn)
+    assert conn.execute(
+        """SELECT proof_complete, proof_status
+           FROM lcm_node_provenance WHERE node_id=?""",
+        (valid_root,),
+    ).fetchone() == (1, "complete")
+    diagnostics = conn.execute(
+        """SELECT ref_text, reason
+           FROM lcm_provenance_migration_diagnostics
+           ORDER BY diagnostic_id"""
+    ).fetchall()
+    assert set(diagnostics) == {
+        ("bad-ref", "non_integer_ref_id"),
+        ("0", "non_positive_ref_id"),
+        ("-7", "non_positive_ref_id"),
+    }
+    assert len(diagnostics) <= db_bootstrap.NODE_PROVENANCE_DIAGNOSTIC_MAX_ROWS
+    conn.close()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve().parents[1] / "lcm_cli.py"),
+            "--database",
+            str(db_path),
+            "doctor",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env={
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join(
+                ["/tmp/hermes-lcm-review-stub", str(Path(__file__).resolve().parents[2])]
+            ),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["provenance_migration_diagnostic_count"] == 3
+    assert {item["ref_text"] for item in payload["provenance_migration_diagnostics"]} == {
+        "bad-ref", "0", "-7"
+    }
+
+
+def test_malformed_active_ref_diagnostics_have_aggregate_row_and_byte_caps(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "bounded-malformed-active-diagnostics.db"
+    _drop_v13_to_populated_v12(db_path)
+    conn = sqlite3.connect(db_path)
+    source_id = int(conn.execute("SELECT MIN(store_id) FROM messages").fetchone()[0])
+    invalid_rows = [
+        (f"diagnostic-cap-{index}", ("x" * 1000) + str(index))
+        for index in range(30)
+    ]
+    conn.executemany(
+        "INSERT INTO lcm_active_frontiers VALUES(?, 1, ?, ?, '', '', 10, 10)",
+        [(conversation_id, B, source_id) for conversation_id, _ref in invalid_rows],
+    )
+    conn.executemany(
+        "INSERT INTO lcm_frontier_items VALUES(?, 1, 0, 'node', ?, ?, ?)",
+        [
+            (conversation_id, ref_id, source_id, source_id)
+            for conversation_id, ref_id in invalid_rows
+        ],
+    )
+    conn.commit()
+    monkeypatch.setattr(db_bootstrap, "NODE_PROVENANCE_DIAGNOSTIC_MAX_ROWS", 5)
+    monkeypatch.setattr(db_bootstrap, "NODE_PROVENANCE_DIAGNOSTIC_MAX_BYTES", 200)
+
+    db_bootstrap.run_versioned_migrations(conn)
+    rows = conn.execute(
+        """SELECT ref_text, ref_bytes, reason
+           FROM lcm_provenance_migration_diagnostics"""
+    ).fetchall()
+    assert 1 <= len(rows) <= 5
+    assert sum(
+        len(ref_text.encode("utf-8")) + len(reason.encode("utf-8"))
+        for ref_text, _ref_bytes, reason in rows
+    ) <= 200
+    assert all(ref_bytes > len(ref_text.encode("utf-8")) for ref_text, ref_bytes, _ in rows)
+    conn.close()
+
+
+def test_lazy_carried_node_publication_fails_closed_when_budget_cannot_prove(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "lazy-publication-budget-fail-closed.db"
+    engine = LCMEngine(config=_config(db_path))
+    engine.on_session_start(A, conversation_id=CONVERSATION, platform="test")
+    source_id = engine._store.append(
+        A,
+        {"role": "user", "content": "quiet carried source"},
+        source="test",
+        conversation_id=CONVERSATION,
+    )
+    conn = engine._store._conn
+    root = int(conn.execute(
+        """INSERT INTO summary_nodes(
+               session_id, depth, summary, source_ids, source_type, created_at
+           ) VALUES(?, 0, 'quiet carried root', ?, 'messages', 10)""",
+        (A, f"[{source_id}]"),
+    ).lastrowid)
+    conn.commit()
+    engine._frontier.ensure_frontier(CONVERSATION, A, source_end_store_id=0)
+    base_generation = int(
+        engine._frontier.get_active_frontier(CONVERSATION)["generation"]
+    )
+    monkeypatch.setattr(db_bootstrap, "NODE_PROVENANCE_PUBLICATION_ROOTS", 0)
+
+    with pytest.raises(RuntimeError, match="could not prove"):
+        engine._frontier.advance_frontier_generation_with_items(
+            CONVERSATION,
+            A,
+            source_id,
+            "",
+            "",
+            base_generation,
+            [{
+                "kind": "node",
+                "ref_id": root,
+                "source_start": source_id,
+                "source_end": source_id,
+            }],
+        )
+    assert int(engine._frontier.get_active_frontier(CONVERSATION)["generation"]) == base_generation
+    assert conn.execute(
+        "SELECT 1 FROM lcm_node_provenance WHERE node_id=?", (root,)
+    ).fetchone() is None
+    engine.shutdown()
+
+
 def test_v14_dependency_guards_keep_ancestor_proof_exact_across_restart_and_interleaving(
     tmp_path
 ):
@@ -625,8 +1060,12 @@ def test_authorized_message_reassignment_and_node_deletion_invalidate_ancestor_p
     engine.shutdown()
 
 
-@pytest.mark.parametrize("phase", V13_MIGRATION_PHASES + V14_MIGRATION_PHASES)
-def test_v13_v14_process_kill_restores_all_populated_v12_state_and_triggers(tmp_path, phase):
+@pytest.mark.parametrize(
+    "phase", V13_MIGRATION_PHASES + V14_MIGRATION_PHASES + V15_MIGRATION_PHASES
+)
+def test_v13_v14_v15_process_kill_restores_all_populated_v12_state_and_triggers(
+    tmp_path, phase
+):
     db_path = tmp_path / f"kill-{phase}.db"
     snapshot = _drop_v13_to_populated_v12(db_path)
     script = """

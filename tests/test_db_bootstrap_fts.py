@@ -24,6 +24,8 @@ from hermes_lcm.db_bootstrap import (
     ExternalContentFtsSpec,
     ensure_external_content_fts,
 )
+from hermes_lcm.dag import build_nodes_fts_spec
+from hermes_lcm.store import build_message_fts_spec
 
 INTERVAL_ENV = "LCM_FTS_INTEGRITY_CHECK_INTERVAL_HOURS"
 MARKER_KEY = "fts_integrity_checked_at:messages_fts"
@@ -52,6 +54,75 @@ def _spec():
         indexed_column="content",
         trigger_sqls=(),
     )
+
+
+def _make_v4_fts_migration_db(db_path, family, *, healthy=False):
+    conn = sqlite3.connect(str(db_path))
+    if family == "messages":
+        conn.executescript(
+            """
+            CREATE TABLE messages (
+                store_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                source TEXT DEFAULT 'test',
+                conversation_id TEXT DEFAULT '',
+                role TEXT NOT NULL,
+                content TEXT,
+                tool_call_id TEXT,
+                tool_calls TEXT,
+                tool_name TEXT,
+                timestamp REAL NOT NULL,
+                token_estimate INTEGER DEFAULT 0,
+                pinned INTEGER DEFAULT 0
+            );
+            INSERT INTO messages(session_id, role, content, timestamp)
+            VALUES ('migration-session', 'user', 'healthy message fts', 1);
+            """
+        )
+        spec = build_message_fts_spec()
+    else:
+        conn.executescript(
+            """
+            CREATE TABLE summary_nodes (
+                node_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                depth INTEGER NOT NULL DEFAULT 0,
+                summary TEXT NOT NULL,
+                token_count INTEGER DEFAULT 0,
+                source_token_count INTEGER DEFAULT 0,
+                source_ids TEXT NOT NULL DEFAULT '[]',
+                source_type TEXT NOT NULL DEFAULT 'messages',
+                created_at REAL NOT NULL,
+                earliest_at REAL,
+                latest_at REAL,
+                expand_hint TEXT DEFAULT ''
+            );
+            INSERT INTO summary_nodes(session_id, summary, created_at)
+            VALUES ('migration-session', 'healthy node fts', 1);
+            """
+        )
+        spec = build_nodes_fts_spec()
+    if healthy:
+        conn.execute(
+            f"""CREATE VIRTUAL TABLE {spec.table_name} USING fts5(
+                    {spec.indexed_column},
+                    content={spec.content_table},
+                    content_rowid={spec.content_rowid}
+                )"""
+        )
+        conn.execute(
+            f"INSERT INTO {spec.table_name}({spec.table_name}) VALUES('rebuild')"
+        )
+    for trigger_sql in spec.trigger_sqls:
+        conn.execute(trigger_sql)
+    conn.executescript(
+        """
+        CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT);
+        INSERT INTO metadata(key, value) VALUES ('schema_version', '4');
+        """
+    )
+    conn.commit()
+    return conn, spec
 
 
 def _make_future_schema_db(db_path):
@@ -384,6 +455,133 @@ def test_run_versioned_migrations_refuses_newer_schema(tmp_path):
         conn.close()
 
 
+@pytest.mark.parametrize("family", ["messages", "nodes"])
+def test_v13_receipt_rebuild_low_disk_drops_only_broken_known_fts_triggers(
+    tmp_path, monkeypatch, family
+):
+    conn, spec = _make_v4_fts_migration_db(
+        tmp_path / f"missing-{family}-fts.db", family
+    )
+    monkeypatch.setattr(db_bootstrap, "_check_disk_space", lambda _path: False)
+    try:
+        db_bootstrap.run_versioned_migrations(conn, fts_specs=(spec,))
+
+        trigger_names = {
+            db_bootstrap._extract_trigger_name(sql) for sql in spec.trigger_sqls
+        }
+        placeholders = ",".join("?" for _ in trigger_names)
+        assert db_bootstrap.get_schema_version(conn) == db_bootstrap.SCHEMA_VERSION
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (spec.table_name,),
+        ).fetchone() is None
+        assert conn.execute(
+            f"""SELECT name FROM sqlite_master
+                WHERE type='trigger' AND name IN ({placeholders})""",
+            tuple(sorted(trigger_names)),
+        ).fetchall() == []
+        assert conn.execute("PRAGMA quick_check").fetchone() == ("ok",)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("family", ["messages", "nodes"])
+def test_v13_receipt_rebuild_preserves_healthy_external_content_fts_triggers(
+    tmp_path, family
+):
+    conn, spec = _make_v4_fts_migration_db(
+        tmp_path / f"healthy-{family}-fts.db", family, healthy=True
+    )
+    trigger_names = tuple(
+        sorted(db_bootstrap._extract_trigger_name(sql) for sql in spec.trigger_sqls)
+    )
+    placeholders = ",".join("?" for _ in trigger_names)
+    before = conn.execute(
+        f"""SELECT name, sql FROM sqlite_master
+            WHERE type='trigger' AND name IN ({placeholders}) ORDER BY name""",
+        trigger_names,
+    ).fetchall()
+    try:
+        db_bootstrap.run_versioned_migrations(conn, fts_specs=(spec,))
+
+        after = conn.execute(
+            f"""SELECT name, sql FROM sqlite_master
+                WHERE type='trigger' AND name IN ({placeholders}) ORDER BY name""",
+            trigger_names,
+        ).fetchall()
+        assert after == before
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (spec.table_name,),
+        ).fetchone() == (1,)
+        assert conn.execute("PRAGMA quick_check").fetchone() == ("ok",)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "v13_after_receipt_shadow_table",
+        "v13_after_receipt_copy",
+        "v13_after_receipt_rebuild",
+    ],
+)
+def test_broken_fts_trigger_cleanup_rolls_back_with_v13_receipt_rebuild_crash(
+    tmp_path, monkeypatch, phase
+):
+    conn, spec = _make_v4_fts_migration_db(
+        tmp_path / f"broken-fts-{phase}.db", "messages"
+    )
+    first_trigger = db_bootstrap._extract_trigger_name(spec.trigger_sqls[0])
+
+    def crash_at_boundary(observed):
+        if observed == phase:
+            raise RuntimeError(f"injected crash at {phase}")
+
+    monkeypatch.setattr(db_bootstrap, "_migration_crash_boundary", crash_at_boundary)
+    try:
+        with pytest.raises(RuntimeError, match="injected crash"):
+            db_bootstrap.run_versioned_migrations(conn, fts_specs=(spec,))
+
+        assert db_bootstrap.get_schema_version(conn) == 4
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?",
+            (first_trigger,),
+        ).fetchone() == (1,)
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_session_end_receipts'"
+        ).fetchone() is None
+        assert conn.execute("PRAGMA quick_check").fetchone() == ("ok",)
+    finally:
+        conn.close()
+
+
+def test_too_new_refusal_does_not_drop_known_broken_fts_trigger(tmp_path):
+    conn, spec = _make_v4_fts_migration_db(
+        tmp_path / "too-new-broken-fts.db", "messages"
+    )
+    first_trigger = db_bootstrap._extract_trigger_name(spec.trigger_sqls[0])
+    conn.execute(
+        "UPDATE metadata SET value=? WHERE key='schema_version'",
+        (str(db_bootstrap.SCHEMA_VERSION + 1),),
+    )
+    conn.commit()
+    try:
+        with pytest.raises(db_bootstrap.SchemaVersionTooNewError):
+            db_bootstrap.run_versioned_migrations(conn, fts_specs=(spec,))
+
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?",
+            (first_trigger,),
+        ).fetchone() == (1,)
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_migration_state'"
+        ).fetchone() is None
+    finally:
+        conn.close()
+
+
 def test_run_versioned_migrations_accepts_current_schema(tmp_path):
     from hermes_lcm.db_bootstrap import run_versioned_migrations, get_schema_version, SCHEMA_VERSION
 
@@ -395,13 +593,13 @@ def test_run_versioned_migrations_accepts_current_schema(tmp_path):
         conn.close()
 
 
-def test_fresh_database_is_schema_v14_with_durable_rollover_state(tmp_path):
+def test_fresh_database_is_schema_v15_with_durable_rollover_state(tmp_path):
     conn = sqlite3.connect(tmp_path / "fresh-v11.db")
     try:
         db_bootstrap.run_versioned_migrations(conn)
 
-        assert db_bootstrap.SCHEMA_VERSION == 14
-        assert db_bootstrap.get_schema_version(conn) == 14
+        assert db_bootstrap.SCHEMA_VERSION == 15
+        assert db_bootstrap.get_schema_version(conn) == 15
         lifecycle_columns = {
             row[1]: row
             for row in conn.execute(
@@ -452,7 +650,7 @@ def test_v9_rollover_carry_policy_migrates_to_v11_and_restarts_idempotently(tmp_
 
         db_bootstrap.run_versioned_migrations(conn)
 
-        assert db_bootstrap.get_schema_version(conn) == db_bootstrap.SCHEMA_VERSION == 14
+        assert db_bootstrap.get_schema_version(conn) == db_bootstrap.SCHEMA_VERSION == 15
         assert "rollover_carry_over_context" in {
             row[1]
             for row in conn.execute(
@@ -477,7 +675,7 @@ def test_v9_rollover_carry_policy_migrates_to_v11_and_restarts_idempotently(tmp_
     restarted = sqlite3.connect(db_path)
     try:
         db_bootstrap.run_versioned_migrations(restarted)
-        assert db_bootstrap.get_schema_version(restarted) == 14
+        assert db_bootstrap.get_schema_version(restarted) == 15
         assert restarted.execute("PRAGMA quick_check").fetchone() == ("ok",)
         assert restarted.execute(
             "SELECT COUNT(*) FROM lcm_lifecycle_state WHERE conversation_id = 'legacy-conversation'"
@@ -746,10 +944,10 @@ def test_v11_migration_blocks_concurrent_base_v9_schema_downgrade(
         assert not base_v9_thread.is_alive()
         assert "migration_error" not in outcomes
         assert "base_v9_error" not in outcomes
-        assert outcomes["base_v9_version"] == "14"
+        assert outcomes["base_v9_version"] == "15"
         check = sqlite3.connect(db_path)
         try:
-            assert db_bootstrap.get_schema_version(check) == 14
+            assert db_bootstrap.get_schema_version(check) == 15
             assert "rollover_carry_over_context" in {
                 row[1]
                 for row in check.execute(

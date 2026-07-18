@@ -32,7 +32,7 @@ class SQLiteStartupBusyError(RuntimeError):
     """Raised when bounded SQLite startup lock waiting is exhausted."""
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 SQLITE_STARTUP_BACKOFF_INITIAL_SECONDS = 0.01
 SQLITE_STARTUP_BACKOFF_MAX_SECONDS = 0.25
@@ -54,6 +54,7 @@ REQUIRED_CORE_TABLES = (
     "lcm_node_provenance_sessions",
     "lcm_node_provenance_node_dependencies",
     "lcm_node_provenance_message_dependencies",
+    "lcm_provenance_migration_diagnostics",
     "lcm_migration_state",
     "lcm_focus_briefs",
     "messages_fts",
@@ -73,6 +74,17 @@ NODE_PROVENANCE_MAX_SOURCE_IDS = 6_400
 NODE_PROVENANCE_MAX_SESSIONS = 10_000
 NODE_PROVENANCE_SESSION_ID_MAX_BYTES = 2 * 1024
 NODE_PROVENANCE_MIGRATION_ROOTS = 256
+NODE_PROVENANCE_MIGRATION_DEPENDENCIES = 10_000
+NODE_PROVENANCE_MIGRATION_BYTES = 4 * 1024 * 1024
+NODE_PROVENANCE_MIGRATION_DEADLINE_SECONDS = 0.75
+NODE_PROVENANCE_PUBLICATION_ROOTS = 256
+NODE_PROVENANCE_PUBLICATION_DEPENDENCIES = 10_000
+NODE_PROVENANCE_PUBLICATION_BYTES = 4 * 1024 * 1024
+NODE_PROVENANCE_PUBLICATION_DEADLINE_SECONDS = 1.0
+NODE_PROVENANCE_DIAGNOSTIC_MAX_ROWS = 256
+NODE_PROVENANCE_DIAGNOSTIC_MAX_BYTES = 64 * 1024
+NODE_PROVENANCE_DIAGNOSTIC_REF_MAX_BYTES = 512
+NODE_PROVENANCE_PROOF_VERSION = 15
 
 # Test-only subprocess crash injection. Production callers never set this;
 # tests assign a phase name in the child process and verify SQLite rolls the
@@ -698,6 +710,29 @@ def ensure_rollover_v14_tables(conn: sqlite3.Connection) -> None:
     )
 
 
+def ensure_rollover_v15_tables(conn: sqlite3.Connection) -> None:
+    """Add bounded diagnostics for isolated active-frontier migration failures."""
+    ensure_rollover_v14_tables(conn)
+    conn.execute(
+        f"""CREATE TABLE IF NOT EXISTS lcm_provenance_migration_diagnostics (
+               diagnostic_id INTEGER PRIMARY KEY AUTOINCREMENT,
+               ref_text TEXT NOT NULL
+                   CHECK (length(CAST(ref_text AS BLOB)) BETWEEN 1 AND
+                          {NODE_PROVENANCE_DIAGNOSTIC_REF_MAX_BYTES}),
+               ref_bytes INTEGER NOT NULL CHECK (ref_bytes >= 0),
+               reason TEXT NOT NULL
+                   CHECK (reason IN ('non_integer_ref_id', 'non_positive_ref_id')),
+               observed_at REAL NOT NULL
+           )"""
+    )
+    _migration_crash_boundary("v15_after_diagnostic_table")
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_lcm_provenance_migration_diagnostic_reason
+           ON lcm_provenance_migration_diagnostics(reason, diagnostic_id)"""
+    )
+    _migration_crash_boundary("v15_after_diagnostic_index")
+
+
 def _proof_dependency_tables_ready(conn: sqlite3.Connection) -> bool:
     return all(
         conn.execute(
@@ -833,17 +868,69 @@ def _proof_failure_status(exc: BaseException) -> str:
     return (value or "provenance_error")[:256]
 
 
+def new_node_provenance_work_budget(
+    *,
+    max_roots: int,
+    max_dependencies: int,
+    max_bytes: int,
+    deadline_seconds: float,
+) -> dict[str, int | float]:
+    """Create one aggregate proof-work budget shared by every attempted root."""
+    return {
+        "roots": 0,
+        "dependencies": 0,
+        "bytes": 0,
+        "max_roots": max(0, int(max_roots)),
+        "max_dependencies": max(0, int(max_dependencies)),
+        "max_bytes": max(0, int(max_bytes)),
+        "deadline_at": time.monotonic() + max(0.0, float(deadline_seconds)),
+    }
+
+
+def _charge_node_provenance_work(
+    budget: dict[str, int | float] | None,
+    *,
+    roots: int = 0,
+    dependencies: int = 0,
+    encoded_bytes: int = 0,
+) -> None:
+    if budget is None:
+        return
+    if time.monotonic() >= float(budget["deadline_at"]):
+        raise ValueError("node provenance aggregate deadline exceeded")
+    next_roots = int(budget["roots"]) + max(0, int(roots))
+    next_dependencies = int(budget["dependencies"]) + max(0, int(dependencies))
+    next_bytes = int(budget["bytes"]) + max(0, int(encoded_bytes))
+    if next_roots > int(budget["max_roots"]):
+        raise ValueError("node provenance aggregate root budget exceeded")
+    if next_dependencies > int(budget["max_dependencies"]):
+        raise ValueError("node provenance aggregate dependency budget exceeded")
+    if next_bytes > int(budget["max_bytes"]):
+        raise ValueError("node provenance aggregate byte budget exceeded")
+    budget["roots"] = next_roots
+    budget["dependencies"] = next_dependencies
+    budget["bytes"] = next_bytes
+
+
 def _record_incomplete_root_proof_no_commit(
     conn: sqlite3.Connection, root: int, exc: BaseException
 ) -> None:
-    _clear_root_proof_no_commit(conn, root)
     conn.execute(
         """INSERT INTO lcm_node_provenance(
                node_id, proof_complete, proof_version, proof_status,
                closure_node_count, closure_edge_count, closure_message_count,
                source_session_count, proved_at
-           ) VALUES(?, 0, 14, ?, 0, 0, 0, 0, ?)""",
-        (root, _proof_failure_status(exc), time.time()),
+           ) VALUES(?, 0, ?, ?, 0, 0, 0, 0, ?)
+           ON CONFLICT(node_id) DO UPDATE SET
+               proof_complete=0,
+               proof_version=excluded.proof_version,
+               proof_status=excluded.proof_status,
+               closure_node_count=0,
+               closure_edge_count=0,
+               closure_message_count=0,
+               source_session_count=0,
+               proved_at=excluded.proved_at""",
+        (root, NODE_PROVENANCE_PROOF_VERSION, _proof_failure_status(exc), time.time()),
     )
 
 
@@ -882,6 +969,7 @@ def materialize_node_provenance_no_commit(
     max_depth: int = NODE_PROVENANCE_MAX_DEPTH,
     max_bytes: int = NODE_PROVENANCE_MAX_BYTES,
     raise_on_failure: bool = True,
+    work_budget: dict[str, int | float] | None = None,
 ) -> bool:
     """Materialize an exact node-to-source-session proof under fixed bounds.
 
@@ -893,22 +981,66 @@ def materialize_node_provenance_no_commit(
     del conversation_id
     if not _proof_dependency_tables_ready(conn):
         ensure_rollover_v14_tables(conn)
-    root = int(node_id or 0)
+    try:
+        if isinstance(node_id, bool):
+            raise ValueError("node provenance requires a positive node id")
+        root = int(node_id)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("node provenance requires a positive node id") from exc
     if root <= 0:
         raise ValueError("node provenance requires a positive node id")
-    stack: list[tuple[int, int]] = [(root, 0)]
-    seen: set[int] = set()
+    # Frames are (node id, depth, exiting). A node is visiting from its enter
+    # frame until its exit frame runs, so any edge to a visiting node is a real
+    # cycle. Edges to visited nodes are valid shared-DAG revisits.
+    stack: list[tuple[int, int, bool]] = [(root, 0, False)]
+    states: dict[int, int] = {}  # 1=visiting, 2=visited
     sessions: set[str] = set()
     message_dependencies: set[int] = set()
     edges = 0
     encoded_total = 0
     try:
+        _charge_node_provenance_work(work_budget, roots=1)
+        if work_budget is not None:
+            remaining_dependencies = max(
+                0,
+                int(work_budget["max_dependencies"])
+                - int(work_budget["dependencies"]),
+            )
+            existing_dependency_rows = int(conn.execute(
+                """SELECT COUNT(*) FROM (
+                       SELECT 1 FROM lcm_node_provenance_node_dependencies
+                       WHERE root_node_id=?
+                       UNION ALL
+                       SELECT 1 FROM lcm_node_provenance_message_dependencies
+                       WHERE root_node_id=?
+                       UNION ALL
+                       SELECT 1 FROM lcm_node_provenance_sessions
+                       WHERE node_id=?
+                       LIMIT ?
+                   )""",
+                (root, root, root, remaining_dependencies + 1),
+            ).fetchone()[0])
+            _charge_node_provenance_work(
+                work_budget, dependencies=existing_dependency_rows
+            )
         while stack:
-            current, depth = stack.pop()
-            if current in seen:
-                continue
-            if depth > int(max_depth) or len(seen) >= int(max_rows):
+            _charge_node_provenance_work(work_budget)
+            current, depth, exiting = stack.pop()
+            if depth > int(max_depth):
                 raise ValueError("node provenance closure bound exceeded")
+            state = states.get(current, 0)
+            if exiting:
+                if state != 1:
+                    raise ValueError("node provenance traversal state is invalid")
+                states[current] = 2
+                continue
+            if state == 1:
+                raise ValueError("node provenance closure contains a cycle")
+            if state == 2:
+                continue
+            if len(states) >= int(max_rows):
+                raise ValueError("node provenance closure bound exceeded")
+            _charge_node_provenance_work(work_budget, dependencies=1)
             row = conn.execute(
                 """SELECT session_id, source_type,
                           COALESCE(length(CAST(source_ids AS BLOB)), 0),
@@ -927,7 +1059,8 @@ def materialize_node_provenance_no_commit(
             if row is None:
                 raise ValueError("node provenance closure references a missing node")
             session_id = str(row[0] or "")
-            if not session_id or len(session_id.encode("utf-8")) > NODE_PROVENANCE_SESSION_ID_MAX_BYTES:
+            session_bytes = len(session_id.encode("utf-8"))
+            if not session_id or session_bytes > NODE_PROVENANCE_SESSION_ID_MAX_BYTES:
                 raise ValueError("node provenance session id bound exceeded")
             sessions.add(session_id)
             if len(sessions) > NODE_PROVENANCE_MAX_SESSIONS:
@@ -936,27 +1069,28 @@ def materialize_node_provenance_no_commit(
             encoded_total += encoded_bytes
             if encoded_total > int(max_bytes) or row[3] is None:
                 raise ValueError("node provenance closure byte bound exceeded")
+            _charge_node_provenance_work(
+                work_budget, encoded_bytes=encoded_bytes + session_bytes
+            )
             source_ids = _decode_bounded_node_sources(row[3], encoded_bytes=encoded_bytes)
+            if not source_ids:
+                raise ValueError("node provenance source_ids are empty")
             edges += len(source_ids)
             if edges > int(max_edges):
                 raise ValueError("node provenance closure edge bound exceeded")
+            _charge_node_provenance_work(
+                work_budget, dependencies=len(source_ids)
+            )
             source_type = str(row[1] or "")
+            states[current] = 1
             if source_type == "nodes":
+                stack.append((current, depth, True))
                 for source_id in reversed(source_ids):
-                    child_proof = conn.execute(
-                        """SELECT proof_complete, proof_status
-                           FROM lcm_node_provenance WHERE node_id=?""",
-                        (source_id,),
-                    ).fetchone()
-                    if child_proof is not None and int(child_proof[0] or 0) != 1:
-                        # Preserve the originating bounded diagnostic exactly;
-                        # repeatedly prefixing it would eventually truncate the
-                        # actionable reason on a long chain of unproved roots.
-                        raise ValueError(str(child_proof[1] or "dependency_unproved"))
-                    stack.append((source_id, depth + 1))
+                    stack.append((source_id, depth + 1, False))
             elif source_type == "messages":
                 found: dict[int, str] = {}
                 for offset in range(0, len(source_ids), 400):
+                    _charge_node_provenance_work(work_budget)
                     page = source_ids[offset:offset + 400]
                     placeholders = ",".join("?" for _ in page)
                     for store_id, owner in conn.execute(
@@ -973,11 +1107,13 @@ def materialize_node_provenance_no_commit(
                 message_dependencies.update(found)
                 if len(sessions) > NODE_PROVENANCE_MAX_SESSIONS:
                     raise ValueError("node provenance session bound exceeded")
+                states[current] = 2
             else:
                 raise ValueError("node provenance source type is invalid")
-            seen.add(current)
-        if not seen or not sessions:
+        if not states or not sessions:
             raise ValueError("node provenance closure is empty")
+        if not message_dependencies:
+            raise ValueError("node provenance closure has no terminal messages")
     except (sqlite3.Error, TypeError, ValueError, OverflowError) as exc:
         _record_incomplete_root_proof_no_commit(conn, root, exc)
         if raise_on_failure:
@@ -994,7 +1130,7 @@ def materialize_node_provenance_no_commit(
         """INSERT INTO lcm_node_provenance_node_dependencies(
                root_node_id, dependency_node_id
            ) VALUES(?, ?)""",
-        [(root, dependency) for dependency in sorted(seen)],
+        [(root, dependency) for dependency in sorted(states)],
     )
     conn.executemany(
         """INSERT INTO lcm_node_provenance_message_dependencies(
@@ -1007,10 +1143,10 @@ def materialize_node_provenance_no_commit(
                node_id, proof_complete, proof_version, proof_status,
                closure_node_count, closure_edge_count, closure_message_count,
                source_session_count, proved_at
-           ) VALUES(?, 1, 14, 'complete', ?, ?, ?, ?, ?)
+           ) VALUES(?, 1, ?, 'complete', ?, ?, ?, ?, ?)
            ON CONFLICT(node_id) DO UPDATE SET
                proof_complete=1,
-               proof_version=14,
+               proof_version=excluded.proof_version,
                proof_status='complete',
                closure_node_count=excluded.closure_node_count,
                closure_edge_count=excluded.closure_edge_count,
@@ -1019,7 +1155,8 @@ def materialize_node_provenance_no_commit(
                proved_at=excluded.proved_at""",
         (
             root,
-            len(seen),
+            NODE_PROVENANCE_PROOF_VERSION,
+            len(states),
             edges,
             len(message_dependencies),
             len(sessions),
@@ -1027,6 +1164,63 @@ def materialize_node_provenance_no_commit(
         ),
     )
     return True
+
+
+def ensure_frontier_node_provenance_no_commit(
+    conn: sqlite3.Connection,
+    items: Sequence[object],
+) -> None:
+    """Lazily prove carried node items under one fail-closed publish budget."""
+    budget = new_node_provenance_work_budget(
+        max_roots=NODE_PROVENANCE_PUBLICATION_ROOTS,
+        max_dependencies=NODE_PROVENANCE_PUBLICATION_DEPENDENCIES,
+        max_bytes=NODE_PROVENANCE_PUBLICATION_BYTES,
+        deadline_seconds=NODE_PROVENANCE_PUBLICATION_DEADLINE_SECONDS,
+    )
+    inspected = 0
+    for raw_item in items:
+        _charge_node_provenance_work(budget)
+        if not isinstance(raw_item, dict):
+            raise RuntimeError("frontier publication contains a malformed item")
+        if str(raw_item.get("kind", "message")) != "node":
+            continue
+        inspected += 1
+        if inspected > NODE_PROVENANCE_MAX_ROWS:
+            raise RuntimeError("frontier publication node proof budget exceeded")
+        raw_ref = raw_item.get("ref_id", 0)
+        try:
+            if isinstance(raw_ref, bool):
+                raise ValueError
+            root = int(raw_ref)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError("frontier publication node ref_id is invalid") from exc
+        if root <= 0:
+            raise RuntimeError("frontier publication node ref_id is invalid")
+        proof = conn.execute(
+            """SELECT 1 FROM lcm_node_provenance AS proof
+               WHERE proof.node_id=?
+                 AND proof.proof_complete=1
+                 AND proof.proof_version=?
+                 AND proof.proof_status='complete'
+                 AND proof.closure_message_count>0
+                 AND proof.source_session_count>0
+                 AND EXISTS (
+                     SELECT 1
+                     FROM lcm_node_provenance_node_dependencies AS dependency
+                     WHERE dependency.root_node_id=proof.node_id
+                       AND dependency.dependency_node_id=proof.node_id
+                 )""",
+            (root, NODE_PROVENANCE_PROOF_VERSION),
+        ).fetchone()
+        if proof is not None:
+            continue
+        if not materialize_node_provenance_no_commit(
+            conn,
+            root,
+            raise_on_failure=False,
+            work_budget=budget,
+        ):
+            raise RuntimeError("frontier publication could not prove carried node")
 
 
 def backfill_node_provenance_v13(conn: sqlite3.Connection) -> None:
@@ -1060,9 +1254,115 @@ def backfill_node_provenance_v13(conn: sqlite3.Connection) -> None:
     _migration_crash_boundary("v13_after_provenance_backfill")
 
 
-def backfill_node_provenance_v14(conn: sqlite3.Connection) -> None:
-    """Prove every current frontier root before the optional newest-node tail."""
-    ensure_rollover_v14_tables(conn)
+def _bounded_migration_rows(
+    conn: sqlite3.Connection,
+    sql: str,
+    params: Sequence[object],
+    budget: dict[str, int | float],
+) -> list[tuple[object, ...]]:
+    """Run one migration discovery query under the aggregate wall deadline."""
+    if time.monotonic() >= float(budget["deadline_at"]):
+        return []
+
+    def interrupt_after_deadline() -> int:
+        return 1 if time.monotonic() >= float(budget["deadline_at"]) else 0
+
+    conn.set_progress_handler(interrupt_after_deadline, 1_000)
+    try:
+        return list(conn.execute(sql, tuple(params)).fetchall())
+    except sqlite3.OperationalError as exc:
+        if "interrupted" not in str(exc).lower():
+            raise
+        return []
+    finally:
+        conn.set_progress_handler(None, 0)
+
+
+def _execute_migration_sql_with_deadline(
+    conn: sqlite3.Connection,
+    sql: str,
+    params: Sequence[object],
+    budget: dict[str, int | float],
+) -> bool:
+    """Execute one set-based pending-status write under the same deadline."""
+    if time.monotonic() >= float(budget["deadline_at"]):
+        return False
+
+    def interrupt_after_deadline() -> int:
+        return 1 if time.monotonic() >= float(budget["deadline_at"]) else 0
+
+    conn.set_progress_handler(interrupt_after_deadline, 1_000)
+    try:
+        conn.execute(sql, tuple(params))
+        return True
+    except sqlite3.OperationalError as exc:
+        if "interrupted" not in str(exc).lower():
+            raise
+        return False
+    finally:
+        conn.set_progress_handler(None, 0)
+
+
+def _record_malformed_active_root_diagnostics_no_commit(
+    conn: sqlite3.Connection,
+    budget: dict[str, int | float],
+) -> None:
+    rows = _bounded_migration_rows(
+        conn,
+        f"""SELECT DISTINCT
+                    CASE
+                      WHEN typeof(item.ref_id)='integer'
+                        THEN CAST(item.ref_id AS TEXT)
+                      WHEN typeof(item.ref_id)='text' AND length(item.ref_id)>0
+                        THEN substr(item.ref_id, 1, {NODE_PROVENANCE_DIAGNOSTIC_REF_MAX_BYTES // 4})
+                      WHEN typeof(item.ref_id)='text' THEN '<empty>'
+                      ELSE '[' || typeof(item.ref_id) || ']:' ||
+                           substr(hex(item.ref_id), 1, {NODE_PROVENANCE_DIAGNOSTIC_REF_MAX_BYTES // 4})
+                    END AS ref_text,
+                    COALESCE(length(CAST(item.ref_id AS BLOB)), 0) AS ref_bytes,
+                    CASE WHEN typeof(item.ref_id)='integer'
+                         THEN 'non_positive_ref_id'
+                         ELSE 'non_integer_ref_id' END AS reason
+             FROM lcm_frontier_items AS item
+             JOIN lcm_active_frontiers AS frontier
+               ON frontier.conversation_id=item.conversation_id
+              AND frontier.generation=item.generation
+             WHERE item.kind='node'
+               AND (typeof(item.ref_id)!='integer' OR item.ref_id<=0)
+               AND NOT EXISTS (
+                   SELECT 1 FROM lcm_active_frontiers AS newer
+                   WHERE newer.conversation_id=frontier.conversation_id
+                     AND newer.generation>frontier.generation
+               )
+             ORDER BY reason, ref_text
+             LIMIT ?""",
+        (NODE_PROVENANCE_DIAGNOSTIC_MAX_ROWS,),
+        budget,
+    )
+    diagnostic_bytes = 0
+    now = time.time()
+    for raw_text, raw_bytes, raw_reason in rows:
+        ref_text = str(raw_text or "<empty>")
+        reason = str(raw_reason or "non_integer_ref_id")
+        row_bytes = len(ref_text.encode("utf-8")) + len(reason.encode("utf-8"))
+        if diagnostic_bytes + row_bytes > NODE_PROVENANCE_DIAGNOSTIC_MAX_BYTES:
+            break
+        diagnostic_bytes += row_bytes
+        conn.execute(
+            """INSERT INTO lcm_provenance_migration_diagnostics(
+                   ref_text, ref_bytes, reason, observed_at
+               ) VALUES(?, ?, ?, ?)""",
+            (ref_text, max(0, int(raw_bytes or 0)), reason, now),
+        )
+
+
+def backfill_node_provenance_v14(
+    conn: sqlite3.Connection,
+    *,
+    work_budget: dict[str, int | float] | None = None,
+) -> None:
+    """Boundedly prove active roots, leaving every omitted root fail-closed."""
+    ensure_rollover_v15_tables(conn)
     if not conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='summary_nodes'"
     ).fetchone():
@@ -1070,34 +1370,155 @@ def backfill_node_provenance_v14(conn: sqlite3.Connection) -> None:
         _migration_crash_boundary("v14_after_provenance_backfill")
         return
 
-    active_roots = conn.execute(
+    budget = work_budget or new_node_provenance_work_budget(
+        max_roots=NODE_PROVENANCE_MIGRATION_ROOTS,
+        max_dependencies=NODE_PROVENANCE_MIGRATION_DEPENDENCIES,
+        max_bytes=NODE_PROVENANCE_MIGRATION_BYTES,
+        deadline_seconds=NODE_PROVENANCE_MIGRATION_DEADLINE_SECONDS,
+    )
+    remaining_roots = max(
+        0, int(budget["max_roots"]) - int(budget["roots"])
+    )
+    active_roots = _bounded_migration_rows(
+        conn,
         """SELECT DISTINCT item.ref_id
            FROM lcm_frontier_items AS item
            JOIN lcm_active_frontiers AS frontier
              ON frontier.conversation_id=item.conversation_id
             AND frontier.generation=item.generation
            WHERE item.kind='node'
+             AND typeof(item.ref_id)='integer'
+             AND item.ref_id>0
              AND NOT EXISTS (
                  SELECT 1 FROM lcm_active_frontiers AS newer
                  WHERE newer.conversation_id=frontier.conversation_id
                    AND newer.generation>frontier.generation
              )
-           ORDER BY item.ref_id"""
+           ORDER BY item.ref_id
+           LIMIT ?""",
+        (remaining_roots,),
+        budget,
     )
     for row in active_roots:
-        materialize_node_provenance_no_commit(
-            conn, int(row[0]), raise_on_failure=False
+        try:
+            root = int(row[0])
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if root <= 0:
+            continue
+        if not materialize_node_provenance_no_commit(
+            conn, root, raise_on_failure=False, work_budget=budget
+        ) and time.monotonic() >= float(budget["deadline_at"]):
+            break
+
+    # Valid active roots receive the traversal budget first. Malformed peers
+    # are then isolated into their own bounded ledger and never converted by
+    # Python on the proof path.
+    _record_malformed_active_root_diagnostics_no_commit(conn, budget)
+
+    # One set-based write records valid active roots omitted by the traversal
+    # budget. It performs no lineage decoding or dependency queries; absence or
+    # this explicit pending row are both rejected by the v15 frontier trigger.
+    if time.monotonic() < float(budget["deadline_at"]):
+        _execute_migration_sql_with_deadline(
+            conn,
+            """INSERT INTO lcm_node_provenance(
+                   node_id, proof_complete, proof_version, proof_status,
+                   closure_node_count, closure_edge_count, closure_message_count,
+                   source_session_count, proved_at
+               )
+               SELECT DISTINCT item.ref_id, 0, ?, 'migration_pending',
+                      0, 0, 0, 0, ?
+               FROM lcm_frontier_items AS item
+               JOIN lcm_active_frontiers AS frontier
+                 ON frontier.conversation_id=item.conversation_id
+                AND frontier.generation=item.generation
+               WHERE item.kind='node'
+                 AND typeof(item.ref_id)='integer'
+                 AND item.ref_id>0
+                 AND NOT EXISTS (
+                     SELECT 1 FROM lcm_active_frontiers AS newer
+                     WHERE newer.conversation_id=frontier.conversation_id
+                       AND newer.generation>frontier.generation
+                 )
+               ON CONFLICT(node_id) DO UPDATE SET
+                   proof_complete=0,
+                   proof_version=excluded.proof_version,
+                   proof_status=excluded.proof_status,
+                   closure_node_count=0,
+                   closure_edge_count=0,
+                   closure_message_count=0,
+                   source_session_count=0,
+                   proved_at=excluded.proved_at
+               WHERE lcm_node_provenance.proof_version < ?""",
+            (
+                NODE_PROVENANCE_PROOF_VERSION,
+                time.time(),
+                NODE_PROVENANCE_PROOF_VERSION,
+            ),
+            budget,
         )
     _migration_crash_boundary("v14_after_active_provenance_backfill")
 
-    for row in conn.execute(
-        """SELECT node_id FROM summary_nodes
-           ORDER BY node_id DESC LIMIT ?""",
-        (NODE_PROVENANCE_MIGRATION_ROOTS,),
-    ):
-        materialize_node_provenance_no_commit(
-            conn, int(row[0]), raise_on_failure=False
+    remaining_roots = max(
+        0, int(budget["max_roots"]) - int(budget["roots"])
+    )
+    if remaining_roots and time.monotonic() < float(budget["deadline_at"]):
+        tail_rows = _bounded_migration_rows(
+            conn,
+            """SELECT node.node_id FROM summary_nodes AS node
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM lcm_node_provenance AS proof
+                   WHERE proof.node_id=node.node_id
+                     AND proof.proof_complete=1
+                     AND proof.proof_version=?
+                     AND proof.proof_status='complete'
+                     AND proof.closure_message_count>0
+               )
+               ORDER BY node.node_id DESC LIMIT ?""",
+            (NODE_PROVENANCE_PROOF_VERSION, remaining_roots),
+            budget,
         )
+        for row in tail_rows:
+            try:
+                root = int(row[0])
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if root <= 0:
+                continue
+            if not materialize_node_provenance_no_commit(
+                conn, root, raise_on_failure=False, work_budget=budget
+            ) and time.monotonic() >= float(budget["deadline_at"]):
+                break
+        if time.monotonic() < float(budget["deadline_at"]):
+            _execute_migration_sql_with_deadline(
+                conn,
+                """INSERT INTO lcm_node_provenance(
+                       node_id, proof_complete, proof_version, proof_status,
+                       closure_node_count, closure_edge_count,
+                       closure_message_count, source_session_count, proved_at
+                   )
+                   SELECT node_id, 0, ?, 'migration_pending', 0, 0, 0, 0, ?
+                   FROM summary_nodes
+                   WHERE 1 ORDER BY node_id DESC LIMIT ?
+                   ON CONFLICT(node_id) DO UPDATE SET
+                       proof_complete=0,
+                       proof_version=excluded.proof_version,
+                       proof_status=excluded.proof_status,
+                       closure_node_count=0,
+                       closure_edge_count=0,
+                       closure_message_count=0,
+                       source_session_count=0,
+                       proved_at=excluded.proved_at
+                   WHERE lcm_node_provenance.proof_version < ?""",
+                (
+                    NODE_PROVENANCE_PROOF_VERSION,
+                    time.time(),
+                    NODE_PROVENANCE_MIGRATION_ROOTS,
+                    NODE_PROVENANCE_PROOF_VERSION,
+                ),
+                budget,
+            )
     _migration_crash_boundary("v14_after_provenance_backfill")
 
 
@@ -1545,8 +1966,9 @@ def ensure_rollover_v13_triggers(conn: sqlite3.Connection) -> None:
                         SELECT 1 FROM lcm_node_provenance AS proof
                         WHERE proof.node_id = {reference}.ref_id
                           AND proof.proof_complete = 1
-                          AND proof.proof_version = 14
+                          AND proof.proof_version = {NODE_PROVENANCE_PROOF_VERSION}
                           AND proof.proof_status = 'complete'
+                          AND proof.closure_message_count > 0
                           AND proof.source_session_count > 0
                           AND EXISTS (
                               SELECT 1
@@ -1592,7 +2014,7 @@ def ensure_rollover_v13_triggers(conn: sqlite3.Connection) -> None:
         conn.execute(f"DROP TRIGGER IF EXISTS {name}")
     if source_tables_ready:
         conn.execute(
-            """CREATE TRIGGER lcm_node_dependency_update
+            f"""CREATE TRIGGER lcm_node_dependency_update
                BEFORE UPDATE OF node_id, session_id, source_ids, source_type
                ON summary_nodes
                WHEN EXISTS (
@@ -1602,14 +2024,14 @@ def ensure_rollover_v13_triggers(conn: sqlite3.Connection) -> None:
                      ON proof.node_id=dependency.root_node_id
                    WHERE dependency.dependency_node_id=OLD.node_id
                      AND proof.proof_complete=1
-                     AND proof.proof_version=14
+                     AND proof.proof_version={NODE_PROVENANCE_PROOF_VERSION}
                )
                BEGIN
                    SELECT RAISE(ABORT, 'referenced provenance dependency node is immutable');
                END"""
         )
         conn.execute(
-            """CREATE TRIGGER lcm_node_dependency_delete
+            f"""CREATE TRIGGER lcm_node_dependency_delete
                BEFORE DELETE ON summary_nodes
                WHEN EXISTS (
                    SELECT 1
@@ -1618,14 +2040,14 @@ def ensure_rollover_v13_triggers(conn: sqlite3.Connection) -> None:
                      ON proof.node_id=dependency.root_node_id
                    WHERE dependency.dependency_node_id=OLD.node_id
                      AND proof.proof_complete=1
-                     AND proof.proof_version=14
+                     AND proof.proof_version={NODE_PROVENANCE_PROOF_VERSION}
                )
                BEGIN
                    SELECT RAISE(ABORT, 'referenced provenance dependency node is immutable');
                END"""
         )
         conn.execute(
-            """CREATE TRIGGER lcm_message_dependency_update
+            f"""CREATE TRIGGER lcm_message_dependency_update
                BEFORE UPDATE OF store_id, session_id, conversation_id ON messages
                WHEN EXISTS (
                    SELECT 1
@@ -1634,14 +2056,14 @@ def ensure_rollover_v13_triggers(conn: sqlite3.Connection) -> None:
                      ON proof.node_id=dependency.root_node_id
                    WHERE dependency.dependency_store_id=OLD.store_id
                      AND proof.proof_complete=1
-                     AND proof.proof_version=14
+                     AND proof.proof_version={NODE_PROVENANCE_PROOF_VERSION}
                )
                BEGIN
                    SELECT RAISE(ABORT, 'referenced provenance dependency message is immutable');
                END"""
         )
         conn.execute(
-            """CREATE TRIGGER lcm_message_dependency_delete
+            f"""CREATE TRIGGER lcm_message_dependency_delete
                BEFORE DELETE ON messages
                WHEN EXISTS (
                    SELECT 1
@@ -1650,7 +2072,7 @@ def ensure_rollover_v13_triggers(conn: sqlite3.Connection) -> None:
                      ON proof.node_id=dependency.root_node_id
                    WHERE dependency.dependency_store_id=OLD.store_id
                      AND proof.proof_complete=1
-                     AND proof.proof_version=14
+                     AND proof.proof_version={NODE_PROVENANCE_PROOF_VERSION}
                )
                BEGIN
                    SELECT RAISE(ABORT, 'referenced provenance dependency message is immutable');
@@ -1662,6 +2084,13 @@ def ensure_rollover_v13_triggers(conn: sqlite3.Connection) -> None:
 def ensure_rollover_v14_triggers(conn: sqlite3.Connection) -> None:
     ensure_rollover_v13_triggers(conn)
     _migration_crash_boundary("v14_after_triggers")
+
+
+def ensure_rollover_v15_triggers(conn: sqlite3.Connection) -> None:
+    ensure_rollover_v14_triggers(conn)
+    _migration_crash_boundary("v15_after_triggers")
+
+
 def ensure_message_origin_columns(conn: sqlite3.Connection) -> None:
     table_row = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'"
@@ -2350,6 +2779,58 @@ def _drop_fts_triggers(conn: sqlite3.Connection, trigger_sqls: Sequence[str]) ->
             conn.execute(f"DROP TRIGGER IF EXISTS {quote_sql_identifier(trigger_name)}")
 
 
+def _drop_known_triggers_for_missing_fts_tables(
+    conn: sqlite3.Connection,
+    specs: Sequence[ExternalContentFtsSpec],
+) -> tuple[tuple[str, str], ...]:
+    """Remove only canonical FTS triggers whose target table is absent.
+
+    SQLite recompiles existing trigger programs during some unrelated schema
+    changes, including the v13 receipt-table rename.  A trigger left behind
+    after its external-content FTS table was lost can therefore block the
+    migration before the bounded canonical FTS repair runs.  Snapshot the
+    exact definitions for crash-atomic rollback/debugging, but let the
+    canonical specs recreate them after migration rather than replaying stale
+    SQL.
+    """
+    dropped: list[tuple[str, str]] = []
+    for spec in specs:
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (spec.table_name,),
+        ).fetchone():
+            continue
+        known_names = {
+            name
+            for name in (_extract_trigger_name(sql) for sql in spec.trigger_sqls)
+            if name
+        }
+        if not known_names:
+            continue
+        placeholders = ",".join("?" for _ in known_names)
+        rows = conn.execute(
+            f"""SELECT name, sql FROM sqlite_master
+                WHERE type='trigger' AND name IN ({placeholders})""",
+            tuple(sorted(known_names)),
+        ).fetchall()
+        identifier = re.compile(
+            rf"(?<![A-Za-z0-9_])(?:{re.escape(spec.table_name)}|"
+            rf'"{re.escape(spec.table_name)}"|'
+            rf"`{re.escape(spec.table_name)}`|"
+            rf"\[{re.escape(spec.table_name)}\])(?![A-Za-z0-9_])",
+            re.IGNORECASE,
+        )
+        for raw_name, raw_sql in rows:
+            name = str(raw_name or "")
+            sql = str(raw_sql or "")
+            if name in known_names and identifier.search(sql):
+                dropped.append((name, sql))
+                conn.execute(
+                    f"DROP TRIGGER IF EXISTS {quote_sql_identifier(name)}"
+                )
+    return tuple(dropped)
+
+
 def _drop_fts_artifacts(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> None:
     _drop_fts_triggers(conn, spec.trigger_sqls)
     _drop_fts_table(conn, spec.table_name)
@@ -2460,6 +2941,14 @@ def run_versioned_migrations(
     try:
         conn.execute("BEGIN IMMEDIATE")
         refuse_schema_version_too_new(conn)
+        # Broken external-content triggers can make SQLite reject the v13
+        # receipt-table ALTER while recompiling the schema.  Remove only known
+        # triggers for an actually missing FTS table inside this migration
+        # transaction.  The canonical repair below recreates them when space
+        # permits, or leaves them absent for safe LIKE-mode degradation.
+        missing_fts_trigger_snapshot = _drop_known_triggers_for_missing_fts_tables(
+            conn, fts_specs
+        )
         ensure_metadata_table(conn)
         # Install while the migration owns the writer lock, before publishing
         # v8 and releasing older processes waiting to run unconditional marker
@@ -2558,7 +3047,9 @@ def run_versioned_migrations(
         if migrating_to_v13:
             ensure_rollover_v13_tables(conn)
             _migration_crash_boundary("v13_after_ddl")
-            backfill_node_provenance_v13(conn)
+            # The target schema is newer than v13, so do not spend the shared
+            # migration budget on a newest-node tail before active roots.
+            _migration_crash_boundary("v13_after_provenance_backfill")
             ensure_rollover_v13_triggers(conn)
             mark_migration_step_complete(
                 conn, "v13_exact_node_provenance_and_durable_receipts"
@@ -2574,11 +3065,11 @@ def run_versioned_migrations(
         if migrating_to_v14:
             ensure_rollover_v14_tables(conn)
             _migration_crash_boundary("v14_after_dependency_tables")
-            _remove_provenance_roots_no_commit(
-                conn, "SELECT node_id FROM lcm_node_provenance"
-            )
+            # v15 proof-version gating invalidates legacy completeness without
+            # an unbounded delete of every historical dependency row.
             _migration_crash_boundary("v14_after_legacy_proof_invalidation")
-            backfill_node_provenance_v14(conn)
+            _migration_crash_boundary("v14_after_active_provenance_backfill")
+            _migration_crash_boundary("v14_after_provenance_backfill")
             ensure_rollover_v14_triggers(conn)
             mark_migration_step_complete(
                 conn, "v14_exact_provenance_dependencies"
@@ -2588,6 +3079,30 @@ def run_versioned_migrations(
         else:
             ensure_rollover_v14_tables(conn)
             ensure_rollover_v14_triggers(conn)
+
+        migrating_to_v15 = current_version < 15
+        if migrating_to_v15:
+            ensure_rollover_v15_tables(conn)
+            _migration_crash_boundary("v15_after_ddl")
+            migration_proof_budget = new_node_provenance_work_budget(
+                max_roots=NODE_PROVENANCE_MIGRATION_ROOTS,
+                max_dependencies=NODE_PROVENANCE_MIGRATION_DEPENDENCIES,
+                max_bytes=NODE_PROVENANCE_MIGRATION_BYTES,
+                deadline_seconds=NODE_PROVENANCE_MIGRATION_DEADLINE_SECONDS,
+            )
+            backfill_node_provenance_v14(
+                conn, work_budget=migration_proof_budget
+            )
+            _migration_crash_boundary("v15_after_provenance_backfill")
+            ensure_rollover_v15_triggers(conn)
+            mark_migration_step_complete(
+                conn, "v15_bounded_exact_provenance_and_diagnostics"
+            )
+            _migration_crash_boundary("v15_after_migration_step")
+            current_version = 15
+        else:
+            ensure_rollover_v15_tables(conn)
+            ensure_rollover_v15_triggers(conn)
 
         # Startup FTS inspection, repair, rebuild, and trigger installation are
         # part of the same cross-connection writer transaction as schema
@@ -2600,6 +3115,9 @@ def run_versioned_migrations(
                 throttle=True,
                 commit=False,
             )
+        # Keep the pre-migration definitions alive until canonical repair has
+        # succeeded.  Any exception still rolls their DROP back atomically.
+        del missing_fts_trigger_snapshot
 
         set_schema_version(conn, current_version)
         if migrating_to_v11:
@@ -2610,6 +3128,8 @@ def run_versioned_migrations(
             _migration_crash_boundary("v13_after_schema_version")
         if migrating_to_v14:
             _migration_crash_boundary("v14_after_schema_version")
+        if migrating_to_v15:
+            _migration_crash_boundary("v15_after_schema_version")
         conn.commit()
     except Exception:
         conn.rollback()

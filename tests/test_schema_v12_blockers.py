@@ -288,7 +288,7 @@ def test_v10_lifecycle_and_v11_policy_backfill_atomically(tmp_path, source_versi
         conn.execute("DROP TABLE lcm_rollover_policies")
     _drop_v12(conn, version=source_version)
     db_bootstrap.run_versioned_migrations(conn)
-    assert db_bootstrap.get_schema_version(conn) == 14
+    assert db_bootstrap.get_schema_version(conn) == 15
     assert conn.execute(
         """SELECT finalized_session_id FROM lcm_protected_sessions
            WHERE conversation_id=?""", (CONVERSATION,),
@@ -347,7 +347,7 @@ db_bootstrap.run_versioned_migrations(conn)
         assert snapshot["triggers"] == []
     db_bootstrap._MIGRATION_CRASH_PHASE = None
     db_bootstrap.run_versioned_migrations(conn)
-    assert db_bootstrap.get_schema_version(conn) == 14
+    assert db_bootstrap.get_schema_version(conn) == 15
     assert conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_rollover_heads'"
     ).fetchone() == (1,)

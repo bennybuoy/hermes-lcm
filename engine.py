@@ -7466,7 +7466,7 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
 
         session_id = str(frontier.get("session_id") or "")
         nodes: list[SummaryNode] = []
-        messages: list[Dict[str, Any]] = []
+        message_refs: list[int] = []
         previous_end = 0
         for item in items:
             start = int(item.get("source_start") or 0)
@@ -7491,19 +7491,26 @@ class LCMEngine(FullSweepMixin, CompactionMixin, ResetStateMixin, ReconcileMixin
                     raise RuntimeError(
                         f"frontier generation {generation} has out-of-range message ref {ref_id}"
                     )
-                stored = self._store.get(ref_id)
-                stored_conversation_id = str(
-                    stored.get("conversation_id") or ""
-                ) if stored else ""
-                if stored is None or stored_conversation_id != conversation_id:
-                    raise RuntimeError(
-                        f"frontier generation {generation} references missing raw message {ref_id}"
-                    )
-                messages.append(self._store.to_openai_msg(stored))
+                message_refs.append(ref_id)
                 continue
             raise RuntimeError(
                 f"frontier generation {generation} has unknown item kind {kind!r}"
             )
+        stored_messages, missing_ref = (
+            self._store.resolve_authoritative_frontier_messages(
+                message_refs,
+                conversation_id=conversation_id,
+                legacy_session_id=session_id,
+            )
+        )
+        if missing_ref is not None:
+            raise RuntimeError(
+                f"frontier generation {generation} references missing raw message {missing_ref}"
+            )
+        messages = [
+            self._store.to_openai_msg(stored_messages[ref_id])
+            for ref_id in message_refs
+        ]
         return nodes, messages
 
     def _merge_unpublished_host_tail(

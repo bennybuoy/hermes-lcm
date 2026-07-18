@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional, Sequence
 
 from .db_bootstrap import (
     ensure_frontier_tables,
+    ensure_frontier_node_provenance_no_commit,
     ensure_prepared_batch_payload_columns,
     configure_connection,
     run_versioned_migrations,
@@ -334,6 +335,13 @@ class FrontierStore:
         current_gen = int(row[0]) if row else 0
         if current_gen != int(base_generation):
             return 0
+
+        # A v15 migration may deliberately leave quiet active roots pending
+        # once its aggregate startup budget is exhausted. Re-prove only the
+        # carried node items here, inside this same writer transaction, before
+        # any new generation becomes visible. Failure rolls the publication
+        # back and the trigger remains a second fail-closed guard.
+        ensure_frontier_node_provenance_no_commit(conn, items)
 
         now = time.time()
         new_gen = int(base_generation) + 1

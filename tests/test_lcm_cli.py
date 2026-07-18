@@ -74,7 +74,7 @@ def test_cli_status_is_json_first_and_works_without_gateway(tmp_path):
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["database_path"] == str(db)
-    assert payload["schema_version"] == SCHEMA_VERSION == 14
+    assert payload["schema_version"] == SCHEMA_VERSION == 15
     assert payload["supported_schema_version"] == SCHEMA_VERSION
     assert payload["counts"]["messages"] == 2
     assert payload["read_only"] is True
@@ -130,7 +130,7 @@ def test_cli_reads_legacy_v9_without_migrating_it(tmp_path):
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["schema_version"] == 9
-    assert payload["supported_schema_version"] == SCHEMA_VERSION == 14
+    assert payload["supported_schema_version"] == SCHEMA_VERSION == 15
     check = sqlite3.connect(db)
     try:
         assert check.execute(
