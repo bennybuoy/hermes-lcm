@@ -7,11 +7,14 @@ validation, pending-summary invisibility, and status/doctor reporting.
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
+import time
 
 import pytest
 
 from hermes_lcm.config import LCMConfig
+from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.frontier import PREPARED_PAYLOAD_VERSION, compute_source_identity_hash
 
@@ -399,6 +402,259 @@ def test_prepare_skips_canonical_owned_source_ids_after_publication(tmp_path, mo
         rejected = engine.promote_prepared_compaction(poisoned, all_msgs)
         assert rejected.promoted is False
         assert rejected.reason == "canonical_source_overlap"
+    finally:
+        engine.shutdown()
+
+
+def _install_mixed_node_message_frontier(engine, *, r1_len=4, r2_len=6):
+    """Install Vish-gen-6-shaped frontier: nodeA | R1 | nodeB | R2[/suffix].
+
+    Returns (messages, node_a_range, r1_ids, node_b_range, r2_ids) where ranges
+    are inclusive (start, end) store_id spans for the two prior nodes.
+    """
+    # Enough rows for nodeA + R1 + nodeB + R2 + protected fresh tail.
+    total = 3 + r1_len + 3 + r2_len + 2
+    messages = _messages(total)
+    engine.ingest(messages)
+    stored = engine._store.get_session_messages(engine.current_session_id)
+    ids = [int(m["store_id"]) for m in stored]
+    assert len(ids) >= total
+
+    node_a_ids = ids[0:3]
+    r1_ids = ids[3 : 3 + r1_len]
+    node_b_ids = ids[3 + r1_len : 3 + r1_len + 3]
+    r2_ids = ids[3 + r1_len + 3 :]  # includes fresh tail rows still on frontier
+
+    now = time.time()
+    node_a = engine._dag.add_node(
+        SummaryNode(
+            session_id=engine.current_session_id,
+            depth=0,
+            summary="prior node A",
+            token_count=4,
+            source_token_count=30,
+            source_ids=list(node_a_ids),
+            source_type="messages",
+            created_at=now,
+            earliest_at=now,
+            latest_at=now,
+        )
+    )
+    node_b = engine._dag.add_node(
+        SummaryNode(
+            session_id=engine.current_session_id,
+            depth=0,
+            summary="prior node B",
+            token_count=4,
+            source_token_count=30,
+            source_ids=list(node_b_ids),
+            source_type="messages",
+            created_at=now,
+            earliest_at=now,
+            latest_at=now,
+        )
+    )
+
+    items = [
+        {
+            "kind": "node",
+            "ref_id": node_a,
+            "source_start": node_a_ids[0],
+            "source_end": node_a_ids[-1],
+        },
+        *[
+            {"kind": "message", "ref_id": sid, "source_start": sid, "source_end": sid}
+            for sid in r1_ids
+        ],
+        {
+            "kind": "node",
+            "ref_id": node_b,
+            "source_start": node_b_ids[0],
+            "source_end": node_b_ids[-1],
+        },
+        *[
+            {"kind": "message", "ref_id": sid, "source_start": sid, "source_end": sid}
+            for sid in r2_ids
+        ],
+    ]
+    tip = ids[-1]
+    policy_fp = engine._async_policy_fingerprint()
+    route_fp = engine._async_route_fingerprint()
+    engine._frontier.ensure_frontier(
+        engine.current_conversation_id,
+        engine.current_session_id,
+        policy_fingerprint=policy_fp,
+        route_fingerprint=route_fp,
+    )
+    active = engine._frontier.get_active_frontier(engine.current_conversation_id)
+    assert active is not None
+    new_gen = engine._frontier.advance_frontier_generation_with_items(
+        engine.current_conversation_id,
+        engine.current_session_id,
+        tip,
+        policy_fp,
+        route_fp,
+        int(active["generation"]),
+        items,
+    )
+    assert new_gen > 0
+    engine._lifecycle.advance_frontier(
+        engine.current_conversation_id,
+        engine.current_session_id,
+        tip,
+    )
+    return (
+        messages,
+        (node_a_ids[0], node_a_ids[-1]),
+        r1_ids,
+        (node_b_ids[0], node_b_ids[-1]),
+        r2_ids,
+    )
+
+
+def test_prepare_mixed_frontier_never_spans_intervening_node(tmp_path, monkeypatch):
+    """Mixed node/message/node/message frontier must not one-leaf across node B.
+
+    Collecting every message-kind ref into a single prepared leaf advertises a
+    min/max replacement span that crosses intervening canonical nodes, so
+    promote correctly raises overlapping frontier node replacement. Prepare
+    must pick one contiguous replaceable raw run only.
+    """
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(
+        engine,
+        "_summarize_leaf_chunk_with_rescue",
+        lambda initial_chunk, focus_topic=None: (
+            list(initial_chunk),
+            max(1, len(initial_chunk) * 10),
+            "mixed-frontier leaf",
+            1,
+            1,
+        ),
+    )
+    try:
+        messages, node_a_span, r1_ids, node_b_span, r2_ids = (
+            _install_mixed_node_message_frontier(engine)
+        )
+        # Fresh tail is protected; R2 eligible prefix is everything but the
+        # last fresh_tail_count rows of the session (which sit at the end of R2).
+        fresh_tail = int(engine._config.fresh_tail_count)
+        r2_eligible = r2_ids[:-fresh_tail] if fresh_tail else list(r2_ids)
+        assert r1_ids, "fixture must leave a first raw run"
+        assert r2_eligible, "fixture must leave a second raw run outside the tail"
+
+        batch = engine.prepare_background_compaction_once(messages)
+        assert batch is not None, "mixed frontier with raw runs must prepare a batch"
+        assert batch.state == "ready", (
+            f"expected ready, got state={batch.state!r} "
+            f"reason={getattr(batch, 'failure_reason', None)!r} "
+            f"source_ids={batch.source_ids!r}"
+        )
+        source_ids = [int(s) for s in batch.source_ids]
+        assert source_ids, "prepared batch must cover some raw rows"
+        span_lo, span_hi = min(source_ids), max(source_ids)
+
+        # Must not create one candidate spanning intervening node B.
+        b_lo, b_hi = node_b_span
+        assert not (span_lo <= b_hi and span_hi >= b_lo), (
+            f"candidate span [{span_lo},{span_hi}] overlaps node B [{b_lo},{b_hi}]; "
+            f"source_ids={source_ids}"
+        )
+        a_lo, a_hi = node_a_span
+        assert not (span_lo <= a_hi and span_hi >= a_lo), (
+            f"candidate span [{span_lo},{span_hi}] overlaps node A [{a_lo},{a_hi}]"
+        )
+
+        # Single contiguous run: either R1 or the eligible R2 prefix — not both.
+        as_set = set(source_ids)
+        assert as_set.isdisjoint(set(range(b_lo, b_hi + 1)))
+        in_r1 = as_set <= set(r1_ids)
+        in_r2 = as_set <= set(r2_eligible)
+        assert in_r1 or in_r2, (
+            f"source_ids {source_ids} must lie entirely in R1={r1_ids} "
+            f"or R2-eligible={r2_eligible}"
+        )
+        # Prefer earliest eligible run (frontier order / oldest raw debt first).
+        assert in_r1 and as_set == set(r1_ids), (
+            f"expected earliest run R1={r1_ids}, got {source_ids}"
+        )
+
+        # Contiguous numeric sequence (no holes that inflate the replacement span).
+        assert source_ids == list(range(span_lo, span_hi + 1)) or source_ids == sorted(
+            source_ids
+        )
+        assert max(source_ids) - min(source_ids) + 1 == len(source_ids)
+
+        promoted = engine.promote_prepared_compaction(batch.batch_id, messages)
+        assert promoted.promoted is True, promoted.reason
+        assert "overlapping frontier node" not in (promoted.reason or "")
+    finally:
+        engine.shutdown()
+
+
+def test_prepare_fails_closed_when_canonical_ownership_read_errors(
+    tmp_path, monkeypatch
+):
+    """DAG ownership read failure must not yield a potentially overlapping batch."""
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(
+        engine,
+        "_summarize_leaf_chunk_with_rescue",
+        lambda initial_chunk, focus_topic=None: (
+            list(initial_chunk),
+            10,
+            "should-not-run",
+            1,
+            1,
+        ),
+    )
+    try:
+        messages = _messages(12)
+        engine.ingest(messages)
+
+        def boom(_session_id):
+            raise sqlite3.OperationalError("injected dag ownership read failure")
+
+        monkeypatch.setattr(engine._dag, "get_session_nodes", boom)
+        batch = engine.prepare_background_compaction_once(messages)
+        assert batch is None or (
+            getattr(batch, "state", None) == "failed"
+            and "ownership" in (getattr(batch, "failure_reason", "") or "").lower()
+        )
+        # Never a ready batch that skipped ownership filtering.
+        if batch is not None:
+            assert batch.state != "ready"
+    finally:
+        engine.shutdown()
+
+
+def test_prepare_fails_closed_when_frontier_items_read_errors(tmp_path, monkeypatch):
+    """Frontier item read failure must not fall back to whole-session prepare."""
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(
+        engine,
+        "_summarize_leaf_chunk_with_rescue",
+        lambda initial_chunk, focus_topic=None: (
+            list(initial_chunk),
+            10,
+            "should-not-run",
+            1,
+            1,
+        ),
+    )
+    try:
+        messages, *_ = _install_mixed_node_message_frontier(engine)
+
+        def boom(*_args, **_kwargs):
+            raise sqlite3.OperationalError("injected frontier items read failure")
+
+        monkeypatch.setattr(engine._frontier, "get_frontier_items", boom)
+        batch = engine.prepare_background_compaction_once(messages)
+        assert batch is None or (
+            getattr(batch, "state", None) == "failed"
+        )
+        if batch is not None:
+            assert batch.state != "ready"
     finally:
         engine.shutdown()
 

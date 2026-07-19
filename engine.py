@@ -5505,14 +5505,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         promote time: every ``source_type == "messages"`` node contributes
         its source_ids. Higher condensation nodes point at nodes, not raw
         rows, so expanding the message leaves is sufficient.
+
+        Raises on DAG read failure so callers (prepare) can fail closed
+        rather than treating an empty set as "nothing is owned".
         """
         owned: set[int] = set()
         if not session_id:
             return owned
-        try:
-            existing_nodes = self._dag.get_session_nodes(session_id)
-        except Exception:
-            return owned
+        existing_nodes = self._dag.get_session_nodes(session_id)
         for node in existing_nodes or []:
             if getattr(node, "source_type", "") != "messages":
                 continue
@@ -5522,6 +5522,127 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 except (TypeError, ValueError):
                     continue
         return owned
+
+    def _select_prepare_contiguous_message_run(
+        self,
+        *,
+        frontier_items: list[dict[str, Any]],
+        frontier_tip: int,
+        prep_by_id: dict[int, dict[str, Any]],
+        covered_owned: set[int],
+    ) -> list[int] | None:
+        """Pick one replaceable contiguous raw-message interval for prepare.
+
+        Mixed authoritative frontiers interleave prior nodes with raw message
+        runs. A single prepared leaf must not advertise a min/max replacement
+        span that crosses an intervening node (promote would raise
+        ``overlapping frontier node replacement``). Under the one-leaf
+        payload contract we therefore select exactly one eligible contiguous
+        run, preserving frontier order (earliest first), the protected fresh
+        tail (via ``prep_by_id``), and source identity.
+
+        Returns sorted store_ids for that run, or ``None`` if no eligible work.
+        Raises ``ValueError`` on malformed frontier layouts whose spans cannot
+        be authorized.
+        """
+        node_ranges: list[tuple[int, int]] = []
+        runs: list[list[int]] = []
+        current_run: list[int] = []
+        last_kind = ""
+
+        for it in frontier_items or []:
+            kind = str(it.get("kind") or "")
+            if kind == "node":
+                if current_run:
+                    runs.append(current_run)
+                    current_run = []
+                try:
+                    ref_id = int(it.get("ref_id") or 0)
+                    start = int(it.get("source_start") or ref_id)
+                    end = int(it.get("source_end") or ref_id)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("malformed frontier node item") from exc
+                if ref_id <= 0 or start <= 0 or end < start:
+                    raise ValueError("malformed frontier node range")
+                node_ranges.append((start, end))
+                last_kind = "node"
+                continue
+            if kind == "message":
+                try:
+                    ref_id = int(it.get("ref_id") or 0)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("malformed frontier message item") from exc
+                if ref_id <= 0:
+                    raise ValueError("malformed frontier message ref_id")
+                current_run.append(ref_id)
+                last_kind = "message"
+                continue
+            if kind:
+                raise ValueError(f"unknown frontier item kind: {kind}")
+
+        if current_run:
+            runs.append(current_run)
+
+        # Raw suffix beyond the published tip (and the full prep pool on a
+        # first prepare with tip 0 / empty items).
+        suffix_ids: list[int] = []
+        for sid in sorted(prep_by_id):
+            if frontier_tip <= 0 or sid > frontier_tip:
+                suffix_ids.append(sid)
+
+        if not frontier_items:
+            # No authoritative layout yet: one contiguous prep-pool interval.
+            runs = [suffix_ids] if suffix_ids else []
+        elif suffix_ids:
+            if last_kind == "message" and runs:
+                # Extend the trailing raw run with newly ingested rows only.
+                already = set(runs[-1])
+                for sid in suffix_ids:
+                    if sid not in already:
+                        runs[-1].append(sid)
+            else:
+                runs.append(list(suffix_ids))
+
+        def _eligible_subruns(raw_ids: list[int]) -> list[list[int]]:
+            """Filter owned/tail rows and split residual holes into sub-runs."""
+            filtered: list[int] = []
+            for sid in raw_ids:
+                if sid in covered_owned:
+                    continue
+                if sid not in prep_by_id:
+                    continue
+                filtered.append(sid)
+            if not filtered:
+                return []
+            # Contiguous in store-id order so min/max never covers a hole.
+            filtered = sorted(set(filtered))
+            subruns: list[list[int]] = []
+            cur: list[int] = [filtered[0]]
+            for sid in filtered[1:]:
+                if sid == cur[-1] + 1:
+                    cur.append(sid)
+                else:
+                    subruns.append(cur)
+                    cur = [sid]
+            subruns.append(cur)
+            return subruns
+
+        def _span_overlaps_nodes(lo: int, hi: int) -> bool:
+            for n_lo, n_hi in node_ranges:
+                if lo <= n_hi and hi >= n_lo:
+                    return True
+            return False
+
+        # Earliest eligible run in frontier order whose advertised replacement
+        # interval is disjoint from every existing node item range.
+        for run in runs:
+            for sub in _eligible_subruns(run):
+                lo, hi = sub[0], sub[-1]
+                if _span_overlaps_nodes(lo, hi):
+                    # This sub-run is not safely replaceable; try the next.
+                    continue
+                return sub
+        return None
 
     def prepare_background_compaction_once(
         self,
@@ -5580,65 +5701,95 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Canonical message ownership (same set promote uses for
         # canonical_source_overlap). Never re-select already-published rows —
         # the old blind all_stored[:-fresh_tail] re-read the summarized
-        # prefix and poisoned post-success batches.
-        covered_owned = self._canonical_message_owned_store_ids(session_id)
+        # prefix and poisoned post-success batches. Storage errors fail closed
+        # (no batch) rather than treating ownership as empty.
+        try:
+            covered_owned = self._canonical_message_owned_store_ids(session_id)
+        except Exception as exc:
+            logger.warning(
+                "LCM background prepare aborted: canonical ownership read failed: %s",
+                exc,
+            )
+            return None
 
-        # Authoritative uncovered set:
-        # 1) message-kind refs on the active frontier generation (raw still
-        #    represented on the tip, not yet published as nodes)
-        # 2) store rows after the frontier tip that are in the prep pool
-        #    (newly ingested suffix not yet reflected in frontier items)
-        # Always subtract canonical ownership so holes under a tip that were
-        # later published remain excluded, and fail closed if nothing remains.
-        candidate_ids: set[int] = set()
+        # Authoritative uncovered set from frontier layout:
+        # walk ordered items, collect contiguous message runs separated by
+        # nodes, then select ONE replaceable run (plus tip suffix when it
+        # extends the trailing run). Never union all message refs into a
+        # single min/max span that would cross intervening nodes.
         frontier_tip = int(source_end or 0)
+        items: list[dict[str, Any]] = []
         if frontier is not None:
             try:
                 gen = int(frontier.get("generation") or 0)
-                items = (
-                    self._frontier.get_frontier_items(conv_id, gen) if gen > 0 else []
+                if gen > 0:
+                    items = list(self._frontier.get_frontier_items(conv_id, gen) or [])
+            except Exception as exc:
+                logger.warning(
+                    "LCM background prepare aborted: frontier items read failed: %s",
+                    exc,
                 )
-            except Exception:
-                items = []
-            for it in items or []:
-                if str(it.get("kind") or "") != "message":
-                    continue
-                try:
-                    ref_id = int(it.get("ref_id") or 0)
-                except (TypeError, ValueError):
-                    continue
-                if ref_id > 0:
-                    candidate_ids.add(ref_id)
-        # Raw suffix beyond the published tip (and any prep-pool rows when the
-        # tip is still zero / first prepare).
-        for m in prep_pool:
-            try:
-                sid = int(m["store_id"])
-            except (TypeError, ValueError, KeyError):
-                continue
-            if sid > frontier_tip or frontier_tip <= 0:
-                candidate_ids.add(sid)
+                return None
 
-        candidate_ids -= covered_owned
-        if not candidate_ids:
-            return None
-
-        # Preserve store order and stay inside the prep pool (fresh tail out).
-        prep_by_id = {}
+        prep_by_id: dict[int, dict[str, Any]] = {}
         for m in prep_pool:
             try:
                 prep_by_id[int(m["store_id"])] = m
             except (TypeError, ValueError, KeyError):
                 continue
-        candidate_stored = [
-            prep_by_id[sid]
-            for sid in sorted(candidate_ids)
-            if sid in prep_by_id
-        ]
-        if not candidate_stored:
+
+        try:
+            candidate_store_ids = self._select_prepare_contiguous_message_run(
+                frontier_items=items,
+                frontier_tip=frontier_tip,
+                prep_by_id=prep_by_id,
+                covered_owned=covered_owned,
+            )
+        except ValueError as exc:
+            logger.warning(
+                "LCM background prepare aborted: malformed frontier layout: %s",
+                exc,
+            )
             return None
 
-        candidate_store_ids = [int(m["store_id"]) for m in candidate_stored]
+        if not candidate_store_ids:
+            return None
+
+        # Final pre-LLM authorization: advertised replacement interval must
+        # be disjoint from every existing node item range on this generation.
+        span_lo = min(candidate_store_ids)
+        span_hi = max(candidate_store_ids)
+        for it in items:
+            if str(it.get("kind") or "") != "node":
+                continue
+            try:
+                n_lo = int(it.get("source_start") or it.get("ref_id") or 0)
+                n_hi = int(it.get("source_end") or it.get("ref_id") or 0)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "LCM background prepare aborted: unreadable node range on frontier"
+                )
+                return None
+            if n_lo <= 0 or n_hi < n_lo:
+                logger.warning(
+                    "LCM background prepare aborted: invalid node range on frontier"
+                )
+                return None
+            if span_lo <= n_hi and span_hi >= n_lo:
+                logger.warning(
+                    "LCM background prepare aborted: candidate span [%s,%s] "
+                    "overlaps frontier node [%s,%s]",
+                    span_lo,
+                    span_hi,
+                    n_lo,
+                    n_hi,
+                )
+                return None
+
+        candidate_stored = [prep_by_id[sid] for sid in candidate_store_ids]
+        if not candidate_stored or len(candidate_stored) != len(candidate_store_ids):
+            return None
+
         actual_source_end = candidate_store_ids[-1] if candidate_store_ids else source_end
 
         # Compute source identity hash for CAS validation
