@@ -161,6 +161,23 @@ class TestAuthoritativeFrontierRangeReplacement:
         finally:
             engine.shutdown()
 
+    def test_consumed_span_without_lineage_cannot_publish_unrepresented_node(
+        self, tmp_path
+    ):
+        engine = _engine(tmp_path)
+        try:
+            with pytest.raises(ValueError, match="covered source ids"):
+                engine._build_promoted_frontier_items(
+                    session_id=engine.current_session_id,
+                    node_id=99,
+                    covered_source_ids=[],
+                    consumed_source_ids=[10],
+                    frontier_end_store_id=10,
+                    previous_items=[self._item("message", 10)],
+                )
+        finally:
+            engine.shutdown()
+
     def test_async_promotion_publishes_generation_and_items_atomically(
         self, tmp_path, monkeypatch
     ):

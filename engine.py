@@ -5946,6 +5946,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         canonical summaries.  Newly ingested raw tail rows are then appended.
         """
         items: list[dict[str, Any]] = []
+        if node_id > 0 and consumed_source_ids and not covered_source_ids:
+            raise ValueError("frontier node requires covered source ids")
         node_item: dict[str, Any] | None = None
         if covered_source_ids and node_id > 0:
             node_item = {
