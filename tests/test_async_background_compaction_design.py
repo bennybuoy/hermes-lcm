@@ -283,7 +283,19 @@ def test_successful_atomic_promotion_is_all_or_nothing(tmp_path):
         assert engine._dag.get_session_node_count(engine.current_session_id) == batch.expected_leaf_count
         lifecycle = engine.get_status()["lifecycle"]
         assert lifecycle["current_frontier_store_id"] > old_frontier
-        assert lifecycle["current_frontier_store_id"] == batch.frontier_end_store_id
+        frontier = engine._frontier.get_active_frontier(engine.current_conversation_id)
+        assert frontier is not None
+        items = engine._frontier.get_frontier_items(
+            engine.current_conversation_id, int(frontier["generation"])
+        )
+        layout_tip = max(
+            int(it.get("source_end") or it.get("ref_id") or 0) for it in items
+        )
+        # Lifecycle and frontier metadata track the full layout tip (includes
+        # preserved suffix / fresh tail), not merely batch candidate end.
+        assert lifecycle["current_frontier_store_id"] == layout_tip
+        assert int(frontier["source_end_store_id"]) == layout_tip
+        assert layout_tip >= int(batch.frontier_end_store_id or 0)
         assert engine.get_async_compaction_status()["promoted_batches"] == 1
     finally:
         engine.shutdown()
@@ -764,6 +776,362 @@ def test_mixed_frontier_promotion_appends_only_new_suffix_beyond_prior_tip(
         for sid in range(b_lo, b_hi + 1):
             assert sid not in msg_refs, (
                 f"raw rows under preserved node B must not reappear: {sid}"
+            )
+    finally:
+        engine.shutdown()
+
+
+def _layout_publication_tip(items) -> int:
+    """Max positive source_end/ref_id across a final frontier item layout."""
+    tip = 0
+    for it in items:
+        for key in ("source_end", "ref_id"):
+            try:
+                val = int(it.get(key) or 0)
+            except (TypeError, ValueError):
+                val = 0
+            if val > tip:
+                tip = val
+    return tip
+
+
+def test_mixed_frontier_promotion_publishes_authoritative_layout_tip(
+    tmp_path, monkeypatch
+):
+    """Publication metadata must not regress to early-run candidate end.
+
+    Mixed promote of R1 reconstructs a complete layout that still owns later
+    node B + R2. Batch frontier_end_store_id remains the candidate identity
+    (max R1), but active frontier source_end and lifecycle current tip must
+    equal max(item source_end) over the full final layout — never behind it.
+    """
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(
+        engine,
+        "_summarize_leaf_chunk_with_rescue",
+        lambda initial_chunk, focus_topic=None: (
+            list(initial_chunk),
+            max(1, len(initial_chunk) * 10),
+            "mixed-frontier tip leaf",
+            1,
+            1,
+        ),
+    )
+    try:
+        messages, node_a_span, r1_ids, node_b_span, r2_ids = (
+            _install_mixed_node_message_frontier(engine)
+        )
+        prior_tip = max(r2_ids)
+        prior_lifecycle = engine.get_status()["lifecycle"]["current_frontier_store_id"]
+        assert prior_lifecycle == prior_tip
+
+        batch = engine.prepare_background_compaction_once(messages)
+        assert batch is not None and batch.state == "ready"
+        assert set(int(s) for s in batch.source_ids) == set(r1_ids)
+        # Candidate identity metadata may stay at early-run end.
+        assert int(batch.frontier_end_store_id) == max(r1_ids)
+        assert int(batch.frontier_end_store_id) < prior_tip
+
+        promoted = engine.promote_prepared_compaction(batch.batch_id, messages)
+        assert promoted.promoted is True, promoted.reason
+
+        frontier = engine._frontier.get_active_frontier(
+            engine.current_conversation_id
+        )
+        assert frontier is not None
+        items = engine._frontier.get_frontier_items(
+            engine.current_conversation_id, int(frontier["generation"])
+        )
+        assert items, "promoted generation must publish ordered items"
+        layout_tip = _layout_publication_tip(items)
+        assert layout_tip == prior_tip, (
+            f"final layout tip {layout_tip} must retain prior tip {prior_tip}; "
+            f"items={items}"
+        )
+        assert layout_tip > int(batch.frontier_end_store_id)
+
+        # Canonical frontier metadata must track the full layout tip.
+        pub_tip = int(frontier["source_end_store_id"] or 0)
+        assert pub_tip == layout_tip, (
+            f"active frontier source_end_store_id={pub_tip} regressed behind "
+            f"layout tip {layout_tip} (batch candidate end="
+            f"{batch.frontier_end_store_id})"
+        )
+        assert pub_tip >= prior_tip
+        assert pub_tip > int(batch.frontier_end_store_id)
+
+        lifecycle_tip = int(
+            engine.get_status()["lifecycle"]["current_frontier_store_id"] or 0
+        )
+        assert lifecycle_tip == layout_tip == pub_tip
+        assert lifecycle_tip >= prior_lifecycle
+        # Batch may still record candidate end; only publication tips are
+        # authoritative for frontier/lifecycle.
+        assert int(batch.frontier_end_store_id) == max(r1_ids)
+    finally:
+        engine.shutdown()
+
+
+def test_mixed_frontier_promotion_publication_tip_includes_concurrent_suffix(
+    tmp_path, monkeypatch
+):
+    """Concurrent rows past prior tip must advance frontier and lifecycle tips."""
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(
+        engine,
+        "_summarize_leaf_chunk_with_rescue",
+        lambda initial_chunk, focus_topic=None: (
+            list(initial_chunk),
+            max(1, len(initial_chunk) * 10),
+            "mixed-frontier concurrent tip leaf",
+            1,
+            1,
+        ),
+    )
+    try:
+        messages, node_a_span, r1_ids, node_b_span, r2_ids = (
+            _install_mixed_node_message_frontier(engine)
+        )
+        prior_tip = max(r2_ids)
+        prior_lifecycle = engine.get_status()["lifecycle"]["current_frontier_store_id"]
+        extra = [
+            {"role": "user", "content": "concurrent tip a " + ("x " * 12)},
+            {"role": "assistant", "content": "concurrent tip b " + ("x " * 12)},
+            {"role": "user", "content": "concurrent tip c " + ("x " * 12)},
+        ]
+        extended = list(messages) + extra
+        engine.ingest(extended)
+        stored = engine._store.get_session_messages(engine.current_session_id)
+        new_suffix_ids = [
+            int(m["store_id"]) for m in stored if int(m["store_id"]) > prior_tip
+        ]
+        assert new_suffix_ids, "fixture must produce concurrent suffix"
+
+        batch = engine.prepare_background_compaction_once(extended)
+        assert batch is not None and batch.state == "ready"
+        assert set(int(s) for s in batch.source_ids) == set(r1_ids)
+        assert int(batch.frontier_end_store_id) == max(r1_ids)
+
+        promoted = engine.promote_prepared_compaction(batch.batch_id, extended)
+        assert promoted.promoted is True, promoted.reason
+
+        frontier = engine._frontier.get_active_frontier(
+            engine.current_conversation_id
+        )
+        items = engine._frontier.get_frontier_items(
+            engine.current_conversation_id, int(frontier["generation"])
+        )
+        layout_tip = _layout_publication_tip(items)
+        expected_tip = max(new_suffix_ids)
+        assert layout_tip == expected_tip, (
+            f"layout tip {layout_tip} must include concurrent suffix tip "
+            f"{expected_tip}; items={items}"
+        )
+        msg_refs = [int(it["ref_id"]) for it in items if it["kind"] == "message"]
+        for sid in new_suffix_ids:
+            assert sid in msg_refs, f"concurrent suffix row {sid} missing from layout"
+
+        pub_tip = int(frontier["source_end_store_id"] or 0)
+        lifecycle_tip = int(
+            engine.get_status()["lifecycle"]["current_frontier_store_id"] or 0
+        )
+        assert pub_tip == layout_tip == lifecycle_tip == expected_tip
+        assert pub_tip > prior_tip
+        assert lifecycle_tip > prior_lifecycle
+        assert pub_tip > int(batch.frontier_end_store_id)
+        # Monotonic and includes concurrent suffix.
+        assert pub_tip == max(prior_tip, *new_suffix_ids)
+    finally:
+        engine.shutdown()
+
+
+def test_async_promotion_preserves_tool_result_rows_in_lineage(
+    tmp_path, monkeypatch
+):
+    """Async prepare/promote retains every selected store row in node lineage.
+
+    Reviewer claim: async promotion cannot preserve omitted consumed
+    tool-result ranges because promote passes
+    ``consumed_source_ids=covered_source_ids``.
+
+    Adjudication: prepare builds ``candidate_store_ids`` from all selected
+    stored frontier message refs (user/assistant/tool-call/tool-result).
+    Batch ``source_ids``, payload ``source_ids``, and the promoted node
+    ``source_ids`` are that same list; summarizer output may omit tool text
+    without narrowing lineage. The wider covered/consumed distinction is a
+    foreground compaction concern. This fixture is non-vacuous: tool text is
+    stripped from the summary, a foreign-session store-id gap exists, and
+    every selected row must still appear exactly once on batch, node, and
+    frontier ownership.
+    """
+    engine = _engine(tmp_path, session_id="async-tool-session")
+    secret = "TOOL_RESULT_SECRET_PAYLOAD_SHOULD_NOT_APPEAR_IN_SUMMARY"
+    monkeypatch.setattr(
+        engine,
+        "_summarize_leaf_chunk_with_rescue",
+        lambda initial_chunk, focus_topic=None: (
+            # Summarizer "omits" tool content: return a transformed leaf that
+            # drops tool roles entirely. Lineage must still keep their ids.
+            [
+                m
+                for m in initial_chunk
+                if str(m.get("role") or "") not in {"tool"}
+            ],
+            max(1, len(initial_chunk) * 10),
+            "summary without tool body (transformed)",
+            1,
+            1,
+        ),
+    )
+    try:
+        # Build a tool-bearing history large enough that prepare selects past
+        # the protected fresh tail, including the tool-result row.
+        history = [
+            {"role": "system", "content": "system prompt for tool lineage"},
+            {
+                "role": "user",
+                "content": "please inspect the file " + ("u " * 16),
+            },
+            {
+                "role": "assistant",
+                "content": "calling read_file",
+                "tool_calls": [
+                    {
+                        "id": "call_tool_lineage_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"x.py"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_tool_lineage_1",
+                "content": secret + " " + ("t " * 24),
+            },
+            {
+                "role": "assistant",
+                "content": "tool returned data; continuing " + ("a " * 16),
+            },
+        ]
+        # Extra turns so fresh_tail_count=2 does not protect the tool row.
+        for idx in range(8):
+            role = "user" if idx % 2 == 0 else "assistant"
+            history.append(
+                {
+                    "role": role,
+                    "content": f"followup {idx} " + ("x " * 14),
+                }
+            )
+        engine.ingest(history)
+
+        # Foreign-session row creates a global store_id gap mid-session growth.
+        foreign_id = engine._store.append(
+            "foreign-other-session",
+            {"role": "user", "content": "foreign gap filler " + ("f " * 8)},
+            token_estimate=20,
+            source="test",
+        )
+        assert int(foreign_id) > 0
+
+        # Same-session growth after the gap so candidates may sit across a hole.
+        extra = [
+            {"role": "user", "content": "post-gap user " + ("p " * 14)},
+            {"role": "assistant", "content": "post-gap asst " + ("q " * 14)},
+            {"role": "user", "content": "tail protect a " + ("r " * 10)},
+            {"role": "assistant", "content": "tail protect b " + ("s " * 10)},
+        ]
+        extended = list(history) + extra
+        engine.ingest(extended)
+
+        stored = engine._store.get_session_messages(engine.current_session_id)
+        by_id = {int(m["store_id"]): m for m in stored}
+        roles = {int(m["store_id"]): m["role"] for m in stored}
+        tool_ids = [sid for sid, role in roles.items() if role == "tool"]
+        assert tool_ids, "fixture must include at least one tool-result row"
+        tool_id = tool_ids[0]
+        assert secret in (by_id[tool_id].get("content") or "")
+        all_session_ids = sorted(by_id)
+        assert int(foreign_id) not in all_session_ids
+        # Gap: foreign id sits between some session rows numerically.
+        assert min(all_session_ids) < int(foreign_id) < max(all_session_ids)
+
+        batch = engine.prepare_background_compaction_once(extended)
+        assert batch is not None and batch.state == "ready", (
+            f"expected ready batch, got {getattr(batch, 'state', None)!r} "
+            f"{getattr(batch, 'failure_reason', None)!r}"
+        )
+        batch_ids = [int(s) for s in batch.source_ids]
+        assert batch_ids, "batch must select stored rows"
+        assert tool_id in batch_ids, (
+            f"tool-result store_id {tool_id} must be in batch.source_ids="
+            f"{batch_ids} (async does not drop tool rows at prepare)"
+        )
+        # Exactly the selected stored refs; no foreign id, each once.
+        assert batch_ids == sorted(set(batch_ids))
+        assert int(foreign_id) not in batch_ids
+        for sid in batch_ids:
+            assert sid in by_id, f"batch id {sid} not in session store"
+        # Payload source_ids must match batch (promote reads batch.source_ids;
+        # payload mirrors candidates for zero-LLM publish).
+        payload = batch.parsed_summary_payload()
+        assert payload is not None
+        payload_ids = [int(s) for s in (payload.get("source_ids") or [])]
+        assert payload_ids == batch_ids
+        assert secret not in str(payload.get("summary_text") or ""), (
+            "summarizer fixture must omit/transform tool body text"
+        )
+
+        promoted = engine.promote_prepared_compaction(batch.batch_id, extended)
+        assert promoted.promoted is True, promoted.reason
+        covered = [int(s) for s in (promoted.covered_source_ids or [])]
+        assert sorted(covered) == sorted(batch_ids)
+        assert tool_id in covered
+
+        node = engine._dag.get_node(int(promoted.node_id))
+        assert node is not None
+        node_ids = [int(s) for s in (node.source_ids or [])]
+        assert sorted(node_ids) == sorted(batch_ids), (
+            f"promoted node lineage must equal every selected stored row; "
+            f"node={node_ids} batch={batch_ids}"
+        )
+        assert len(node_ids) == len(set(node_ids))
+        assert tool_id in node_ids
+        assert secret not in (node.summary or "")
+
+        frontier = engine._frontier.get_active_frontier(
+            engine.current_conversation_id
+        )
+        assert frontier is not None
+        items = engine._frontier.get_frontier_items(
+            engine.current_conversation_id, int(frontier["generation"])
+        )
+        # Node authoritative range spans the selected batch ids (may be
+        # non-contiguous numerically when a foreign-session gap exists).
+        node_items = [it for it in items if it["kind"] == "node"]
+        assert len(node_items) == 1
+        n_lo = int(node_items[0]["source_start"])
+        n_hi = int(node_items[0]["source_end"])
+        assert n_lo == min(batch_ids)
+        assert n_hi == max(batch_ids)
+        assert n_lo <= tool_id <= n_hi
+        # No selected row reappears as a raw message item alongside the node.
+        msg_refs = {int(it["ref_id"]) for it in items if it["kind"] == "message"}
+        assert msg_refs.isdisjoint(set(batch_ids)), (
+            f"selected rows must not dual-own as raw messages: "
+            f"{sorted(msg_refs & set(batch_ids))}"
+        )
+        # Ownership closure: expand node lineage + remaining raw covers each
+        # selected id exactly once and never the foreign gap id.
+        owned = list(node_ids) + sorted(msg_refs)
+        assert owned.count(tool_id) == 1
+        assert int(foreign_id) not in owned
+        for sid in batch_ids:
+            assert owned.count(sid) == 1, (
+                f"selected source {sid} must appear exactly once in frontier "
+                f"ownership, got {owned.count(sid)}"
             )
     finally:
         engine.shutdown()

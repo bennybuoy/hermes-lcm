@@ -5416,10 +5416,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             if source_end > 0 and not items:
                 return False
+            # Publish the full reconstructed layout tip (may exceed the
+            # compacting source_end when preserved later items/suffix remain).
+            publication_tip = (
+                self._frontier_layout_publication_tip(items)
+                if items
+                else int(source_end or 0)
+            )
+            if publication_tip <= 0 and source_end > 0:
+                return False
             new_gen = self._frontier.advance_frontier_generation_with_items(
                 conv_id,
                 session_id,
-                source_end,
+                publication_tip if publication_tip > 0 else source_end,
                 policy_fp,
                 route_fp,
                 frontier["generation"],
@@ -6074,12 +6083,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             if not frontier_items:
                 raise RuntimeError("frontier_items_empty_after_promotion")
+            # Authoritative publication tip is the full final layout max, not
+            # the early-run candidate end stored on the batch.  Mixed-frontier
+            # promotion preserves later nodes/raw and concurrent suffix in
+            # items; publishing batch.frontier_end_store_id would regress
+            # active frontier metadata and lifecycle behind that layout.
+            publication_tip = self._frontier_layout_publication_tip(
+                frontier_items
+            )
 
             # CAS-advance the generation and ordered items in one transaction.
             new_gen = self._frontier.advance_frontier_generation_with_items(
                 batch.conversation_id,
                 batch.session_id,
-                batch.frontier_end_store_id,
+                publication_tip,
                 current_policy_fp,
                 current_route_fp,
                 batch.base_generation,
@@ -6109,17 +6126,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
             # Also advance lifecycle frontier. A stale session returns an
             # unchanged state instead of raising, so verify the checkpoint
-            # actually acknowledges this batch before declaring promotion.
+            # actually acknowledges this layout tip before declaring promotion.
             lifecycle_state = self._lifecycle.advance_frontier(
                 batch.conversation_id,
                 batch.session_id,
-                batch.frontier_end_store_id,
+                publication_tip,
             )
             if (
                 lifecycle_state is None
                 or lifecycle_state.current_session_id != batch.session_id
                 or int(lifecycle_state.current_frontier_store_id or 0)
-                < int(batch.frontier_end_store_id or 0)
+                < int(publication_tip)
             ):
                 raise RuntimeError("lifecycle_frontier_not_advanced")
 
@@ -6211,6 +6228,44 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 batch_id, "rejected", failure_reason=f"promotion_error: {exc}",
             )
             return _result(promoted=False, reason=f"promotion_error: {exc}")
+
+    @staticmethod
+    def _frontier_layout_publication_tip(
+        items: list[dict[str, Any]],
+    ) -> int:
+        """Validated max positive tip across a final frontier item layout.
+
+        Uses each item's ``source_end`` when positive, otherwise ``ref_id``.
+        Fails closed on empty layouts or non-positive computed tips so
+        promotion never publishes a zero/regressed metadata boundary for a
+        non-empty reconstructed layout.
+        """
+        if not items:
+            raise ValueError("frontier layout empty: cannot compute publication tip")
+        tip = 0
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError("frontier layout malformed: non-dict item")
+            end_val = 0
+            for key in ("source_end", "ref_id"):
+                raw = item.get(key)
+                if raw is None:
+                    continue
+                try:
+                    val = int(raw)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"frontier layout malformed: unreadable {key}"
+                    ) from exc
+                if val > end_val:
+                    end_val = val
+            if end_val > tip:
+                tip = end_val
+        if tip <= 0:
+            raise ValueError(
+                "frontier layout nonpositive: cannot compute publication tip"
+            )
+        return tip
 
     def _build_promoted_frontier_items(
         self,
