@@ -5337,6 +5337,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         source_end_store_id: int,
         node_id: int = 0,
         covered_source_ids: Optional[List[int]] = None,
+        consumed_source_ids: Optional[List[int]] = None,
     ) -> int:
         """Atomically advance async frontier after foreground compaction.
 
@@ -5369,11 +5370,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if frontier is None:
                 return False
             source_end = int(source_end_store_id or 0)
+            previous_items = self._frontier.get_frontier_items(
+                conv_id, int(frontier["generation"])
+            )
             items = self._build_promoted_frontier_items(
                 session_id=session_id,
                 node_id=int(node_id or 0),
                 covered_source_ids=[int(s) for s in (covered_source_ids or [])],
+                consumed_source_ids=[int(s) for s in (consumed_source_ids or [])],
                 frontier_end_store_id=source_end,
+                previous_items=previous_items,
             )
             if source_end > 0 and not items:
                 return False
@@ -5756,6 +5762,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         frontier_items_written = False
         try:
             publication_started = time.perf_counter()
+            previous_items = self._frontier.get_frontier_items(
+                batch.conversation_id, batch.base_generation
+            )
             earliest_at, latest_at = self._store.get_time_bounds(covered_source_ids)
             now = time.time()
             node = SummaryNode(
@@ -5779,14 +5788,26 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if hook == "after_canonical_insert":
                 raise RuntimeError("injected async promotion failure")
 
-            # CAS-advance frontier generation
-            new_gen = self._frontier.advance_frontier_generation(
+            frontier_items = self._build_promoted_frontier_items(
+                session_id=batch.session_id,
+                node_id=int(inserted_node_id),
+                covered_source_ids=covered_source_ids,
+                consumed_source_ids=covered_source_ids,
+                frontier_end_store_id=int(batch.frontier_end_store_id or 0),
+                previous_items=previous_items,
+            )
+            if not frontier_items:
+                raise RuntimeError("frontier_items_empty_after_promotion")
+
+            # CAS-advance the generation and ordered items in one transaction.
+            new_gen = self._frontier.advance_frontier_generation_with_items(
                 batch.conversation_id,
                 batch.session_id,
                 batch.frontier_end_store_id,
                 current_policy_fp,
                 current_route_fp,
                 batch.base_generation,
+                frontier_items,
             )
             if new_gen == 0:
                 # Concurrent promotion / foreground race won — roll back orphan.
@@ -5798,20 +5819,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 return _result(promoted=False, reason="frontier_mismatch")
 
             advanced_frontier_generation = new_gen
-
-            # Write ordered frontier items BEFORE marking the batch promoted.
-            # A generation tip with source_end > 0 must never be itemless.
-            frontier_items = self._build_promoted_frontier_items(
-                session_id=batch.session_id,
-                node_id=int(inserted_node_id),
-                covered_source_ids=covered_source_ids,
-                frontier_end_store_id=int(batch.frontier_end_store_id or 0),
-            )
-            if not frontier_items:
-                raise RuntimeError("frontier_items_empty_after_promotion")
-            self._frontier.set_frontier_items(
-                batch.conversation_id, new_gen, frontier_items,
-            )
             frontier_items_written = True
 
             # Fault-injection points after items / generation CAS.
@@ -5924,30 +5931,96 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         session_id: str,
         node_id: int,
         covered_source_ids: list[int],
+        consumed_source_ids: Optional[list[int]] = None,
         frontier_end_store_id: int,
+        previous_items: Optional[list[dict[str, Any]]] = None,
     ) -> list[dict[str, Any]]:
         """Build ordered frontier items for a just-promoted generation.
 
-        Layout:
-        1. One ``node`` item for the newly published DAG leaf, covering the
-           prepared source range.
-        2. Ordered ``message`` items for the uncovered raw tail (store_ids
-           strictly after the promoted frontier end), preserving monotonic
-           non-overlapping ranges.
+        When an ordered prior generation exists, replace the consumed raw
+        message span in that layout with the new node and preserve every prior
+        node.  The DAG node retains its exact source IDs; the wider layout span
+        can also consume dependent tool-result rows intentionally omitted from
+        lineage.  This mirrors Lossless Claw's authoritative ``context_items``
+        range replacement and prevents a later leaf pass from dropping earlier
+        canonical summaries.  Newly ingested raw tail rows are then appended.
         """
         items: list[dict[str, Any]] = []
+        node_item: dict[str, Any] | None = None
         if covered_source_ids and node_id > 0:
+            node_item = {
+                "kind": "node",
+                "ref_id": int(node_id),
+                "source_start": int(min(covered_source_ids)),
+                "source_end": int(max(covered_source_ids)),
+            }
+        covered_set = {int(s) for s in covered_source_ids}
+        consumed_set = {int(s) for s in (consumed_source_ids or covered_source_ids)}
+        replacement_start = min(consumed_set) if consumed_set else 0
+        replacement_end = max(
+            max(consumed_set) if consumed_set else 0,
+            int(frontier_end_store_id or 0),
+        )
+        inserted_node = False
+        for prior in previous_items or []:
+            kind = str(prior.get("kind") or "message")
+            ref_id = int(prior.get("ref_id") or 0)
+            prior_start = int(prior.get("source_start") or ref_id)
+            prior_end = int(prior.get("source_end") or ref_id)
+            if kind == "node" and node_item is not None and ref_id == int(node_id):
+                items.append(
+                    {
+                        "kind": kind,
+                        "ref_id": ref_id,
+                        "source_start": prior_start,
+                        "source_end": prior_end,
+                    }
+                )
+                inserted_node = True
+                continue
+            if (
+                kind == "node"
+                and node_item is not None
+                and replacement_start > 0
+                and prior_start <= replacement_end
+                and prior_end >= replacement_start
+            ):
+                raise ValueError("overlapping frontier node replacement")
+            if (
+                kind == "message"
+                and replacement_start > 0
+                and replacement_start <= ref_id <= replacement_end
+            ):
+                if node_item is not None and not inserted_node:
+                    items.append(node_item)
+                    inserted_node = True
+                continue
+            if (
+                node_item is not None
+                and not inserted_node
+                and int(prior.get("source_start") or 0)
+                > int(node_item["source_start"])
+            ):
+                items.append(node_item)
+                inserted_node = True
             items.append(
                 {
-                    "kind": "node",
-                    "ref_id": int(node_id),
-                    "source_start": int(min(covered_source_ids)),
-                    "source_end": int(max(covered_source_ids)),
+                    "kind": kind,
+                    "ref_id": ref_id,
+                    "source_start": int(prior.get("source_start") or ref_id),
+                    "source_end": int(prior.get("source_end") or ref_id),
                 }
             )
+        if node_item is not None and not inserted_node:
+            items.append(node_item)
+            inserted_node = True
         # Uncovered fresh-tail raw messages after the promoted end.
         end_id = int(frontier_end_store_id or 0)
-        covered_set = {int(s) for s in covered_source_ids}
+        existing_messages = {
+            int(item.get("ref_id") or 0)
+            for item in items
+            if item.get("kind") == "message"
+        }
         try:
             all_stored = self._store.get_session_messages_after(
                 session_id, after_store_id=end_id,
@@ -5959,7 +6032,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 sid = int(row.get("store_id") or 0)
             except (TypeError, ValueError):
                 continue
-            if sid <= 0 or sid in covered_set:
+            if sid <= 0 or sid in covered_set or sid in existing_messages:
                 continue
             if end_id > 0 and sid <= end_id:
                 continue

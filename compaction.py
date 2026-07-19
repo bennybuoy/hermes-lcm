@@ -1097,6 +1097,7 @@ class CompactionMixin:
                                 source_end_store_id=self._last_compacted_store_id,
                                 node_id=int(published_node_id or 0),
                                 covered_source_ids=list(source_store_ids),
+                                consumed_source_ids=list(consumed_store_ids),
                             )
                             frontier_generation = (
                                 frontier_result
@@ -1143,6 +1144,7 @@ class CompactionMixin:
                                 source_end_store_id=self._last_compacted_store_id,
                                 node_id=int(published_node_id),
                                 covered_source_ids=list(source_store_ids),
+                                consumed_source_ids=list(consumed_store_ids),
                             )
                             recovery_generation = (
                                 recovery_result

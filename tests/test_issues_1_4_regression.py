@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from hermes_lcm.config import LCMConfig
+from hermes_lcm.dag import SummaryNode
 from hermes_lcm.db_bootstrap import (
     SCHEMA_VERSION,
     run_versioned_migrations,
@@ -81,6 +82,187 @@ def _stub_summarize(monkeypatch, engine, *, text: str = "prepared leaf summary")
 
     monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", fake)
     return calls
+
+
+class TestAuthoritativeFrontierRangeReplacement:
+    @staticmethod
+    def _item(kind, ref_id, start=None, end=None):
+        start = ref_id if start is None else start
+        end = ref_id if end is None else end
+        return {
+            "kind": kind,
+            "ref_id": ref_id,
+            "source_start": start,
+            "source_end": end,
+        }
+
+    def test_range_replacement_consumes_leading_and_in_span_dependent_rows(
+        self, tmp_path
+    ):
+        engine = _engine(tmp_path)
+        try:
+            items = engine._build_promoted_frontier_items(
+                session_id=engine.current_session_id,
+                node_id=99,
+                covered_source_ids=[11, 12],
+                consumed_source_ids=[10, 11, 12],
+                frontier_end_store_id=12,
+                previous_items=[
+                    self._item("node", 1, 1, 9),
+                    self._item("message", 10),
+                    self._item("message", 11),
+                    self._item("message", 12),
+                    self._item("message", 13),
+                ],
+            )
+            assert [(item["kind"], int(item["ref_id"])) for item in items] == [
+                ("node", 1), ("node", 99), ("message", 13)
+            ]
+        finally:
+            engine.shutdown()
+
+    def test_same_node_retry_is_idempotent(self, tmp_path):
+        engine = _engine(tmp_path)
+        try:
+            items = engine._build_promoted_frontier_items(
+                session_id=engine.current_session_id,
+                node_id=99,
+                covered_source_ids=[10, 11],
+                consumed_source_ids=[10, 11],
+                frontier_end_store_id=11,
+                previous_items=[
+                    self._item("node", 99, 10, 11),
+                    self._item("message", 12),
+                ],
+            )
+            assert [(item["kind"], int(item["ref_id"])) for item in items] == [
+                ("node", 99), ("message", 12)
+            ]
+        finally:
+            engine.shutdown()
+
+    def test_different_node_overlapping_replacement_range_fails_closed(
+        self, tmp_path
+    ):
+        engine = _engine(tmp_path)
+        try:
+            with pytest.raises(ValueError, match="overlapping frontier node"):
+                engine._build_promoted_frontier_items(
+                    session_id=engine.current_session_id,
+                    node_id=100,
+                    covered_source_ids=[10, 11],
+                    consumed_source_ids=[10, 11],
+                    frontier_end_store_id=11,
+                    previous_items=[
+                        self._item("node", 99, 10, 11),
+                        self._item("message", 12),
+                    ],
+                )
+        finally:
+            engine.shutdown()
+
+    def test_async_promotion_publishes_generation_and_items_atomically(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path)
+        _stub_summarize(monkeypatch, engine)
+        try:
+            messages = _messages()
+            engine.ingest(messages)
+            batch = engine.prepare_background_compaction_once(messages)
+            assert batch is not None
+
+            def forbidden_split_write(*args, **kwargs):
+                raise AssertionError("split frontier publication used")
+
+            monkeypatch.setattr(
+                engine._frontier, "advance_frontier_generation", forbidden_split_write
+            )
+            monkeypatch.setattr(
+                engine._frontier, "set_frontier_items", forbidden_split_write
+            )
+            result = engine.promote_prepared_compaction(batch.batch_id, messages)
+            assert result.promoted is True
+            frontier = engine._frontier.get_active_frontier(
+                engine.current_conversation_id
+            )
+            assert frontier is not None
+            assert engine._frontier.get_frontier_items(
+                engine.current_conversation_id, int(frontier["generation"])
+            )
+        finally:
+            engine.shutdown()
+
+    def test_three_leaf_passes_preserve_order_and_exact_source_closure(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path, fresh_tail_count=2, leaf_chunk_tokens=20)
+        _stub_summarize(monkeypatch, engine, text="prepared prefix")
+        try:
+            messages = _messages(18, tokens_each=40)
+            engine.ingest(messages)
+            batch = engine.prepare_background_compaction_once(messages)
+            assert engine.promote_prepared_compaction(batch.batch_id, messages).promoted
+            frontier = engine._frontier.get_active_frontier(
+                engine.current_conversation_id
+            )
+            items = engine._frontier.get_frontier_items(
+                engine.current_conversation_id, int(frontier["generation"])
+            )
+            expected_nodes = [
+                int(item["ref_id"]) for item in items if item["kind"] == "node"
+            ]
+            raw_ids = [
+                int(item["ref_id"]) for item in items if item["kind"] == "message"
+            ]
+            assert len(expected_nodes) == 1 and len(raw_ids) >= 2
+
+            for index, source_id in enumerate(raw_ids[:2], start=2):
+                now = time.time()
+                node_id = engine._dag.add_node(SummaryNode(
+                    session_id=engine.current_session_id,
+                    depth=0,
+                    summary=f"continuation leaf {index}",
+                    token_count=4,
+                    source_token_count=30,
+                    source_ids=[source_id],
+                    source_type="messages",
+                    created_at=now,
+                    earliest_at=now,
+                    latest_at=now,
+                ))
+                expected_nodes.append(node_id)
+                generation = engine._note_foreground_async_frontier_advance(
+                    source_end_store_id=source_id,
+                    node_id=node_id,
+                    covered_source_ids=[source_id],
+                    consumed_source_ids=[source_id],
+                )
+                items = engine._frontier.get_frontier_items(
+                    engine.current_conversation_id, generation
+                )
+
+            assert [
+                int(item["ref_id"]) for item in items if item["kind"] == "node"
+            ] == expected_nodes
+            represented = []
+            for item in items:
+                if item["kind"] == "message":
+                    represented.append(int(item["ref_id"]))
+                else:
+                    node = engine._dag.get_node(int(item["ref_id"]))
+                    assert node is not None
+                    represented.extend(int(sid) for sid in node.source_ids)
+            stored = [
+                int(row["store_id"])
+                for row in engine._store.get_session_messages_after(
+                    engine.current_session_id, after_store_id=0
+                )
+            ]
+            assert sorted(represented) == sorted(stored)
+            assert len(represented) == len(set(represented))
+        finally:
+            engine.shutdown()
 
 
 # ===========================================================================
