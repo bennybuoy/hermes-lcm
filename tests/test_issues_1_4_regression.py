@@ -210,8 +210,44 @@ class TestAuthoritativeFrontierRangeReplacement:
             assert engine._frontier.get_frontier_items(
                 engine.current_conversation_id, int(frontier["generation"])
             )
+            generation_count = engine._frontier.conn.execute(
+                "SELECT COUNT(*) FROM lcm_active_frontiers WHERE conversation_id = ?",
+                (engine.current_conversation_id,),
+            ).fetchone()[0]
+            assert generation_count == 1
         finally:
             engine.shutdown()
+
+    def test_prune_superseded_generations_retains_only_requested_snapshot(
+        self, tmp_path
+    ):
+        frontier = FrontierStore(str(tmp_path / "prune.db"))
+        try:
+            conversation_id = "prune-conversation"
+            session_id = "prune-session"
+            generation = frontier.ensure_frontier(conversation_id, session_id)
+            for source_id in (10, 20, 30):
+                generation = frontier.advance_frontier_generation_with_items(
+                    conversation_id,
+                    session_id,
+                    source_id,
+                    "policy",
+                    "route",
+                    generation,
+                    [self._item("node", source_id, 1, source_id)],
+                )
+            deleted = frontier.prune_frontier_generations(
+                conversation_id, keep_generation=generation
+            )
+            assert deleted == 3
+            rows = frontier.conn.execute(
+                "SELECT generation FROM lcm_active_frontiers WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchall()
+            assert rows == [(generation,)]
+            assert frontier.get_frontier_items(conversation_id, generation)
+        finally:
+            frontier.close()
 
     def test_three_leaf_passes_preserve_order_and_exact_source_closure(
         self, tmp_path, monkeypatch

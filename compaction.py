@@ -1120,6 +1120,18 @@ class CompactionMixin:
                     else:
                         frontier_publication_ready = True
                     self._persist_frontier_marker()
+                    if advanced_frontier_generation > 0:
+                        try:
+                            self._frontier.prune_frontier_generations(
+                                self._conversation_id,
+                                keep_generation=advanced_frontier_generation,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "LCM could not prune superseded foreground "
+                                "frontier generations",
+                                exc_info=True,
+                            )
             except Exception as exc:
                 if published_node_id:
                     # add_node() commits on its own connection. If a later
@@ -1191,6 +1203,19 @@ class CompactionMixin:
                             logger.debug(
                                 "LCM could not verify lifecycle frontier after "
                                 "committed foreground leaf",
+                                exc_info=True,
+                            )
+
+                    if recovery_frontier_ok and recovery_lifecycle_ok:
+                        try:
+                            self._frontier.prune_frontier_generations(
+                                self._conversation_id,
+                                keep_generation=advanced_frontier_generation,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "LCM could not prune superseded recovered "
+                                "frontier generations",
                                 exc_info=True,
                             )
 

@@ -337,6 +337,54 @@ class FrontierStore:
                 conn.rollback()
                 raise
 
+    def prune_frontier_generations(
+        self, conversation_id: str, *, keep_generation: int
+    ) -> int:
+        """Delete superseded snapshot generations older than ``keep_generation``.
+
+        Frontier generations are rollback snapshots, not an audit log.  The
+        caller invokes this only after the retained generation's lifecycle and
+        batch publication is complete.  A concurrent newer generation is left
+        untouched; a missing retained generation fails closed without deleting
+        anything.  Returns the number of generation rows deleted.
+        """
+        keep = int(keep_generation)
+        if keep <= 0:
+            return 0
+        with self._lock:
+            conn = self.conn
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                retained = conn.execute(
+                    """
+                    SELECT 1 FROM lcm_active_frontiers
+                    WHERE conversation_id = ? AND generation = ?
+                    """,
+                    (conversation_id, keep),
+                ).fetchone()
+                if retained is None:
+                    conn.rollback()
+                    return 0
+                conn.execute(
+                    """
+                    DELETE FROM lcm_frontier_items
+                    WHERE conversation_id = ? AND generation < ?
+                    """,
+                    (conversation_id, keep),
+                )
+                deleted = conn.execute(
+                    """
+                    DELETE FROM lcm_active_frontiers
+                    WHERE conversation_id = ? AND generation < ?
+                    """,
+                    (conversation_id, keep),
+                ).rowcount
+                conn.commit()
+                return max(0, int(deleted or 0))
+            except Exception:
+                conn.rollback()
+                raise
+
     # -- Frontier items ---------------------------------------------------
 
     def set_frontier_items(

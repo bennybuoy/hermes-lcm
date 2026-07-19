@@ -5866,11 +5866,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 publication_ms,
                 wall_ms,
             )
-            return _result(
+            result = _result(
                 promoted=True,
                 node_id=int(inserted_node_id or 0),
                 covered=covered_source_ids,
             )
+            try:
+                self._frontier.prune_frontier_generations(
+                    batch.conversation_id,
+                    keep_generation=advanced_frontier_generation,
+                )
+            except Exception:
+                logger.debug(
+                    "LCM could not prune superseded frontier generations",
+                    exc_info=True,
+                )
+            return result
 
         except Exception as exc:
             # Compensate the committed frontier CAS before removing the DAG node.
