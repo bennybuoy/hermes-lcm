@@ -5946,16 +5946,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         canonical summaries.  Newly ingested raw tail rows are then appended.
         """
         items: list[dict[str, Any]] = []
-        if node_id > 0 and consumed_source_ids and not covered_source_ids:
-            raise ValueError("frontier node requires covered source ids")
-        node_item: dict[str, Any] | None = None
-        if covered_source_ids and node_id > 0:
-            node_item = {
-                "kind": "node",
-                "ref_id": int(node_id),
-                "source_start": int(min(covered_source_ids)),
-                "source_end": int(max(covered_source_ids)),
-            }
         covered_set = {int(s) for s in covered_source_ids}
         consumed_set = {int(s) for s in (consumed_source_ids or covered_source_ids)}
         replacement_start = min(consumed_set) if consumed_set else 0
@@ -5963,6 +5953,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             max(consumed_set) if consumed_set else 0,
             int(frontier_end_store_id or 0),
         )
+        if node_id > 0 and not covered_set:
+            raise ValueError("frontier node requires covered source ids")
+        node_item: dict[str, Any] | None = None
+        if node_id > 0:
+            node_item = {
+                "kind": "node",
+                "ref_id": int(node_id),
+                "source_start": replacement_start,
+                "source_end": replacement_end,
+            }
         inserted_node = False
         for prior in previous_items or []:
             kind = str(prior.get("kind") or "message")

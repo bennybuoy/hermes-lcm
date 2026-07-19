@@ -118,6 +118,8 @@ class TestAuthoritativeFrontierRangeReplacement:
             assert [(item["kind"], int(item["ref_id"])) for item in items] == [
                 ("node", 1), ("node", 99), ("message", 13)
             ]
+            assert items[1]["source_start"] == 10
+            assert items[1]["source_end"] == 12
         finally:
             engine.shutdown()
 
@@ -161,8 +163,9 @@ class TestAuthoritativeFrontierRangeReplacement:
         finally:
             engine.shutdown()
 
+    @pytest.mark.parametrize("consumed_source_ids", ([10], []))
     def test_consumed_span_without_lineage_cannot_publish_unrepresented_node(
-        self, tmp_path
+        self, tmp_path, consumed_source_ids
     ):
         engine = _engine(tmp_path)
         try:
@@ -171,7 +174,7 @@ class TestAuthoritativeFrontierRangeReplacement:
                     session_id=engine.current_session_id,
                     node_id=99,
                     covered_source_ids=[],
-                    consumed_source_ids=[10],
+                    consumed_source_ids=consumed_source_ids,
                     frontier_end_store_id=10,
                     previous_items=[self._item("message", 10)],
                 )
