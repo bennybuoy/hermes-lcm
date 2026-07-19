@@ -588,6 +588,183 @@ def test_prepare_mixed_frontier_never_spans_intervening_node(tmp_path, monkeypat
         promoted = engine.promote_prepared_compaction(batch.batch_id, messages)
         assert promoted.promoted is True, promoted.reason
         assert "overlapping frontier node" not in (promoted.reason or "")
+
+        # --- Complete post-promotion frontier ownership closure ---
+        frontier = engine._frontier.get_active_frontier(
+            engine.current_conversation_id
+        )
+        assert frontier is not None
+        items = engine._frontier.get_frontier_items(
+            engine.current_conversation_id, int(frontier["generation"])
+        )
+        assert items, "promoted generation must publish ordered items"
+
+        kind_refs = [(it["kind"], int(it["ref_id"])) for it in items]
+        node_refs = [ref for kind, ref in kind_refs if kind == "node"]
+        msg_refs = [ref for kind, ref in kind_refs if kind == "message"]
+
+        # New node replaces only R1; node A and node B remain exactly once.
+        a_lo, a_hi = node_a_span
+        b_lo, b_hi = node_b_span
+        nodes_by_span = {
+            (int(it["source_start"]), int(it["source_end"])): int(it["ref_id"])
+            for it in items
+            if it["kind"] == "node"
+        }
+        assert (a_lo, a_hi) in nodes_by_span, f"node A missing from {items}"
+        assert (b_lo, b_hi) in nodes_by_span, f"node B missing from {items}"
+        new_node_spans = [
+            (int(it["source_start"]), int(it["source_end"]), int(it["ref_id"]))
+            for it in items
+            if it["kind"] == "node"
+            and (int(it["source_start"]), int(it["source_end"]))
+            not in {(a_lo, a_hi), (b_lo, b_hi)}
+        ]
+        assert len(new_node_spans) == 1, (
+            f"expected exactly one replacement node for R1, got {new_node_spans}"
+        )
+        new_lo, new_hi, new_node_id = new_node_spans[0]
+        assert new_lo == min(r1_ids) and new_hi == max(r1_ids), (
+            f"replacement span {new_lo}-{new_hi} must equal R1 {r1_ids}"
+        )
+        assert node_refs.count(nodes_by_span[(a_lo, a_hi)]) == 1
+        assert node_refs.count(nodes_by_span[(b_lo, b_hi)]) == 1
+        assert node_refs.count(new_node_id) == 1
+
+        # Raw R2 remains exactly once; no raw item inside any canonical range.
+        assert sorted(msg_refs) == sorted(r2_ids), (
+            f"raw frontier messages must be exactly R2={r2_ids}, got {msg_refs}"
+        )
+        assert len(msg_refs) == len(set(msg_refs)), "duplicate raw message refs"
+        for it in items:
+            if it["kind"] != "node":
+                continue
+            n_lo, n_hi = int(it["source_start"]), int(it["source_end"])
+            for mid in msg_refs:
+                assert not (n_lo <= mid <= n_hi), (
+                    f"raw message {mid} lies inside node "
+                    f"{it['ref_id']} range [{n_lo},{n_hi}]"
+                )
+
+        # Recursive canonical lineage + remaining raw items cover sources once.
+        node_map = {
+            int(n.node_id): n
+            for n in engine._dag.get_session_nodes(engine.current_session_id)
+        }
+
+        def expand_node_sources(nid: int, seen_nodes: set[int] | None = None) -> list[int]:
+            if seen_nodes is None:
+                seen_nodes = set()
+            if nid in seen_nodes:
+                return []
+            seen_nodes.add(nid)
+            node = node_map.get(nid)
+            assert node is not None, f"missing DAG node {nid}"
+            if getattr(node, "source_type", "") == "messages":
+                return [int(s) for s in (node.source_ids or [])]
+            out: list[int] = []
+            for child in node.source_ids or []:
+                out.extend(expand_node_sources(int(child), seen_nodes))
+            return out
+
+        covered: list[int] = []
+        for it in items:
+            if it["kind"] == "node":
+                covered.extend(expand_node_sources(int(it["ref_id"])))
+            else:
+                covered.append(int(it["ref_id"]))
+        assert sorted(covered) == sorted(set(covered)), (
+            f"duplicate source ownership in promoted frontier: {covered}"
+        )
+        expected_sources = sorted(set(r1_ids) | set(r2_ids) | set(range(a_lo, a_hi + 1)) | set(range(b_lo, b_hi + 1)))
+        # Node A/B source spans are contiguous in the fixture.
+        assert sorted(covered) == expected_sources, (
+            f"lineage+raw must cover session sources exactly once; "
+            f"got {sorted(covered)} expected {expected_sources}"
+        )
+
+        # Only one canonical generation remains after normal pruning.
+        gen_count = engine._frontier.conn.execute(
+            "SELECT COUNT(*) FROM lcm_active_frontiers WHERE conversation_id = ?",
+            (engine.current_conversation_id,),
+        ).fetchone()[0]
+        assert gen_count == 1, f"expected single active generation, got {gen_count}"
+    finally:
+        engine.shutdown()
+
+
+def test_mixed_frontier_promotion_appends_only_new_suffix_beyond_prior_tip(
+    tmp_path, monkeypatch
+):
+    """Concurrent rows past the prior full-snapshot tip append once, never replaying node ranges."""
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(
+        engine,
+        "_summarize_leaf_chunk_with_rescue",
+        lambda initial_chunk, focus_topic=None: (
+            list(initial_chunk),
+            max(1, len(initial_chunk) * 10),
+            "mixed-frontier suffix leaf",
+            1,
+            1,
+        ),
+    )
+    try:
+        messages, node_a_span, r1_ids, node_b_span, r2_ids = (
+            _install_mixed_node_message_frontier(engine)
+        )
+        prior_tip = max(r2_ids)
+        # Ingest brand-new suffix beyond the authoritative prior tip (full
+        # history append so the session store advances past prior_tip).
+        extra = [
+            {"role": "user", "content": "post-tip a " + ("x " * 12)},
+            {"role": "assistant", "content": "post-tip b " + ("x " * 12)},
+            {"role": "user", "content": "post-tip c " + ("x " * 12)},
+        ]
+        extended = list(messages) + extra
+        engine.ingest(extended)
+        stored = engine._store.get_session_messages(engine.current_session_id)
+        new_suffix_ids = [
+            int(m["store_id"])
+            for m in stored
+            if int(m["store_id"]) > prior_tip
+        ]
+        assert new_suffix_ids, "fixture must produce rows beyond prior tip"
+
+        batch = engine.prepare_background_compaction_once(extended)
+        assert batch is not None and batch.state == "ready"
+        source_ids = [int(s) for s in batch.source_ids]
+        assert set(source_ids) == set(r1_ids)
+
+        promoted = engine.promote_prepared_compaction(batch.batch_id, extended)
+        assert promoted.promoted is True, promoted.reason
+
+        frontier = engine._frontier.get_active_frontier(
+            engine.current_conversation_id
+        )
+        items = engine._frontier.get_frontier_items(
+            engine.current_conversation_id, int(frontier["generation"])
+        )
+        msg_refs = [
+            int(it["ref_id"]) for it in items if it["kind"] == "message"
+        ]
+        # Prior R2 retained exactly once; new suffix appended exactly once.
+        assert sorted(msg_refs) == sorted(r2_ids + new_suffix_ids), (
+            f"expected R2+new suffix, got {msg_refs}; "
+            f"R2={r2_ids} new={new_suffix_ids}"
+        )
+        assert len(msg_refs) == len(set(msg_refs))
+
+        b_lo, b_hi = node_b_span
+        a_lo, a_hi = node_a_span
+        for mid in msg_refs:
+            assert not (a_lo <= mid <= a_hi)
+            assert not (b_lo <= mid <= b_hi)
+            assert not (min(r1_ids) <= mid <= max(r1_ids))
+        for sid in range(b_lo, b_hi + 1):
+            assert sid not in msg_refs, (
+                f"raw rows under preserved node B must not reappear: {sid}"
+            )
     finally:
         engine.shutdown()
 

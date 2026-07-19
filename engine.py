@@ -6303,14 +6303,38 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if node_item is not None and not inserted_node:
             items.append(node_item)
             inserted_node = True
-        # Uncovered fresh-tail raw messages after the promoted end.
+        # Append only truly new DB rows beyond the reconstructed authoritative
+        # layout tip.  Starting at the new candidate end (frontier_end_store_id)
+        # re-walks preserved prior node ranges and reintroduces their raw
+        # rows as message items alongside the canonical nodes — duplicating
+        # ownership.  Use the max of every item range end in the transformed
+        # layout and the replacement/candidate end so concurrent suffix past
+        # a prior full-snapshot tip is still picked up exactly once.
+        layout_tip = 0
+        node_ranges: list[tuple[int, int]] = []
+        for item in items:
+            try:
+                item_end = int(item.get("source_end") or item.get("ref_id") or 0)
+            except (TypeError, ValueError):
+                item_end = 0
+            if item_end > layout_tip:
+                layout_tip = item_end
+            if item.get("kind") == "node":
+                try:
+                    lo = int(item.get("source_start") or 0)
+                    hi = int(item.get("source_end") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if lo > 0 and hi >= lo:
+                    node_ranges.append((lo, hi))
         end_id = int(frontier_end_store_id or 0)
         existing_messages = {
             int(item.get("ref_id") or 0)
             for item in items
             if item.get("kind") == "message"
         }
-        suffix_cursor = end_id
+        # Never restart suffix scanning inside preserved prior ranges.
+        suffix_cursor = max(layout_tip, end_id, replacement_end)
         scanned_suffix_rows = 0
         while True:
             remaining = _MAX_FRONTIER_SUFFIX_ITEMS - scanned_suffix_rows
@@ -6334,7 +6358,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 scanned_suffix_rows += 1
                 if scanned_suffix_rows > _MAX_FRONTIER_SUFFIX_ITEMS:
                     raise ValueError("frontier suffix item limit exceeded")
+                # Fail closed on any path that would re-emit canonical ownership
+                # as raw items (covered by the new node, any preserved node
+                # range, or an existing message ref already in the layout).
                 if sid in covered_set or sid in existing_messages:
+                    continue
+                if any(lo <= sid <= hi for lo, hi in node_ranges):
                     continue
                 items.append(
                     {

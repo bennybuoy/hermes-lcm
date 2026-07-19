@@ -143,6 +143,70 @@ class TestAuthoritativeFrontierRangeReplacement:
         finally:
             engine.shutdown()
 
+    def test_suffix_scan_starts_after_prior_layout_tip_not_replacement_end(
+        self, tmp_path, monkeypatch
+    ):
+        """Mixed prior layout must not re-emit raw rows under preserved nodes.
+
+        Prior full snapshot: nodeA | R1 | nodeB | R2. Promoting R1 must keep
+        nodeB and R2, append only store_ids past the prior tip, and never
+        reintroduce nodeB's underlying raw rows as message items.
+        """
+        engine = _engine(tmp_path)
+        # DB rows after R1 end: raw under B (8-10), R2 (11-14), new suffix (15).
+        db_rows = list(range(8, 16))
+
+        def paged_suffix(_session_id, after_store_id=0, limit=10_000):
+            start = int(after_store_id) + 1
+            stop = start + int(limit)
+            return [
+                {"store_id": sid}
+                for sid in db_rows
+                if start <= sid < stop
+            ]
+
+        monkeypatch.setattr(
+            engine._store, "get_session_messages_after", paged_suffix
+        )
+        try:
+            items = engine._build_promoted_frontier_items(
+                session_id=engine.current_session_id,
+                node_id=99,
+                covered_source_ids=[4, 5, 6, 7],
+                consumed_source_ids=[4, 5, 6, 7],
+                frontier_end_store_id=7,  # end of R1 / new candidate only
+                previous_items=[
+                    self._item("node", 1, 1, 3),
+                    self._item("message", 4),
+                    self._item("message", 5),
+                    self._item("message", 6),
+                    self._item("message", 7),
+                    self._item("node", 2, 8, 10),
+                    self._item("message", 11),
+                    self._item("message", 12),
+                    self._item("message", 13),
+                    self._item("message", 14),
+                ],
+            )
+            assert [(item["kind"], int(item["ref_id"])) for item in items] == [
+                ("node", 1),
+                ("node", 99),
+                ("node", 2),
+                ("message", 11),
+                ("message", 12),
+                ("message", 13),
+                ("message", 14),
+                ("message", 15),
+            ]
+            msg_refs = [
+                int(it["ref_id"]) for it in items if it["kind"] == "message"
+            ]
+            for owned in (8, 9, 10):
+                assert owned not in msg_refs
+            assert items[1]["source_start"] == 4 and items[1]["source_end"] == 7
+        finally:
+            engine.shutdown()
+
     def test_different_node_overlapping_replacement_range_fails_closed(
         self, tmp_path
     ):
