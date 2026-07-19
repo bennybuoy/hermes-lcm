@@ -178,12 +178,21 @@ class LifecycleStateStore:
         if existing is not None:
             if existing.current_session_id == session_id:
                 return existing
-            current_frontier = (
-                existing.current_frontier_store_id if existing.current_session_id == session_id else 0
+            # Same-session resume after finalize: current_* was zeroed when the
+            # durable tip moved into last_finalized_*. Rehydrate the active
+            # frontier from that matching finalized checkpoint so compress
+            # identity-mapping does not re-select already-covered store rows.
+            # Never apply another session's finalized tip to a rollover bind.
+            same_session_resume = (
+                existing.current_session_id is None
+                and existing.last_finalized_session_id == session_id
             )
-            current_bound_at = (
-                existing.current_bound_at if existing.current_session_id == session_id else now
-            )
+            if same_session_resume:
+                current_frontier = int(existing.last_finalized_frontier_store_id or 0)
+                current_bound_at = now
+            else:
+                current_frontier = 0
+                current_bound_at = now
             last_finalized_session_id = existing.last_finalized_session_id
             last_finalized_frontier = existing.last_finalized_frontier_store_id
             debt_kind = existing.debt_kind

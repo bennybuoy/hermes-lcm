@@ -13,6 +13,7 @@ import pytest
 
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
+from hermes_lcm.frontier import PREPARED_PAYLOAD_VERSION, compute_source_identity_hash
 
 
 def _engine(tmp_path, *, session_id="async-session", conversation_id="async-conversation"):
@@ -281,6 +282,123 @@ def test_successful_atomic_promotion_is_all_or_nothing(tmp_path):
         assert lifecycle["current_frontier_store_id"] > old_frontier
         assert lifecycle["current_frontier_store_id"] == batch.frontier_end_store_id
         assert engine.get_async_compaction_status()["promoted_batches"] == 1
+    finally:
+        engine.shutdown()
+
+
+def test_prepare_skips_canonical_owned_source_ids_after_publication(tmp_path, monkeypatch):
+    """Post-publication prepare must not re-select already-covered message IDs.
+
+    Blind all_stored[:-fresh_tail] re-reads the summarized prefix, poisons the
+    batch with owned source_ids, and promote correctly rejects
+    canonical_source_overlap. Candidates must be the uncovered frontier/raw
+    suffix only; the overlap guard stays fail-closed.
+    """
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(
+        engine,
+        "_summarize_leaf_chunk_with_rescue",
+        lambda initial_chunk, focus_topic=None: (
+            list(initial_chunk),
+            max(1, len(initial_chunk) * 10),
+            "frontier-aware prep leaf",
+            1,
+            1,
+        ),
+    )
+    try:
+        messages = _messages(16)
+        engine.ingest(messages)
+        first = engine.prepare_background_compaction_once(messages)
+        assert first is not None and first.state == "ready"
+        first_ids = {int(s) for s in first.source_ids}
+        assert first_ids
+
+        promoted = engine.promote_prepared_compaction(first.batch_id, messages)
+        assert promoted.promoted is True
+        covered = set(int(s) for s in (promoted.covered_source_ids or first.source_ids))
+        assert covered
+
+        # Append additional durable raw rows beyond the published span so the
+        # prepare pool (session minus fresh tail) has uncovered work. Host
+        # re-ingest of a full replacement list can no-op against the store
+        # cursor; append is the reliable post-publication growth path.
+        session_id = engine.current_session_id
+        extra_host: list[dict] = []
+        for idx in range(12):
+            role = "user" if idx % 2 == 0 else "assistant"
+            msg = {
+                "role": role,
+                "content": f"post-promote {idx} " + ("y " * 12),
+            }
+            extra_host.append(msg)
+            engine._store.append(
+                session_id,
+                msg,
+                token_estimate=40,
+                source="test",
+            )
+        all_msgs = list(messages) + extra_host
+
+        second = engine.prepare_background_compaction_once(all_msgs)
+        assert second is not None
+        assert second.state == "ready", (
+            f"expected ready uncovered batch, got state={second.state!r} "
+            f"reason={getattr(second, 'failure_reason', None)!r} "
+            f"source_ids={second.source_ids!r}"
+        )
+        second_ids = {int(s) for s in second.source_ids}
+        assert second_ids, "prepared batch must cover some uncovered raw rows"
+        assert second_ids.isdisjoint(covered), (
+            f"prepared batch re-selected canonical-owned ids: "
+            f"overlap={sorted(second_ids & covered)}"
+        )
+
+        # A correctly prepared uncovered batch must also promote cleanly.
+        second_promote = engine.promote_prepared_compaction(second.batch_id, all_msgs)
+        assert second_promote.promoted is True, second_promote.reason
+        assert second_promote.reason != "canonical_source_overlap"
+
+        # Fail-closed guard still rejects intentional overlap even when the
+        # source identity / fingerprints would otherwise pass.
+        poison_ids = sorted(covered)[:1]
+        poison_hash = compute_source_identity_hash(
+            engine._store._conn, engine.current_session_id, poison_ids
+        )
+        active = engine._frontier.get_active_frontier(engine.current_conversation_id)
+        poisoned = engine._frontier.create_batch(
+            conversation_id=engine.current_conversation_id,
+            session_id=engine.current_session_id,
+            base_generation=int(active["generation"]),
+            source_end_store_id=max(covered),
+            source_identity_hash=poison_hash,
+            source_ids=poison_ids,
+            policy_fingerprint=engine._async_policy_fingerprint(),
+            route_fingerprint=engine._async_route_fingerprint(),
+            state="ready",
+        )
+        engine._frontier.update_batch_state(
+            poisoned,
+            "ready",
+            expected_leaf_count=1,
+            frontier_end_store_id=max(covered),
+            summary_payload=json.dumps(
+                {
+                    "summary_text": "poisoned",
+                    "source_tokens": 1,
+                    "token_count": 1,
+                    "level": 1,
+                    "attempts": 1,
+                    "source_ids": poison_ids,
+                    "expand_hint": "",
+                },
+                sort_keys=True,
+            ),
+            payload_version=PREPARED_PAYLOAD_VERSION,
+        )
+        rejected = engine.promote_prepared_compaction(poisoned, all_msgs)
+        assert rejected.promoted is False
+        assert rejected.reason == "canonical_source_overlap"
     finally:
         engine.shutdown()
 

@@ -3172,6 +3172,39 @@ class TestLifecycleStateStore:
 
         state.close()
 
+    def test_bind_session_restores_same_session_finalized_checkpoint(self, tmp_path):
+        """After finalize, rebinding the exact same session restores the frontier tip.
+
+        finalize_session moves the durable checkpoint into last_finalized_* and
+        zeros current_*. Same-session resume must rehydrate current_frontier from
+        that finalized tip; a different session must still start at zero.
+        """
+        store = LifecycleStateStore(tmp_path / "lifecycle-same-session-resume.db")
+        try:
+            store.bind_session("sess-S", conversation_id="conv-S")
+            store.advance_frontier("conv-S", "sess-S", 24111)
+            finalized = store.finalize_session("conv-S", "sess-S", frontier_store_id=24111)
+            assert finalized is not None
+            assert finalized.current_session_id is None
+            assert finalized.current_frontier_store_id == 0
+            assert finalized.last_finalized_session_id == "sess-S"
+            assert finalized.last_finalized_frontier_store_id == 24111
+
+            resumed = store.bind_session("sess-S", conversation_id="conv-S")
+            assert resumed.current_session_id == "sess-S"
+            assert resumed.current_frontier_store_id == 24111
+            assert resumed.last_finalized_session_id == "sess-S"
+            assert resumed.last_finalized_frontier_store_id == 24111
+
+            # Different/rollover session must not inherit the prior tip.
+            rolled = store.bind_session("sess-T", conversation_id="conv-S")
+            assert rolled.current_session_id == "sess-T"
+            assert rolled.current_frontier_store_id == 0
+            assert rolled.last_finalized_session_id == "sess-S"
+            assert rolled.last_finalized_frontier_store_id == 24111
+        finally:
+            store.close()
+
     def test_record_debt_and_clear_debt(self, tmp_path):
         state = LifecycleStateStore(tmp_path / "lifecycle-debt.db")
         bound = state.bind_session("sess-1")

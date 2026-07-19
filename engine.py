@@ -1420,7 +1420,38 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         state = self._lifecycle.bind_session(session_id, conversation_id=conversation_id)
         self._conversation_id = state.conversation_id
         self._lcm_session_last_conversation_id[session_id] = state.conversation_id
-        self._last_compacted_store_id = state.current_frontier_store_id
+        # Prefer the higher of lifecycle current tip and the authoritative
+        # frontier tip for this exact session (never another session's tip).
+        restored_tip = int(state.current_frontier_store_id or 0)
+        try:
+            frontier = self._frontier.get_active_frontier(state.conversation_id)
+        except Exception:
+            frontier = None
+        if (
+            frontier is not None
+            and str(frontier.get("session_id") or "") == session_id
+        ):
+            frontier_tip = int(frontier.get("source_end_store_id") or 0)
+            if frontier_tip > restored_tip:
+                restored_tip = frontier_tip
+                try:
+                    advanced = self._lifecycle.advance_frontier(
+                        state.conversation_id,
+                        session_id,
+                        frontier_tip,
+                    )
+                    if advanced is not None:
+                        state = advanced
+                        restored_tip = max(
+                            restored_tip,
+                            int(advanced.current_frontier_store_id or 0),
+                        )
+                except Exception:
+                    logger.debug(
+                        "LCM could not align lifecycle frontier with authoritative tip",
+                        exc_info=True,
+                    )
+        self._last_compacted_store_id = restored_tip
         self._register_active_engine_binding()
         if not self._session_ignored and not self._session_stateless:
             self._remember_foreground_rebind_candidate(session_id)
@@ -5467,6 +5498,31 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             **telemetry,
         }
 
+    def _canonical_message_owned_store_ids(self, session_id: str) -> set[int]:
+        """Return store_ids recursively owned by canonical DAG message leaves.
+
+        Matches the fail-closed ``canonical_source_overlap`` check used at
+        promote time: every ``source_type == "messages"`` node contributes
+        its source_ids. Higher condensation nodes point at nodes, not raw
+        rows, so expanding the message leaves is sufficient.
+        """
+        owned: set[int] = set()
+        if not session_id:
+            return owned
+        try:
+            existing_nodes = self._dag.get_session_nodes(session_id)
+        except Exception:
+            return owned
+        for node in existing_nodes or []:
+            if getattr(node, "source_type", "") != "messages":
+                continue
+            for sid in getattr(node, "source_ids", None) or []:
+                try:
+                    owned.add(int(sid))
+                except (TypeError, ValueError):
+                    continue
+        return owned
+
     def prepare_background_compaction_once(
         self,
         messages: List[Dict[str, Any]],
@@ -5515,13 +5571,74 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if not all_stored:
             return None
 
-        # Determine which messages are candidates (exclude fresh tail)
+        # Exclude the protected fresh tail from the prepare pool.
         candidate_count = max(0, len(all_stored) - fresh_tail)
         if candidate_count <= 0:
             return None
+        prep_pool = all_stored[:candidate_count]
 
-        candidate_stored = all_stored[:candidate_count]
-        candidate_store_ids = [m["store_id"] for m in candidate_stored]
+        # Canonical message ownership (same set promote uses for
+        # canonical_source_overlap). Never re-select already-published rows —
+        # the old blind all_stored[:-fresh_tail] re-read the summarized
+        # prefix and poisoned post-success batches.
+        covered_owned = self._canonical_message_owned_store_ids(session_id)
+
+        # Authoritative uncovered set:
+        # 1) message-kind refs on the active frontier generation (raw still
+        #    represented on the tip, not yet published as nodes)
+        # 2) store rows after the frontier tip that are in the prep pool
+        #    (newly ingested suffix not yet reflected in frontier items)
+        # Always subtract canonical ownership so holes under a tip that were
+        # later published remain excluded, and fail closed if nothing remains.
+        candidate_ids: set[int] = set()
+        frontier_tip = int(source_end or 0)
+        if frontier is not None:
+            try:
+                gen = int(frontier.get("generation") or 0)
+                items = (
+                    self._frontier.get_frontier_items(conv_id, gen) if gen > 0 else []
+                )
+            except Exception:
+                items = []
+            for it in items or []:
+                if str(it.get("kind") or "") != "message":
+                    continue
+                try:
+                    ref_id = int(it.get("ref_id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if ref_id > 0:
+                    candidate_ids.add(ref_id)
+        # Raw suffix beyond the published tip (and any prep-pool rows when the
+        # tip is still zero / first prepare).
+        for m in prep_pool:
+            try:
+                sid = int(m["store_id"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if sid > frontier_tip or frontier_tip <= 0:
+                candidate_ids.add(sid)
+
+        candidate_ids -= covered_owned
+        if not candidate_ids:
+            return None
+
+        # Preserve store order and stay inside the prep pool (fresh tail out).
+        prep_by_id = {}
+        for m in prep_pool:
+            try:
+                prep_by_id[int(m["store_id"])] = m
+            except (TypeError, ValueError, KeyError):
+                continue
+        candidate_stored = [
+            prep_by_id[sid]
+            for sid in sorted(candidate_ids)
+            if sid in prep_by_id
+        ]
+        if not candidate_stored:
+            return None
+
+        candidate_store_ids = [int(m["store_id"]) for m in candidate_stored]
         actual_source_end = candidate_store_ids[-1] if candidate_store_ids else source_end
 
         # Compute source identity hash for CAS validation

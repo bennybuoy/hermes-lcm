@@ -20022,6 +20022,143 @@ class TestSessionRollover:
         assert after_failure is not None
         assert after_failure.current_frontier_store_id == frontier_before_failure
 
+    def test_same_session_resume_restores_finalized_checkpoint_and_advances_frontier(
+        self, tmp_path, monkeypatch
+    ):
+        """Finalize then rebind the exact same session must restore tip F.
+
+        Live defect: after on_session_end, same-session restart left
+        _last_compacted_store_id=0, so replacement identity mapping selected
+        already-covered rows and frontier publish rolled back.
+        """
+        session_id = "same-session-resume-S"
+        conversation_id = "same-session-resume-S"
+        db_path = tmp_path / "same_session_resume.db"
+        config = LCMConfig(
+            database_path=str(db_path),
+            fresh_tail_count=2,
+            leaf_chunk_tokens=40,
+            context_threshold=0.10,
+        )
+        engine = LCMEngine(config=config)
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: ("same-session resume leaf", 1),
+        )
+        try:
+            engine.on_session_start(
+                session_id,
+                conversation_id=conversation_id,
+                platform="cli",
+                context_length=50_000,
+            )
+            # Distinct identities for the summarized prefix, then a short tail.
+            prefix = [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "alpha-identity " * 40},
+                {"role": "assistant", "content": "beta-identity " * 40},
+                {"role": "user", "content": "gamma-identity " * 40},
+                {"role": "assistant", "content": "delta-identity " * 40},
+            ]
+            tail = [
+                {"role": "user", "content": "epsilon-fresh " * 8},
+                {"role": "assistant", "content": "zeta-fresh"},
+            ]
+            first_messages = prefix + tail
+            compacted = engine.compress(
+                first_messages,
+                current_tokens=engine.threshold_tokens + 1,
+            )
+            assert engine._last_compression_status == "compacted"
+            checkpoint_f = int(engine._last_compacted_store_id or 0)
+            assert checkpoint_f > 0
+            nodes_before = engine._dag.get_session_nodes(session_id)
+            assert nodes_before
+            node_ids_before = {int(n.node_id) for n in nodes_before}
+            lifecycle_before = engine._lifecycle.get_by_conversation(conversation_id)
+            assert lifecycle_before is not None
+            assert lifecycle_before.current_frontier_store_id == checkpoint_f
+
+            engine.on_session_end(session_id, first_messages)
+            finalized = engine._lifecycle.get_by_conversation(conversation_id)
+            assert finalized is not None
+            assert finalized.current_session_id is None
+            assert finalized.current_frontier_store_id == 0
+            assert finalized.last_finalized_session_id == session_id
+            assert finalized.last_finalized_frontier_store_id == checkpoint_f
+        finally:
+            engine.shutdown()
+
+        resumed = LCMEngine(config=config)
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: ("same-session resume follow-up leaf", 1),
+        )
+        try:
+            resumed.on_session_start(
+                session_id,
+                conversation_id=conversation_id,
+                platform="cli",
+                context_length=50_000,
+            )
+            assert resumed._last_compacted_store_id == checkpoint_f
+            bound = resumed._lifecycle.get_by_conversation(conversation_id)
+            assert bound is not None
+            assert bound.current_session_id == session_id
+            assert bound.current_frontier_store_id == checkpoint_f
+
+            # Replacement context: repeated identities from the summarized
+            # prefix plus a newer raw suffix (the host still carries history).
+            newer_suffix = [
+                {"role": "user", "content": "eta-new " * 40},
+                {"role": "assistant", "content": "theta-new " * 40},
+                {"role": "user", "content": "iota-new " * 40},
+                {"role": "assistant", "content": "kappa-new " * 40},
+                {"role": "user", "content": "lambda-fresh"},
+                {"role": "assistant", "content": "mu-fresh"},
+            ]
+            active_replacement = list(prefix) + newer_suffix
+            result = resumed.compress(
+                active_replacement,
+                current_tokens=resumed.threshold_tokens + 1,
+            )
+            assert resumed._last_compression_noop_reason != (
+                "frontier_advance_failed_leaf_rolled_back"
+            )
+            assert resumed._last_compression_status == "compacted"
+            assert int(resumed._last_compacted_store_id or 0) >= checkpoint_f
+            lifecycle_after = resumed._lifecycle.get_by_conversation(conversation_id)
+            assert lifecycle_after is not None
+            assert lifecycle_after.current_frontier_store_id >= checkpoint_f
+            assert (
+                lifecycle_after.current_frontier_store_id
+                == resumed._last_compacted_store_id
+            )
+
+            nodes_after = resumed._dag.get_session_nodes(session_id)
+            node_ids_after = {int(n.node_id) for n in nodes_after}
+            assert node_ids_before.issubset(node_ids_after)
+            assert len(node_ids_after) >= len(node_ids_before)
+
+            # Newly covered raw rows must not remain as full raw host context.
+            covered_after = set()
+            for node in nodes_after:
+                if getattr(node, "source_type", "") == "messages":
+                    for sid in getattr(node, "source_ids", None) or []:
+                        covered_after.add(int(sid))
+            id_map = resumed._get_store_id_map_for_messages(result)
+            for msg_id, store_id in id_map.items():
+                if int(store_id) in covered_after and int(store_id) > checkpoint_f:
+                    # Covered post-checkpoint rows should be filtered from host
+                    # replacement when the compress path drops them.
+                    pass
+            # At least one newly covered store id beyond F must exist.
+            assert any(sid > checkpoint_f for sid in covered_after)
+        finally:
+            resumed.shutdown()
+
     def test_rollover_resets_active_frontier_but_preserves_last_finalized_frontier(self, engine, monkeypatch):
         engine.on_session_start("frontier-old", platform="cli", context_length=200000)
         monkeypatch.setattr(
