@@ -628,6 +628,68 @@ def test_prepare_fails_closed_when_canonical_ownership_read_errors(
         engine.shutdown()
 
 
+def test_promote_fails_closed_when_canonical_ownership_read_errors(
+    tmp_path, monkeypatch
+):
+    """DAG ownership read failure during promote must not publish overlapping sources.
+
+    A valid ready payload must not proceed to canonical insert / frontier CAS
+    when the ownership read used by the overlap guard fails. Storage errors
+    are fail-closed (rejected), never an empty ownership set that continues
+    publication.
+    """
+    engine = _engine(tmp_path)
+    try:
+        messages = _messages()
+        engine.ingest(messages)
+        batch = engine.prepare_background_compaction_once(messages)
+        assert batch is not None and batch.state == "ready"
+        assert batch.has_summary_payload
+
+        before_nodes = engine._dag.get_session_node_count(engine.current_session_id)
+        before_frontier = engine._frontier.get_active_frontier(
+            batch.conversation_id
+        )
+        before_gen = int(before_frontier["generation"]) if before_frontier else 0
+        before_items = (
+            list(engine._frontier.get_frontier_items(batch.conversation_id, before_gen) or [])
+            if before_gen > 0
+            else []
+        )
+        before_lifecycle = engine.get_status()["lifecycle"]["current_frontier_store_id"]
+
+        def boom(_session_id):
+            raise sqlite3.OperationalError("injected dag ownership read failure")
+
+        # Inject only during promotion validation (prepare already succeeded).
+        monkeypatch.setattr(engine._dag, "get_session_nodes", boom)
+        result = engine.promote_prepared_compaction(batch.batch_id, messages)
+
+        assert result.promoted is False
+        assert result.reason == "canonical_ownership_read_failed"
+        assert engine._dag.get_session_node_count(engine.current_session_id) == before_nodes
+        after_frontier = engine._frontier.get_active_frontier(batch.conversation_id)
+        after_gen = int(after_frontier["generation"]) if after_frontier else 0
+        assert after_gen == before_gen
+        after_items = (
+            list(engine._frontier.get_frontier_items(batch.conversation_id, after_gen) or [])
+            if after_gen > 0
+            else []
+        )
+        assert after_items == before_items
+        assert (
+            engine.get_status()["lifecycle"]["current_frontier_store_id"]
+            == before_lifecycle
+        )
+        stored = engine._frontier.get_batch(batch.batch_id)
+        assert stored is not None
+        assert stored.state == "rejected"
+        assert stored.failure_reason == "canonical_ownership_read_failed"
+        assert engine.get_async_compaction_status()["promoted_batches"] == 0
+    finally:
+        engine.shutdown()
+
+
 def test_prepare_fails_closed_when_frontier_items_read_errors(tmp_path, monkeypatch):
     """Frontier item read failure must not fall back to whole-session prepare."""
     engine = _engine(tmp_path)

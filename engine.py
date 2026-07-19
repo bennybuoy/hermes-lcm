@@ -5506,8 +5506,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         its source_ids. Higher condensation nodes point at nodes, not raw
         rows, so expanding the message leaves is sufficient.
 
-        Raises on DAG read failure so callers (prepare) can fail closed
-        rather than treating an empty set as "nothing is owned".
+        Raises on DAG read failure so callers (prepare / promote) can fail
+        closed rather than treating an empty set as "nothing is owned".
         """
         owned: set[int] = set()
         if not session_id:
@@ -5999,25 +5999,31 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             validation_ms = (time.perf_counter() - validation_started) * 1000.0
             return _result(promoted=False, reason="frontier_mismatch")
 
-        # 5. Canonical source overlap (foreground race already published)
+        # 5. Canonical source overlap (foreground race already published).
+        # Ownership/DAG read failures must fail closed: never treat a storage
+        # error as an empty ownership set and continue to publish.
         try:
-            existing_nodes = self._dag.get_session_nodes(batch.session_id)
-            covered: set[int] = set()
-            for node in existing_nodes:
-                if getattr(node, "source_type", "") == "messages":
-                    for sid in getattr(node, "source_ids", None) or []:
-                        try:
-                            covered.add(int(sid))
-                        except (TypeError, ValueError):
-                            continue
-            if covered.intersection(covered_source_ids):
-                self._frontier.update_batch_state(
-                    batch_id, "rejected", failure_reason="canonical_source_overlap",
-                )
-                validation_ms = (time.perf_counter() - validation_started) * 1000.0
-                return _result(promoted=False, reason="canonical_source_overlap")
-        except Exception:
-            logger.debug("LCM canonical source-overlap check failed", exc_info=True)
+            covered = self._canonical_message_owned_store_ids(batch.session_id)
+        except Exception as exc:
+            logger.warning(
+                "LCM promotion aborted: canonical ownership read failed: %s",
+                exc,
+            )
+            self._frontier.update_batch_state(
+                batch_id,
+                "rejected",
+                failure_reason="canonical_ownership_read_failed",
+            )
+            validation_ms = (time.perf_counter() - validation_started) * 1000.0
+            return _result(
+                promoted=False, reason="canonical_ownership_read_failed"
+            )
+        if covered.intersection(covered_source_ids):
+            self._frontier.update_batch_state(
+                batch_id, "rejected", failure_reason="canonical_source_overlap",
+            )
+            validation_ms = (time.perf_counter() - validation_started) * 1000.0
+            return _result(promoted=False, reason="canonical_source_overlap")
 
         validation_ms = (time.perf_counter() - validation_started) * 1000.0
 
