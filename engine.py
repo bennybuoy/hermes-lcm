@@ -134,6 +134,8 @@ from . import tools as lcm_tools
 logger = logging.getLogger(__name__)
 
 _SESSION_END_BUSY_TIMEOUT_MS = 50
+_FRONTIER_SUFFIX_PAGE_SIZE = 1_000
+_MAX_FRONTIER_SUFFIX_ITEMS = 20_000
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 
 # Auto-focus topic derivation: infer a compact focus hint from the most recent
@@ -6034,29 +6036,44 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             for item in items
             if item.get("kind") == "message"
         }
-        try:
-            all_stored = self._store.get_session_messages_after(
-                session_id, after_store_id=end_id,
+        suffix_cursor = end_id
+        scanned_suffix_rows = 0
+        while True:
+            remaining = _MAX_FRONTIER_SUFFIX_ITEMS - scanned_suffix_rows
+            page_limit = min(_FRONTIER_SUFFIX_PAGE_SIZE, remaining + 1)
+            page = self._store.get_session_messages_after(
+                session_id,
+                after_store_id=suffix_cursor,
+                limit=page_limit,
             )
-        except Exception:
-            all_stored = []
-        for row in all_stored:
-            try:
-                sid = int(row.get("store_id") or 0)
-            except (TypeError, ValueError):
-                continue
-            if sid <= 0 or sid in covered_set or sid in existing_messages:
-                continue
-            if end_id > 0 and sid <= end_id:
-                continue
-            items.append(
-                {
-                    "kind": "message",
-                    "ref_id": sid,
-                    "source_start": sid,
-                    "source_end": sid,
-                }
-            )
+            if not page:
+                break
+            page_cursor = suffix_cursor
+            for row in page:
+                try:
+                    sid = int(row.get("store_id") or 0)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("invalid frontier suffix store_id") from exc
+                if sid <= page_cursor:
+                    raise ValueError("frontier suffix cursor did not advance")
+                page_cursor = sid
+                scanned_suffix_rows += 1
+                if scanned_suffix_rows > _MAX_FRONTIER_SUFFIX_ITEMS:
+                    raise ValueError("frontier suffix item limit exceeded")
+                if sid in covered_set or sid in existing_messages:
+                    continue
+                items.append(
+                    {
+                        "kind": "message",
+                        "ref_id": sid,
+                        "source_start": sid,
+                        "source_end": sid,
+                    }
+                )
+                existing_messages.add(sid)
+            suffix_cursor = page_cursor
+            if len(page) < page_limit:
+                break
         # If there is no uncovered tail (empty session after full cover), the
         # node item alone still satisfies non-empty for source_end > 0.
         return items

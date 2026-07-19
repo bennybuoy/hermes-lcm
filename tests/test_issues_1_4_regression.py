@@ -249,6 +249,115 @@ class TestAuthoritativeFrontierRangeReplacement:
         finally:
             frontier.close()
 
+    def test_frontier_suffix_pages_beyond_legacy_ten_thousand_row_limit(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path)
+        calls = []
+        final_store_id = 10_002
+
+        def paged_suffix(_session_id, after_store_id=0, limit=10_000):
+            calls.append((after_store_id, limit))
+            start = max(2, int(after_store_id) + 1)
+            stop = min(final_store_id + 1, start + int(limit))
+            return [{"store_id": sid} for sid in range(start, stop)]
+
+        monkeypatch.setattr(
+            engine._store, "get_session_messages_after", paged_suffix
+        )
+        try:
+            items = engine._build_promoted_frontier_items(
+                session_id=engine.current_session_id,
+                node_id=99,
+                covered_source_ids=[1],
+                consumed_source_ids=[1],
+                frontier_end_store_id=1,
+                previous_items=[],
+            )
+            assert len(calls) > 10
+            assert items[-1]["kind"] == "message"
+            assert int(items[-1]["ref_id"]) == final_store_id
+        finally:
+            engine.shutdown()
+
+    def test_frontier_suffix_read_error_fails_publication_closed(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path)
+
+        def fail_suffix(*_args, **_kwargs):
+            raise sqlite3.OperationalError("injected suffix read failure")
+
+        monkeypatch.setattr(
+            engine._store, "get_session_messages_after", fail_suffix
+        )
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="suffix read"):
+                engine._build_promoted_frontier_items(
+                    session_id=engine.current_session_id,
+                    node_id=99,
+                    covered_source_ids=[1],
+                    consumed_source_ids=[1],
+                    frontier_end_store_id=1,
+                    previous_items=[],
+                )
+        finally:
+            engine.shutdown()
+
+    def test_frontier_suffix_operation_limit_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path)
+
+        def oversized_suffix(_session_id, after_store_id=0, limit=10_000):
+            start = max(2, int(after_store_id) + 1)
+            return [{"store_id": sid} for sid in range(start, start + int(limit))]
+
+        monkeypatch.setattr(
+            engine._store, "get_session_messages_after", oversized_suffix
+        )
+        try:
+            with pytest.raises(ValueError, match="item limit exceeded"):
+                engine._build_promoted_frontier_items(
+                    session_id=engine.current_session_id,
+                    node_id=99,
+                    covered_source_ids=[1],
+                    consumed_source_ids=[1],
+                    frontier_end_store_id=1,
+                    previous_items=[],
+                )
+        finally:
+            engine.shutdown()
+
+    def test_async_suffix_read_failure_compensates_canonical_insert(
+        self, tmp_path, monkeypatch
+    ):
+        engine = _engine(tmp_path)
+        _stub_summarize(monkeypatch, engine)
+        try:
+            messages = _messages()
+            engine.ingest(messages)
+            batch = engine.prepare_background_compaction_once(messages)
+            before = engine._frontier.get_active_frontier(
+                engine.current_conversation_id
+            )["generation"]
+
+            def fail_suffix(*_args, **_kwargs):
+                raise sqlite3.OperationalError("injected suffix read failure")
+
+            monkeypatch.setattr(
+                engine._store, "get_session_messages_after", fail_suffix
+            )
+            result = engine.promote_prepared_compaction(batch.batch_id, messages)
+            assert result.promoted is False
+            assert "suffix read failure" in result.reason
+            assert engine._dag.get_session_node_count(engine.current_session_id) == 0
+            assert engine._frontier.get_active_frontier(
+                engine.current_conversation_id
+            )["generation"] == before
+        finally:
+            engine.shutdown()
+
     def test_three_leaf_passes_preserve_order_and_exact_source_closure(
         self, tmp_path, monkeypatch
     ):
