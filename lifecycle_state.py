@@ -178,12 +178,21 @@ class LifecycleStateStore:
         if existing is not None:
             if existing.current_session_id == session_id:
                 return existing
+            # ``finalize_session`` moves the durable checkpoint from current_*
+            # to last_finalized_* and clears the active binding. Rebinding the
+            # exact same session must restore that checkpoint; otherwise the
+            # engine resumes from zero and can compact already-covered rows.
+            # A different session is a rollover and must start at zero.
+            same_session_resume = (
+                existing.current_session_id is None
+                and existing.last_finalized_session_id == session_id
+            )
             current_frontier = (
-                existing.current_frontier_store_id if existing.current_session_id == session_id else 0
+                int(existing.last_finalized_frontier_store_id or 0)
+                if same_session_resume
+                else 0
             )
-            current_bound_at = (
-                existing.current_bound_at if existing.current_session_id == session_id else now
-            )
+            current_bound_at = now
             last_finalized_session_id = existing.last_finalized_session_id
             last_finalized_frontier = existing.last_finalized_frontier_store_id
             debt_kind = existing.debt_kind

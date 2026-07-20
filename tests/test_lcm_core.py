@@ -2677,6 +2677,48 @@ class TestMessageStore:
 
 
 class TestLifecycleStateStore:
+    def test_bind_session_restores_checkpoint_when_resuming_same_finalized_session(
+        self, tmp_path
+    ):
+        store = LifecycleStateStore(tmp_path / "lifecycle-same-session-resume.db")
+        try:
+            store.bind_session("s1", conversation_id="c1")
+            store.advance_frontier("c1", "s1", 42)
+            finalized = store.finalize_session("c1", "s1", frontier_store_id=42)
+
+            assert finalized is not None
+            assert finalized.current_session_id is None
+            assert finalized.current_frontier_store_id == 0
+            assert finalized.last_finalized_session_id == "s1"
+            assert finalized.last_finalized_frontier_store_id == 42
+
+            resumed = store.bind_session("s1", conversation_id="c1")
+
+            assert resumed.current_session_id == "s1"
+            assert resumed.current_frontier_store_id == 42
+            assert resumed.last_finalized_session_id == "s1"
+            assert resumed.last_finalized_frontier_store_id == 42
+        finally:
+            store.close()
+
+    def test_bind_session_does_not_restore_checkpoint_for_different_session(
+        self, tmp_path
+    ):
+        store = LifecycleStateStore(tmp_path / "lifecycle-different-session.db")
+        try:
+            store.bind_session("s1", conversation_id="c1")
+            store.advance_frontier("c1", "s1", 42)
+            store.finalize_session("c1", "s1", frontier_store_id=42)
+
+            rebound = store.bind_session("s2", conversation_id="c1")
+
+            assert rebound.current_session_id == "s2"
+            assert rebound.current_frontier_store_id == 0
+            assert rebound.last_finalized_session_id == "s1"
+            assert rebound.last_finalized_frontier_store_id == 42
+        finally:
+            store.close()
+
     def test_init_creates_lifecycle_state_table(self, tmp_path):
         state = LifecycleStateStore(tmp_path / "lifecycle.db")
 
