@@ -4038,7 +4038,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             redacted_replay_messages.append(redacted_message)
         return redacted_replay_messages
 
-    def _ingest_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _ingest_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline_at: float | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Persist messages inside the shared session/rollover boundary."""
+        with self._storage_lifetime_lock:
+            return self._ingest_messages_locked(
+                messages,
+                deadline_at=deadline_at,
+            )
+
+    def _ingest_messages_locked(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline_at: float | None = None,
+    ) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
 
         Uses a cursor to track which portion of the current messages list
@@ -4119,7 +4137,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 else replay_msg
                 for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
             ]
-            self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
+            self._ingest_cursor = self._reconcile_ingest_cursor_from_store(
+                reconcile_messages,
+                deadline_at=deadline_at,
+            )
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)
         if cursor > 0:
@@ -4949,6 +4970,61 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return self._build_preserved_objective_summary_part(message)
         return None
 
+    @staticmethod
+    def _tool_transaction_safe_prefix_length(
+        messages: Sequence[Dict[str, Any]],
+        selected_count: int,
+    ) -> int:
+        """Back a prefix boundary up before a split tool transaction."""
+        selected_count = max(0, min(int(selected_count), len(messages)))
+        if (
+            selected_count == 0
+            or selected_count >= len(messages)
+            or messages[selected_count].get("role") != "tool"
+        ):
+            return selected_count
+
+        transaction_start = selected_count - 1
+        while (
+            transaction_start >= 0
+            and messages[transaction_start].get("role") == "tool"
+        ):
+            transaction_start -= 1
+        if transaction_start < 0:
+            return selected_count
+
+        assistant = messages[transaction_start]
+        if assistant.get("role") != "assistant":
+            return selected_count
+        expected_ids = {
+            call_id
+            for call_id in (
+                _tool_call_id(tool_call)
+                for tool_call in assistant.get("tool_calls") or []
+            )
+            if call_id
+        }
+        if not expected_ids:
+            return transaction_start if assistant.get("tool_calls") else selected_count
+
+        excluded_result_ids: set[str] = set()
+        result_index = selected_count
+        while (
+            result_index < len(messages)
+            and messages[result_index].get("role") == "tool"
+        ):
+            result_id = str(
+                messages[result_index].get("tool_call_id") or ""
+            ).strip()
+            if result_id:
+                excluded_result_ids.add(result_id)
+            result_index += 1
+        return (
+            transaction_start
+            if expected_ids.intersection(excluded_result_ids)
+            else selected_count
+        )
+
     def _assemble_context(
         self,
         system_msg: Optional[Dict[str, Any]],
@@ -4983,7 +5059,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         assembly_cap = (
             assembly_cap_override
             if assembly_cap_override is not None
-            else self._assembly_token_budget()
+            else self._effective_assembly_token_cap()
         )
         # The typed post-compaction target is a convergence goal, not
         # permission to discard raw messages that have not been published into
@@ -5764,6 +5840,26 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if not candidate_store_ids:
             return None
 
+        selected_start_index = next(
+            (
+                index
+                for index, stored_message in enumerate(all_stored)
+                if int(stored_message.get("store_id") or 0)
+                == candidate_store_ids[0]
+            ),
+            -1,
+        )
+        if selected_start_index < 0:
+            return None
+        safe_prefix_length = self._tool_transaction_safe_prefix_length(
+            all_stored[selected_start_index:],
+            len(candidate_store_ids),
+        )
+        if safe_prefix_length < len(candidate_store_ids):
+            candidate_store_ids = candidate_store_ids[:safe_prefix_length]
+        if not candidate_store_ids:
+            return None
+
         # Final pre-LLM authorization: advertised replacement interval must
         # be disjoint from every existing node item range on this generation.
         span_lo = min(candidate_store_ids)
@@ -5841,8 +5937,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
             # Convert stored messages to OpenAI format for the summarizer
             candidate_messages = [
-                {"role": m["role"], "content": m.get("content") or ""}
-                for m in candidate_stored
+                self._store.to_openai_msg(message)
+                for message in candidate_stored
             ]
 
             # Use the engine's existing leaf summarization path

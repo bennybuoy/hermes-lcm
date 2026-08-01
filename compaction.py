@@ -420,6 +420,7 @@ class CompactionMixin:
                 canonical_fallback_state=canonical_fallback_state,
                 busy_timeout_ms=busy_timeout_ms,
                 compress_started=_compress_started,
+                deadline_at=deadline_at,
             )
         except Exception as exc:
             if _is_sqlite_locked_error(exc):
@@ -474,6 +475,7 @@ class CompactionMixin:
         ],
         busy_timeout_ms: int,
         compress_started: float,
+        deadline_at: float,
     ) -> List[Dict[str, Any]]:
         """Inner compress pipeline (runs under foreground-priority + deadline)."""
 
@@ -704,7 +706,10 @@ class CompactionMixin:
                 ],
                 busy_timeout_ms,
             ):
-                working_messages = self._ingest_messages(messages)
+                working_messages = self._ingest_messages(
+                    messages,
+                    deadline_at=deadline_at,
+                )
         except Exception as exc:
             if _is_sqlite_locked_error(exc):
                 return fail_timeout(
@@ -983,6 +988,16 @@ class CompactionMixin:
 
             if not to_compact:
                 noop_reason = "no eligible leaf chunk selected"
+                break
+
+            safe_prefix_length = self._tool_transaction_safe_prefix_length(
+                working_messages[leading_anchor_count:],
+                len(to_compact),
+            )
+            if safe_prefix_length < len(to_compact):
+                to_compact = candidate_raw[:safe_prefix_length]
+            if not to_compact:
+                noop_reason = "tool transaction crosses leaf boundary"
                 break
 
             selected_raw_chunk = to_compact

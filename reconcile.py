@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -427,12 +428,50 @@ class ReconcileMixin:
         allow_empty_prefix: bool,
         session_count: int,
         raw_session_count: int,
+        deadline_at: float | None = None,
     ) -> int | None:
+        def check_deadline() -> None:
+            if deadline_at is not None and time.perf_counter() >= deadline_at:
+                raise RuntimeError("source reconciliation deadline exceeded")
+
+        check_deadline()
+        # Restart reconciliation considers every incoming prefix from longest
+        # to shortest. Identity construction may recover externalized payloads,
+        # so recomputing it in every prefix made this path quadratic in CPU and
+        # file I/O. Capture each active identity and persisted-output proof once.
+        active_identities = {
+            id(message): self._message_replay_identity(message)
+            for message in messages
+        }
+        persisted_output_recoverable: dict[int, bool] = {}
+        durable_persisted_output: dict[int, bool] = {}
+
+        def identity_for(message: Dict[str, Any]) -> tuple[str, str, str, str]:
+            return active_identities[id(message)]
+
+        def persisted_marker_is_recoverable(message: Dict[str, Any]) -> bool:
+            message_id = id(message)
+            if message_id not in persisted_output_recoverable:
+                content = normalize_content_value(message.get("content")) or ""
+                persisted_output_recoverable[message_id] = (
+                    recover_hermes_persisted_output_with_file_stat(content) is not None
+                )
+            return persisted_output_recoverable[message_id]
+
+        def has_durable_persisted_output(message: Dict[str, Any]) -> bool:
+            message_id = id(message)
+            if message_id not in durable_persisted_output:
+                durable_persisted_output[message_id] = (
+                    self._has_durable_persisted_output_replay_identity(message)
+                )
+            return durable_persisted_output[message_id]
+
         sanitized_replay_tail = self._stored_tail_for_sanitized_active_replay(stored_tail)
         effective_session_count = len(sanitized_replay_tail)
         sanitized_tail_collapsed = len(sanitized_replay_tail) < len(stored_tail)
         empty_prefix_cursor: int | None = None
         for cursor in range(len(messages), -1, -1):
+            check_deadline()
             candidate_messages = messages[:cursor]
             candidate_visible_messages = [
                 msg
@@ -454,7 +493,7 @@ class ReconcileMixin:
                 and not (
                     self._compiled_ignore_message_patterns
                     and self._is_quarantined_assistant_replay_identity(
-                        self._message_replay_identity(msg)
+                        identity_for(msg)
                     )
                     and self._matches_ignore_message_patterns(msg, stored_row=True)
                 )
@@ -464,7 +503,7 @@ class ReconcileMixin:
                 self._is_replayed_context_scaffold_message(msg) for msg in candidate_messages
             )
             candidate_has_quarantined_replay_evidence = any(
-                self._is_quarantined_assistant_replay_identity(self._message_replay_identity(msg))
+                self._is_quarantined_assistant_replay_identity(identity_for(msg))
                 for msg in candidate_messages
             )
             candidate_identity_messages = (
@@ -473,11 +512,11 @@ class ReconcileMixin:
                 else candidate_visible_messages
             )
             candidate_visible_prefix = [
-                self._message_replay_identity(msg)
+                identity_for(msg)
                 for msg in candidate_visible_messages
             ]
             candidate_prefix = [
-                self._message_replay_identity(msg)
+                identity_for(msg)
                 for msg in candidate_identity_messages
             ]
             if not candidate_prefix:
@@ -509,10 +548,7 @@ class ReconcileMixin:
             early_candidate_has_unrecoverable_persisted_marker = any(
                 str(msg.get("role") or "") == "tool"
                 and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
-                and recover_hermes_persisted_output_with_file_stat(
-                    normalize_content_value(msg.get("content")) or ""
-                )
-                is None
+                and not persisted_marker_is_recoverable(msg)
                 for msg in candidate_identity_messages
             )
             if (matches_visible_sanitized_tail or matches_visible_raw_tail) and not early_candidate_has_unrecoverable_persisted_marker:
@@ -531,10 +567,7 @@ class ReconcileMixin:
             candidate_has_unrecoverable_persisted_marker = any(
                 str(msg.get("role") or "") == "tool"
                 and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
-                and recover_hermes_persisted_output_with_file_stat(
-                    normalize_content_value(msg.get("content")) or ""
-                )
-                is None
+                and not persisted_marker_is_recoverable(msg)
                 for msg in candidate_identity_messages
             )
             matches_inline_generation_cleanup_tail = False
@@ -587,7 +620,7 @@ class ReconcileMixin:
                 or (
                     self._compiled_ignore_message_patterns
                     and self._is_quarantined_assistant_replay_identity(
-                        self._message_replay_identity(msg)
+                        identity_for(msg)
                     )
                     and self._matches_ignore_message_patterns(msg, stored_row=True)
                 )
@@ -626,7 +659,7 @@ class ReconcileMixin:
                 and any(
                     str(msg.get("role") or "") == "tool"
                     and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
-                    and self._has_durable_persisted_output_replay_identity(msg)
+                    and has_durable_persisted_output(msg)
                     for msg in candidate_messages
                 )
             )
@@ -787,7 +820,12 @@ class ReconcileMixin:
             return False
         return stored_head[: len(incoming_identities)] == incoming_identities
 
-    def _reconcile_ingest_cursor_from_store(self, messages: List[Dict[str, Any]]) -> int:
+    def _reconcile_ingest_cursor_from_store(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline_at: float | None = None,
+    ) -> int:
         """Infer the in-memory cursor for an existing session after process restart."""
         if not self._session_id or not messages:
             return 0
@@ -847,6 +885,7 @@ class ReconcileMixin:
             allow_empty_prefix=True,
             session_count=len(stored_tail),
             raw_session_count=session_count,
+            deadline_at=deadline_at,
         )
         if cursor is not None and cursor > 0:
             reason = (
