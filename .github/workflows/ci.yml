@@ -40,9 +40,12 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        # Production runs 3.11; latest guards forward compatibility without
+        # paying for every intermediate minor release.
+        python-version: ["3.11", "3.14"]
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -53,7 +56,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install test dependencies
-        run: pip install pytest
+        run: pip install pytest pytest-timeout
 
       - name: Stub hermes-agent ABC
         run: |
@@ -87,7 +90,7 @@ jobs:
       - name: Run pytest under low file descriptor limit
         run: |
           ulimit -n 1024
-          python -m pytest tests/ -q
+          python -m pytest tests/ -q --timeout=60 --timeout-method=thread
 
       - name: Run static validation
         run: |
