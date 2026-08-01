@@ -23,7 +23,6 @@ so they become real gates as each feature lands.
 
 from __future__ import annotations
 
-import json
 import time
 from typing import Any
 
@@ -327,7 +326,7 @@ class TestDeterministicHierarchy:
         _stub_condensation_summarize(monkeypatch, engine)
         try:
             d0_nodes, store_ids = _seed_depth0_leaves(engine, count=16)
-            d1_nodes = _seed_depth1_from_depth0(engine, d0_nodes, fanin=4)
+            _seed_depth1_from_depth0(engine, d0_nodes, fanin=4)
 
             engine._maybe_condense(
                 focus_topic=None,
@@ -362,7 +361,7 @@ class TestDeterministicHierarchy:
             threshold = engine.threshold_tokens
 
             # Compress with high token count to trigger compaction
-            result = engine.compress(msgs, current_tokens=threshold + 5000)
+            engine.compress(msgs, current_tokens=threshold + 5000)
 
             depth_stats = engine._dag.get_session_depth_stats(engine.current_session_id)
             # We should have at least a few depth-0 leaves
@@ -463,7 +462,7 @@ class TestHostReplacementSeam:
         original_msgs = [{"role": "system", "content": "system"}] + _messages(20, tokens_each=40)
         engine.ingest(original_msgs)
         threshold = engine.threshold_tokens
-        result = engine.compress(original_msgs, current_tokens=threshold + 200)
+        engine.compress(original_msgs, current_tokens=threshold + 200)
         engine.shutdown()
 
         # Reload with a new engine instance
@@ -972,7 +971,7 @@ class TestNoCompactionLoop:
             leaf_chunk_tokens=20,
             session_id="no-loop-session",
         )
-        call_counter = _stub_summary(monkeypatch, engine)
+        _stub_summary(monkeypatch, engine)
         try:
             msgs = [{"role": "system", "content": "system"}] + _messages(40, tokens_each=40)
             engine.ingest(msgs)
@@ -982,8 +981,6 @@ class TestNoCompactionLoop:
             result = engine.compress(msgs, current_tokens=threshold + 100)
             first_count = engine.compression_count
             assert first_count >= 1, "First compress did not compact"
-
-            summary_calls_after_first = call_counter[0]
 
             # Now feed the compressed result back unchanged — should not recompact
             # The compressed context should be below cutover
@@ -1000,7 +997,7 @@ class TestNoCompactionLoop:
             else:
                 # If still above cutover, the second compress should make progress
                 # but should not loop indefinitely
-                result2 = engine.compress(result, current_tokens=result_tokens)
+                engine.compress(result, current_tokens=result_tokens)
                 second_count = engine.compression_count
                 # Compression count should not have exploded
                 assert second_count <= first_count + 2, (
@@ -1058,7 +1055,6 @@ class TestNoCompactionLoop:
         try:
             msgs = [{"role": "system", "content": "system"}] + _messages(20, tokens_each=30)
             engine.ingest(msgs)
-            threshold = engine.threshold_tokens  # 500
 
             # Force emergency by providing very high token count
             emergency_threshold = engine._effective_emergency_threshold_tokens()
@@ -1075,7 +1071,7 @@ class TestNoCompactionLoop:
             )
 
             # A second compress with the same token count should not loop
-            result2 = engine.compress(result, current_tokens=emergency_threshold + 50)
+            engine.compress(result, current_tokens=emergency_threshold + 50)
             # Compression count should not have exploded
             # (it may compact once more but should not loop)
         finally:

@@ -6140,7 +6140,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # CRITICAL: publication uses the prepared payload only — zero LLM calls.
         inserted_node_id: int | None = None
         advanced_frontier_generation = 0
-        frontier_items_written = False
         try:
             publication_started = time.perf_counter()
             previous_items = self._frontier.get_frontier_items(
@@ -6208,7 +6207,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 return _result(promoted=False, reason="frontier_mismatch")
 
             advanced_frontier_generation = new_gen
-            frontier_items_written = True
 
             # Fault-injection points after items / generation CAS.
             if hook == "after_frontier_items":
@@ -6288,7 +6286,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                             advanced_frontier_generation,
                         )
                     else:
-                        frontier_items_written = False
                         can_delete_inserted_node = True
                 except Exception:
                     logger.error(

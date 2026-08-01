@@ -796,7 +796,7 @@ class TestIssue2HostReplacementDropsCovered:
 
             original_ingest = engine._ingest_messages
 
-            def locked_ingest(_messages):
+            def locked_ingest(_messages, **_kwargs):
                 raise sqlite3.OperationalError("database is locked")
 
             monkeypatch.setattr(engine, "_ingest_messages", locked_ingest)
@@ -1316,7 +1316,7 @@ class TestIssue2HostReplacementDropsCovered:
         self, tmp_path, monkeypatch
     ):
         engine = _engine(tmp_path, fresh_tail_count=2)
-        calls = _stub_summarize(monkeypatch, engine)
+        _stub_summarize(monkeypatch, engine)
         try:
             msgs = _messages(16, tokens_each=40)
             engine.ingest(msgs)

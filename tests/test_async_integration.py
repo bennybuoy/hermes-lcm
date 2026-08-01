@@ -10,8 +10,6 @@ from __future__ import annotations
 import time
 from typing import Any
 
-import pytest
-
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 

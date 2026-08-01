@@ -26,7 +26,6 @@ from typing import Any, Optional, Sequence
 
 from .db_bootstrap import (
     ensure_frontier_tables,
-    ensure_prepared_batch_payload_columns,
     configure_connection,
     run_versioned_migrations,
 )

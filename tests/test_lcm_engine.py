@@ -20066,7 +20066,7 @@ class TestSessionRollover:
                 {"role": "assistant", "content": "zeta-fresh"},
             ]
             first_messages = prefix + tail
-            compacted = engine.compress(
+            engine.compress(
                 first_messages,
                 current_tokens=engine.threshold_tokens + 1,
             )
