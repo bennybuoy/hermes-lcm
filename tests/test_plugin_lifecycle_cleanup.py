@@ -14,6 +14,8 @@ def _load_plugin_module(name: str):
         str(REPO_ROOT / "__init__.py"),
         submodule_search_locations=[str(REPO_ROOT)],
     )
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
