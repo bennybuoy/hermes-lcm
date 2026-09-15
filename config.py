@@ -270,22 +270,47 @@ def _parse_model_thresholds_env(raw: str) -> dict[str, float]:
     """Parse ``LCM_MODEL_THRESHOLDS`` env var.
 
     Format: ``"glm-5.2:0.70,glm-5.2-1M:0.25"``
+
+    An explicitly empty (or whitespace-only) string is a deliberate override
+    that clears any YAML-configured ``lcm.model_thresholds`` -- it returns
+    ``{}``. Any other content that fails to parse (missing ``:``, empty model
+    name, non-numeric or out-of-range threshold) raises ``ValueError`` instead
+    of silently dropping the bad entry: a parse failure must never be treated
+    as an intentional empty override, since ``from_env`` would otherwise use
+    that empty result to clear a valid ``lcm.model_thresholds`` YAML config.
+    See ``LCMConfig.from_env`` for how callers keep the YAML value on error.
     """
+    if not raw.strip():
+        return {}
     result: dict[str, float] = {}
     for pair in raw.split(","):
         pair = pair.strip()
-        if ":" not in pair:
+        if not pair:
             continue
+        if ":" not in pair:
+            raise ValueError(
+                f"LCM_MODEL_THRESHOLDS: invalid entry {pair!r}; expected "
+                "'model:threshold' pairs, e.g. 'glm-5.2:0.70,glm-5.2-1M:0.25'"
+            )
         key, _, val = pair.rpartition(":")
         key = key.strip()
         if not key:
-            continue
+            raise ValueError(
+                f"LCM_MODEL_THRESHOLDS: invalid entry {pair!r}; missing model name"
+            )
+        val = val.strip()
         try:
-            threshold = float(val.strip())
-        except ValueError:
-            continue
-        if _is_valid_context_threshold(threshold):
-            result[key] = threshold
+            threshold = float(val)
+        except ValueError as exc:
+            raise ValueError(
+                f"LCM_MODEL_THRESHOLDS: invalid threshold {val!r} for model {key!r}"
+            ) from exc
+        if not _is_valid_context_threshold(threshold):
+            raise ValueError(
+                f"LCM_MODEL_THRESHOLDS: threshold {threshold!r} for model {key!r} "
+                "must be > 0.0 and <= 1.0"
+            )
+        result[key] = threshold
     return result
 
 
@@ -880,11 +905,39 @@ class LCMConfig:
         _record("context_threshold", source, warning)
         # Per-model threshold overrides: load from lcm.model_thresholds in
         # config.yaml, then LCM_MODEL_THRESHOLDS env var (comma-separated
-        # key:value pairs). Env overrides config.yaml.
+        # key:value pairs). A *valid* parse of the env var overrides
+        # config.yaml; an explicitly empty env var ("") is a deliberate
+        # override that clears config.yaml. An *invalid* env var (malformed,
+        # unparseable) must never be treated as empty -- that would silently
+        # discard a valid YAML config -- so it is rejected loudly (logged and
+        # surfaced via config_source_warnings) and the YAML value is kept.
         c.model_thresholds = _load_model_thresholds_from_yaml()
+        model_thresholds_source = (
+            "config_yaml:lcm.model_thresholds" if c.model_thresholds else "default"
+        )
         _raw_env_thresholds = os.environ.get("LCM_MODEL_THRESHOLDS")
         if _raw_env_thresholds is not None:
-            c.model_thresholds = _parse_model_thresholds_env(_raw_env_thresholds)
+            try:
+                c.model_thresholds = _parse_model_thresholds_env(_raw_env_thresholds)
+            except ValueError as exc:
+                logger.error(
+                    "LCM ignoring invalid LCM_MODEL_THRESHOLDS (keeping "
+                    "lcm.model_thresholds from config.yaml, if any): %s",
+                    exc,
+                )
+                # c.model_thresholds and model_thresholds_source are left as
+                # whatever the YAML load produced above -- the invalid env
+                # var is rejected outright, not treated as an empty override.
+                _record(
+                    "model_thresholds",
+                    model_thresholds_source,
+                    f"invalid LCM_MODEL_THRESHOLDS ignored: {exc}",
+                )
+            else:
+                model_thresholds_source = "env:LCM_MODEL_THRESHOLDS"
+                _record("model_thresholds", model_thresholds_source)
+        else:
+            _record("model_thresholds", model_thresholds_source)
         c.codex_gpt55_autoraise_enabled, source = _hermes_codex_gpt55_autoraise_with_source(
             c.codex_gpt55_autoraise_enabled
         )

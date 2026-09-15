@@ -1,5 +1,7 @@
 """Tests for per-model compression threshold overrides in LCM."""
 
+import pytest
+
 from hermes_lcm.config import LCMConfig, _parse_model_thresholds_env
 
 
@@ -9,25 +11,37 @@ class TestParseModelThresholdsEnv:
         assert result == {"glm-5.2": 0.70, "glm-5.2-1M": 0.25}
 
     def test_empty_string(self):
+        """An explicitly empty value is a deliberate override -- not an error."""
         assert _parse_model_thresholds_env("") == {}
+        assert _parse_model_thresholds_env("   ") == {}
 
-    def test_missing_colon_skipped(self):
-        result = _parse_model_thresholds_env("glm-5.2:0.70,badentry,glm-5.2-1M:0.25")
-        assert result == {"glm-5.2": 0.70, "glm-5.2-1M": 0.25}
+    def test_missing_colon_raises(self):
+        """A malformed entry must be rejected loudly, not silently skipped.
 
-    def test_invalid_float_skipped(self):
-        result = _parse_model_thresholds_env("glm-5.2:0.70,bad:abc")
-        assert result == {"glm-5.2": 0.70}
+        Silently dropping it would make an invalid env var indistinguishable
+        from an intentionally empty one, which could silently clear a valid
+        YAML ``lcm.model_thresholds`` config (see LCMConfig.from_env).
+        """
+        with pytest.raises(ValueError, match="badentry"):
+            _parse_model_thresholds_env("glm-5.2:0.70,badentry,glm-5.2-1M:0.25")
 
-    def test_out_of_range_and_non_finite_values_are_skipped(self):
-        result = _parse_model_thresholds_env(
-            "zero:0,negative:-0.1,too-high:1.01,nan:nan,inf:inf,valid:1.0"
-        )
-        assert result == {"valid": 1.0}
+    def test_invalid_float_raises(self):
+        with pytest.raises(ValueError, match="abc"):
+            _parse_model_thresholds_env("glm-5.2:0.70,bad:abc")
+
+    def test_out_of_range_and_non_finite_values_raise(self):
+        for raw in ("zero:0", "negative:-0.1", "too-high:1.01", "nan:nan", "inf:inf"):
+            with pytest.raises(ValueError):
+                _parse_model_thresholds_env(raw)
 
     def test_whitespace_stripped(self):
         result = _parse_model_thresholds_env(" glm-5.2 : 0.70 , glm-5.2-1M : 0.25 ")
         assert result == {"glm-5.2": 0.70, "glm-5.2-1M": 0.25}
+
+    def test_trailing_comma_ignored(self):
+        """Stray empty segments from a trailing/leading comma are not errors."""
+        result = _parse_model_thresholds_env("glm-5.2:0.70,")
+        assert result == {"glm-5.2": 0.70}
 
 
 class TestLCMConfigModelThresholds:
@@ -64,6 +78,60 @@ class TestLCMConfigModelThresholds:
         c = LCMConfig.from_env()
 
         assert c.model_thresholds == {"valid": 0.4}
+
+    def test_empty_env_clears_yaml(self, monkeypatch, tmp_path):
+        """An explicit LCM_MODEL_THRESHOLDS="" intentionally clears YAML."""
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "lcm:\n  model_thresholds:\n    glm-5.2: 0.4\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("LCM_MODEL_THRESHOLDS", "")
+
+        c = LCMConfig.from_env()
+
+        assert c.model_thresholds == {}
+        assert c.config_sources["model_thresholds"] == "env:LCM_MODEL_THRESHOLDS"
+
+    def test_invalid_env_does_not_clear_yaml(self, monkeypatch, tmp_path):
+        """An invalid (unparseable) env var must never silently clear YAML.
+
+        Regression test: the original implementation treated any env var
+        value -- valid, empty, or garbage -- the same way: parse it (garbage
+        parses to `{}` since no entry has a ':') and unconditionally replace
+        `model_thresholds` with the result. That silently discarded a valid
+        YAML config whenever the env var happened to be malformed.
+        """
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "lcm:\n  model_thresholds:\n    glm-5.2: 0.4\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("LCM_MODEL_THRESHOLDS", "not-a-valid-entry")
+
+        c = LCMConfig.from_env()
+
+        assert c.model_thresholds == {"glm-5.2": 0.4}
+        assert c.config_sources["model_thresholds"] == "config_yaml:lcm.model_thresholds"
+        assert any(
+            "LCM_MODEL_THRESHOLDS" in warning
+            for warning in c.config_source_warnings
+        )
+
+    def test_invalid_env_with_no_yaml_leaves_empty_and_warns(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setenv("LCM_MODEL_THRESHOLDS", "garbage-no-colon")
+
+        c = LCMConfig.from_env()
+
+        assert c.model_thresholds == {}
+        assert c.config_sources["model_thresholds"] == "default"
+        assert any(
+            "LCM_MODEL_THRESHOLDS" in warning
+            for warning in c.config_source_warnings
+        )
 
 
 class TestRuntimeContextThreshold:
