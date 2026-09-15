@@ -223,3 +223,88 @@ class TestRuntimeContextThreshold:
             assert engine._context_threshold_source == "model_thresholds:large-model"
         finally:
             engine.shutdown()
+
+
+class TestModelOverrideNotLabeledAsAutoraise:
+    """A per-model override is a distinct mechanism from codex_gpt55_autoraise.
+
+    Regression coverage: the engine used to report both under the same
+    ``context_threshold_autoraised`` status field/attribute, which mislabels
+    a per-model override -- especially one that *lowers* the effective
+    threshold -- as an "autoraise" (a term that specifically means Hermes
+    Agent's Codex gpt-5.5 route-specific threshold raise).
+    """
+
+    def test_lowering_override_is_not_reported_as_autoraised(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "model-override-lower.db"),
+                model_thresholds={"small-model": 0.15},
+            )
+        )
+        try:
+            engine.update_model(
+                model="small-model",
+                provider="test",
+                context_length=100_000,
+            )
+            assert engine.context_threshold == 0.15
+            assert engine._context_threshold_source == "model_thresholds:small-model"
+            # Must NOT be surfaced as an autoraise notice.
+            assert engine._context_threshold_autoraised is None
+            assert engine._context_threshold_model_override == {"from": 0.35, "to": 0.15}
+
+            status = engine.get_status()
+            assert status["context_threshold_autoraised"] is None
+            assert status["context_threshold_model_override"] == {"from": 0.35, "to": 0.15}
+        finally:
+            engine.shutdown()
+
+    def test_raising_override_is_also_not_reported_as_autoraised(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "model-override-raise.db"),
+                model_thresholds={"big-model": 0.85},
+            )
+        )
+        try:
+            engine.update_model(
+                model="big-model",
+                provider="test",
+                context_length=100_000,
+            )
+            assert engine.context_threshold == 0.85
+            assert engine._context_threshold_autoraised is None
+            assert engine._context_threshold_model_override == {"from": 0.35, "to": 0.85}
+        finally:
+            engine.shutdown()
+
+    def test_codex_gpt55_autoraise_still_uses_autoraise_field(self, tmp_path):
+        """The genuine autoraise case is unaffected by the new field."""
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(
+            context_threshold=0.68,
+            database_path=str(tmp_path / "codex-autoraise-still-works.db"),
+        )
+        config.config_sources["context_threshold"] = "config_yaml:compression.threshold"
+        engine = LCMEngine(config=config)
+        try:
+            engine.update_model(
+                model="gpt-5.5",
+                provider="openai-codex",
+                context_length=400_000,
+            )
+            assert engine._context_threshold_source == "codex_gpt55_autoraise"
+            assert engine._context_threshold_autoraised == {"from": 0.68, "to": 0.85}
+            assert engine._context_threshold_model_override is None
+
+            status = engine.get_status()
+            assert status["context_threshold_autoraised"] == {"from": 0.68, "to": 0.85}
+            assert status["context_threshold_model_override"] is None
+        finally:
+            engine.shutdown()
