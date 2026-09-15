@@ -883,7 +883,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if self._config.model_thresholds and route_model:
             best_key = ""
             for key in self._config.model_thresholds:
-                if key in route_model and len(key) > len(best_key):
+                needle = route_model.lower()
+                if key.lower() in needle and len(key) > len(best_key):
                     best_key = key
             if best_key:
                 override = float(self._config.model_thresholds[best_key])

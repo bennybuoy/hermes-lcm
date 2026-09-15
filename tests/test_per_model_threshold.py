@@ -166,6 +166,33 @@ class TestRuntimeContextThreshold:
         assert "model_thresholds" in source
         assert notice == {"from": 0.35, "to": 0.70}
 
+    def test_match_is_case_insensitive(self, tmp_path):
+        """Model-name matching follows repo convention: case-insensitive.
+
+        config.py normalizes model/provider names with ``strip().lower()``
+        elsewhere, so a threshold key written as ``GLM-5.2`` must match a
+        route model reported as ``glm-5.2-instant`` (and vice versa).
+        """
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "case-insensitive.db"),
+                model_thresholds={"GLM-5.2": 0.5},
+            )
+        )
+        try:
+            engine.update_model(
+                model="glm-5.2-instant",
+                provider="test",
+                context_length=100_000,
+            )
+            assert engine.context_threshold == 0.5
+            assert engine._context_threshold_source == "model_thresholds:GLM-5.2"
+        finally:
+            engine.shutdown()
+
     def test_longest_match_wins(self):
         engine = self._make_engine({"glm-5.2": 0.70, "glm-5.2-1M": 0.25})
         engine.model = "glm-5.2-1M"
