@@ -60,3 +60,6 @@ benchmarks/runs/
 # Internal documentation
 internal docs/
 docs/plans/
+
+# uv.lock: not a uv project — the plugin is a virtual member of Hermes' PM-generated workspace lock, never locked in-repo
+uv.lock

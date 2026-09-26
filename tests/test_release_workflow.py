@@ -34,12 +34,14 @@ def test_release_candidate_identity_surfaces_are_synchronized():
     bug_report = (
         REPO_ROOT / ".github" / "ISSUE_TEMPLATE" / "bug_report.yml"
     ).read_text(encoding="utf-8")
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
     assert f"version: {RELEASE_VERSION}" in manifest
     assert f"hermes-lcm v{RELEASE_VERSION} (15 tools)" in readme
     assert f"hermes-lcm v{RELEASE_VERSION} (15 tools)" in operator_guide
     assert f"## v{RELEASE_VERSION} - " in changelog
     assert f"v{RELEASE_VERSION}, main, or commit SHA" in bug_report
+    assert f'version = "{RELEASE_VERSION}"' in pyproject
 
 
 def test_upgrade_guide_requires_sqlite_safe_backup_semantics():

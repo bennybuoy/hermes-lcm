@@ -1,8 +1,37 @@
 # Tooling configuration for the hermes-lcm plugin.
 #
-# This file exists only to pin lint settings so `ruff` behaves identically
-# locally and in CI. It intentionally declares no [build-system] or project
-# metadata: the plugin is installed via scripts/install.sh, not pip.
+# This file pins lint settings so `ruff` behaves identically locally and in
+# CI, and declares minimal PEP 621 project metadata.
+#
+# Why the [project] table is required: Hermes Agent's package manager (PM)
+# snapshots every pyproject-bearing plugin into a uv workspace as a "virtual"
+# member and injects a [project] table with only a name when the plugin has no
+# [project] of its own. uv >= 0.12 hard-rejects a [project] table that lacks
+# `version` (or `project.dynamic`), which made `uv lock` fail for every
+# enabled hermes-lcm install:
+#
+#   error: Failed to parse: plugin-sources/<key>/pyproject.toml
+#   TOML parse error: `pyproject.toml` is using the `[project]` table, but
+#   the required `project.version` field is neither set nor present in the
+#   `project.dynamic` list
+#
+# Declaring the table here (with `version`) keeps the PM workspace lock clean.
+# The plugin is not built or installed as a package by the PM workspace: it
+# has no [build-system], and [tool.uv] package = false keeps it a virtual
+# workspace member uv will not build or install during project operations.
+# Do NOT add a [build-system]: it would flip this member to buildable in
+# the PM workspace, defeat the PM's unique-name virtual-member handling,
+# and change the install story. Supported installation remains
+# `scripts/install.sh` / clone, not pip.
+
+[project]
+name = "hermes-lcm"
+version = "1.0.0-rc.1"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false
 
 [tool.ruff]
 # Match the oldest runtime CI exercises; keeps lint aligned with the 3.11 leg.
