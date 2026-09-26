@@ -1,8 +1,22 @@
 # Tooling configuration for the hermes-lcm plugin.
 #
-# This file exists only to pin lint settings so `ruff` behaves identically
-# locally and in CI. It intentionally declares no [build-system] or project
-# metadata: the plugin is installed via scripts/install.sh, not pip.
+# The ruff section pins lint settings so `ruff` behaves identically
+# locally and in CI. The [project] table carries the minimal metadata
+# Hermes's package manager needs to include the plugin as a virtual
+# workspace member when resolving the runtime lockfile: uv >= 0.12
+# rejects a [project] table without a version. There is still no
+# [build-system]: the plugin is installed via scripts/install.sh as a
+# plain directory, and [tool.uv] package = false keeps uv from ever
+# building it as a wheel.
+
+[project]
+name = "hermes-lcm"
+version = "0.19.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false
 
 [tool.ruff]
 # Match the oldest runtime CI exercises; keeps lint aligned with the 3.11 leg.
