@@ -61,8 +61,22 @@ def _config_bool_disabled(value) -> bool:
 
 
 def _hermes_config_path() -> Path:
-    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    return home / "config.yaml"
+    home = ""
+    try:
+        # Context-local home: under a multiplexed gateway os.environ["HERMES_HOME"]
+        # stays frozen at the launch profile, so reading it here silently resolves
+        # every profile's LCM policy (context_threshold, model_thresholds) from the
+        # default profile's config.yaml. get_hermes_home() honours the per-activity
+        # profile scope, matching the storage path resolution in __init__.py.
+        # Imported from the defining module: hermes_cli.config drags the full host
+        # dependency chain, and the plugin must degrade gracefully without it.
+        from hermes_constants import get_hermes_home
+        home = str(get_hermes_home())
+    except Exception:
+        home = ""
+    if not home:
+        home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+    return Path(home) / "config.yaml"
 
 
 def _load_hermes_config_yaml() -> dict[str, Any]:
