@@ -23,11 +23,38 @@ from .dag import SummaryNode
 from .db_bootstrap import (
     FOREGROUND_COMPRESS_BUSY_TIMEOUT_MS,
     FOREGROUND_COMPRESS_DEADLINE_SECONDS,
+    FOREGROUND_DEADLINE_SUMMARY_MARGIN_SECONDS,
 )
 from .message_content import text_content_for_pattern_matching
 from .sanitize import _contains_sensitive_redaction
 from .sqlite_util import _is_sqlite_locked_error, _temporary_sqlite_busy_timeout
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
+
+
+def resolve_foreground_deadline_seconds(config: Any) -> float:
+    """Resolve the wall-clock budget for a single compress() invocation.
+
+    An explicit positive ``foreground_compress_deadline_seconds`` (config
+    field / ``LCM_FOREGROUND_COMPRESS_DEADLINE_SECONDS``) wins. Otherwise
+    the deadline auto-derives from the summary timeout: at least the
+    hardcoded floor, and at least one full summary round-trip plus a
+    selection/publication margin. A fixed budget shorter than the summary
+    timeout cannot finish a slow first leaf pass before the next turn
+    re-trips the cutover, so it truncates to one published leaf per turn
+    and blocks user-visible latency repeatedly instead of converging.
+    """
+    explicit = float(
+        getattr(config, "foreground_compress_deadline_seconds", 0.0) or 0.0
+    )
+    if explicit > 0:
+        return explicit
+    summary_budget_seconds = (
+        float(getattr(config, "summary_timeout_ms", 0.0) or 0.0) / 1000.0
+    )
+    return max(
+        FOREGROUND_COMPRESS_DEADLINE_SECONDS,
+        summary_budget_seconds + FOREGROUND_DEADLINE_SUMMARY_MARGIN_SECONDS,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -336,14 +363,7 @@ class CompactionMixin:
 
         # Phase timing bookkeeping for operator diagnostics (issue #3).
         phase_timings: dict[str, float] = {}
-        deadline_seconds = float(
-            getattr(
-                self._config,
-                "foreground_compress_deadline_seconds",
-                FOREGROUND_COMPRESS_DEADLINE_SECONDS,
-            )
-            or FOREGROUND_COMPRESS_DEADLINE_SECONDS
-        )
+        deadline_seconds = resolve_foreground_deadline_seconds(self._config)
         busy_timeout_ms = int(
             getattr(
                 self._config,

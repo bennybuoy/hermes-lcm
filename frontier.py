@@ -476,6 +476,7 @@ class FrontierStore:
         batch_id: int,
         state: str,
         *,
+        from_state: Optional[str] = None,
         expected_leaf_count: Optional[int] = None,
         frontier_end_store_id: Optional[int] = None,
         failure_reason: str = "",
@@ -500,9 +501,17 @@ class FrontierStore:
             if payload_version is not None:
                 sets.append("payload_version = ?")
                 params.append(int(payload_version))
+            where = "batch_id = ?"
             params.append(batch_id)
+            if from_state is not None:
+                # A frontier advance can invalidate a batch mid-prepare
+                # (supersede/failed/promoted are terminal). A straggler
+                # completion write must not resurrect such a batch to
+                # 'ready': that re-jams the async worker gate.
+                where += " AND state = ?"
+                params.append(from_state)
             self._conn.execute(
-                f"UPDATE lcm_prepared_batches SET {', '.join(sets)} WHERE batch_id = ?",
+                f"UPDATE lcm_prepared_batches SET {', '.join(sets)} WHERE {where}",
                 params,
             )
             self._conn.commit()
@@ -610,17 +619,35 @@ class FrontierStore:
         conversation_id: str,
         *,
         reason: str = "foreground_compaction",
+        below_generation: Optional[int] = None,
     ) -> int:
-        """Mark ready/preparing batches as superseded (foreground race won)."""
+        """Mark ready/preparing batches as superseded (foreground race won).
+
+        ``below_generation`` restricts the sweep to batches whose
+        ``base_generation`` is strictly lower — i.e. batches a frontier
+        advance retro-invalidated — so a batch prepared against the live
+        generation is never swept.
+        """
         with self._lock:
-            cur = self._conn.execute(
-                """
-                UPDATE lcm_prepared_batches
-                SET state = 'superseded', failure_reason = ?, updated_at = ?
-                WHERE conversation_id = ? AND state IN ('ready', 'preparing')
-                """,
-                (reason, time.time(), conversation_id),
-            )
+            if below_generation is not None:
+                cur = self._conn.execute(
+                    """
+                    UPDATE lcm_prepared_batches
+                    SET state = 'superseded', failure_reason = ?, updated_at = ?
+                    WHERE conversation_id = ? AND state IN ('ready', 'preparing')
+                      AND base_generation < ?
+                    """,
+                    (reason, time.time(), conversation_id, int(below_generation)),
+                )
+            else:
+                cur = self._conn.execute(
+                    """
+                    UPDATE lcm_prepared_batches
+                    SET state = 'superseded', failure_reason = ?, updated_at = ?
+                    WHERE conversation_id = ? AND state IN ('ready', 'preparing')
+                    """,
+                    (reason, time.time(), conversation_id),
+                )
             self._conn.commit()
             return cur.rowcount
 

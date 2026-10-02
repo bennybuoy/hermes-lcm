@@ -34,6 +34,9 @@ SQLITE_BUSY_TIMEOUT_MS = 30_000
 FOREGROUND_COMPRESS_BUSY_TIMEOUT_MS = 2_000
 # Hard wall-clock budget for a single compress() invocation.
 FOREGROUND_COMPRESS_DEADLINE_SECONDS = 45.0
+# Margin over the summary timeout when auto-deriving the foreground deadline:
+# leaf selection, publication and SQLite critical sections.
+FOREGROUND_DEADLINE_SUMMARY_MARGIN_SECONDS = 15.0
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
 REQUIRED_CORE_TABLES = (
     "messages",

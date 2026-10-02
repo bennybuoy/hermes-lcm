@@ -959,7 +959,12 @@ class TestIssue2HostReplacementDropsCovered:
                 messages,
             )
             assert stale_result.promoted is False
-            assert stale_result.reason == "frontier_mismatch"
+            # Wired sweep supersedes the batch at the foreground advance;
+            # if it missed, CAS/guard rejection is the fallback outcome.
+            assert stale_result.reason in {
+                "batch_state_superseded",
+                "frontier_mismatch",
+            }
         finally:
             engine.shutdown()
 

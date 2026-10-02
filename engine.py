@@ -5510,6 +5510,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 frontier["generation"],
                 items,
             )
+            if new_gen:
+                # Pending prepared batches against the superseded generation
+                # can no longer CAS-promote; supersede them here so the async
+                # worker gate (ready/preparing > 0) cannot starve the lane.
+                try:
+                    swept = self._frontier.supersede_pending_batches(
+                        conv_id,
+                        reason="foreground_compaction",
+                        below_generation=int(new_gen),
+                    )
+                    if swept:
+                        logger.info(
+                            "LCM superseded %d stale pending batch(es) after "
+                            "foreground frontier advance to generation %s",
+                            swept,
+                            new_gen,
+                        )
+                except Exception:
+                    logger.debug(
+                        "LCM could not supersede stale pending batches after "
+                        "foreground frontier advance",
+                        exc_info=True,
+                    )
             return int(new_gen or 0)
         except Exception:
             logger.debug(
@@ -5980,6 +6003,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
             self._frontier.update_batch_state(
                 batch_id, leave_state,
+                from_state="preparing",
                 expected_leaf_count=leaf_count,
                 frontier_end_store_id=actual_source_end,
                 summary_payload=summary_payload,
@@ -6253,6 +6277,24 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 publication_ms,
                 wall_ms,
             )
+            try:
+                swept = self._frontier.supersede_pending_batches(
+                    batch.conversation_id,
+                    reason="frontier_advanced",
+                    below_generation=advanced_frontier_generation,
+                )
+                if swept:
+                    logger.info(
+                        "LCM superseded %d stale pending batch(es) after promote "
+                        "(conversation frontier advanced to generation %s)",
+                        swept,
+                        advanced_frontier_generation,
+                    )
+            except Exception:
+                logger.debug(
+                    "LCM could not supersede stale pending batches after promote",
+                    exc_info=True,
+                )
             result = _result(
                 promoted=True,
                 node_id=int(inserted_node_id or 0),
@@ -6889,7 +6931,35 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return None
         counts = self._frontier.get_batch_counts_by_state(conv_id)
         if counts.get("ready", 0) > 0 or counts.get("preparing", 0) > 0:
-            return None
+            # A pending batch blocks this conversation's lane. But a batch
+            # whose base generation is below the live frontier generation can
+            # never CAS-promote (frontier_mismatch is its only outcome), so
+            # leaving it pending starves the lane forever on idle
+            # conversations. Reap the stale ones here and re-evaluate.
+            frontier = self._frontier.get_active_frontier(conv_id)
+            current_gen = int((frontier or {}).get("generation") or 0)
+            try:
+                reaped = self._frontier.supersede_pending_batches(
+                    conv_id,
+                    reason="stale_generation_reaped",
+                    below_generation=current_gen,
+                )
+            except Exception:
+                logger.debug(
+                    "LCM async worker could not reap stale pending batches",
+                    exc_info=True,
+                )
+                reaped = 0
+            if reaped:
+                logger.info(
+                    "LCM async worker reaped %d stale pending batch(es) "
+                    "(conversation frontier at generation %s)",
+                    reaped,
+                    current_gen,
+                )
+                counts = self._frontier.get_batch_counts_by_state(conv_id)
+            if counts.get("ready", 0) > 0 or counts.get("preparing", 0) > 0:
+                return None
         fresh_tail = int(getattr(self._config, "fresh_tail_count", 0) or 0)
         try:
             stored = self._store.get_session_messages(session_id)

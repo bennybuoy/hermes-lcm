@@ -322,6 +322,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("expansion_model", "LCM_EXPANSION_MODEL", str),
     _EnvFieldSpec("expansion_context_tokens", "LCM_EXPANSION_CONTEXT_TOKENS", int),
     _EnvFieldSpec("summary_timeout_ms", "LCM_SUMMARY_TIMEOUT_MS", int),
+    _EnvFieldSpec("foreground_compress_deadline_seconds", "LCM_FOREGROUND_COMPRESS_DEADLINE_SECONDS", float),
     _EnvFieldSpec("expansion_timeout_ms", "LCM_EXPANSION_TIMEOUT_MS", int),
     _EnvFieldSpec("database_path", "LCM_DATABASE_PATH", str),
     _EnvFieldSpec("new_session_retain_depth", "LCM_NEW_SESSION_RETAIN_DEPTH", int),
@@ -578,6 +579,11 @@ class LCMConfig:
     # -- Timeouts ---
     summary_timeout_ms: int = 60_000
     expansion_timeout_ms: int = 120_000
+    # Foreground compress() wall-clock budget. 0 = auto-derive from
+    # summary_timeout_ms (max of the 45s floor and summary budget + margin)
+    # so one slow summary round-trip can never guarantee a one-pass
+    # truncation on every turn.
+    foreground_compress_deadline_seconds: float = 0.0
 
     # -- Storage ---
     database_path: str = ""       # empty = HERMES_HOME/lcm.db; LCM_DATABASE_PATH may override

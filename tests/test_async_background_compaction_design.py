@@ -206,7 +206,14 @@ def test_foreground_compaction_race_supersedes_pending_batch(tmp_path, monkeypat
 
         assert engine._dag.get_session_node_count(engine.current_session_id) >= 1
         assert result.promoted is False
-        assert result.reason in {"frontier_mismatch", "canonical_source_overlap"}
+        # The foreground frontier advance now supersedes the stale batch at
+        # publication (wired sweep), so promote observes a terminal state.
+        # If the sweep missed it, CAS/guard rejection is the fallback outcome.
+        assert result.reason in {
+            "batch_state_superseded",
+            "frontier_mismatch",
+            "canonical_source_overlap",
+        }
         async_status = engine.get_async_compaction_status()
         assert async_status["superseded_batches"] + async_status["rejected_batches"] >= 1
     finally:
